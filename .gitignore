@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.db
+.env
+uploads/
+generated_pdfs/
+node_modules/
