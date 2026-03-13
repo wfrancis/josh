@@ -189,7 +189,8 @@ export default function JobDetail() {
                 <FileSpreadsheet className="w-12 h-12 text-gray-600 mx-auto mb-4" />
                 <p className="text-gray-400 font-medium">Upload your RFMS takeoff first</p>
                 <p className="text-sm text-gray-600 mt-1 mb-4">Materials need to be imported before adding pricing</p>
-                <button onClick={() => setStep('info')} className="btn-primary">
+                <button onClick={() => setStep('info')}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-si-bright/10 border border-si-bright/20 text-si-bright text-sm font-medium hover:bg-si-bright/15 transition-colors">
                   <ArrowLeft className="w-4 h-4" /> Go to Step 1
                 </button>
               </div>

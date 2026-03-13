@@ -262,7 +262,7 @@ export default function Dashboard() {
                 <div
                   key={job.id}
                   onClick={() => navigate(`/jobs/${job.id}`)}
-                  className="glass-card-hover p-4 flex items-center gap-4 animate-fade-in"
+                  className="glass-card-hover p-4 flex items-center gap-4 animate-fade-in cursor-pointer"
                   style={{ animationDelay: `${i * 50}ms` }}
                 >
                   <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-si-navy/40 to-si-navy/20
