@@ -19,7 +19,7 @@ from openai import OpenAI
 _openai_config = {
     "api_key": None,   # None = use OPENAI_API_KEY env var
     "model": "gpt-5-mini",
-    "num_passes": 3,
+    "num_passes": 2,
 }
 
 

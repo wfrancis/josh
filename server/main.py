@@ -406,7 +406,7 @@ def api_get_settings():
         "openai_api_key_set": bool(raw_key),
         "openai_api_key_masked": masked,
         "openai_model": settings.get("openai_model", "gpt-5-mini"),
-        "multi_pass_count": int(settings.get("multi_pass_count", "3")),
+        "multi_pass_count": int(settings.get("multi_pass_count", "2")),
     }
 
 
@@ -438,7 +438,7 @@ def _apply_openai_config(settings: dict = None):
         settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
-    passes = int(settings.get("multi_pass_count", "3"))
+    passes = int(settings.get("multi_pass_count", "2"))
     print(f"[openai_config] api_key={'set' if api_key else 'MISSING'}, model={model}, passes={passes}")
     set_openai_config(api_key=api_key, model=model, num_passes=passes)
 

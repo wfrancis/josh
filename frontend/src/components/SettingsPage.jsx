@@ -23,7 +23,7 @@ export default function SettingsPage() {
   const [showApiKey, setShowApiKey] = useState(false)
   const [editingKey, setEditingKey] = useState(false)
   const [model, setModel] = useState('gpt-5-mini')
-  const [multiPassCount, setMultiPassCount] = useState(3)
+  const [multiPassCount, setMultiPassCount] = useState(2)
 
   // Load settings on mount
   useEffect(() => {
@@ -32,7 +32,7 @@ export default function SettingsPage() {
         setApiKeySet(data.openai_api_key_set)
         setApiKeyMasked(data.openai_api_key_masked)
         setModel(data.openai_model || 'gpt-5-mini')
-        setMultiPassCount(data.multi_pass_count || 3)
+        setMultiPassCount(data.multi_pass_count || 2)
       })
       .catch(console.error)
       .finally(() => setSettingsLoading(false))
@@ -227,8 +227,8 @@ export default function SettingsPage() {
                 </div>
                 <div className="mt-2 text-xs text-gray-600">
                   {multiPassCount === 1 && 'Single pass — fastest, no redundancy check'}
-                  {multiPassCount === 2 && '2 passes — basic verification'}
-                  {multiPassCount === 3 && '3 passes — recommended balance of accuracy & speed'}
+                  {multiPassCount === 2 && '2 passes — recommended balance of accuracy & speed'}
+                  {multiPassCount === 3 && '3 passes — higher accuracy, slower'}
                   {multiPassCount === 4 && '4 passes — high accuracy'}
                   {multiPassCount === 5 && '5 passes — maximum accuracy, slowest'}
                 </div>
