@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Plus, Briefcase, FileText, DollarSign, Clock,
   ChevronRight, Building2, User, Loader2, HardHat,
@@ -198,6 +198,7 @@ function CreateJobModal({ open, onClose, onCreated }) {
 /* ── Dashboard ─────────────────────────────────────────── */
 export default function Dashboard() {
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [jobs, setJobs] = useState([])
   const [loading, setLoading] = useState(true)
   const [showCreate, setShowCreate] = useState(false)
@@ -208,6 +209,14 @@ export default function Dashboard() {
       .catch(console.error)
       .finally(() => setLoading(false))
   }, [])
+
+  // Auto-open create modal if ?new=1
+  useEffect(() => {
+    if (searchParams.get('new') === '1') {
+      setShowCreate(true)
+      setSearchParams({}, { replace: true })
+    }
+  }, [searchParams])
 
   const completedJobs = jobs.filter(j => j.bundles?.length > 0).length
 
