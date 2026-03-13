@@ -34,6 +34,7 @@ def init_db() -> None:
                 tax_rate REAL DEFAULT 0.0,
                 unit_count INTEGER DEFAULT 0,
                 salesperson TEXT,
+                notes TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -96,6 +97,12 @@ def init_db() -> None:
             );
         """)
         conn.commit()
+        # Migrations for existing DBs
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN notes TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     finally:
         conn.close()
 
@@ -109,26 +116,26 @@ def save_job(job_data: dict) -> int:
             conn.execute("""
                 UPDATE jobs SET
                     project_name=?, gc_name=?, address=?, city=?, state=?, zip=?,
-                    tax_rate=?, unit_count=?, salesperson=?
+                    tax_rate=?, unit_count=?, salesperson=?, notes=?
                 WHERE id=?
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
                 job_data.get("state"), job_data.get("zip"),
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
-                job_data.get("salesperson"), job_id
+                job_data.get("salesperson"), job_data.get("notes"), job_id
             ))
         else:
             cur = conn.execute("""
                 INSERT INTO jobs (project_name, gc_name, address, city, state, zip,
-                                  tax_rate, unit_count, salesperson, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  tax_rate, unit_count, salesperson, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
                 job_data.get("state"), job_data.get("zip"),
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
-                job_data.get("salesperson"),
+                job_data.get("salesperson"), job_data.get("notes"),
                 datetime.now().isoformat()
             ))
             job_id = cur.lastrowid

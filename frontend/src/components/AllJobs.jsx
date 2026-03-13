@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import {
   Plus, Building2, User, Loader2, ChevronRight,
-  Search, FolderOpen
+  Search, FolderOpen, Trash2
 } from 'lucide-react'
 import { api } from '../api'
 import StatusBadge, { getJobStatus } from './StatusBadge'
@@ -12,6 +12,8 @@ export default function AllJobs() {
   const [jobs, setJobs] = useState([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
+  const [selected, setSelected] = useState(new Set())
+  const [deleting, setDeleting] = useState(false)
 
   useEffect(() => {
     api.listJobs()
@@ -30,6 +32,34 @@ export default function AllJobs() {
       j.city?.toLowerCase().includes(q)
     )
   })
+
+  const toggleSelect = (id, e) => {
+    e.stopPropagation()
+    setSelected(prev => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }
+
+  const toggleAll = () => {
+    if (selected.size === filtered.length) setSelected(new Set())
+    else setSelected(new Set(filtered.map(j => j.id)))
+  }
+
+  const handleBulkDelete = async () => {
+    if (!window.confirm(`Delete ${selected.size} job${selected.size !== 1 ? 's' : ''}? This cannot be undone.`)) return
+    setDeleting(true)
+    try {
+      await api.bulkDeleteJobs([...selected])
+      setJobs(prev => prev.filter(j => !selected.has(j.id)))
+      setSelected(new Set())
+    } catch (err) {
+      console.error(err)
+    } finally {
+      setDeleting(false)
+    }
+  }
 
   if (loading) {
     return (
@@ -55,15 +85,26 @@ export default function AllJobs() {
 
       {/* Search */}
       {jobs.length > 0 && (
-        <div className="relative mb-6">
-          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search by project, GC, salesperson, or city..."
-            className="input pl-11 w-full"
-          />
+        <div className="flex items-center gap-3 mb-6">
+          <div className="relative flex-1">
+            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search by project, GC, salesperson, or city..."
+              className="input pl-11 w-full"
+            />
+          </div>
+          <label className="flex items-center gap-2 text-xs text-gray-500 cursor-pointer select-none whitespace-nowrap">
+            <input
+              type="checkbox"
+              checked={filtered.length > 0 && selected.size === filtered.length}
+              onChange={toggleAll}
+              className="accent-si-bright w-4 h-4 rounded"
+            />
+            Select all
+          </label>
         </div>
       )}
 
@@ -96,6 +137,13 @@ export default function AllJobs() {
                 className="glass-card-hover p-4 flex items-center gap-4 animate-fade-in cursor-pointer"
                 style={{ animationDelay: `${i * 40}ms` }}
               >
+                <input
+                  type="checkbox"
+                  checked={selected.has(job.id)}
+                  onChange={(e) => toggleSelect(job.id, e)}
+                  onClick={(e) => e.stopPropagation()}
+                  className="accent-si-bright w-4 h-4 rounded flex-shrink-0"
+                />
                 <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-si-navy/40 to-si-navy/20
                               flex items-center justify-center flex-shrink-0 border border-white/[0.04]">
                   <Building2 className="w-5 h-5 text-gray-400" />
@@ -126,6 +174,30 @@ export default function AllJobs() {
               </div>
             )
           })}
+        </div>
+      )}
+      {/* Floating bulk action bar */}
+      {selected.size > 0 && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-slide-up">
+          <div className="flex items-center gap-4 px-6 py-3 rounded-2xl bg-gray-900/95 backdrop-blur-xl border border-white/[0.08] shadow-2xl">
+            <span className="text-sm text-gray-300 font-medium">
+              {selected.size} selected
+            </span>
+            <button
+              onClick={handleBulkDelete}
+              disabled={deleting}
+              className="flex items-center gap-2 px-4 py-2 rounded-xl bg-red-500/15 border border-red-500/25 text-red-400 text-sm font-medium hover:bg-red-500/25 transition-colors disabled:opacity-50"
+            >
+              {deleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+              Delete
+            </button>
+            <button
+              onClick={() => setSelected(new Set())}
+              className="text-sm text-gray-500 hover:text-gray-300 transition-colors"
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
     </div>

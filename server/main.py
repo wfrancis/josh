@@ -61,10 +61,19 @@ class JobCreate(BaseModel):
     tax_rate: float = 0.0
     unit_count: int = 0
     salesperson: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class MaterialUpdate(BaseModel):
     materials: list[dict]
+
+
+class NotesUpdate(BaseModel):
+    notes: str = ""
+
+
+class BulkDeleteRequest(BaseModel):
+    job_ids: list[int]
 
 
 class SettingsUpdate(BaseModel):
@@ -97,12 +106,33 @@ def api_get_job(job_id: int):
     return job
 
 
+@app.post("/api/jobs/bulk-delete")
+def api_bulk_delete(body: BulkDeleteRequest):
+    """Delete multiple jobs."""
+    deleted = 0
+    for jid in body.job_ids:
+        if delete_job(jid):
+            deleted += 1
+    return {"deleted": deleted}
+
+
 @app.delete("/api/jobs/{job_id}")
 def api_delete_job(job_id: int):
     """Delete a job and all related data."""
     if not delete_job(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"message": "Job deleted"}
+
+
+@app.put("/api/jobs/{job_id}/notes")
+def api_update_notes(job_id: int, body: NotesUpdate):
+    """Update job notes."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job["notes"] = body.notes
+    save_job(job)
+    return {"message": "Notes saved"}
 
 
 @app.post("/api/jobs/{job_id}/upload-rfms")
@@ -127,15 +157,16 @@ async def api_upload_rfms(job_id: int, file: UploadFile = File(...)):
     rfms_job_info = result.get("job_info", {})
     job_update = {
         "id": job_id,
-        "project_name": rfms_job_info.get("project_name", job["project_name"]),
-        "gc_name": rfms_job_info.get("gc_name", job.get("gc_name")),
-        "address": rfms_job_info.get("address", job.get("address")),
-        "city": rfms_job_info.get("city", job.get("city")),
-        "state": rfms_job_info.get("state", job.get("state")),
-        "zip": rfms_job_info.get("zip", job.get("zip")),
+        "project_name": rfms_job_info.get("project_name") or job["project_name"],
+        "gc_name": rfms_job_info.get("gc_name") or job.get("gc_name"),
+        "address": rfms_job_info.get("address") or job.get("address"),
+        "city": rfms_job_info.get("city") or job.get("city"),
+        "state": rfms_job_info.get("state") or job.get("state"),
+        "zip": rfms_job_info.get("zip") or job.get("zip"),
         "tax_rate": job.get("tax_rate", 0),
         "unit_count": job.get("unit_count", 0),
         "salesperson": job.get("salesperson"),
+        "notes": job.get("notes"),
     }
     save_job(job_update)
 

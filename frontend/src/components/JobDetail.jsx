@@ -2,7 +2,8 @@ import { useState, useEffect } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, Building2, MapPin, User, Percent, Hash,
-  Loader2, FileSpreadsheet, Save, AlertTriangle, Trash2
+  Loader2, FileSpreadsheet, Save, AlertTriangle, Trash2,
+  StickyNote, ChevronDown, ChevronUp, Cpu
 } from 'lucide-react'
 import { api } from '../api'
 import StepIndicator from './StepIndicator'
@@ -10,6 +11,7 @@ import FileUpload from './FileUpload'
 import MaterialsTable from './MaterialsTable'
 import QuoteUpload from './QuoteUpload'
 import BidPreview from './BidPreview'
+import StatusBadge, { getJobStatus } from './StatusBadge'
 
 export default function JobDetail() {
   const { jobId } = useParams()
@@ -21,11 +23,16 @@ export default function JobDetail() {
   const [rfmsSuccess, setRfmsSuccess] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
+  const [notesOpen, setNotesOpen] = useState(false)
+  const [notes, setNotes] = useState('')
+  const [aiSettings, setAiSettings] = useState(null)
 
   const loadJob = async () => {
     try {
       const data = await api.getJob(jobId)
       setJob(data)
+      setNotes(data.notes || '')
+      setNotesOpen(!!data.notes)
       if (data.bundles?.length > 0) setStep('bid')
       else if (data.materials?.some(m => m.unit_price > 0)) setStep('pricing')
       else if (data.materials?.length > 0) setStep('pricing')
@@ -37,6 +44,7 @@ export default function JobDetail() {
   }
 
   useEffect(() => { loadJob() }, [jobId])
+  useEffect(() => { api.getSettings().then(setAiSettings).catch(() => {}) }, [])
 
   const handleRfmsUpload = async (file) => {
     setRfmsLoading(true)
@@ -104,7 +112,10 @@ export default function JobDetail() {
           <ArrowLeft className="w-5 h-5" />
         </button>
         <div className="flex-1">
-          <h1 className="text-2xl font-extrabold text-white tracking-tight">{job.project_name}</h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-extrabold text-white tracking-tight">{job.project_name}</h1>
+            <StatusBadge status={getJobStatus(job)} />
+          </div>
           <div className="flex flex-wrap items-center gap-4 mt-2 text-sm text-gray-500">
             {job.gc_name && (
               <span className="flex items-center gap-1.5">
@@ -132,6 +143,11 @@ export default function JobDetail() {
                 <Hash className="w-3.5 h-3.5" /> {job.unit_count} units
               </span>
             )}
+            {aiSettings && (
+              <span className="flex items-center gap-1.5">
+                <Cpu className="w-3.5 h-3.5" /> {aiSettings.openai_model} · {aiSettings.multi_pass_count}x
+              </span>
+            )}
           </div>
         </div>
         <button
@@ -145,6 +161,27 @@ export default function JobDetail() {
         >
           <Trash2 className="w-5 h-5" />
         </button>
+      </div>
+
+      {/* Notes */}
+      <div className="mb-4">
+        <button
+          onClick={() => setNotesOpen(!notesOpen)}
+          className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-300 transition-colors"
+        >
+          <StickyNote className="w-3.5 h-3.5" />
+          {notesOpen ? 'Hide' : 'Show'} Notes
+          {notesOpen ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+        </button>
+        {notesOpen && (
+          <textarea
+            className="input w-full mt-2 min-h-[80px] text-sm resize-y"
+            placeholder="Add notes about this job..."
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            onBlur={() => api.updateNotes(jobId, notes).catch(() => {})}
+          />
+        )}
       </div>
 
       {/* Stepper */}
