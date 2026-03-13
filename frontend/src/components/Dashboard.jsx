@@ -62,7 +62,7 @@ function CreateJobModal({ open, onClose, onCreated }) {
         tax_rate: parseFloat(form.tax_rate) / 100 || 0,
         unit_count: parseInt(form.unit_count) || 0,
       })
-      onCreated(result.id)
+      onCreated(result.slug || result.id)
     } catch (err) {
       alert(err.message)
     } finally {
@@ -216,7 +216,7 @@ export default function Dashboard() {
               return (
                 <div
                   key={job.id}
-                  onClick={() => navigate(`/jobs/${job.id}`)}
+                  onClick={() => navigate(`/jobs/${job.slug || job.id}`)}
                   className="glass-card-hover p-4 flex items-center gap-4 animate-fade-in cursor-pointer"
                   style={{ animationDelay: `${i * 50}ms` }}
                 >

@@ -1,13 +1,13 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, Building2, MapPin, User, Percent, Hash,
   Loader2, FileSpreadsheet, Save, AlertTriangle, Trash2,
-  StickyNote, ChevronDown, ChevronUp, Cpu
+  StickyNote, ChevronDown, ChevronUp, Cpu, CheckCircle2, X, Upload
 } from 'lucide-react'
 import { api } from '../api'
 import StepIndicator from './StepIndicator'
-import FileUpload from './FileUpload'
+
 import MaterialsTable from './MaterialsTable'
 import QuoteUpload from './QuoteUpload'
 import BidPreview from './BidPreview'
@@ -21,6 +21,8 @@ export default function JobDetail() {
   const [step, setStep] = useState('info')
   const [rfmsLoading, setRfmsLoading] = useState(false)
   const [rfmsSuccess, setRfmsSuccess] = useState(false)
+  const [stagedFiles, setStagedFiles] = useState([])
+  const rfmsInputRef = useRef(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
   const [notesOpen, setNotesOpen] = useState(false)
@@ -46,23 +48,50 @@ export default function JobDetail() {
   useEffect(() => { loadJob() }, [jobId])
   useEffect(() => { api.getSettings().then(setAiSettings).catch(() => {}) }, [])
 
-  const handleRfmsUpload = async (files) => {
-    console.log('[handleRfmsUpload] received:', files, 'type:', typeof files, 'isArray:', Array.isArray(files))
+  const handleRfmsUpload = async (fileList) => {
     setRfmsLoading(true)
     setError(null)
     try {
-      const fileList = Array.isArray(files) ? files : [files]
-      console.log('[handleRfmsUpload] fileList:', fileList.map(f => f?.name || f))
       await api.uploadRFMS(jobId, fileList)
       const updated = await api.getJob(jobId)
       setJob(updated)
       setRfmsSuccess(true)
+      setStagedFiles([])
       setTimeout(() => setStep('pricing'), 800)
     } catch (err) {
       setError(err.message)
     } finally {
       setRfmsLoading(false)
     }
+  }
+
+  // Stage a file and auto-trigger when both are ready
+  const stageRfmsFile = useCallback((newFiles) => {
+    const incoming = Array.isArray(newFiles) ? newFiles : [newFiles]
+    setStagedFiles(prev => {
+      const combined = [...prev, ...incoming].slice(0, 2)
+      // Auto-trigger upload when we hit 2 files
+      if (combined.length >= 2) {
+        setTimeout(() => handleRfmsUpload(combined), 300)
+      }
+      return combined
+    })
+  }, [jobId])
+
+  const handleRfmsDrop = useCallback((e) => {
+    e.preventDefault(); e.stopPropagation()
+    const dropped = Array.from(e.dataTransfer.files)
+    if (dropped.length) stageRfmsFile(dropped)
+  }, [stageRfmsFile])
+
+  const handleRfmsFileSelect = (e) => {
+    const selected = Array.from(e.target.files)
+    if (selected.length) stageRfmsFile(selected)
+    if (rfmsInputRef.current) rfmsInputRef.current.value = ''
+  }
+
+  const removeStaged = (idx) => {
+    setStagedFiles(prev => prev.filter((_, i) => i !== idx))
   }
 
   const handleMaterialsUpdate = (materials) => {
@@ -208,20 +237,95 @@ export default function JobDetail() {
             <div className="glass-card p-8">
               <h2 className="text-lg font-bold text-white mb-1">Upload RFMS Takeoff</h2>
               <p className="text-sm text-gray-500 mb-6">
-                RFMS pivot table export (.xlsx, .xls, .csv). Materials and waste factors are parsed automatically.
+                Upload both RFMS pivot table files (.xlsx). Materials and waste factors are parsed automatically.
               </p>
-              <FileUpload
-                accept=".xlsx,.xls,.csv"
-                multiple
-                label="Drop RFMS Excel Files Here"
-                description="Upload one or more .xlsx takeoffs (e.g. Units + Common Areas)"
-                icon={FileSpreadsheet}
-                onUpload={handleRfmsUpload}
-                onReset={() => setRfmsSuccess(false)}
-                loading={rfmsLoading}
-                success={rfmsSuccess}
-                successMessage={`${job.materials?.length || 0} materials parsed with waste factors applied`}
-              />
+
+              {rfmsSuccess ? (
+                <div className="upload-zone !border-emerald-500/30 !bg-emerald-500/[0.04] text-center">
+                  <CheckCircle2 className="w-12 h-12 text-emerald-400 mx-auto mb-3" />
+                  <p className="text-sm font-medium text-emerald-300">
+                    {job.materials?.length || 0} materials parsed with waste factors applied
+                  </p>
+                  <button
+                    onClick={() => { setStagedFiles([]); setRfmsSuccess(false) }}
+                    className="mt-2 text-xs text-emerald-500 hover:text-emerald-400 underline"
+                  >Upload new files</button>
+                </div>
+              ) : rfmsLoading ? (
+                <div className="upload-zone text-center py-10">
+                  <div className="relative w-16 h-16 mx-auto mb-5">
+                    <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-si-bright/20 to-blue-500/20 animate-pulse" />
+                    <div className="relative w-full h-full rounded-2xl bg-white/[0.04] flex items-center justify-center border border-white/[0.08]"
+                         style={{ animation: 'pulse-glow 2s ease-in-out infinite' }}>
+                      <svg className="w-8 h-8 text-si-bright" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                        <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z" />
+                      </svg>
+                    </div>
+                  </div>
+                  <p className="text-sm font-medium text-white mb-1">AI is analyzing your files</p>
+                  <div className="flex items-center justify-center gap-1 mb-4">
+                    <span className="text-xs text-gray-500">Classifying materials</span>
+                    <span className="flex gap-0.5 ml-1">
+                      <span className="ai-dot w-1 h-1 rounded-full bg-si-bright inline-block" />
+                      <span className="ai-dot w-1 h-1 rounded-full bg-si-bright inline-block" />
+                      <span className="ai-dot w-1 h-1 rounded-full bg-si-bright inline-block" />
+                    </span>
+                  </div>
+                  <div className="w-48 h-1 mx-auto rounded-full overflow-hidden bg-white/[0.06]">
+                    <div className="ai-thinking-bar h-full rounded-full" />
+                  </div>
+                </div>
+              ) : (
+                <div
+                  className="upload-zone text-center cursor-pointer"
+                  onDragEnter={(e) => { e.preventDefault(); e.stopPropagation() }}
+                  onDragLeave={(e) => { e.preventDefault(); e.stopPropagation() }}
+                  onDragOver={(e) => { e.preventDefault(); e.stopPropagation() }}
+                  onDrop={handleRfmsDrop}
+                  onClick={() => rfmsInputRef.current?.click()}
+                >
+                  <input ref={rfmsInputRef} type="file" accept=".xlsx,.xls,.csv" multiple
+                         onChange={handleRfmsFileSelect} className="hidden" />
+
+                  {stagedFiles.length === 0 ? (
+                    <>
+                      <div className="w-14 h-14 rounded-2xl bg-si-bright/[0.08] flex items-center justify-center mx-auto mb-4 border border-si-bright/[0.1]">
+                        <FileSpreadsheet className="w-7 h-7 text-si-bright" />
+                      </div>
+                      <p className="text-sm font-semibold text-gray-200 mb-1">Drop RFMS file 1 of 2</p>
+                      <p className="text-xs text-gray-500">Units file or Common Areas file (.xlsx)</p>
+                    </>
+                  ) : (
+                    <>
+                      <div className="w-14 h-14 rounded-2xl bg-emerald-500/[0.12] flex items-center justify-center mx-auto mb-4 border border-emerald-500/[0.2]">
+                        <Upload className="w-7 h-7 text-emerald-400" />
+                      </div>
+                      <p className="text-sm font-semibold text-emerald-300 mb-1">
+                        1 of 2 files received — drop the second file
+                      </p>
+                      <p className="text-xs text-gray-500">Processing starts automatically when both files are uploaded</p>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Staged file indicators */}
+              {stagedFiles.length > 0 && !rfmsLoading && !rfmsSuccess && (
+                <div className="mt-3 space-y-2">
+                  {stagedFiles.map((f, i) => (
+                    <div key={i} className="flex items-center gap-2 px-3 py-2 bg-emerald-500/[0.06] border border-emerald-500/[0.15] rounded-xl text-sm">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                      <span className="flex-1 truncate text-emerald-300">{f.name}</span>
+                      <span className="text-xs text-gray-600">{(f.size / 1024).toFixed(0)} KB</span>
+                      <button onClick={(e) => { e.stopPropagation(); removeStaged(i) }}
+                        className="p-0.5 hover:bg-white/[0.06] rounded">
+                        <X className="w-3.5 h-3.5 text-gray-500" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {job.materials?.length > 0 && (
                 <button
                   onClick={async () => {
@@ -230,6 +334,7 @@ export default function JobDetail() {
                     const updated = await api.getJob(jobId)
                     setJob(updated)
                     setRfmsSuccess(false)
+                    setStagedFiles([])
                   }}
                   className="mt-3 text-xs text-gray-500 hover:text-red-400 transition-colors"
                 >

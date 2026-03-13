@@ -5,8 +5,18 @@ Tables: jobs, job_materials, job_sundries, job_labor, job_bundles.
 
 import sqlite3
 import os
+import re
 from datetime import datetime
 from typing import Optional
+
+
+def _slugify(text: str) -> str:
+    """Convert text to URL-safe slug."""
+    s = text.lower().strip()
+    s = re.sub(r'[^\w\s-]', '', s)
+    s = re.sub(r'[\s_]+', '-', s)
+    s = re.sub(r'-+', '-', s).strip('-')
+    return s
 
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "si_bid_tool.db"))
 
@@ -98,13 +108,40 @@ def init_db() -> None:
         """)
         conn.commit()
         # Migrations for existing DBs
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN notes TEXT")
+        for col, sql in [
+            ("notes", "ALTER TABLE jobs ADD COLUMN notes TEXT"),
+            ("slug", "ALTER TABLE jobs ADD COLUMN slug TEXT"),
+        ]:
+            try:
+                conn.execute(sql)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+        # Backfill slugs for any jobs missing them
+        rows = conn.execute("SELECT id, project_name FROM jobs WHERE slug IS NULL OR slug = ''").fetchall()
+        for row in rows:
+            slug = _make_unique_slug(conn, _slugify(row[1]), exclude_id=row[0])
+            conn.execute("UPDATE jobs SET slug=? WHERE id=?", (slug, row[0]))
+        if rows:
             conn.commit()
-        except sqlite3.OperationalError:
-            pass  # Column already exists
     finally:
         conn.close()
+
+
+def _make_unique_slug(conn, base_slug: str, exclude_id: int = None) -> str:
+    """Ensure slug is unique, appending -2, -3, etc. if needed."""
+    slug = base_slug
+    counter = 2
+    while True:
+        if exclude_id:
+            row = conn.execute("SELECT id FROM jobs WHERE slug=? AND id!=?", (slug, exclude_id)).fetchone()
+        else:
+            row = conn.execute("SELECT id FROM jobs WHERE slug=?", (slug,)).fetchone()
+        if not row:
+            return slug
+        slug = f"{base_slug}-{counter}"
+        counter += 1
 
 
 def save_job(job_data: dict) -> int:
@@ -112,30 +149,33 @@ def save_job(job_data: dict) -> int:
     conn = _get_conn()
     try:
         job_id = job_data.get("id")
+        slug = _slugify(job_data["project_name"])
         if job_id:
+            slug = _make_unique_slug(conn, slug, exclude_id=job_id)
             conn.execute("""
                 UPDATE jobs SET
                     project_name=?, gc_name=?, address=?, city=?, state=?, zip=?,
-                    tax_rate=?, unit_count=?, salesperson=?, notes=?
+                    tax_rate=?, unit_count=?, salesperson=?, notes=?, slug=?
                 WHERE id=?
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
                 job_data.get("state"), job_data.get("zip"),
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
-                job_data.get("salesperson"), job_data.get("notes"), job_id
+                job_data.get("salesperson"), job_data.get("notes"), slug, job_id
             ))
         else:
+            slug = _make_unique_slug(conn, slug)
             cur = conn.execute("""
                 INSERT INTO jobs (project_name, gc_name, address, city, state, zip,
-                                  tax_rate, unit_count, salesperson, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  tax_rate, unit_count, salesperson, notes, slug, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
                 job_data.get("state"), job_data.get("zip"),
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
-                job_data.get("salesperson"), job_data.get("notes"),
+                job_data.get("salesperson"), job_data.get("notes"), slug,
                 datetime.now().isoformat()
             ))
             job_id = cur.lastrowid
@@ -231,41 +271,48 @@ def save_bundles(job_id: int, bundles: list[dict]) -> None:
         conn.close()
 
 
-def delete_job(job_id: int) -> bool:
-    """Delete a job and all related data (cascading)."""
+def delete_job(job_ref) -> bool:
+    """Delete a job by ID or slug and all related data (cascading)."""
     conn = _get_conn()
     try:
-        cur = conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        if isinstance(job_ref, int) or (isinstance(job_ref, str) and job_ref.isdigit()):
+            cur = conn.execute("DELETE FROM jobs WHERE id=?", (int(job_ref),))
+        else:
+            cur = conn.execute("DELETE FROM jobs WHERE slug=?", (job_ref,))
         conn.commit()
         return cur.rowcount > 0
     finally:
         conn.close()
 
 
-def load_job(job_id: int) -> Optional[dict]:
-    """Load a job with all related data."""
+def load_job(job_ref) -> Optional[dict]:
+    """Load a job by ID (int) or slug (str) with all related data."""
     conn = _get_conn()
     try:
-        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if isinstance(job_ref, int) or (isinstance(job_ref, str) and job_ref.isdigit()):
+            row = conn.execute("SELECT * FROM jobs WHERE id=?", (int(job_ref),)).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM jobs WHERE slug=?", (job_ref,)).fetchone()
         if not row:
             return None
         job = dict(row)
+        jid = job["id"]
 
         job["materials"] = [
             dict(r) for r in
-            conn.execute("SELECT * FROM job_materials WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
+            conn.execute("SELECT * FROM job_materials WHERE job_id=? ORDER BY id", (jid,)).fetchall()
         ]
         job["sundries"] = [
             dict(r) for r in
-            conn.execute("SELECT * FROM job_sundries WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
+            conn.execute("SELECT * FROM job_sundries WHERE job_id=? ORDER BY id", (jid,)).fetchall()
         ]
         job["labor"] = [
             dict(r) for r in
-            conn.execute("SELECT * FROM job_labor WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
+            conn.execute("SELECT * FROM job_labor WHERE job_id=? ORDER BY id", (jid,)).fetchall()
         ]
         job["bundles"] = [
             dict(r) for r in
-            conn.execute("SELECT * FROM job_bundles WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
+            conn.execute("SELECT * FROM job_bundles WHERE job_id=? ORDER BY id", (jid,)).fetchall()
         ]
         return job
     finally:
@@ -302,7 +349,7 @@ def list_jobs() -> list[dict]:
     conn = _get_conn()
     try:
         rows = conn.execute(
-            """SELECT j.id, j.project_name, j.gc_name, j.salesperson, j.city, j.state, j.created_at,
+            """SELECT j.id, j.slug, j.project_name, j.gc_name, j.salesperson, j.city, j.state, j.created_at,
                       (SELECT COUNT(*) FROM job_bundles b WHERE b.job_id = j.id) AS bundle_count
                FROM jobs j ORDER BY j.created_at DESC"""
         ).fetchall()

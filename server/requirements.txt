@@ -3,7 +3,7 @@ uvicorn==0.30.0
 openpyxl==3.1.5
 pdfplumber==0.11.4
 reportlab==4.2.0
-openai==1.50.0
+openai>=1.60.0
 python-multipart==0.0.9
 aiofiles==24.1.0
 # email parsing uses stdlib email module - no extra package needed

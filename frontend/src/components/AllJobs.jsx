@@ -133,7 +133,7 @@ export default function AllJobs() {
             return (
               <div
                 key={job.id}
-                onClick={() => navigate(`/jobs/${job.id}`)}
+                onClick={() => navigate(`/jobs/${job.slug || job.id}`)}
                 className="glass-card-hover p-4 flex items-center gap-4 animate-fade-in cursor-pointer"
                 style={{ animationDelay: `${i * 40}ms` }}
               >

@@ -18,7 +18,7 @@ from models import (
     save_materials, save_sundries, save_labor, save_bundles,
     get_settings, save_settings,
 )
-from rfms_parser import parse_rfms
+from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
 from sundry_calc import calculate_sundries_for_materials
 from labor_calc import calculate_labor_for_materials, load_labor_catalog
@@ -94,12 +94,13 @@ def api_list_jobs():
 def api_create_job(job: JobCreate):
     """Create a new job."""
     job_id = save_job(job.model_dump())
-    return {"id": job_id, "message": "Job created"}
+    created = load_job(job_id)
+    return {"id": job_id, "slug": created.get("slug", ""), "message": "Job created"}
 
 
 @app.get("/api/jobs/{job_id}")
-def api_get_job(job_id: int):
-    """Get job details with all materials, sundries, labor, bundles."""
+def api_get_job(job_id: str):
+    """Get job details by ID or slug."""
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -117,15 +118,15 @@ def api_bulk_delete(body: BulkDeleteRequest):
 
 
 @app.delete("/api/jobs/{job_id}")
-def api_delete_job(job_id: int):
-    """Delete a job and all related data."""
+def api_delete_job(job_id: str):
+    """Delete a job by ID or slug and all related data."""
     if not delete_job(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"message": "Job deleted"}
 
 
 @app.put("/api/jobs/{job_id}/notes")
-def api_update_notes(job_id: int, body: NotesUpdate):
+def api_update_notes(job_id: str, body: NotesUpdate):
     """Update job notes."""
     job = load_job(job_id)
     if not job:
@@ -136,7 +137,7 @@ def api_update_notes(job_id: int, body: NotesUpdate):
 
 
 @app.post("/api/jobs/{job_id}/upload-rfms")
-async def api_upload_rfms(job_id: int, request: Request, files: list[UploadFile] = File(default=None)):
+async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile] = File(default=None)):
     """Upload one or more RFMS pivot tables, parse them, return merged materials."""
     # Debug: log what we received
     ct = request.headers.get("content-type", "")
@@ -155,13 +156,14 @@ async def api_upload_rfms(job_id: int, request: Request, files: list[UploadFile]
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    db_id = job["id"]
 
     all_materials_raw = []
     rfms_job_info = {}
 
     for file in files:
         # Save uploaded file
-        file_path = os.path.join(UPLOAD_DIR, f"rfms_{job_id}_{file.filename}")
+        file_path = os.path.join(UPLOAD_DIR, f"rfms_{db_id}_{file.filename}")
         with open(file_path, "wb") as f:
             content = await file.read()
             f.write(content)
@@ -180,7 +182,7 @@ async def api_upload_rfms(job_id: int, request: Request, files: list[UploadFile]
 
     # Update job info from RFMS if available
     job_update = {
-        "id": job_id,
+        "id": db_id,
         "project_name": rfms_job_info.get("project_name") or job["project_name"],
         "gc_name": rfms_job_info.get("gc_name") or job.get("gc_name"),
         "address": rfms_job_info.get("address") or job.get("address"),
@@ -194,12 +196,29 @@ async def api_upload_rfms(job_id: int, request: Request, files: list[UploadFile]
     }
     save_job(job_update)
 
-    # Prepare materials with waste factors
+    # AI merge if job already has materials, otherwise use raw parsed
+    existing_materials = job.get("materials", [])
+    if existing_materials:
+        print(f"[rfms_upload] Job has {len(existing_materials)} existing materials, running AI merge")
+        merged_raw = ai_merge_materials(existing_materials, all_materials_raw)
+    else:
+        # First upload — just use the parsed materials directly
+        merged_raw = []
+        for m in all_materials_raw:
+            merged_raw.append({
+                "item_code": m.get("item_code"),
+                "description": m.get("description"),
+                "material_type": m.get("material_type", "unknown"),
+                "installed_qty": m.get("qty", 0),
+                "unit": m.get("unit"),
+            })
+
+    # Apply waste factors to the final merged list
     materials = []
-    for m in all_materials_raw:
+    for m in merged_raw:
         material_type = m.get("material_type", "unknown")
         waste_pct = WASTE_FACTORS.get(material_type, 0)
-        installed_qty = m.get("qty", 0)
+        installed_qty = m.get("installed_qty", m.get("qty", 0))
         order_qty = installed_qty * (1 + waste_pct)
 
         materials.append({
@@ -210,12 +229,12 @@ async def api_upload_rfms(job_id: int, request: Request, files: list[UploadFile]
             "unit": m.get("unit"),
             "waste_pct": waste_pct,
             "order_qty": round(order_qty, 2),
-            "vendor": "",
-            "unit_price": 0,
-            "extended_cost": 0,
+            "vendor": m.get("vendor", ""),
+            "unit_price": m.get("unit_price", 0),
+            "extended_cost": round(m.get("unit_price", 0) * round(order_qty, 2), 2),
         })
 
-    material_ids = save_materials(job_id, materials)
+    material_ids = save_materials(db_id, materials)
 
     # Attach IDs to returned materials
     for mat, mid in zip(materials, material_ids):
@@ -225,7 +244,7 @@ async def api_upload_rfms(job_id: int, request: Request, files: list[UploadFile]
 
 
 @app.post("/api/jobs/{job_id}/upload-quotes")
-async def api_upload_quotes(job_id: int, files: list[UploadFile] = File(...)):
+async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     """Upload vendor quote files, parse them, return pricing."""
     job = load_job(job_id)
     if not job:
@@ -233,7 +252,7 @@ async def api_upload_quotes(job_id: int, files: list[UploadFile] = File(...)):
 
     all_products = []
     for upload in files:
-        file_path = os.path.join(UPLOAD_DIR, f"quote_{job_id}_{upload.filename}")
+        file_path = os.path.join(UPLOAD_DIR, f"quote_{job['id']}_{upload.filename}")
         with open(file_path, "wb") as f:
             content = await upload.read()
             f.write(content)
@@ -248,7 +267,7 @@ async def api_upload_quotes(job_id: int, files: list[UploadFile] = File(...)):
 
 
 @app.post("/api/jobs/{job_id}/calculate")
-def api_calculate(job_id: int):
+def api_calculate(job_id: str):
     """Run sundry + labor calculators, return results."""
     job = load_job(job_id)
     if not job:
@@ -258,17 +277,17 @@ def api_calculate(job_id: int):
 
     # Calculate sundries
     sundries = calculate_sundries_for_materials(materials)
-    save_sundries(job_id, sundries)
+    save_sundries(job["id"], sundries)
 
     # Calculate labor
     labor_items = calculate_labor_for_materials(materials)
-    save_labor(job_id, labor_items)
+    save_labor(job["id"], labor_items)
 
     return {"sundries": sundries, "labor": labor_items}
 
 
 @app.put("/api/jobs/{job_id}/materials")
-def api_update_materials(job_id: int, body: MaterialUpdate):
+def api_update_materials(job_id: str, body: MaterialUpdate):
     """Update materials (edited pricing, waste, etc.)."""
     job = load_job(job_id)
     if not job:
@@ -293,7 +312,7 @@ def api_update_materials(job_id: int, body: MaterialUpdate):
         merged["extended_cost"] = round(extended_cost, 2)
         updated.append(merged)
 
-    material_ids = save_materials(job_id, updated)
+    material_ids = save_materials(job["id"], updated)
     for mat, mid in zip(updated, material_ids):
         mat["id"] = mid
 
@@ -301,7 +320,7 @@ def api_update_materials(job_id: int, body: MaterialUpdate):
 
 
 @app.post("/api/jobs/{job_id}/generate-bid")
-def api_generate_bid(job_id: int):
+def api_generate_bid(job_id: str):
     """Assemble bid + generate PDF, return bid data."""
     job = load_job(job_id)
     if not job:
@@ -328,19 +347,22 @@ def api_generate_bid(job_id: int):
     bid_data = assemble_bid(job_info, materials, sundries, labor_items)
 
     # Save bundles
-    save_bundles(job_id, bid_data["bundles"])
+    save_bundles(job["id"], bid_data["bundles"])
 
     # Generate PDF
-    pdf_path = os.path.join(PDF_DIR, f"bid_{job_id}.pdf")
+    pdf_path = os.path.join(PDF_DIR, f"bid_{job['id']}.pdf")
     generate_bid_pdf(bid_data, pdf_path)
 
     return bid_data
 
 
 @app.get("/api/jobs/{job_id}/bid.pdf")
-def api_download_bid_pdf(job_id: int):
+def api_download_bid_pdf(job_id: str):
     """Download the generated bid PDF."""
-    pdf_path = os.path.join(PDF_DIR, f"bid_{job_id}.pdf")
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    pdf_path = os.path.join(PDF_DIR, f"bid_{job['id']}.pdf")
     if not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="PDF not found. Generate bid first.")
     return FileResponse(
@@ -414,9 +436,10 @@ def _apply_openai_config(settings: dict = None):
     """Apply stored OpenAI settings to the quote parser."""
     if settings is None:
         settings = get_settings()
-    api_key = settings.get("openai_api_key")
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
     passes = int(settings.get("multi_pass_count", "3"))
+    print(f"[openai_config] api_key={'set' if api_key else 'MISSING'}, model={model}, passes={passes}")
     set_openai_config(api_key=api_key, model=model, num_passes=passes)
 
 

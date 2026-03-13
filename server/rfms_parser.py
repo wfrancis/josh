@@ -162,10 +162,11 @@ CLASSIFICATION RULES:
 - Carpet with "Broadloom" in units/bedrooms → unit_carpet_no_pattern (or unit_carpet_pattern if pattern repeat is mentioned)
 - Lines about carpet pad, isolation strips, adhesive → these are sundries, classify as "sundry"
 
-Return a JSON array where each element has:
+Return a JSON object with a "classifications" key containing an array. Each element must have:
   {"index": <number>, "material_type": "<type>"}
 
-Only return the JSON array, nothing else."""
+You MUST classify EVERY material line — one entry per material. Return ALL of them.
+Example response format: {"classifications": [{"index": 0, "material_type": "floor_tile"}, {"index": 1, "material_type": "wall_tile"}]}"""
 
 
 def _classify_with_ai(material_lines: list[tuple[int, str]],
@@ -181,9 +182,11 @@ def _classify_with_ai(material_lines: list[tuple[int, str]],
         # Use same API key/model as quote parser (set by main.py on startup)
         api_key = _openai_config.get("api_key") or os.environ.get("OPENAI_API_KEY")
         if not api_key:
+            print("[rfms_parser] No API key available for classification")
             return {}
 
         model = _openai_config.get("model", "gpt-5-mini")
+        print(f"[rfms_parser] Classifying {len(material_lines)} materials with model={model}")
 
         client = OpenAI(api_key=api_key)
 
@@ -205,16 +208,26 @@ INSTALL LINES (use these to identify material types):
                 {"role": "system", "content": AI_CLASSIFICATION_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            temperature=0,
             response_format={"type": "json_object"},
         )
 
         raw = response.choices[0].message.content.strip()
+        print(f"[rfms_parser] AI classification raw response: {raw[:500]}")
         parsed = json.loads(raw)
 
-        # Handle both {"classifications": [...]} and bare [...]
+        # Handle various response formats
         if isinstance(parsed, dict):
+            # Check for known wrapper keys
             items = parsed.get("classifications", parsed.get("results", []))
+            if not items:
+                # Try any list value in the dict
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        items = v
+                        break
+            if not items and "index" in parsed and "material_type" in parsed:
+                # Single item response — wrap it
+                items = [parsed]
         elif isinstance(parsed, list):
             items = parsed
         else:
@@ -229,6 +242,7 @@ INSTALL LINES (use these to identify material types):
             elif idx is not None and mtype == "sundry":
                 result[idx] = "sundry"
 
+        print(f"[rfms_parser] Classification result: {len(result)} classified out of {len(material_lines)}")
         return result
 
     except Exception as e:
@@ -347,3 +361,189 @@ def parse_rfms(file_path: str) -> dict:
 
     wb.close()
     return {"job_info": job_info, "materials": materials}
+
+
+# ── AI Merge Prompt ───────────────────────────────────────────────────────────
+
+AI_MERGE_PROMPT = """You are a commercial flooring estimator. You are given two lists of materials for a job:
+
+1. EXISTING MATERIALS — already saved on the job (may have pricing set by the estimator)
+2. NEW MATERIALS — just parsed from a newly uploaded RFMS takeoff file
+
+Your task: Return the CORRECT FINAL materials list as a JSON array.
+
+Use your expertise to:
+- Identify duplicates (same material uploaded again) and keep only one copy
+- Identify materials that exist in both lists and should be combined (sum their quantities)
+- Keep materials that are genuinely different (different areas, different products)
+- Preserve any pricing data (vendor, unit_price) from existing materials — the estimator already set these
+- Review and correct all material_type values — fix any "unknown" types using context from the full list
+
+VALID MATERIAL TYPES:
+unit_carpet_no_pattern, unit_carpet_pattern, unit_lvt, cpt_tile, corridor_broadloom,
+floor_tile, wall_tile, backsplash, tub_shower_surround, rubber_base, vct,
+rubber_tile, rubber_sheet, wood, tread_riser, transitions, waterproofing
+
+Return ONLY a JSON object: {"materials": [...]}
+Each material must have: item_code, description, material_type, installed_qty, unit
+If preserving pricing from existing: also include vendor, unit_price"""
+
+
+AI_VERIFY_PROMPT = """You are a commercial flooring estimator reviewing a material merge.
+
+ORIGINAL EXISTING MATERIALS (count: {existing_count}, total qty: {existing_total}):
+{existing_summary}
+
+ORIGINAL NEW MATERIALS (count: {new_count}, total qty: {new_total}):
+{new_summary}
+
+PROPOSED MERGED RESULT (count: {merged_count}, total qty: {merged_total}):
+{merged_json}
+
+Review this merge carefully:
+- Are any materials missing that should be in the final list?
+- Are any materials incorrectly duplicated?
+- Are any quantities wrong (e.g. should have been summed or shouldn't have been)?
+- Are all material_type values correct?
+
+If the merge is correct, return: {{"correct": true}}
+If there are issues, return: {{"correct": false, "materials": [<the corrected full list>]}}
+Each material must have: item_code, description, material_type, installed_qty, unit, and optionally vendor, unit_price"""
+
+
+def ai_merge_materials(existing: list[dict], new_parsed: list[dict]) -> list[dict]:
+    """
+    Use AI to intelligently merge existing materials with newly parsed ones.
+    Returns the correct final materials list.
+    Falls back to appending new to existing if AI is unavailable.
+    """
+    try:
+        from openai import OpenAI
+        from quote_parser import _openai_config
+
+        api_key = _openai_config.get("api_key") or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            print("[ai_merge] No API key, falling back to append")
+            return _fallback_merge(existing, new_parsed)
+
+        model = _openai_config.get("model", "gpt-5-mini")
+        client = OpenAI(api_key=api_key)
+
+        # Prepare existing materials for AI (strip DB-only fields)
+        existing_for_ai = []
+        for m in existing:
+            existing_for_ai.append({
+                "item_code": m.get("item_code"),
+                "description": m.get("description"),
+                "material_type": m.get("material_type"),
+                "installed_qty": m.get("installed_qty", 0),
+                "unit": m.get("unit"),
+                "vendor": m.get("vendor", ""),
+                "unit_price": m.get("unit_price", 0),
+            })
+
+        # Prepare new materials (rename qty → installed_qty for consistency)
+        new_for_ai = []
+        for m in new_parsed:
+            new_for_ai.append({
+                "item_code": m.get("item_code"),
+                "description": m.get("description"),
+                "material_type": m.get("material_type"),
+                "installed_qty": m.get("qty", m.get("installed_qty", 0)),
+                "unit": m.get("unit"),
+            })
+
+        user_msg = f"""EXISTING MATERIALS ({len(existing_for_ai)} items):
+{json.dumps(existing_for_ai, indent=2)}
+
+NEW MATERIALS ({len(new_for_ai)} items):
+{json.dumps(new_for_ai, indent=2)}"""
+
+        # Pass 1: Merge
+        print(f"[ai_merge] Pass 1: merging {len(existing_for_ai)} existing + {len(new_for_ai)} new materials")
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": AI_MERGE_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content.strip()
+        parsed = json.loads(raw)
+        merged = parsed.get("materials", [])
+        print(f"[ai_merge] Pass 1 result: {len(merged)} materials")
+
+        if not merged:
+            print("[ai_merge] Empty merge result, falling back")
+            return _fallback_merge(existing, new_parsed)
+
+        # Pass 2: Verify
+        existing_total = sum(m.get("installed_qty", 0) for m in existing_for_ai)
+        new_total = sum(m.get("installed_qty", 0) for m in new_for_ai)
+        merged_total = sum(m.get("installed_qty", 0) for m in merged)
+
+        verify_msg = AI_VERIFY_PROMPT.format(
+            existing_count=len(existing_for_ai),
+            existing_total=round(existing_total, 2),
+            existing_summary=json.dumps(existing_for_ai, indent=2),
+            new_count=len(new_for_ai),
+            new_total=round(new_total, 2),
+            new_summary=json.dumps(new_for_ai, indent=2),
+            merged_count=len(merged),
+            merged_total=round(merged_total, 2),
+            merged_json=json.dumps(merged, indent=2),
+        )
+
+        print(f"[ai_merge] Pass 2: verifying merge")
+        verify_response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a commercial flooring estimator verifying a material list merge. Return your response as JSON."},
+                {"role": "user", "content": verify_msg},
+            ],
+            response_format={"type": "json_object"},
+        )
+
+        verify_raw = verify_response.choices[0].message.content.strip()
+        verify_parsed = json.loads(verify_raw)
+
+        if verify_parsed.get("correct"):
+            print("[ai_merge] Pass 2: merge verified correct")
+            return merged
+        elif verify_parsed.get("materials"):
+            corrected = verify_parsed["materials"]
+            print(f"[ai_merge] Pass 2: corrected to {len(corrected)} materials")
+            return corrected
+        else:
+            print("[ai_merge] Pass 2: unclear response, using pass 1 result")
+            return merged
+
+    except Exception as e:
+        print(f"[ai_merge] AI merge failed: {e}")
+        return _fallback_merge(existing, new_parsed)
+
+
+def _fallback_merge(existing: list[dict], new_parsed: list[dict]) -> list[dict]:
+    """Simple fallback: append new materials to existing."""
+    result = []
+    for m in existing:
+        result.append({
+            "item_code": m.get("item_code"),
+            "description": m.get("description"),
+            "material_type": m.get("material_type"),
+            "installed_qty": m.get("installed_qty", 0),
+            "unit": m.get("unit"),
+            "vendor": m.get("vendor", ""),
+            "unit_price": m.get("unit_price", 0),
+        })
+    for m in new_parsed:
+        result.append({
+            "item_code": m.get("item_code"),
+            "description": m.get("description"),
+            "material_type": m.get("material_type"),
+            "installed_qty": m.get("qty", m.get("installed_qty", 0)),
+            "unit": m.get("unit"),
+        })
+    return result
