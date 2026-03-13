@@ -18,6 +18,7 @@ export const api = {
   createJob: (data) => request('/jobs', { method: 'POST', body: JSON.stringify(data) }),
   getJob: (id) => request(`/jobs/${id}`),
   deleteJob: (id) => request(`/jobs/${id}`, { method: 'DELETE' }),
+  duplicateJob: (jobId) => request('/jobs/' + jobId + '/duplicate', { method: 'POST' }),
   bulkDeleteJobs: (jobIds) => request('/jobs/bulk-delete', { method: 'POST', body: JSON.stringify({ job_ids: jobIds }) }),
   updateNotes: (jobId, notes) => request(`/jobs/${jobId}/notes`, { method: 'PUT', body: JSON.stringify({ notes }) }),
 

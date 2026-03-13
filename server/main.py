@@ -127,6 +127,42 @@ def api_delete_job(job_id: str):
     return {"message": "Job deleted"}
 
 
+@app.post("/api/jobs/{job_id}/duplicate")
+def api_duplicate_job(job_id: str):
+    """Duplicate a job and all its materials."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Create new job with same fields
+    new_job = {
+        "project_name": job["project_name"] + " (Copy)",
+        "gc_name": job.get("gc_name"),
+        "address": job.get("address"),
+        "city": job.get("city"),
+        "state": job.get("state"),
+        "zip": job.get("zip"),
+        "tax_rate": job.get("tax_rate", 0),
+        "unit_count": job.get("unit_count", 0),
+        "salesperson": job.get("salesperson"),
+        "notes": job.get("notes"),
+        "exclusions": job.get("exclusions"),
+    }
+    new_id = save_job(new_job)
+
+    # Copy materials (strip id and job_id)
+    materials = job.get("materials", [])
+    copied = []
+    for m in materials:
+        mat = {k: v for k, v in m.items() if k not in ("id", "job_id")}
+        copied.append(mat)
+    if copied:
+        save_materials(new_id, copied)
+
+    created = load_job(new_id)
+    return {"id": new_id, "slug": created.get("slug", "")}
+
+
 @app.put("/api/jobs/{job_id}/notes")
 def api_update_notes(job_id: str, body: NotesUpdate):
     """Update job notes."""
@@ -312,7 +348,14 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
         waste_pct = merged.get("waste_pct", 0)
         installed_qty = merged.get("installed_qty", 0)
         unit_price = merged.get("unit_price", 0)
-        order_qty = installed_qty * (1 + waste_pct)
+
+        # Trust order_qty from frontend if provided and > 0
+        frontend_order_qty = m.get("order_qty")
+        if frontend_order_qty and frontend_order_qty > 0:
+            order_qty = frontend_order_qty
+        else:
+            order_qty = installed_qty * (1 + waste_pct)
+
         extended_cost = order_qty * unit_price
 
         merged["order_qty"] = round(order_qty, 2)

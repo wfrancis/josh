@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import {
   Plus, Building2, User, Loader2, ChevronRight,
-  Search, FolderOpen, Trash2
+  Search, FolderOpen, Trash2, Copy
 } from 'lucide-react'
 import { api } from '../api'
 import StatusBadge, { getJobStatus } from './StatusBadge'
@@ -80,7 +80,7 @@ export default function AllJobs() {
   }
 
   return (
-    <div className="max-w-5xl mx-auto px-8 py-10">
+    <div className="max-w-5xl mx-auto px-4 sm:px-8 py-6 sm:py-10">
       {/* Header */}
       <div className="flex items-center justify-between mb-8">
         <div>
@@ -179,8 +179,18 @@ export default function AllJobs() {
                     <span>{new Date(job.created_at).toLocaleDateString()}</span>
                   </div>
                 </div>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    api.duplicateJob(job.id).then(r => navigate(`/jobs/${r.slug || r.id}`))
+                  }}
+                  className="p-2 rounded-lg text-gray-600 hover:text-si-bright hover:bg-si-bright/10 transition-colors flex-shrink-0"
+                  title="Duplicate job"
+                >
+                  <Copy className="w-4 h-4" />
+                </button>
                 <StatusBadge status={status} />
-                <ChevronRight className="w-4 h-4 text-gray-600" />
+                <ChevronRight className="w-4 h-4 text-gray-600 hidden sm:block" />
               </div>
             )
           })}

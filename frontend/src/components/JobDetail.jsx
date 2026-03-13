@@ -3,7 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, Building2, MapPin, User, Percent, Hash,
   Loader2, FileSpreadsheet, Save, AlertTriangle, Trash2,
-  StickyNote, ChevronDown, ChevronUp, Cpu, CheckCircle2, X, Upload, Download
+  StickyNote, ChevronDown, ChevronUp, Cpu, CheckCircle2, X, Upload, Download, Copy
 } from 'lucide-react'
 import { api } from '../api'
 import StepIndicator from './StepIndicator'
@@ -154,7 +154,7 @@ export default function JobDetail() {
   }
 
   return (
-    <div className="max-w-5xl mx-auto px-8 py-8">
+    <div className="max-w-5xl mx-auto px-4 sm:px-8 py-6 sm:py-8">
       {/* Header */}
       <div className="flex items-start gap-4 mb-8">
         <button onClick={() => navigate('/')} className="btn-ghost p-2 mt-0.5">
@@ -199,6 +199,14 @@ export default function JobDetail() {
             )}
           </div>
         </div>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => api.duplicateJob(jobId).then(r => navigate(`/jobs/${r.slug || r.id}`))}
+            className="btn-ghost p-2 mt-0.5 text-gray-500 hover:text-si-bright hover:bg-si-bright/10"
+            title="Duplicate job"
+          >
+            <Copy className="w-5 h-5" />
+          </button>
         <button
           onClick={() => setConfirmDialog({
             title: 'Delete Job',
@@ -215,6 +223,7 @@ export default function JobDetail() {
         >
           <Trash2 className="w-5 h-5" />
         </button>
+        </div>
       </div>
 
       {/* Notes */}

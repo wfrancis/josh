@@ -92,7 +92,7 @@ export default function SettingsPage() {
   }
 
   return (
-    <div className="max-w-3xl mx-auto px-8 py-10">
+    <div className="max-w-3xl mx-auto px-4 sm:px-8 py-6 sm:py-10">
       {/* Header */}
       <div className="mb-8">
         <h1 className="text-2xl font-extrabold text-white tracking-tight flex items-center gap-3">

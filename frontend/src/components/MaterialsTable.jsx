@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { Package } from 'lucide-react'
+import { Package, Trash2, Copy } from 'lucide-react'
 
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
@@ -154,10 +154,12 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
     const updated = materials.map((m, i) => {
       if (i !== idx) return m
       const next = { ...m, ...changes }
-      // Recalculate order_qty and extended_cost
+      // If order_qty was directly edited, use it; otherwise auto-calculate
       const installedQty = next.installed_qty || 0
       const wastePct = next.waste_pct || 0
-      const orderQty = installedQty * (1 + wastePct)
+      const orderQty = ('order_qty' in changes)
+        ? (changes.order_qty || 0)
+        : installedQty * (1 + wastePct)
       const unitPrice = next.unit_price || 0
       return {
         ...next,
@@ -168,12 +170,30 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
     onUpdate?.(updated)
   }
 
+  const deleteMaterial = (idx) => {
+    onUpdate?.(materials.filter((_, i) => i !== idx))
+  }
+
   const handlePriceChange = (idx, value) => {
     updateMaterial(idx, { unit_price: parseFloat(value) || 0 })
   }
 
   const handleTypeChange = (idx, newType) => {
     updateMaterial(idx, { material_type: newType, ai_confidence: 1.0 })
+  }
+
+  // Batch pricing: apply unit_price to all materials of the same type
+  const applyPriceToType = (materialType, unitPrice) => {
+    const updated = materials.map((m) => {
+      if (m.material_type !== materialType) return m
+      const orderQty = m.order_qty || 0
+      return {
+        ...m,
+        unit_price: unitPrice,
+        extended_cost: Math.round(orderQty * unitPrice * 100) / 100,
+      }
+    })
+    onUpdate?.(updated)
   }
 
   if (!materials?.length) {
@@ -186,7 +206,14 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
   }
 
   const showPriceCol = !readOnly && !editable
-  const colCount = 6 + (showPriceCol ? 1 : 0)
+  const showDeleteCol = editable
+  const colCount = 6 + (showPriceCol ? 1 : 0) + (showDeleteCol ? 1 : 0)
+
+  // Count materials per type for batch pricing
+  const typeCounts = {}
+  materials.forEach(m => {
+    typeCounts[m.material_type] = (typeCounts[m.material_type] || 0) + 1
+  })
 
   return (
     <div className="overflow-x-auto">
@@ -194,18 +221,21 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
         <thead>
           <tr className="border-b border-white/[0.06]">
             {['Material', 'Type', 'Install Qty', 'Waste', 'Order Qty',
-              ...(showPriceCol ? ['Unit Price'] : []), 'Extended'].map(h => (
-              <th key={h} className={`py-3 px-3 font-bold text-gray-500 text-[10px] uppercase tracking-[0.12em]
-                ${h === 'Material' || h === 'Type' ? 'text-left' : 'text-right'}`}>{h}</th>
+              ...(showPriceCol ? ['Unit Price'] : []), 'Extended',
+              ...(showDeleteCol ? [''] : [])].map((h, i) => (
+              <th key={h || `col-${i}`} className={`py-3 px-2 sm:px-3 font-bold text-gray-500 text-[10px] uppercase tracking-[0.12em]
+                ${h === 'Material' || h === 'Type' ? 'text-left' : 'text-right'}
+                ${h === '' ? 'w-10' : ''}`}>{h}</th>
             ))}
           </tr>
         </thead>
         <tbody className="divide-y divide-white/[0.03]">
           {materials.map((m, idx) => {
             const hasPrice = m.unit_price > 0
+            const sameTypeCount = typeCounts[m.material_type] || 0
             return (
-              <tr key={m.id || idx} className="hover:bg-white/[0.02] transition-colors">
-                <td className="py-3 px-3">
+              <tr key={m.id || idx} className="group hover:bg-white/[0.02] transition-colors">
+                <td className="py-3 px-2 sm:px-3">
                   {editable ? (
                     <EditableCell
                       value={m.description || m.item_code || ''}
@@ -219,7 +249,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     <div className="text-[11px] text-gray-600 mt-0.5">{m.item_code}</div>
                   )}
                 </td>
-                <td className="py-3 px-3">
+                <td className="py-3 px-2 sm:px-3">
                   <TypeDropdown
                     currentType={m.material_type}
                     confidence={m.ai_confidence}
@@ -227,7 +257,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     editable={editable}
                   />
                 </td>
-                <td className="py-3 px-3 text-right tabular-nums text-gray-300">
+                <td className="py-3 px-2 sm:px-3 text-right tabular-nums text-gray-300">
                   {editable ? (
                     <EditableCell
                       value={m.installed_qty}
@@ -239,7 +269,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   )}
                   {' '}<span className="text-gray-600 text-xs">{m.unit}</span>
                 </td>
-                <td className="py-3 px-3 text-right tabular-nums text-gray-500">
+                <td className="py-3 px-2 sm:px-3 text-right tabular-nums text-gray-500">
                   {editable ? (
                     <EditableCell
                       value={((m.waste_pct || 0) * 100)}
@@ -250,11 +280,19 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     ((m.waste_pct || 0) * 100).toFixed(0)
                   )}%
                 </td>
-                <td className="py-3 px-3 text-right tabular-nums text-gray-300">
-                  {formatNumber(m.order_qty)}
+                <td className="py-3 px-2 sm:px-3 text-right tabular-nums text-gray-300">
+                  {editable ? (
+                    <EditableCell
+                      value={m.order_qty}
+                      type="number"
+                      onSave={(val) => updateMaterial(idx, { order_qty: val })}
+                    />
+                  ) : (
+                    formatNumber(m.order_qty)
+                  )}
                 </td>
                 {showPriceCol && (
-                  <td className="py-3 px-3 text-right">
+                  <td className="py-3 px-2 sm:px-3 text-right">
                     <input
                       type="number" step="0.01" min="0"
                       value={m.unit_price || ''}
@@ -263,25 +301,47 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                       placeholder="0.00"
                       className={`editable-cell w-24 ${!hasPrice && editingPriceId !== idx ? 'text-gray-600' : 'text-gray-100'}`}
                     />
+                    {hasPrice && sameTypeCount > 1 && (
+                      <button
+                        onClick={() => applyPriceToType(m.material_type, m.unit_price)}
+                        className="flex items-center gap-1 text-[10px] text-gray-600 hover:text-si-bright mt-1 ml-auto transition-colors"
+                        title={`Apply $${m.unit_price} to all ${TYPE_LABELS[m.material_type] || m.material_type} materials`}
+                      >
+                        <Copy className="w-3 h-3" />
+                        Apply to {sameTypeCount} {TYPE_LABELS[m.material_type] || m.material_type}
+                      </button>
+                    )}
                   </td>
                 )}
-                <td className="py-3 px-3 text-right tabular-nums font-medium">
+                <td className="py-3 px-2 sm:px-3 text-right tabular-nums font-medium">
                   {hasPrice ? (
                     <span className="text-white">{formatCurrency(m.extended_cost)}</span>
                   ) : (
                     <span className="text-gray-600">—</span>
                   )}
                 </td>
+                {showDeleteCol && (
+                  <td className="py-3 px-1 text-center">
+                    <button
+                      onClick={() => deleteMaterial(idx)}
+                      className="p-1.5 rounded-lg text-gray-700 opacity-0 group-hover:opacity-100
+                                 hover:text-red-400 hover:bg-red-500/10 transition-all"
+                      title="Remove material"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </td>
+                )}
               </tr>
             )
           })}
         </tbody>
         <tfoot>
           <tr className="border-t border-white/[0.08]">
-            <td colSpan={colCount - 1} className="py-3 px-3 text-right font-semibold text-gray-500 text-xs uppercase tracking-wider">
+            <td colSpan={colCount - 1} className="py-3 px-2 sm:px-3 text-right font-semibold text-gray-500 text-xs uppercase tracking-wider">
               Material Total
             </td>
-            <td className="py-3 px-3 text-right tabular-nums font-bold text-white">
+            <td className="py-3 px-2 sm:px-3 text-right tabular-nums font-bold text-white">
               {formatCurrency(materials.reduce((sum, m) => sum + (m.extended_cost || 0), 0))}
             </td>
           </tr>

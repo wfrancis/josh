@@ -87,7 +87,7 @@ function CreateJobModal({ open, onClose, onCreated }) {
               <input className="input" value={form.project_name} onChange={set('project_name')} required
                      placeholder="e.g., Oakwood Apartments Phase 2" autoFocus />
             </div>
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="label">General Contractor</label>
                 <input className="input" value={form.gc_name} onChange={set('gc_name')} placeholder="GC name" />
@@ -101,7 +101,7 @@ function CreateJobModal({ open, onClose, onCreated }) {
               <label className="label">Address</label>
               <input className="input" value={form.address} onChange={set('address')} placeholder="Street address" />
             </div>
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-3 sm:grid-cols-3 gap-3">
               <div>
                 <label className="label">City</label>
                 <input className="input" value={form.city} onChange={set('city')} />
@@ -115,7 +115,7 @@ function CreateJobModal({ open, onClose, onCreated }) {
                 <input className="input" value={form.zip} onChange={set('zip')} />
               </div>
             </div>
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="label">Tax Rate (%)</label>
                 <input className="input" type="number" step="0.01" min="0" max="20"
@@ -175,7 +175,7 @@ export default function Dashboard() {
   }
 
   return (
-    <div className="max-w-5xl mx-auto px-8 py-10">
+    <div className="max-w-5xl mx-auto px-4 sm:px-8 py-6 sm:py-10">
       {/* Header */}
       <div className="flex items-center justify-between mb-8">
         <div>
@@ -192,7 +192,7 @@ export default function Dashboard() {
 
       {/* Stats */}
       {jobs.length > 0 && (
-        <div className="grid grid-cols-3 gap-4 mb-8">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-8">
           <StatCard icon={Briefcase} label="Total Jobs" value={jobs.length}
                     gradient="from-si-bright/[0.06] to-transparent" />
           <StatCard icon={FileText} label="Bids Generated" value={completedJobs}
