@@ -21,10 +21,11 @@ export const api = {
   bulkDeleteJobs: (jobIds) => request('/jobs/bulk-delete', { method: 'POST', body: JSON.stringify({ job_ids: jobIds }) }),
   updateNotes: (jobId, notes) => request(`/jobs/${jobId}/notes`, { method: 'PUT', body: JSON.stringify({ notes }) }),
 
-  // RFMS Upload
-  uploadRFMS: (jobId, file) => {
+  // RFMS Upload (supports multiple files)
+  uploadRFMS: (jobId, files) => {
     const form = new FormData();
-    form.append('file', file);
+    const fileList = Array.isArray(files) ? files : [files];
+    fileList.forEach(f => form.append('files', f));
     return fetch(`${BASE}/jobs/${jobId}/upload-rfms`, { method: 'POST', body: form })
       .then(r => { if (!r.ok) throw new Error('Upload failed'); return r.json(); });
   },

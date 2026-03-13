@@ -46,11 +46,12 @@ export default function JobDetail() {
   useEffect(() => { loadJob() }, [jobId])
   useEffect(() => { api.getSettings().then(setAiSettings).catch(() => {}) }, [])
 
-  const handleRfmsUpload = async (file) => {
+  const handleRfmsUpload = async (files) => {
     setRfmsLoading(true)
     setError(null)
     try {
-      await api.uploadRFMS(jobId, file)
+      const fileList = Array.isArray(files) ? files : [files]
+      await api.uploadRFMS(jobId, fileList)
       const updated = await api.getJob(jobId)
       setJob(updated)
       setRfmsSuccess(true)
@@ -209,8 +210,9 @@ export default function JobDetail() {
               </p>
               <FileUpload
                 accept=".xlsx,.xls,.csv"
-                label="Drop RFMS Excel File Here"
-                description="Supports .xlsx, .xls, and .csv pivot table exports"
+                multiple
+                label="Drop RFMS Excel Files Here"
+                description="Upload one or more .xlsx takeoffs (e.g. Units + Common Areas)"
                 icon={FileSpreadsheet}
                 onUpload={handleRfmsUpload}
                 onReset={() => setRfmsSuccess(false)}

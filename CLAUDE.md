@@ -50,3 +50,6 @@
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+- **No Hardcoding**: Never hardcode answers, mappings, or classification logic that should be derived from data. Use AI/dynamic parsing to handle variability. Hardcoded fallbacks are only acceptable as a last resort when the AI service is literally unreachable — not as a substitute for doing it right.
+- **No Shortcuts**: Don't assume what the output will be. Let the data and the AI determine the answer. If the answer could vary by project, it must be handled dynamically.
+- **No Assumptions**: Every classification, mapping, or business rule that depends on project-specific data (finish schedules, material codes, designer specs) must be derived at runtime — never baked into the code as static lookups.

@@ -136,25 +136,35 @@ def api_update_notes(job_id: int, body: NotesUpdate):
 
 
 @app.post("/api/jobs/{job_id}/upload-rfms")
-async def api_upload_rfms(job_id: int, file: UploadFile = File(...)):
-    """Upload RFMS pivot table, parse it, return materials."""
+async def api_upload_rfms(job_id: int, files: list[UploadFile] = File(...)):
+    """Upload one or more RFMS pivot tables, parse them, return merged materials."""
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Save uploaded file
-    file_path = os.path.join(UPLOAD_DIR, f"rfms_{job_id}_{file.filename}")
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    all_materials_raw = []
+    rfms_job_info = {}
 
-    try:
-        result = parse_rfms(file_path)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse RFMS file: {e}")
+    for file in files:
+        # Save uploaded file
+        file_path = os.path.join(UPLOAD_DIR, f"rfms_{job_id}_{file.filename}")
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        try:
+            result = parse_rfms(file_path)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse RFMS file '{file.filename}': {e}")
+
+        # Use job info from first file that has it
+        file_job_info = result.get("job_info", {})
+        if not rfms_job_info and any(file_job_info.values()):
+            rfms_job_info = file_job_info
+
+        all_materials_raw.extend(result.get("materials", []))
 
     # Update job info from RFMS if available
-    rfms_job_info = result.get("job_info", {})
     job_update = {
         "id": job_id,
         "project_name": rfms_job_info.get("project_name") or job["project_name"],
@@ -172,7 +182,7 @@ async def api_upload_rfms(job_id: int, file: UploadFile = File(...)):
 
     # Prepare materials with waste factors
     materials = []
-    for m in result.get("materials", []):
+    for m in all_materials_raw:
         material_type = m.get("material_type", "unknown")
         waste_pct = WASTE_FACTORS.get(material_type, 0)
         installed_qty = m.get("qty", 0)
