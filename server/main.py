@@ -7,7 +7,7 @@ import shutil
 import tempfile
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -136,8 +136,22 @@ def api_update_notes(job_id: int, body: NotesUpdate):
 
 
 @app.post("/api/jobs/{job_id}/upload-rfms")
-async def api_upload_rfms(job_id: int, files: list[UploadFile] = File(...)):
+async def api_upload_rfms(job_id: int, request: Request, files: list[UploadFile] = File(default=None)):
     """Upload one or more RFMS pivot tables, parse them, return merged materials."""
+    # Debug: log what we received
+    ct = request.headers.get("content-type", "")
+    print(f"[rfms_upload] Content-Type: {ct}")
+    print(f"[rfms_upload] files param: {files}, type: {type(files)}")
+
+    # If 'files' field is missing, try reading from the raw form
+    if not files:
+        form = await request.form()
+        print(f"[rfms_upload] Raw form keys: {list(form.keys())}")
+        files = form.getlist("files") or form.getlist("file")
+        print(f"[rfms_upload] Extracted files: {files}")
+        if not files:
+            raise HTTPException(status_code=422, detail=f"No files received. Form keys: {list(form.keys())}")
+
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -423,5 +437,5 @@ if _static_root:
         file_path = os.path.join(_static_root, full_path)
         if full_path and os.path.isfile(file_path):
             return FileResponse(file_path)
-        # Otherwise serve index.html for client-side routing
-        return FileResponse(os.path.join(_static_root, "index.html"))
+        # Otherwise serve index.html for client-side routing (no cache so deploys are instant)
+        return FileResponse(os.path.join(_static_root, "index.html"), headers={"Cache-Control": "no-cache, no-store, must-revalidate"})

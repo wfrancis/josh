@@ -22,20 +22,38 @@ export const api = {
   updateNotes: (jobId, notes) => request(`/jobs/${jobId}/notes`, { method: 'PUT', body: JSON.stringify({ notes }) }),
 
   // RFMS Upload (supports multiple files)
-  uploadRFMS: (jobId, files) => {
+  uploadRFMS: async (jobId, files) => {
     const form = new FormData();
     const fileList = Array.isArray(files) ? files : [files];
-    fileList.forEach(f => form.append('files', f));
-    return fetch(`${BASE}/jobs/${jobId}/upload-rfms`, { method: 'POST', body: form })
-      .then(r => { if (!r.ok) throw new Error('Upload failed'); return r.json(); });
+    const validFiles = fileList.filter(f => f && f.size > 0);
+    console.log('[uploadRFMS] input files:', files, 'valid:', validFiles.length, validFiles.map(f => `${f.name} (${f.size}b)`));
+    if (validFiles.length === 0) throw new Error('No valid files selected');
+    validFiles.forEach(f => form.append('files', f));
+    const r = await fetch(`${BASE}/jobs/${jobId}/upload-rfms`, { method: 'POST', body: form });
+    if (!r.ok) {
+      const text = await r.text();
+      console.error('[uploadRFMS] error:', r.status, text);
+      let msg;
+      try { const err = JSON.parse(text); msg = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail); } catch { msg = text; }
+      throw new Error(msg || 'Upload failed');
+    }
+    return r.json();
   },
 
   // Quote Upload
-  uploadQuotes: (jobId, files) => {
+  uploadQuotes: async (jobId, files) => {
     const form = new FormData();
-    files.forEach(f => form.append('files', f));
-    return fetch(`${BASE}/jobs/${jobId}/upload-quotes`, { method: 'POST', body: form })
-      .then(r => { if (!r.ok) throw new Error('Upload failed'); return r.json(); });
+    const fileList = Array.isArray(files) ? files : [files];
+    const validFiles = fileList.filter(f => f instanceof File && f.size > 0);
+    if (validFiles.length === 0) throw new Error('No valid files selected');
+    validFiles.forEach(f => form.append('files', f));
+    const r = await fetch(`${BASE}/jobs/${jobId}/upload-quotes`, { method: 'POST', body: form });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: r.statusText }));
+      const msg = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
+      throw new Error(msg || 'Upload failed');
+    }
+    return r.json();
   },
 
   // Materials

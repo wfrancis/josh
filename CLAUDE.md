@@ -23,6 +23,7 @@
 - Diff behavior between main and your changes when relevant
 - Ask yourself: "Would a staff engineer approve this?"
 - Run tests, check logs, demonstrate correctness
+- **All testing must happen on Fly.io** — never test locally. Deploy first, then test against the live server via curl/browser. No local servers, no local test clients.
 
 ### 5. Demand Elegance (Balanced)
 - For non-trivial changes: pause and ask "is there a more elegant way?"
@@ -44,6 +45,10 @@
 4. **Explain Changes**: High-level summary at each step
 5. **Document Results**: Add review section to `tasks/todo.md`
 6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
+
+## Git Commits
+
+- **No Co-Authored-By**: Never add a `Co-Authored-By` trailer to commit messages. Only the user's git config determines authorship.
 
 ## Core Principles
 

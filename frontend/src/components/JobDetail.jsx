@@ -47,10 +47,12 @@ export default function JobDetail() {
   useEffect(() => { api.getSettings().then(setAiSettings).catch(() => {}) }, [])
 
   const handleRfmsUpload = async (files) => {
+    console.log('[handleRfmsUpload] received:', files, 'type:', typeof files, 'isArray:', Array.isArray(files))
     setRfmsLoading(true)
     setError(null)
     try {
       const fileList = Array.isArray(files) ? files : [files]
+      console.log('[handleRfmsUpload] fileList:', fileList.map(f => f?.name || f))
       await api.uploadRFMS(jobId, fileList)
       const updated = await api.getJob(jobId)
       setJob(updated)
@@ -220,6 +222,20 @@ export default function JobDetail() {
                 success={rfmsSuccess}
                 successMessage={`${job.materials?.length || 0} materials parsed with waste factors applied`}
               />
+              {job.materials?.length > 0 && (
+                <button
+                  onClick={async () => {
+                    if (!window.confirm('Clear all materials and start over?')) return
+                    await api.updateMaterials(jobId, [])
+                    const updated = await api.getJob(jobId)
+                    setJob(updated)
+                    setRfmsSuccess(false)
+                  }}
+                  className="mt-3 text-xs text-gray-500 hover:text-red-400 transition-colors"
+                >
+                  Clear materials &amp; start over
+                </button>
+              )}
             </div>
 
             {job.materials?.length > 0 && (

@@ -17,11 +17,13 @@ export default function FileUpload({
   const handleDrop = useCallback((e) => {
     e.preventDefault(); e.stopPropagation(); setDragOver(false)
     const droppedFiles = Array.from(e.dataTransfer.files)
+    console.log('[FileUpload] drop:', droppedFiles.length, 'files, multiple:', multiple, droppedFiles.map(f => `${f.name} (${f.size}b)`))
     if (droppedFiles.length) { setFiles(droppedFiles); onUpload?.(multiple ? droppedFiles : droppedFiles[0]) }
   }, [onUpload, multiple])
 
   const handleChange = (e) => {
     const selected = Array.from(e.target.files)
+    console.log('[FileUpload] change:', selected.length, 'files, multiple:', multiple, selected.map(f => `${f.name} (${f.size}b)`))
     if (selected.length) { setFiles(selected); onUpload?.(multiple ? selected : selected[0]) }
   }
 
