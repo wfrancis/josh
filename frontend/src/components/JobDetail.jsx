@@ -35,6 +35,7 @@ export default function JobDetail() {
       setJob(data)
       setNotes(data.notes || '')
       setNotesOpen(!!data.notes)
+      if (data.materials?.length > 0) setRfmsSuccess(true)
       if (data.bundles?.length > 0) setStep('bid')
       else if (data.materials?.some(m => m.unit_price > 0)) setStep('pricing')
       else if (data.materials?.length > 0) setStep('pricing')
