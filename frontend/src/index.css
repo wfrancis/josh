@@ -1,0 +1,118 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-[#0A0F1E] text-gray-100 antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+  ::selection {
+    @apply bg-si-orange/30 text-white;
+  }
+}
+
+@layer components {
+  /* ── Buttons ─────────────────────────────────────────── */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5
+           bg-gradient-to-b from-si-orange to-orange-600
+           text-white font-semibold rounded-xl
+           shadow-[0_1px_2px_rgba(0,0,0,0.4),inset_0_1px_0_rgba(255,255,255,0.12)]
+           hover:from-orange-500 hover:to-orange-700 hover:shadow-[0_4px_16px_rgba(255,95,0,0.3)]
+           active:from-orange-600 active:to-orange-800
+           transition-all duration-150 cursor-pointer
+           focus:outline-none focus:ring-2 focus:ring-si-orange/40 focus:ring-offset-2 focus:ring-offset-[#0A0F1E];
+  }
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5
+           bg-white/[0.05] text-gray-200 font-medium rounded-xl
+           border border-white/[0.08]
+           hover:bg-white/[0.09] hover:border-white/[0.14] hover:text-white
+           transition-all duration-150 cursor-pointer;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2
+           text-gray-400 font-medium rounded-xl
+           hover:text-gray-200 hover:bg-white/[0.05]
+           transition-all duration-150 cursor-pointer;
+  }
+
+  /* ── Cards ───────────────────────────────────────────── */
+  .glass-card {
+    @apply bg-white/[0.03] backdrop-blur-xl border border-white/[0.06] rounded-2xl;
+  }
+  .glass-card-hover {
+    @apply glass-card hover:bg-white/[0.06] hover:border-white/[0.1]
+           hover:shadow-[0_8px_40px_rgba(0,0,0,0.25)] transition-all duration-300 cursor-pointer;
+  }
+
+  /* ── Inputs ──────────────────────────────────────────── */
+  .input {
+    @apply w-full px-4 py-3 bg-white/[0.04] border border-white/[0.08] rounded-xl
+           text-sm text-gray-100 placeholder:text-gray-500
+           focus:outline-none focus:ring-2 focus:ring-si-bright/30 focus:border-si-bright/40
+           hover:border-white/[0.14] transition-all duration-150;
+  }
+  .label {
+    @apply block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2;
+  }
+
+  /* ── Badges ──────────────────────────────────────────── */
+  .badge {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold;
+  }
+  .badge-draft     { @apply badge bg-gray-500/10 text-gray-400 border border-gray-500/10; }
+  .badge-progress  { @apply badge bg-si-bright/10 text-blue-400 border border-si-bright/10; }
+  .badge-priced    { @apply badge bg-amber-500/10 text-amber-400 border border-amber-500/10; }
+  .badge-complete  { @apply badge bg-emerald-500/10 text-emerald-400 border border-emerald-500/10; }
+}
+
+/* ── Scrollbar ────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
+
+/* ── Upload zone ──────────────────────────────────────── */
+.upload-zone {
+  @apply relative border-2 border-dashed border-white/[0.08] rounded-2xl p-10
+         bg-white/[0.015] transition-all duration-300 cursor-pointer;
+}
+.upload-zone:hover, .upload-zone.drag-over {
+  @apply border-si-bright/40 bg-si-bright/[0.03];
+}
+
+/* ── Editable cell ────────────────────────────────────── */
+.editable-cell {
+  @apply px-3 py-2 bg-transparent border border-transparent rounded-lg
+         text-right tabular-nums text-gray-200 text-sm;
+}
+.editable-cell:hover { @apply border-white/[0.1] bg-white/[0.03]; }
+.editable-cell:focus { @apply border-si-bright/40 bg-white/[0.05] outline-none ring-1 ring-si-bright/20; }
+
+/* ── Animations ───────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in { animation: fadeIn 0.35s ease-out forwards; }
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-slide-up { animation: slideUp 0.5s cubic-bezier(0.16,1,0.3,1) forwards; }
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* ── Glow effects ─────────────────────────────────────── */
+.glow-orange {
+  box-shadow: 0 0 60px -12px rgba(255, 95, 0, 0.25);
+}
+.glow-blue {
+  box-shadow: 0 0 60px -12px rgba(17, 109, 255, 0.2);
+}

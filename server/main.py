@@ -293,7 +293,18 @@ async def api_upload_labor_catalog(file: UploadFile = File(...)):
 # Check both dev path (../frontend/dist) and Docker path (./static)
 frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 static_dir = os.path.join(os.path.dirname(__file__), "static")
-if os.path.isdir(frontend_dist):
-    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
-elif os.path.isdir(static_dir):
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="frontend")
+_static_root = frontend_dist if os.path.isdir(frontend_dist) else static_dir if os.path.isdir(static_dir) else None
+
+if _static_root:
+    # Serve static assets (JS, CSS, images)
+    app.mount("/assets", StaticFiles(directory=os.path.join(_static_root, "assets")), name="assets")
+
+    # SPA catch-all: serve index.html for any non-API route
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # If the file exists in static dir, serve it directly
+        file_path = os.path.join(_static_root, full_path)
+        if full_path and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        # Otherwise serve index.html for client-side routing
+        return FileResponse(os.path.join(_static_root, "index.html"))
