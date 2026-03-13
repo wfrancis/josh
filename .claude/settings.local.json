@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/william/josh log --oneline -10)",
+      "Bash(git -C /Users/william/josh show c6f26e9 --name-only)",
+      "Bash(git -C /Users/william/josh show c6f26e9 --name-status)",
+      "Bash(grep -E \"\\\\.\\(tsx?|jsx?\\)$\")",
+      "Bash(wc -l /Users/william/josh/server/*.py)",
+      "WebFetch(domain:www.standardinteriors.com)"
+    ]
+  }
+}
