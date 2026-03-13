@@ -43,9 +43,9 @@ export default function JobDetail() {
     setError(null)
     try {
       await api.uploadRFMS(jobId, file)
-      setRfmsSuccess(true)
       const updated = await api.getJob(jobId)
       setJob(updated)
+      setRfmsSuccess(true)
       setTimeout(() => setStep('pricing'), 800)
     } catch (err) {
       setError(err.message)
@@ -165,8 +165,9 @@ export default function JobDetail() {
                 description="Supports .xlsx, .xls, and .csv pivot table exports"
                 icon={FileSpreadsheet}
                 onUpload={handleRfmsUpload}
+                onReset={() => setRfmsSuccess(false)}
                 loading={rfmsLoading}
-                success={rfmsSuccess || job.materials?.length > 0}
+                success={rfmsSuccess}
                 successMessage={`${job.materials?.length || 0} materials parsed with waste factors applied`}
               />
             </div>

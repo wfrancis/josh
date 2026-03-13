@@ -89,6 +89,11 @@ def init_db() -> None:
                 total_price REAL DEFAULT 0,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """)
         conn.commit()
     finally:
@@ -245,6 +250,31 @@ def load_job(job_id: int) -> Optional[dict]:
             conn.execute("SELECT * FROM job_bundles WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
         ]
         return job
+    finally:
+        conn.close()
+
+
+def get_settings() -> dict:
+    """Get all app settings as a dict."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+    finally:
+        conn.close()
+
+
+def save_settings(settings: dict) -> None:
+    """Save app settings (upsert)."""
+    conn = _get_conn()
+    try:
+        for key, value in settings.items():
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(value))
+            )
+        conn.commit()
     finally:
         conn.close()
 

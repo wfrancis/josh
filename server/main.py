@@ -16,9 +16,10 @@ from pydantic import BaseModel
 from models import (
     init_db, save_job, load_job, list_jobs,
     save_materials, save_sundries, save_labor, save_bundles,
+    get_settings, save_settings,
 )
 from rfms_parser import parse_rfms
-from quote_parser import parse_quote_file
+from quote_parser import parse_quote_file, set_openai_config
 from sundry_calc import calculate_sundries_for_materials
 from labor_calc import calculate_labor_for_materials, load_labor_catalog
 from bid_assembler import assemble_bid
@@ -45,6 +46,7 @@ os.makedirs(PDF_DIR, exist_ok=True)
 @app.on_event("startup")
 def startup():
     init_db()
+    _apply_openai_config()
 
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
@@ -63,6 +65,12 @@ class JobCreate(BaseModel):
 
 class MaterialUpdate(BaseModel):
     materials: list[dict]
+
+
+class SettingsUpdate(BaseModel):
+    openai_api_key: Optional[str] = None
+    openai_model: Optional[str] = None
+    multi_pass_count: Optional[int] = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -287,6 +295,60 @@ async def api_upload_labor_catalog(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Failed to parse labor catalog: {e}")
 
     return {"message": "Labor catalog loaded", "entries": len(catalog)}
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/settings")
+def api_get_settings():
+    """Get app settings (API key is masked)."""
+    settings = get_settings()
+    # Mask the API key for display
+    raw_key = settings.get("openai_api_key", "")
+    if raw_key and len(raw_key) > 8:
+        masked = raw_key[:4] + "•" * (len(raw_key) - 8) + raw_key[-4:]
+    elif raw_key:
+        masked = "•" * len(raw_key)
+    else:
+        masked = ""
+    return {
+        "openai_api_key_set": bool(raw_key),
+        "openai_api_key_masked": masked,
+        "openai_model": settings.get("openai_model", "gpt-5-mini"),
+        "multi_pass_count": int(settings.get("multi_pass_count", "3")),
+    }
+
+
+@app.post("/api/settings")
+def api_update_settings(body: SettingsUpdate):
+    """Update app settings."""
+    updates = {}
+    if body.openai_api_key is not None:
+        updates["openai_api_key"] = body.openai_api_key
+    if body.openai_model is not None:
+        if body.openai_model not in ("gpt-5-mini", "gpt-5.4"):
+            raise HTTPException(status_code=400, detail="Invalid model. Choose gpt-5-mini or gpt-5.4")
+        updates["openai_model"] = body.openai_model
+    if body.multi_pass_count is not None:
+        if body.multi_pass_count < 1 or body.multi_pass_count > 5:
+            raise HTTPException(status_code=400, detail="Multi-pass count must be between 1 and 5")
+        updates["multi_pass_count"] = str(body.multi_pass_count)
+    if updates:
+        save_settings(updates)
+        # Apply API key and model to quote parser
+        settings = get_settings()
+        _apply_openai_config(settings)
+    return {"message": "Settings updated", **api_get_settings()}
+
+
+def _apply_openai_config(settings: dict = None):
+    """Apply stored OpenAI settings to the quote parser."""
+    if settings is None:
+        settings = get_settings()
+    api_key = settings.get("openai_api_key")
+    model = settings.get("openai_model", "gpt-5-mini")
+    passes = int(settings.get("multi_pass_count", "3"))
+    set_openai_config(api_key=api_key, model=model, num_passes=passes)
 
 
 # ── Static Files (React frontend) ────────────────────────────────────────────

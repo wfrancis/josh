@@ -2,7 +2,7 @@ import { useState, useRef, useCallback } from 'react'
 import { Upload, FileSpreadsheet, FileText, X, CheckCircle2, Loader2 } from 'lucide-react'
 
 export default function FileUpload({
-  accept, multiple = false, onUpload,
+  accept, multiple = false, onUpload, onReset,
   label = 'Upload File', description = 'Drag and drop or click to browse',
   icon: CustomIcon, loading = false, success = false,
   successMessage = 'File uploaded successfully',
@@ -33,7 +33,7 @@ export default function FileUpload({
         <CheckCircle2 className="w-12 h-12 text-emerald-400 mx-auto mb-3" />
         <p className="text-sm font-medium text-emerald-300">{successMessage}</p>
         <button
-          onClick={() => { setFiles([]); inputRef.current && (inputRef.current.value = '') }}
+          onClick={() => { setFiles([]); inputRef.current && (inputRef.current.value = ''); onReset?.() }}
           className="mt-2 text-xs text-emerald-500 hover:text-emerald-400 underline"
         >Upload another</button>
       </div>

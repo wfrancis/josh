@@ -52,4 +52,8 @@ export const api = {
     return fetch(`${BASE}/labor-catalog/upload`, { method: 'POST', body: form })
       .then(r => { if (!r.ok) throw new Error('Upload failed'); return r.json(); });
   },
+
+  // Settings
+  getSettings: () => request('/settings'),
+  updateSettings: (data) => request('/settings', { method: 'POST', body: JSON.stringify(data) }),
 };

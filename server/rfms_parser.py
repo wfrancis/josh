@@ -117,16 +117,34 @@ def parse_rfms(file_path: str) -> dict:
             break
     if by_item_sheet is None and len(wb.sheetnames) >= 3:
         by_item_sheet = wb[wb.sheetnames[2]]  # Sheet 3 (0-indexed: 2)
+    if by_item_sheet is None and len(wb.sheetnames) >= 1:
+        by_item_sheet = wb[wb.sheetnames[0]]  # Fallback: first sheet
 
     if by_item_sheet:
-        for row in by_item_sheet.iter_rows(min_row=2, max_col=4, values_only=True):
-            item_code = _safe_str(row[0]) if row[0] else ""
+        # Auto-detect column layout from header row
+        col_map = {"item_code": 0, "qty": 1, "description": 2, "unit": 3}
+        header_row = next(by_item_sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if header_row:
+            for idx, cell in enumerate(header_row):
+                h = _safe_str(cell).lower()
+                if "item" in h and ("code" in h or "id" in h or h == "item"):
+                    col_map["item_code"] = idx
+                elif "qty" in h or "quantity" in h or "installed" in h:
+                    col_map["qty"] = idx
+                elif "desc" in h or "product" in h or "style" in h or "name" in h:
+                    col_map["description"] = idx
+                elif h in ("unit", "uom", "units"):
+                    col_map["unit"] = idx
+
+        max_col = max(col_map.values()) + 1
+        for row in by_item_sheet.iter_rows(min_row=2, max_col=max_col, values_only=True):
+            item_code = _safe_str(row[col_map["item_code"]]) if len(row) > col_map["item_code"] and row[col_map["item_code"]] else ""
             if not item_code or item_code.lower() in ("total", "grand total", ""):
                 continue
 
-            qty = _safe_float(row[1]) if len(row) > 1 else 0.0
-            description = _safe_str(row[2]) if len(row) > 2 else ""
-            unit = _safe_str(row[3]) if len(row) > 3 else ""
+            qty = _safe_float(row[col_map["qty"]]) if len(row) > col_map["qty"] else 0.0
+            description = _safe_str(row[col_map["description"]]) if len(row) > col_map["description"] else ""
+            unit = _safe_str(row[col_map["unit"]]) if len(row) > col_map["unit"] else ""
 
             # If unit wasn't in column D, try to extract from description
             if not unit:

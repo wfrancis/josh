@@ -10,8 +10,27 @@ import tempfile
 from email import policy
 from typing import Optional
 
+import statistics
+
 import pdfplumber
 from openai import OpenAI
+
+# ── Configurable OpenAI settings ──────────────────────────────────────────────
+_openai_config = {
+    "api_key": None,   # None = use OPENAI_API_KEY env var
+    "model": "gpt-5-mini",
+    "num_passes": 3,
+}
+
+
+def set_openai_config(api_key: str = None, model: str = None, num_passes: int = None):
+    """Update OpenAI configuration at runtime."""
+    if api_key is not None:
+        _openai_config["api_key"] = api_key if api_key else None
+    if model is not None:
+        _openai_config["model"] = model
+    if num_passes is not None:
+        _openai_config["num_passes"] = max(1, min(5, num_passes))
 
 
 SYSTEM_PROMPT = """You are a flooring vendor quote parser. Extract product pricing from the vendor quote text.
@@ -97,11 +116,10 @@ def _extract_eml(eml_path: str) -> dict:
     }
 
 
-def _call_openai(quote_text: str) -> list[dict]:
-    """Send extracted text to OpenAI GPT-5 Mini and parse the structured response."""
-    client = OpenAI()  # uses OPENAI_API_KEY env var
+def _call_openai_single(quote_text: str, client: OpenAI, model: str) -> list[dict]:
+    """Single pass: send text to OpenAI and parse the structured response."""
     response = client.chat.completions.create(
-        model="gpt-5-mini",
+        model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": quote_text},
@@ -111,6 +129,79 @@ def _call_openai(quote_text: str) -> list[dict]:
     content = response.choices[0].message.content
     parsed = json.loads(content)
     return parsed.get("products", [])
+
+
+def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
+    """
+    Merge results from multiple passes. For each product found,
+    take the median price across passes for stability.
+    """
+    if len(all_results) == 1:
+        return all_results[0]
+
+    # Index products by normalized name across all passes
+    product_map: dict[str, list[dict]] = {}
+    for pass_result in all_results:
+        for product in pass_result:
+            key = (product.get("product_name", "").strip().lower(),
+                   product.get("vendor", "").strip().lower())
+            norm_key = f"{key[0]}||{key[1]}"
+            product_map.setdefault(norm_key, []).append(product)
+
+    merged = []
+    seen = set()
+    for norm_key, variants in product_map.items():
+        if norm_key in seen:
+            continue
+        seen.add(norm_key)
+
+        # Use the most common version as the base
+        base = variants[0]
+
+        # Take median unit_price for stability
+        prices = [v.get("unit_price", 0) for v in variants if v.get("unit_price")]
+        if prices:
+            base["unit_price"] = round(statistics.median(prices), 2)
+
+        # Take median freight if available
+        freights = [v.get("freight", 0) for v in variants if v.get("freight")]
+        if freights:
+            base["freight"] = round(statistics.median(freights), 2)
+
+        merged.append(base)
+
+    return merged
+
+
+def _call_openai(quote_text: str) -> list[dict]:
+    """Multi-pass OpenAI call: runs N passes and merges results for accuracy."""
+    api_key = _openai_config["api_key"]
+    model = _openai_config["model"]
+    num_passes = _openai_config["num_passes"]
+
+    client_kwargs = {}
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    client = OpenAI(**client_kwargs)  # falls back to OPENAI_API_KEY env var
+
+    if num_passes <= 1:
+        return _call_openai_single(quote_text, client, model)
+
+    # Run multiple passes
+    all_results = []
+    for i in range(num_passes):
+        try:
+            result = _call_openai_single(quote_text, client, model)
+            all_results.append(result)
+        except Exception:
+            if i == 0:
+                raise  # If first pass fails, propagate error
+            # If later passes fail, just skip
+
+    if not all_results:
+        return []
+
+    return _merge_multipass_results(all_results)
 
 
 def parse_quote_pdf(pdf_path: str) -> list[dict]:
