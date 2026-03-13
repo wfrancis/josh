@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, Building2, MapPin, User, Percent, Hash,
-  Loader2, FileSpreadsheet, Save, AlertTriangle
+  Loader2, FileSpreadsheet, Save, AlertTriangle, Trash2
 } from 'lucide-react'
 import { api } from '../api'
 import StepIndicator from './StepIndicator'
@@ -134,6 +134,17 @@ export default function JobDetail() {
             )}
           </div>
         </div>
+        <button
+          onClick={() => {
+            if (window.confirm(`Delete "${job.project_name}"? This cannot be undone.`)) {
+              api.deleteJob(job.id).then(() => navigate('/')).catch(err => setError(err.message))
+            }
+          }}
+          className="btn-ghost p-2 mt-0.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10"
+          title="Delete job"
+        >
+          <Trash2 className="w-5 h-5" />
+        </button>
       </div>
 
       {/* Stepper */}

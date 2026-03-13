@@ -17,6 +17,7 @@ export const api = {
   listJobs: () => request('/jobs'),
   createJob: (data) => request('/jobs', { method: 'POST', body: JSON.stringify(data) }),
   getJob: (id) => request(`/jobs/${id}`),
+  deleteJob: (id) => request(`/jobs/${id}`, { method: 'DELETE' }),
 
   // RFMS Upload
   uploadRFMS: (jobId, file) => {

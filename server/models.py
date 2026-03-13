@@ -224,6 +224,17 @@ def save_bundles(job_id: int, bundles: list[dict]) -> None:
         conn.close()
 
 
+def delete_job(job_id: int) -> bool:
+    """Delete a job and all related data (cascading)."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def load_job(job_id: int) -> Optional[dict]:
     """Load a job with all related data."""
     conn = _get_conn()
@@ -280,12 +291,20 @@ def save_settings(settings: dict) -> None:
 
 
 def list_jobs() -> list[dict]:
-    """List all jobs (summary only)."""
+    """List all jobs (summary with bundle count)."""
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT id, project_name, gc_name, salesperson, created_at FROM jobs ORDER BY created_at DESC"
+            """SELECT j.id, j.project_name, j.gc_name, j.salesperson, j.city, j.state, j.created_at,
+                      (SELECT COUNT(*) FROM job_bundles b WHERE b.job_id = j.id) AS bundle_count
+               FROM jobs j ORDER BY j.created_at DESC"""
         ).fetchall()
-        return [dict(r) for r in rows]
+        results = []
+        for r in rows:
+            d = dict(r)
+            # Add bundles field for frontend compatibility
+            d["bundles"] = [{}] * d.pop("bundle_count", 0)
+            results.append(d)
+        return results
     finally:
         conn.close()

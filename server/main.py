@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from models import (
-    init_db, save_job, load_job, list_jobs,
+    init_db, save_job, load_job, list_jobs, delete_job,
     save_materials, save_sundries, save_labor, save_bundles,
     get_settings, save_settings,
 )
@@ -95,6 +95,14 @@ def api_get_job(job_id: int):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.delete("/api/jobs/{job_id}")
+def api_delete_job(job_id: int):
+    """Delete a job and all related data."""
+    if not delete_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"message": "Job deleted"}
 
 
 @app.post("/api/jobs/{job_id}/upload-rfms")
