@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, Settings, HardHat, Zap } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Settings, HardHat } from 'lucide-react'
 
 function NavItem({ to, icon: Icon, label, active }) {
   return (
@@ -50,15 +50,6 @@ export default function Layout({ children }) {
 
         {/* Bottom section */}
         <div className="px-3 pb-4 space-y-1">
-          <div className="mx-3 mb-3 px-3 py-3 rounded-xl bg-gradient-to-br from-si-bright/10 to-si-bright/5 border border-si-bright/10">
-            <div className="flex items-center gap-2 text-si-bright text-xs font-semibold mb-1">
-              <Zap className="w-3.5 h-3.5" />
-              AI-Powered
-            </div>
-            <p className="text-[11px] text-gray-500 leading-relaxed">
-              Quotes parsed automatically with AI. Upload PDFs and let us extract pricing.
-            </p>
-          </div>
           <NavItem to="/settings" icon={Settings} label="Settings" active={location.pathname === '/settings'} />
           <div className="px-3 pt-2 text-[10px] text-gray-600">
             v1.0 · Standard Interiors

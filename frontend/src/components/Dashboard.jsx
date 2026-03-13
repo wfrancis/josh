@@ -1,10 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
-  Plus, Briefcase, FileText, DollarSign, Clock,
-  ChevronRight, Building2, User, Loader2, HardHat,
-  Upload, FileSpreadsheet, Calculator, FileDown,
-  ArrowRight, Sparkles
+  Plus, Briefcase, FileText, Clock,
+  ChevronRight, Building2, User, Loader2
 } from 'lucide-react'
 import { api } from '../api'
 import StatusBadge, { getJobStatus } from './StatusBadge'
@@ -28,71 +26,19 @@ function StatCard({ icon: Icon, label, value, gradient }) {
   )
 }
 
-/* ── Workflow Step ──────────────────────────────────────── */
-function WorkflowStep({ step, icon: Icon, title, desc, accent }) {
-  return (
-    <div className="flex flex-col items-center text-center group">
-      <div className={`w-14 h-14 rounded-2xl flex items-center justify-center mb-4
-                       bg-gradient-to-br ${accent} shadow-lg transition-transform group-hover:scale-110`}>
-        <Icon className="w-6 h-6 text-white" />
-      </div>
-      <div className="text-[10px] font-bold text-gray-500 uppercase tracking-[0.15em] mb-1">Step {step}</div>
-      <div className="text-sm font-semibold text-gray-200">{title}</div>
-      <div className="text-xs text-gray-500 mt-1 max-w-[160px] leading-relaxed">{desc}</div>
-    </div>
-  )
-}
-
 /* ── Empty State ───────────────────────────────────────── */
 function EmptyState({ onCreate }) {
   return (
-    <div className="animate-fade-in">
-      {/* Hero */}
-      <div className="relative overflow-hidden rounded-3xl glass-card p-12 mb-8">
-        {/* Background glow */}
-        <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-si-orange/[0.06] rounded-full blur-[100px] -translate-y-1/2 translate-x-1/4" />
-        <div className="absolute bottom-0 left-0 w-[400px] h-[400px] bg-si-bright/[0.04] rounded-full blur-[80px] translate-y-1/2 -translate-x-1/4" />
-
-        <div className="relative max-w-xl">
-          <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-si-orange/10 border border-si-orange/20 text-si-orange text-xs font-semibold mb-6">
-            <Sparkles className="w-3.5 h-3.5" />
-            AI-Powered Bid Generation
-          </div>
-          <h1 className="text-4xl font-extrabold text-white tracking-tight leading-[1.1] mb-4">
-            Professional flooring bids<br />
-            <span className="bg-clip-text text-transparent bg-gradient-to-r from-si-orange to-amber-400">
-              in minutes, not hours.
-            </span>
-          </h1>
-          <p className="text-gray-400 text-base leading-relaxed mb-8 max-w-lg">
-            Upload your RFMS takeoff and vendor quotes. We handle waste calculations,
-            sundries, labor pricing, and generate a ready-to-send PDF bid.
-          </p>
-          <button onClick={onCreate} className="btn-primary text-base px-8 py-3.5 glow-orange">
-            <Plus className="w-5 h-5" />
-            Create Your First Bid
-          </button>
-        </div>
+    <div className="animate-fade-in glass-card p-12 text-center">
+      <div className="w-14 h-14 rounded-2xl bg-white/[0.06] flex items-center justify-center mx-auto mb-5">
+        <Briefcase className="w-6 h-6 text-gray-400" />
       </div>
-
-      {/* Workflow */}
-      <div className="glass-card p-8">
-        <div className="text-center mb-8">
-          <h2 className="text-lg font-bold text-white">How it works</h2>
-          <p className="text-sm text-gray-500 mt-1">Three steps from takeoff to bid</p>
-        </div>
-        <div className="flex items-start justify-center gap-6">
-          <WorkflowStep step={1} icon={FileSpreadsheet} title="Upload Takeoff" desc="Import your RFMS Excel. Materials auto-parsed with waste factors." accent="from-si-bright to-blue-600" />
-          <div className="flex items-center pt-10">
-            <ArrowRight className="w-5 h-5 text-gray-600" />
-          </div>
-          <WorkflowStep step={2} icon={Upload} title="Add Quotes" desc="Upload vendor PDFs. AI extracts product names and pricing." accent="from-violet-500 to-purple-600" />
-          <div className="flex items-center pt-10">
-            <ArrowRight className="w-5 h-5 text-gray-600" />
-          </div>
-          <WorkflowStep step={3} icon={FileDown} title="Generate Bid" desc="Auto-calculates sundries, labor, freight. Download a professional PDF." accent="from-si-orange to-orange-600" />
-        </div>
-      </div>
+      <h2 className="text-lg font-bold text-white mb-2">No jobs yet</h2>
+      <p className="text-sm text-gray-500 mb-6">Create a job to start building a bid.</p>
+      <button onClick={onCreate} className="btn-primary">
+        <Plus className="w-4 h-4" />
+        New Job
+      </button>
     </div>
   )
 }
@@ -234,7 +180,7 @@ export default function Dashboard() {
       <div className="flex items-center justify-between mb-8">
         <div>
           <h1 className="text-2xl font-extrabold text-white tracking-tight">Dashboard</h1>
-          <p className="text-sm text-gray-500 mt-1">Manage your flooring bids</p>
+          <p className="text-sm text-gray-500 mt-1">Overview</p>
         </div>
         {jobs.length > 0 && (
           <button onClick={() => setShowCreate(true)} className="btn-primary">

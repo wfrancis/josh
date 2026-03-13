@@ -168,7 +168,7 @@ export default function JobDetail() {
             <div className="glass-card p-8">
               <h2 className="text-lg font-bold text-white mb-1">Upload RFMS Takeoff</h2>
               <p className="text-sm text-gray-500 mb-6">
-                Upload your RFMS pivot table Excel export. We'll parse materials, quantities, and auto-calculate waste factors.
+                RFMS pivot table export (.xlsx, .xls, .csv). Materials and waste factors are parsed automatically.
               </p>
               <FileUpload
                 accept=".xlsx,.xls,.csv"
@@ -211,7 +211,7 @@ export default function JobDetail() {
             <div className="glass-card p-8">
               <h2 className="text-lg font-bold text-white mb-1">Vendor Quotes</h2>
               <p className="text-sm text-gray-500 mb-6">
-                Upload vendor quote PDFs or emails. Our AI will extract product names and pricing.
+                Upload vendor quote PDFs. Pricing will be extracted automatically.
               </p>
               <QuoteUpload jobId={jobId} api={api} />
             </div>
@@ -250,7 +250,7 @@ export default function JobDetail() {
           <div className="glass-card p-8">
             <h2 className="text-lg font-bold text-white mb-1">Generate Bid</h2>
             <p className="text-sm text-gray-500 mb-6">
-              Calculate sundries, labor, and freight — then generate your professional PDF bid.
+              Calculate sundries, labor, and freight, then generate the bid PDF.
             </p>
             <BidPreview job={job} api={api} onGoBack={() => setStep('pricing')} />
           </div>

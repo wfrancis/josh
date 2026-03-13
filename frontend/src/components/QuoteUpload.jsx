@@ -23,7 +23,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, api }) {
       <FileUpload
         accept=".pdf,.eml,.msg,.txt" multiple
         label="Upload Vendor Quotes"
-        description="PDF, email, or text files — we'll extract pricing with AI"
+        description="PDF or text files with vendor pricing"
         icon={FileText} onUpload={handleUpload} loading={loading}
         success={products.length > 0 && !loading}
         successMessage={`Parsed ${products.length} product${products.length !== 1 ? 's' : ''} from quotes`}

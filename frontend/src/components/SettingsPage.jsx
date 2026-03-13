@@ -86,7 +86,7 @@ export default function SettingsPage() {
           <Settings className="w-6 h-6 text-gray-400" />
           Settings
         </h1>
-        <p className="text-sm text-gray-500 mt-1">Configure your bid tool defaults and catalogs</p>
+        <p className="text-sm text-gray-500 mt-1">Defaults and catalogs</p>
       </div>
 
       <div className="space-y-6">
@@ -320,8 +320,7 @@ export default function SettingsPage() {
           <div className="mt-4 flex items-start gap-2 px-4 py-3 bg-si-bright/[0.04] border border-si-bright/10 rounded-xl">
             <Info className="w-4 h-4 text-si-bright flex-shrink-0 mt-0.5" />
             <p className="text-xs text-gray-400 leading-relaxed">
-              Business rules are configured server-side. Contact your admin to adjust waste factors,
-              sundry rules, or freight rates.
+              These are configured in the server config. Edit waste factors, sundry rules, or freight rates there.
             </p>
           </div>
         </div>

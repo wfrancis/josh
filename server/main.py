@@ -219,18 +219,24 @@ def api_update_materials(job_id: int, body: MaterialUpdate):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Recalculate order qty and extended cost
+    # Build lookup of existing materials by id
+    existing = {m["id"]: m for m in job.get("materials", [])}
+
+    # Merge incoming updates with existing data
     updated = []
     for m in body.materials:
-        waste_pct = m.get("waste_pct", 0)
-        installed_qty = m.get("installed_qty", 0)
-        unit_price = m.get("unit_price", 0)
+        base = existing.get(m.get("id"), {})
+        merged = {**base, **{k: v for k, v in m.items() if v is not None}}
+
+        waste_pct = merged.get("waste_pct", 0)
+        installed_qty = merged.get("installed_qty", 0)
+        unit_price = merged.get("unit_price", 0)
         order_qty = installed_qty * (1 + waste_pct)
         extended_cost = order_qty * unit_price
 
-        m["order_qty"] = round(order_qty, 2)
-        m["extended_cost"] = round(extended_cost, 2)
-        updated.append(m)
+        merged["order_qty"] = round(order_qty, 2)
+        merged["extended_cost"] = round(extended_cost, 2)
+        updated.append(merged)
 
     material_ids = save_materials(job_id, updated)
     for mat, mid in zip(updated, material_ids):
