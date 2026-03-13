@@ -67,7 +67,16 @@ export const api = {
   generateBid: (jobId) => request(`/jobs/${jobId}/generate-bid`, { method: 'POST' }),
   getBidPdfUrl: (jobId) => `${BASE}/jobs/${jobId}/bid.pdf`,
 
+  // Exclusions
+  getExclusions: (jobId) => request(`/jobs/${jobId}/exclusions`),
+  updateExclusions: (jobId, exclusions) =>
+    request(`/jobs/${jobId}/exclusions`, { method: 'PUT', body: JSON.stringify({ exclusions }) }),
+
+  // Materials export
+  exportMaterialsCsvUrl: (jobId) => `${BASE}/jobs/${jobId}/materials/export`,
+
   // Labor catalog
+  getLaborCatalog: () => request('/labor-catalog'),
   uploadLaborCatalog: (file) => {
     const form = new FormData();
     form.append('file', file);

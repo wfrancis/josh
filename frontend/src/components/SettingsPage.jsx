@@ -11,6 +11,8 @@ export default function SettingsPage() {
   const [laborLoading, setLaborLoading] = useState(false)
   const [laborSuccess, setLaborSuccess] = useState(false)
   const [laborError, setLaborError] = useState(null)
+  const [laborCatalog, setLaborCatalog] = useState(null)
+  const [catalogLoading, setCatalogLoading] = useState(true)
 
   // AI Settings state
   const [settingsLoading, setSettingsLoading] = useState(true)
@@ -38,12 +40,23 @@ export default function SettingsPage() {
       .finally(() => setSettingsLoading(false))
   }, [])
 
+  // Load labor catalog on mount
+  useEffect(() => {
+    api.getLaborCatalog()
+      .then(data => setLaborCatalog(data))
+      .catch(() => setLaborCatalog({ entries: [], count: 0 }))
+      .finally(() => setCatalogLoading(false))
+  }, [])
+
   const handleLaborUpload = async (file) => {
     setLaborLoading(true)
     setLaborError(null)
     try {
       await api.uploadLaborCatalog(file)
       setLaborSuccess(true)
+      // Refresh the catalog preview
+      const data = await api.getLaborCatalog()
+      setLaborCatalog(data)
     } catch (err) {
       setLaborError(err.message)
     } finally {
@@ -287,6 +300,57 @@ export default function SettingsPage() {
           {laborError && (
             <div className="mt-3 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-400">
               {laborError}
+            </div>
+          )}
+
+          {/* Labor Catalog Preview */}
+          {catalogLoading ? (
+            <div className="mt-4 flex items-center justify-center py-6">
+              <Loader2 className="w-4 h-4 text-gray-500 animate-spin" />
+            </div>
+          ) : laborCatalog && laborCatalog.count > 0 ? (
+            <div className="mt-4">
+              <div className="flex items-center gap-2 mb-3">
+                <span className="text-xs font-bold text-gray-500 uppercase tracking-[0.12em]">
+                  Loaded Rates
+                </span>
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-400">
+                  {laborCatalog.count} entries
+                </span>
+              </div>
+              <div className="overflow-x-auto max-h-64 overflow-y-auto rounded-xl border border-white/[0.06]">
+                <table className="w-full text-xs">
+                  <thead className="sticky top-0 bg-gray-900/95 backdrop-blur-sm">
+                    <tr className="border-b border-white/[0.06]">
+                      <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Type</th>
+                      <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Description</th>
+                      <th className="py-2 px-3 text-right font-bold text-gray-500 uppercase tracking-wider">Cost</th>
+                      <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Unit</th>
+                      <th className="py-2 px-3 text-right font-bold text-gray-500 uppercase tracking-wider">Markup</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/[0.03]">
+                    {laborCatalog.entries.map((entry, i) => (
+                      <tr key={i} className="hover:bg-white/[0.02] transition-colors">
+                        <td className="py-2 px-3 text-gray-300 font-medium">{entry.labor_type}</td>
+                        <td className="py-2 px-3 text-gray-400">{entry.description}</td>
+                        <td className="py-2 px-3 text-right tabular-nums text-gray-300">
+                          ${(entry.cost || 0).toFixed(2)}
+                        </td>
+                        <td className="py-2 px-3 text-gray-500">{entry.unit}</td>
+                        <td className="py-2 px-3 text-right tabular-nums text-gray-500">
+                          {entry.gpm_markup ? `${(entry.gpm_markup * 100).toFixed(0)}%` : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : !catalogLoading && (
+            <div className="mt-4 text-center py-6 bg-white/[0.02] rounded-xl border border-white/[0.04]">
+              <HardHat className="w-8 h-8 text-gray-600 mx-auto mb-2 opacity-40" />
+              <p className="text-xs text-gray-500">No labor catalog loaded yet</p>
             </div>
           )}
         </div>

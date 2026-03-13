@@ -54,6 +54,7 @@ def assemble_bid(
     materials: list[dict],
     sundries: list[dict],
     labor_items: list[dict],
+    exclusions: list[str] = None,
 ) -> dict:
     """
     Assemble a complete bid from all components.
@@ -150,5 +151,5 @@ def assemble_bid(
         "tax_rate": tax_rate,
         "tax_amount": tax_amount,
         "grand_total": grand_total,
-        "exclusions": EXCLUSIONS_TEMPLATE,
+        "exclusions": exclusions if exclusions is not None else EXCLUSIONS_TEMPLATE,
     }

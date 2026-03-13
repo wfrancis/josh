@@ -3,7 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, Building2, MapPin, User, Percent, Hash,
   Loader2, FileSpreadsheet, Save, AlertTriangle, Trash2,
-  StickyNote, ChevronDown, ChevronUp, Cpu, CheckCircle2, X, Upload
+  StickyNote, ChevronDown, ChevronUp, Cpu, CheckCircle2, X, Upload, Download
 } from 'lucide-react'
 import { api } from '../api'
 import StepIndicator from './StepIndicator'
@@ -12,6 +12,7 @@ import MaterialsTable from './MaterialsTable'
 import QuoteUpload from './QuoteUpload'
 import BidPreview from './BidPreview'
 import StatusBadge, { getJobStatus } from './StatusBadge'
+import ConfirmDialog from './ConfirmDialog'
 
 export default function JobDetail() {
   const { jobId } = useParams()
@@ -28,6 +29,8 @@ export default function JobDetail() {
   const [notesOpen, setNotesOpen] = useState(false)
   const [notes, setNotes] = useState('')
   const [aiSettings, setAiSettings] = useState(null)
+  const [confirmDialog, setConfirmDialog] = useState(null)
+  const [isDirty, setIsDirty] = useState(false)
 
   const loadJob = async () => {
     try {
@@ -48,6 +51,17 @@ export default function JobDetail() {
 
   useEffect(() => { loadJob() }, [jobId])
   useEffect(() => { api.getSettings().then(setAiSettings).catch(() => {}) }, [])
+
+  useEffect(() => {
+    const handler = (e) => {
+      if (isDirty) {
+        e.preventDefault()
+        e.returnValue = ''
+      }
+    }
+    window.addEventListener('beforeunload', handler)
+    return () => window.removeEventListener('beforeunload', handler)
+  }, [isDirty])
 
   const handleRfmsUpload = async (fileList) => {
     setRfmsLoading(true)
@@ -97,6 +111,7 @@ export default function JobDetail() {
 
   const handleMaterialsUpdate = (materials) => {
     setJob(j => ({ ...j, materials }))
+    setIsDirty(true)
   }
 
   const handleSavePricing = async () => {
@@ -105,6 +120,7 @@ export default function JobDetail() {
     try {
       const result = await api.updateMaterials(jobId, job.materials)
       setJob(j => ({ ...j, materials: result.materials }))
+      setIsDirty(false)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -184,11 +200,16 @@ export default function JobDetail() {
           </div>
         </div>
         <button
-          onClick={() => {
-            if (window.confirm(`Delete "${job.project_name}"? This cannot be undone.`)) {
-              api.deleteJob(job.id).then(() => navigate('/')).catch(err => setError(err.message))
+          onClick={() => setConfirmDialog({
+            title: 'Delete Job',
+            message: `Delete "${job.project_name}"? All materials, pricing, and bid data will be permanently removed.`,
+            confirmLabel: 'Delete Job',
+            confirmVariant: 'danger',
+            onConfirm: () => {
+              setConfirmDialog(null)
+              api.deleteJob(jobId).then(() => navigate('/')).catch(err => setError(err.message))
             }
-          }}
+          })}
           className="btn-ghost p-2 mt-0.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10"
           title="Delete job"
         >
@@ -329,14 +350,20 @@ export default function JobDetail() {
 
               {job.materials?.length > 0 && (
                 <button
-                  onClick={async () => {
-                    if (!window.confirm('Clear all materials and start over?')) return
-                    await api.updateMaterials(jobId, [])
-                    const updated = await api.getJob(jobId)
-                    setJob(updated)
-                    setRfmsSuccess(false)
-                    setStagedFiles([])
-                  }}
+                  onClick={() => setConfirmDialog({
+                    title: 'Clear All Materials',
+                    message: `This will delete all ${job.materials?.length || 0} materials and any associated pricing. You'll need to re-upload your RFMS files.`,
+                    confirmLabel: 'Clear Materials',
+                    confirmVariant: 'danger',
+                    onConfirm: async () => {
+                      setConfirmDialog(null)
+                      await api.updateMaterials(jobId, [])
+                      const updated = await api.getJob(jobId)
+                      setJob(updated)
+                      setRfmsSuccess(false)
+                      setStagedFiles([])
+                    }
+                  })}
                   className="mt-3 text-xs text-gray-500 hover:text-red-400 transition-colors"
                 >
                   Clear materials &amp; start over
@@ -346,10 +373,24 @@ export default function JobDetail() {
 
             {job.materials?.length > 0 && (
               <div className="glass-card p-6 animate-slide-up">
-                <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em] mb-4">
-                  Materials ({job.materials.length})
-                </h3>
-                <MaterialsTable materials={job.materials} readOnly />
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em]">
+                    Materials ({job.materials.length})
+                  </h3>
+                  <div className="flex items-center gap-2">
+                    <a href={api.exportMaterialsCsvUrl(jobId)} download
+                       className="btn-ghost text-xs px-2.5 py-1.5 text-gray-500 hover:text-gray-300"
+                       title="Export CSV">
+                      <Download className="w-4 h-4" />
+                      CSV
+                    </a>
+                    <button onClick={handleSavePricing} disabled={saving} className="btn-secondary text-sm">
+                      {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                      Save Changes
+                    </button>
+                  </div>
+                </div>
+                <MaterialsTable materials={job.materials} editable onUpdate={handleMaterialsUpdate} />
               </div>
             )}
           </div>
@@ -383,10 +424,18 @@ export default function JobDetail() {
                   <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em]">
                     Set Material Pricing
                   </h3>
-                  <button onClick={handleSavePricing} disabled={saving} className="btn-secondary text-sm">
-                    {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                    Save Prices
-                  </button>
+                  <div className="flex items-center gap-3">
+                    {isDirty && (
+                      <span className="text-xs text-amber-400 flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                        Unsaved changes
+                      </span>
+                    )}
+                    <button onClick={handleSavePricing} disabled={saving} className="btn-secondary text-sm">
+                      {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                      Save Prices
+                    </button>
+                  </div>
                 </div>
                 <MaterialsTable materials={job.materials} onUpdate={handleMaterialsUpdate} />
               </div>
@@ -417,6 +466,8 @@ export default function JobDetail() {
           </div>
         )}
       </div>
+
+      <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
     </div>
   )
 }

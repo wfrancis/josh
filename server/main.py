@@ -2,13 +2,15 @@
 FastAPI application for the Standard Interiors Bid Tool.
 """
 
+import csv
+import io
 import os
 import shutil
 import tempfile
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,7 +23,7 @@ from models import (
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
 from sundry_calc import calculate_sundries_for_materials
-from labor_calc import calculate_labor_for_materials, load_labor_catalog
+from labor_calc import calculate_labor_for_materials, load_labor_catalog, get_labor_catalog
 from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf
 from config import WASTE_FACTORS
@@ -232,6 +234,7 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             "vendor": m.get("vendor", ""),
             "unit_price": m.get("unit_price", 0),
             "extended_cost": round(m.get("unit_price", 0) * round(order_qty, 2), 2),
+            "ai_confidence": m.get("ai_confidence"),
         })
 
     material_ids = save_materials(db_id, materials)
@@ -302,6 +305,10 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
         base = existing.get(m.get("id"), {})
         merged = {**base, **{k: v for k, v in m.items() if v is not None}}
 
+        # If user changed the type, mark as human-verified
+        if m.get("material_type") and base.get("material_type") != m.get("material_type"):
+            merged["ai_confidence"] = 1.0
+
         waste_pct = merged.get("waste_pct", 0)
         installed_qty = merged.get("installed_qty", 0)
         unit_price = merged.get("unit_price", 0)
@@ -344,7 +351,17 @@ def api_generate_bid(job_id: str):
         "salesperson": job.get("salesperson"),
     }
 
-    bid_data = assemble_bid(job_info, materials, sundries, labor_items)
+    # Parse job-specific exclusions (stored as JSON string)
+    import json as _json
+    custom_exclusions = None
+    raw_exclusions = job.get("exclusions")
+    if raw_exclusions:
+        try:
+            custom_exclusions = _json.loads(raw_exclusions)
+        except (ValueError, TypeError):
+            pass
+
+    bid_data = assemble_bid(job_info, materials, sundries, labor_items, exclusions=custom_exclusions)
 
     # Save bundles
     save_bundles(job["id"], bid_data["bundles"])
@@ -386,6 +403,90 @@ async def api_upload_labor_catalog(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Failed to parse labor catalog: {e}")
 
     return {"message": "Labor catalog loaded", "entries": len(catalog)}
+
+
+# ── Exclusions ────────────────────────────────────────────────────────────────
+
+class ExclusionsUpdate(BaseModel):
+    exclusions: list[str]
+
+
+@app.put("/api/jobs/{job_id}/exclusions")
+def api_update_exclusions(job_id: str, body: ExclusionsUpdate):
+    """Update job-specific exclusions list."""
+    import json as _json
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job["exclusions"] = _json.dumps(body.exclusions)
+    save_job(job)
+    return {"message": "Exclusions saved", "exclusions": body.exclusions}
+
+
+@app.get("/api/jobs/{job_id}/exclusions")
+def api_get_exclusions(job_id: str):
+    """Get job exclusions (custom or defaults)."""
+    import json as _json
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    raw = job.get("exclusions")
+    if raw:
+        try:
+            return {"exclusions": _json.loads(raw), "is_custom": True}
+        except (ValueError, TypeError):
+            pass
+    return {"exclusions": EXCLUSIONS_TEMPLATE, "is_custom": False}
+
+
+# ── Materials Export ──────────────────────────────────────────────────────────
+
+@app.get("/api/jobs/{job_id}/materials/export")
+def api_export_materials(job_id: str):
+    """Export materials as CSV download."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    materials = job.get("materials", [])
+    if not materials:
+        raise HTTPException(status_code=400, detail="No materials to export")
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Item Code", "Description", "Material Type", "Install Qty", "Unit",
+        "Waste %", "Order Qty", "Unit Price", "Extended Cost"
+    ])
+    for m in materials:
+        writer.writerow([
+            m.get("item_code", ""),
+            m.get("description", ""),
+            m.get("material_type", ""),
+            m.get("installed_qty", 0),
+            m.get("unit", ""),
+            f"{(m.get('waste_pct', 0) * 100):.0f}%",
+            m.get("order_qty", 0),
+            m.get("unit_price", 0),
+            m.get("extended_cost", 0),
+        ])
+
+    output.seek(0)
+    slug = job.get("slug", f"job-{job['id']}")
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{slug}-materials.csv"'}
+    )
+
+
+# ── Labor Catalog ────────────────────────────────────────────────────────────
+
+@app.get("/api/labor-catalog")
+def api_get_labor_catalog():
+    """Get the currently loaded labor catalog entries."""
+    catalog = get_labor_catalog()
+    return {"entries": catalog, "count": len(catalog)}
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────

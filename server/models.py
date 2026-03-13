@@ -111,6 +111,8 @@ def init_db() -> None:
         for col, sql in [
             ("notes", "ALTER TABLE jobs ADD COLUMN notes TEXT"),
             ("slug", "ALTER TABLE jobs ADD COLUMN slug TEXT"),
+            ("ai_confidence", "ALTER TABLE job_materials ADD COLUMN ai_confidence REAL"),
+            ("exclusions", "ALTER TABLE jobs ADD COLUMN exclusions TEXT"),
         ]:
             try:
                 conn.execute(sql)
@@ -155,27 +157,29 @@ def save_job(job_data: dict) -> int:
             conn.execute("""
                 UPDATE jobs SET
                     project_name=?, gc_name=?, address=?, city=?, state=?, zip=?,
-                    tax_rate=?, unit_count=?, salesperson=?, notes=?, slug=?
+                    tax_rate=?, unit_count=?, salesperson=?, notes=?, slug=?, exclusions=?
                 WHERE id=?
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
                 job_data.get("state"), job_data.get("zip"),
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
-                job_data.get("salesperson"), job_data.get("notes"), slug, job_id
+                job_data.get("salesperson"), job_data.get("notes"), slug,
+                job_data.get("exclusions"), job_id
             ))
         else:
             slug = _make_unique_slug(conn, slug)
             cur = conn.execute("""
                 INSERT INTO jobs (project_name, gc_name, address, city, state, zip,
-                                  tax_rate, unit_count, salesperson, notes, slug, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  tax_rate, unit_count, salesperson, notes, slug, exclusions, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
                 job_data.get("state"), job_data.get("zip"),
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
                 job_data.get("salesperson"), job_data.get("notes"), slug,
+                job_data.get("exclusions"),
                 datetime.now().isoformat()
             ))
             job_id = cur.lastrowid
@@ -196,13 +200,14 @@ def save_materials(job_id: int, materials: list[dict]) -> list[int]:
             cur = conn.execute("""
                 INSERT INTO job_materials
                     (job_id, item_code, description, material_type, installed_qty,
-                     unit, waste_pct, order_qty, vendor, unit_price, extended_cost)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     unit, waste_pct, order_qty, vendor, unit_price, extended_cost, ai_confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_id, m.get("item_code"), m.get("description"),
                 m.get("material_type"), m.get("installed_qty", 0),
                 m.get("unit"), m.get("waste_pct", 0), m.get("order_qty", 0),
-                m.get("vendor"), m.get("unit_price", 0), m.get("extended_cost", 0)
+                m.get("vendor"), m.get("unit_price", 0), m.get("extended_cost", 0),
+                m.get("ai_confidence")
             ))
             ids.append(cur.lastrowid)
         conn.commit()

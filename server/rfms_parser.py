@@ -163,14 +163,15 @@ CLASSIFICATION RULES:
 - Lines about carpet pad, isolation strips, adhesive → these are sundries, classify as "sundry"
 
 Return a JSON object with a "classifications" key containing an array. Each element must have:
-  {"index": <number>, "material_type": "<type>"}
+  {"index": <number>, "material_type": "<type>", "confidence": <0.0-1.0>}
+The confidence score indicates how certain you are about the classification (1.0 = very certain, 0.5 = unsure).
 
 You MUST classify EVERY material line — one entry per material. Return ALL of them.
-Example response format: {"classifications": [{"index": 0, "material_type": "floor_tile"}, {"index": 1, "material_type": "wall_tile"}]}"""
+Example response format: {"classifications": [{"index": 0, "material_type": "floor_tile", "confidence": 0.95}, {"index": 1, "material_type": "wall_tile", "confidence": 0.8}]}"""
 
 
 def _classify_with_ai(material_lines: list[tuple[int, str]],
-                       install_lines: list[str]) -> dict[int, str]:
+                       install_lines: list[str]) -> dict[int, dict]:
     """
     Use OpenAI to classify material lines by matching with install lines.
     Returns: {index: material_type}
@@ -237,10 +238,11 @@ INSTALL LINES (use these to identify material types):
         for item in items:
             idx = item.get("index")
             mtype = item.get("material_type", "unknown")
+            confidence = item.get("confidence", 0.5)
             if idx is not None and mtype in VALID_MATERIAL_TYPES:
-                result[idx] = mtype
+                result[idx] = {"type": mtype, "confidence": confidence}
             elif idx is not None and mtype == "sundry":
-                result[idx] = "sundry"
+                result[idx] = {"type": "sundry", "confidence": confidence}
 
         print(f"[rfms_parser] Classification result: {len(result)} classified out of {len(material_lines)}")
         return result
@@ -342,7 +344,14 @@ def parse_rfms(file_path: str) -> dict:
     materials = []
     for i, desc, qty in material_lines:
         # Use AI result — no fallback, stays "unknown" if AI didn't classify
-        material_type = ai_results.get(i, "unknown")
+        ai_result = ai_results.get(i, {"type": "unknown", "confidence": None})
+        if isinstance(ai_result, str):
+            # Backwards compat: old format returned just a string
+            material_type = ai_result
+            ai_confidence = None
+        else:
+            material_type = ai_result.get("type", "unknown")
+            ai_confidence = ai_result.get("confidence")
 
         # Skip if AI classified as sundry
         if material_type == "sundry":
@@ -357,6 +366,7 @@ def parse_rfms(file_path: str) -> dict:
             "unit": unit,
             "description": desc,
             "material_type": material_type,
+            "ai_confidence": ai_confidence,
         })
 
     wb.close()

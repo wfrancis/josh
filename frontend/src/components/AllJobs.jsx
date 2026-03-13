@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { api } from '../api'
 import StatusBadge, { getJobStatus } from './StatusBadge'
+import ConfirmDialog from './ConfirmDialog'
 
 export default function AllJobs() {
   const navigate = useNavigate()
@@ -14,6 +15,7 @@ export default function AllJobs() {
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState(new Set())
   const [deleting, setDeleting] = useState(false)
+  const [confirmDialog, setConfirmDialog] = useState(null)
 
   useEffect(() => {
     api.listJobs()
@@ -47,18 +49,26 @@ export default function AllJobs() {
     else setSelected(new Set(filtered.map(j => j.id)))
   }
 
-  const handleBulkDelete = async () => {
-    if (!window.confirm(`Delete ${selected.size} job${selected.size !== 1 ? 's' : ''}? This cannot be undone.`)) return
-    setDeleting(true)
-    try {
-      await api.bulkDeleteJobs([...selected])
-      setJobs(prev => prev.filter(j => !selected.has(j.id)))
-      setSelected(new Set())
-    } catch (err) {
-      console.error(err)
-    } finally {
-      setDeleting(false)
-    }
+  const handleBulkDelete = () => {
+    setConfirmDialog({
+      title: 'Delete Jobs',
+      message: `Delete ${selected.size} job${selected.size !== 1 ? 's' : ''}? All materials, pricing, and bid data will be permanently removed.`,
+      confirmLabel: `Delete ${selected.size} Job${selected.size !== 1 ? 's' : ''}`,
+      confirmVariant: 'danger',
+      onConfirm: async () => {
+        setConfirmDialog(null)
+        setDeleting(true)
+        try {
+          await api.bulkDeleteJobs([...selected])
+          setJobs(prev => prev.filter(j => !selected.has(j.id)))
+          setSelected(new Set())
+        } catch (err) {
+          console.error(err)
+        } finally {
+          setDeleting(false)
+        }
+      }
+    })
   }
 
   if (loading) {
@@ -200,6 +210,8 @@ export default function AllJobs() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
     </div>
   )
 }

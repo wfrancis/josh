@@ -1,7 +1,7 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   Calculator, FileDown, Loader2, ChevronDown, ChevronRight,
-  Package, Wrench, HardHat, Truck, Ban, DollarSign
+  Package, Wrench, HardHat, Truck, Ban, DollarSign, Plus, X, Save, RotateCcw
 } from 'lucide-react'
 
 function formatCurrency(val) {
@@ -50,6 +50,115 @@ function CostRow({ icon: Icon, label, value }) {
       <Icon className="w-3.5 h-3.5 text-gray-500" />
       <span className="text-xs text-gray-500 flex-1">{label}</span>
       <span className="text-xs font-semibold text-gray-300 tabular-nums">{formatCurrency(value)}</span>
+    </div>
+  )
+}
+
+function ExclusionsList({ jobId, api, exclusions: initialExclusions }) {
+  const [exclusions, setExclusions] = useState(initialExclusions || [])
+  const [newLine, setNewLine] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [dirty, setDirty] = useState(false)
+
+  useEffect(() => {
+    if (!initialExclusions) {
+      api.getExclusions(jobId).then(data => {
+        setExclusions(data.exclusions || [])
+      }).catch(() => {})
+    }
+  }, [jobId])
+
+  const addLine = () => {
+    const text = newLine.trim()
+    if (!text) return
+    setExclusions(prev => [...prev, text])
+    setNewLine('')
+    setDirty(true)
+  }
+
+  const removeLine = (idx) => {
+    setExclusions(prev => prev.filter((_, i) => i !== idx))
+    setDirty(true)
+  }
+
+  const handleSave = async () => {
+    setSaving(true)
+    try {
+      await api.updateExclusions(jobId, exclusions)
+      setDirty(false)
+    } catch (err) {
+      console.error('Failed to save exclusions:', err)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleReset = async () => {
+    try {
+      const data = await api.getExclusions(jobId)
+      // Load defaults by passing empty to get template
+      await api.updateExclusions(jobId, [])
+      const fresh = await api.getExclusions(jobId)
+      setExclusions(fresh.exclusions || [])
+      setDirty(false)
+    } catch (err) {
+      console.error('Failed to reset exclusions:', err)
+    }
+  }
+
+  return (
+    <div className="glass-card p-5">
+      <div className="flex items-center justify-between mb-3">
+        <h4 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em] flex items-center gap-2">
+          <Ban className="w-4 h-4" /> Exclusions ({exclusions.length})
+        </h4>
+        <div className="flex items-center gap-2">
+          {dirty && (
+            <span className="text-xs text-amber-400 flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+              Unsaved
+            </span>
+          )}
+          <button onClick={handleReset} className="btn-ghost text-xs px-2 py-1 text-gray-500 hover:text-gray-300"
+                  title="Reset to defaults">
+            <RotateCcw className="w-3.5 h-3.5" />
+          </button>
+          <button onClick={handleSave} disabled={saving || !dirty}
+                  className="btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">
+            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            Save
+          </button>
+        </div>
+      </div>
+      <ul className="space-y-1.5 mb-3">
+        {exclusions.map((ex, i) => (
+          <li key={i} className="group flex items-start gap-2 text-sm text-gray-400 hover:text-gray-300 transition-colors">
+            <span className="text-gray-600 mt-0.5 flex-shrink-0">•</span>
+            <span className="flex-1">{ex}</span>
+            <button
+              onClick={() => removeLine(i)}
+              className="opacity-0 group-hover:opacity-100 p-0.5 hover:bg-red-500/10 rounded text-gray-600 hover:text-red-400 transition-all flex-shrink-0"
+              title="Remove"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </li>
+        ))}
+      </ul>
+      <div className="flex items-center gap-2">
+        <input
+          type="text"
+          value={newLine}
+          onChange={(e) => setNewLine(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') addLine() }}
+          placeholder="Add exclusion..."
+          className="input flex-1 text-sm py-1.5"
+        />
+        <button onClick={addLine} disabled={!newLine.trim()}
+                className="btn-ghost p-1.5 text-gray-500 hover:text-si-bright disabled:opacity-30">
+          <Plus className="w-4 h-4" />
+        </button>
+      </div>
     </div>
   )
 }
@@ -115,6 +224,17 @@ export default function BidPreview({ job, api, onGoBack }) {
 
       {bidData && (
         <div className="space-y-6 animate-fade-in">
+          {/* Job Info Header */}
+          <div className="glass-card p-5">
+            <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm">
+              <div><span className="text-gray-600">Project:</span> <span className="text-gray-200 font-medium">{job.project_name}</span></div>
+              {job.gc_name && <div><span className="text-gray-600">GC:</span> <span className="text-gray-200">{job.gc_name}</span></div>}
+              {(job.city || job.state) && <div><span className="text-gray-600">Location:</span> <span className="text-gray-200">{[job.city, job.state].filter(Boolean).join(', ')}</span></div>}
+              {job.salesperson && <div><span className="text-gray-600">Salesperson:</span> <span className="text-gray-200">{job.salesperson}</span></div>}
+            </div>
+          </div>
+
+          {/* Line Items */}
           <div>
             <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em] mb-3">
               Line Items ({bidData.bundles?.length || 0})
@@ -146,22 +266,16 @@ export default function BidPreview({ job, api, onGoBack }) {
             </div>
           </div>
 
-          {bidData.exclusions?.length > 0 && (
-            <div className="glass-card p-5">
-              <h4 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em] mb-3 flex items-center gap-2">
-                <Ban className="w-4 h-4" /> Exclusions
-              </h4>
-              <ul className="space-y-1.5">
-                {bidData.exclusions.map((ex, i) => (
-                  <li key={i} className="text-sm text-gray-500 flex items-start gap-2">
-                    <span className="text-gray-600 mt-0.5">•</span> {ex}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
+          {/* Editable Exclusions */}
+          <ExclusionsList jobId={job.id} api={api} exclusions={bidData.exclusions} />
 
-          <div className="flex justify-center pt-2">
+          {/* Actions */}
+          <div className="flex items-center justify-center gap-4 pt-2">
+            <button onClick={handleCalculate} disabled={calculating}
+                    className="btn-secondary text-sm px-5 py-2.5">
+              {calculating ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}
+              Recalculate
+            </button>
             <button onClick={() => window.open(api.getBidPdfUrl(job.id), '_blank')}
                     className="btn-primary text-base px-8 py-3.5 glow-orange">
               <FileDown className="w-5 h-5" /> Download Bid PDF
