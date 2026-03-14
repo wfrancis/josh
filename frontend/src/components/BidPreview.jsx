@@ -233,6 +233,11 @@ function ExclusionsList({ jobId, api, exclusions: initialExclusions }) {
     setDirty(true)
   }
 
+  const updateLine = (idx, text) => {
+    setExclusions(prev => prev.map((ex, i) => i === idx ? text : ex))
+    setDirty(true)
+  }
+
   const handleSave = async () => {
     setSaving(true)
     try {
@@ -284,7 +289,12 @@ function ExclusionsList({ jobId, api, exclusions: initialExclusions }) {
         {exclusions.map((ex, i) => (
           <li key={i} className="group flex items-start gap-2 text-sm text-gray-400 hover:text-gray-300 transition-colors">
             <span className="text-gray-600 mt-0.5 flex-shrink-0">•</span>
-            <span className="flex-1">{ex}</span>
+            <input
+              type="text"
+              value={ex}
+              onChange={(e) => updateLine(i, e.target.value)}
+              className="flex-1 bg-transparent border-0 outline-none text-sm text-gray-400 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+            />
             <button
               onClick={() => removeLine(i)}
               className="opacity-0 group-hover:opacity-100 p-0.5 hover:bg-red-500/10 rounded text-gray-600 hover:text-red-400 transition-all flex-shrink-0"
