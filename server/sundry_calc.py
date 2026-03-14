@@ -50,10 +50,15 @@ def calculate_sundries(material_type: str, installed_qty: float) -> list[dict]:
         # Calculate how many units are needed
         qty_needed = math.ceil(effective_qty / coverage)
 
+        unit_price = rule.get("unit_price", 0)
+        extended_cost = round(qty_needed * unit_price, 2)
+
         results.append({
             "sundry_name": sundry_name,
             "qty": qty_needed,
             "unit": unit,
+            "unit_price": unit_price,
+            "extended_cost": extended_cost,
             "notes": notes,
         })
 

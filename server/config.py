@@ -25,61 +25,96 @@ WASTE_FACTORS: dict[str, float] = {
 }
 
 # ─── Sundry Rules ─────────────────────────────────────────────────────────────
-# Each entry: list of dicts with sundry_name, coverage, unit, notes
+# Each entry: list of dicts with sundry_name, coverage, unit, unit_price, notes
 SUNDRY_RULES: dict[str, list[dict]] = {
     "unit_carpet_no_pattern": [
-        {"sundry_name": "pad", "coverage": 30, "unit": "SY/roll", "waste": 0.05},
-        {"sundry_name": "pad_cement", "coverage": 100, "unit": "SY/each"},
-        {"sundry_name": "tack_strip", "coverage": 400, "unit": "LF/carton",
+        {"sundry_name": "pad", "coverage": 30, "unit": "SY/roll", "waste": 0.05, "unit_price": 85.00},
+        {"sundry_name": "pad_cement", "coverage": 100, "unit": "SY/each", "unit_price": 28.00},
+        {"sundry_name": "tack_strip", "coverage": 400, "unit": "LF/carton", "unit_price": 22.00,
          "notes": "estimate 1 LF per SY for perimeter"},
-        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll"},
+        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll", "unit_price": 18.00},
     ],
     "unit_carpet_pattern": [
-        {"sundry_name": "pad", "coverage": 30, "unit": "SY/roll", "waste": 0.05},
-        {"sundry_name": "pad_cement", "coverage": 100, "unit": "SY/each"},
-        {"sundry_name": "tack_strip", "coverage": 400, "unit": "LF/carton",
+        {"sundry_name": "pad", "coverage": 30, "unit": "SY/roll", "waste": 0.05, "unit_price": 85.00},
+        {"sundry_name": "pad_cement", "coverage": 100, "unit": "SY/each", "unit_price": 28.00},
+        {"sundry_name": "tack_strip", "coverage": 400, "unit": "LF/carton", "unit_price": 22.00,
          "notes": "estimate 1 LF per SY for perimeter"},
-        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll"},
+        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll", "unit_price": 18.00},
     ],
     "unit_lvt": [
-        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail",
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00,
          "notes": "4-gal pail"},
-        {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail"},
+        {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
+    ],
+    "cpt_tile": [
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00,
+         "notes": "4-gal pail"},
+        {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
+    ],
+    "corridor_broadloom": [
+        {"sundry_name": "adhesive", "coverage": 80, "unit": "SY/pail", "unit_price": 95.00,
+         "notes": "direct glue adhesive"},
+        {"sundry_name": "primer", "coverage": 100, "unit": "SY/pail", "unit_price": 65.00},
+        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll", "unit_price": 18.00},
     ],
     "floor_tile": [
-        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag"},
-        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag"},
-        {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag",
+        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 18.00},
+        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag", "unit_price": 22.00},
+        {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag", "unit_price": 32.00,
          "notes": "approximate"},
-        {"sundry_name": "caulking", "coverage": None, "unit": "each",
-         "notes": "not typically needed for floor tile"},
     ],
     "wall_tile": [
-        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag"},
-        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag"},
-        {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag",
+        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 18.00},
+        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag", "unit_price": 22.00},
+        {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag", "unit_price": 32.00,
          "notes": "approximate"},
-        {"sundry_name": "caulking", "coverage": None, "unit": "each",
-         "notes": "depends on application"},
     ],
     "backsplash": [
-        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag"},
-        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag"},
-        {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag",
+        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 18.00},
+        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag", "unit_price": 22.00},
+        {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag", "unit_price": 32.00,
          "notes": "approximate"},
-        {"sundry_name": "caulking", "coverage": 4, "unit": "units/tube",
+        {"sundry_name": "caulking", "coverage": 4, "unit": "units/tube", "unit_price": 8.50,
          "notes": "1 tube per 4 units"},
     ],
     "tub_shower_surround": [
-        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag"},
-        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag"},
-        {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag",
+        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 18.00},
+        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag", "unit_price": 22.00},
+        {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag", "unit_price": 32.00,
          "notes": "approximate"},
-        {"sundry_name": "caulking", "coverage": 2, "unit": "units/tube",
+        {"sundry_name": "caulking", "coverage": 2, "unit": "units/tube", "unit_price": 8.50,
          "notes": "1 tube per 2 units for tubs, 1 per 3 for surrounds"},
     ],
     "rubber_base": [
-        {"sundry_name": "adhesive", "coverage": 60, "unit": "LF/tube"},
+        {"sundry_name": "adhesive", "coverage": 60, "unit": "LF/tube", "unit_price": 12.00},
+    ],
+    "rubber_tile": [
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00},
+        {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
+    ],
+    "rubber_sheet": [
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00},
+        {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
+        {"sundry_name": "seam_weld", "coverage": 500, "unit": "LF/roll", "unit_price": 45.00},
+    ],
+    "transitions": [
+        {"sundry_name": "adhesive", "coverage": 100, "unit": "LF/tube", "unit_price": 12.00},
+    ],
+    "vct": [
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 85.00},
+        {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
+    ],
+    "wood": [
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 110.00},
+        {"sundry_name": "moisture_barrier", "coverage": 500, "unit": "SF/roll", "unit_price": 75.00},
+    ],
+    "waterproofing": [
+        {"sundry_name": "membrane", "coverage": 100, "unit": "SF/gal", "unit_price": 55.00},
+        {"sundry_name": "mesh_fabric", "coverage": 300, "unit": "SF/roll", "unit_price": 42.00},
+    ],
+    "tread_riser": [
+        {"sundry_name": "adhesive", "coverage": 50, "unit": "LF/tube", "unit_price": 12.00},
+        {"sundry_name": "nosing", "coverage": 12, "unit": "LF/piece", "unit_price": 35.00},
     ],
 }
 

@@ -126,6 +126,7 @@ def init_db() -> None:
             ("ai_confidence", "ALTER TABLE job_materials ADD COLUMN ai_confidence REAL"),
             ("exclusions", "ALTER TABLE jobs ADD COLUMN exclusions TEXT"),
             ("markup_pct", "ALTER TABLE jobs ADD COLUMN markup_pct REAL DEFAULT 0"),
+            ("bid_data", "ALTER TABLE jobs ADD COLUMN bid_data TEXT"),
         ]:
             try:
                 conn.execute(sql)
@@ -161,17 +162,22 @@ def _make_unique_slug(conn, base_slug: str, exclude_id: int = None) -> str:
 
 def save_job(job_data: dict) -> int:
     """Insert or update a job. Returns the job id."""
+    import json as _json
     conn = _get_conn()
     try:
         job_id = job_data.get("id")
         slug = _slugify(job_data["project_name"])
+        # Ensure bid_data is stored as JSON string, not dict
+        bid_data_val = job_data.get("bid_data")
+        if isinstance(bid_data_val, dict):
+            bid_data_val = _json.dumps(bid_data_val)
         if job_id:
             slug = _make_unique_slug(conn, slug, exclude_id=job_id)
             conn.execute("""
                 UPDATE jobs SET
                     project_name=?, gc_name=?, address=?, city=?, state=?, zip=?,
                     tax_rate=?, unit_count=?, salesperson=?, notes=?, slug=?, exclusions=?,
-                    markup_pct=?
+                    markup_pct=?, bid_data=?
                 WHERE id=?
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
@@ -179,15 +185,16 @@ def save_job(job_data: dict) -> int:
                 job_data.get("state"), job_data.get("zip"),
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
                 job_data.get("salesperson"), job_data.get("notes"), slug,
-                job_data.get("exclusions"), job_data.get("markup_pct", 0), job_id
+                job_data.get("exclusions"), job_data.get("markup_pct", 0),
+                bid_data_val, job_id
             ))
         else:
             slug = _make_unique_slug(conn, slug)
             cur = conn.execute("""
                 INSERT INTO jobs (project_name, gc_name, address, city, state, zip,
                                   tax_rate, unit_count, salesperson, notes, slug, exclusions,
-                                  markup_pct, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  markup_pct, bid_data, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
@@ -195,6 +202,7 @@ def save_job(job_data: dict) -> int:
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
                 job_data.get("salesperson"), job_data.get("notes"), slug,
                 job_data.get("exclusions"), job_data.get("markup_pct", 0),
+                bid_data_val,
                 datetime.now().isoformat()
             ))
             job_id = cur.lastrowid
@@ -352,6 +360,15 @@ def load_job(job_ref) -> Optional[dict]:
             return None
         job = dict(row)
         jid = job["id"]
+
+        # Parse bid_data JSON if present
+        import json as _json
+        raw_bid = job.get("bid_data")
+        if raw_bid:
+            try:
+                job["bid_data"] = _json.loads(raw_bid)
+            except (ValueError, TypeError):
+                job["bid_data"] = None
 
         job["materials"] = [
             dict(r) for r in

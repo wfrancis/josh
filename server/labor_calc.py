@@ -3,16 +3,39 @@ Labor calculator: match materials to labor catalog entries,
 determine quantities based on LABOR_QTY_RULES, and compute costs.
 """
 
+import json
 import os
 from typing import Optional
 
 import openpyxl
+import pdfplumber
+from openai import OpenAI
 
 from config import LABOR_QTY_RULES, WASTE_FACTORS
 
 
-# In-memory labor catalog (loaded from Excel)
+# In-memory labor catalog (loaded from uploaded file)
 _labor_catalog: list[dict] = []
+
+LABOR_CATALOG_PROMPT = """You are parsing a labor rate catalog for a flooring/interiors contractor.
+Extract every labor line item from this document into a JSON array.
+
+For each entry, extract:
+- labor_type: the category/type (e.g. "Carpet Stretch-In", "LVT Install", "Floor Tile", etc.)
+- description: any additional description or notes
+- cost: the cost/rate as a number (the contractor's cost per unit)
+- retail_display: the retail/display price if shown, otherwise empty string
+- unit: the unit of measure (e.g. "SY", "SF", "LF", "EA", "HR")
+- gpm_markup: the GPM/markup percentage as a decimal if shown (e.g. 0.35 for 35%), otherwise 0
+
+Return JSON in this exact format:
+{"entries": [{"labor_type": "...", "description": "...", "cost": 0.00, "retail_display": "...", "unit": "...", "gpm_markup": 0.00}, ...]}
+
+Important:
+- Extract ALL labor entries, not just a sample
+- Cost must be a number, not a string
+- If a field is missing, use empty string for text or 0 for numbers
+"""
 
 # Map material types to labor catalog type keywords
 MATERIAL_TO_LABOR_MAP: dict[str, list[str]] = {
@@ -70,6 +93,61 @@ def load_labor_catalog(file_path: str) -> list[dict]:
         })
 
     wb.close()
+    _labor_catalog = catalog
+    return catalog
+
+
+def load_labor_catalog_from_pdf(file_path: str, api_key: str = None, model: str = "gpt-5-mini") -> list[dict]:
+    """
+    Parse a Labor Catalog PDF using pdfplumber + OpenAI.
+    Returns list of labor entries and stores them in module-level cache.
+    """
+    global _labor_catalog
+
+    # Extract text from PDF
+    text_parts = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+    text = "\n".join(text_parts)
+
+    if not text.strip():
+        raise ValueError("Could not extract text from labor catalog PDF")
+
+    # Call OpenAI to parse the labor entries
+    client_kwargs = {}
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    client = OpenAI(**client_kwargs)
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": LABOR_CATALOG_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        response_format={"type": "json_object"},
+    )
+    content = response.choices[0].message.content
+    parsed = json.loads(content)
+    entries = parsed.get("entries", [])
+
+    catalog = []
+    for entry in entries:
+        labor_type = str(entry.get("labor_type", "")).strip()
+        if not labor_type:
+            continue
+        catalog.append({
+            "labor_type": labor_type,
+            "description": str(entry.get("description", "")).strip(),
+            "cost": _safe_float(entry.get("cost")),
+            "retail_display": str(entry.get("retail_display", "")).strip(),
+            "unit": str(entry.get("unit", "")).strip(),
+            "gpm_markup": _safe_float(entry.get("gpm_markup")),
+        })
+
     _labor_catalog = catalog
     return catalog
 

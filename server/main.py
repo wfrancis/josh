@@ -24,7 +24,7 @@ from models import (
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
 from sundry_calc import calculate_sundries_for_materials
-from labor_calc import calculate_labor_for_materials, load_labor_catalog, get_labor_catalog
+from labor_calc import calculate_labor_for_materials, load_labor_catalog, load_labor_catalog_from_pdf, get_labor_catalog
 from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf
 from config import WASTE_FACTORS
@@ -497,11 +497,38 @@ def api_generate_bid(job_id: str):
     # Save bundles
     save_bundles(job["id"], bid_data["bundles"])
 
+    # Persist full bid data to job record (bundles + totals)
+    bid_persist = {
+        "bundles": bid_data["bundles"],
+        "subtotal": bid_data["subtotal"],
+        "markup_pct": bid_data["markup_pct"],
+        "markup_amount": bid_data["markup_amount"],
+        "tax_rate": bid_data["tax_rate"],
+        "tax_amount": bid_data["tax_amount"],
+        "grand_total": bid_data["grand_total"],
+        "exclusions": bid_data.get("exclusions", []),
+    }
+    job["bid_data"] = _json.dumps(bid_persist)
+    save_job(job)
+
     # Generate PDF
     pdf_path = os.path.join(PDF_DIR, f"bid_{job['id']}.pdf")
     generate_bid_pdf(bid_data, pdf_path)
 
     return bid_data
+
+
+@app.delete("/api/jobs/{job_id}/bid")
+def api_clear_bid(job_id: str):
+    """Clear saved bid data for a job."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job["bid_data"] = None
+    save_job(job)
+    # Clear bundles too
+    save_bundles(job["id"], [])
+    return {"message": "Bid cleared"}
 
 
 @app.get("/api/jobs/{job_id}/bid.pdf")
@@ -522,14 +549,25 @@ def api_download_bid_pdf(job_id: str):
 
 @app.post("/api/labor-catalog/upload")
 async def api_upload_labor_catalog(file: UploadFile = File(...)):
-    """Upload labor catalog Excel file."""
+    """Upload labor catalog (Excel or PDF)."""
     file_path = os.path.join(UPLOAD_DIR, f"labor_catalog_{file.filename}")
     with open(file_path, "wb") as f:
         content = await file.read()
         f.write(content)
 
+    ext = os.path.splitext(file.filename)[1].lower()
     try:
-        catalog = load_labor_catalog(file_path)
+        if ext == ".pdf":
+            settings = get_settings()
+            api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+            model = settings.get("openai_model", "gpt-5-mini")
+            catalog = load_labor_catalog_from_pdf(file_path, api_key=api_key, model=model)
+        elif ext in (".xlsx", ".xls"):
+            catalog = load_labor_catalog(file_path)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Upload .pdf or .xlsx")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse labor catalog: {e}")
 

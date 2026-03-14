@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import {
   Calculator, FileDown, Loader2, ChevronDown, ChevronRight,
   Package, Wrench, HardHat, Truck, Ban, DollarSign, Plus, X, Save, RotateCcw, AlertTriangle
@@ -11,52 +11,197 @@ const VALID_TYPES = [
   'rubber_sheet', 'wood', 'tread_riser', 'transitions', 'waterproofing'
 ]
 
+const TYPE_LABELS = {
+  unit_carpet_no_pattern: 'Carpet (No Pattern)', unit_carpet_pattern: 'Carpet (Pattern)',
+  unit_lvt: 'LVT', cpt_tile: 'Carpet Tile', corridor_broadloom: 'Broadloom',
+  floor_tile: 'Floor Tile', wall_tile: 'Wall Tile', backsplash: 'Backsplash',
+  tub_shower_surround: 'Tub/Shower', rubber_base: 'Rubber Base', vct: 'VCT',
+  rubber_tile: 'Rubber Tile', rubber_sheet: 'Rubber Sheet', wood: 'Wood',
+  tread_riser: 'Tread & Riser', transitions: 'Transitions', waterproofing: 'Waterproofing',
+}
+
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
 }
 
-function BundleCard({ bundle, index }) {
+function formatCompact(val) {
+  if (!val) return '$0'
+  if (val >= 1000000) return `$${(val / 1000000).toFixed(1)}M`
+  if (val >= 1000) return `$${(val / 1000).toFixed(0)}K`
+  return `$${val.toFixed(0)}`
+}
+
+function formatQty(val) {
+  if (!val) return '0'
+  return val >= 100 ? Math.round(val).toLocaleString() : val.toFixed(1)
+}
+
+function BundleCard({ bundle, index, hasFlag }) {
   const [expanded, setExpanded] = useState(false)
+  const unitRate = bundle.order_qty > 0 ? bundle.total_price / bundle.order_qty : 0
+
   return (
-    <div className="glass-card overflow-hidden animate-slide-up" style={{ animationDelay: `${index * 60}ms` }}>
+    <div className={`overflow-hidden rounded-xl border transition-colors ${
+      hasFlag ? 'border-amber-500/20 bg-amber-500/[0.03]' : 'border-white/[0.06] bg-white/[0.02]'
+    }`}>
       <button
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-4 p-4 hover:bg-white/[0.02] transition-colors text-left"
+        className="w-full flex items-center gap-3 sm:gap-4 p-3 sm:p-4 hover:bg-white/[0.02] transition-colors text-left"
       >
-        <div className="w-10 h-10 rounded-xl bg-si-bright/[0.08] border border-si-bright/[0.1]
-                       flex items-center justify-center flex-shrink-0">
-          <Package className="w-5 h-5 text-si-bright" />
-        </div>
         <div className="flex-1 min-w-0">
-          <div className="font-semibold text-white">{bundle.bundle_name}</div>
-          <div className="text-xs text-gray-500 mt-0.5">{bundle.installed_qty} {bundle.unit} installed</div>
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-white text-sm">{bundle.bundle_name}</span>
+            <span className="text-[10px] text-gray-600 uppercase">{TYPE_LABELS[bundle.material_type] || bundle.material_type}</span>
+          </div>
+          <div className="text-xs text-gray-500 mt-0.5">
+            {formatQty(bundle.installed_qty)} {bundle.unit} installed → {formatQty(bundle.order_qty)} ordered
+            {bundle.waste_pct > 0 && <span className="text-gray-600"> ({(bundle.waste_pct * 100).toFixed(0)}% waste)</span>}
+          </div>
         </div>
-        <div className="text-right">
-          <div className="font-bold text-white tabular-nums">{formatCurrency(bundle.total_price)}</div>
+        <div className="text-right flex-shrink-0">
+          <div className="font-bold text-white tabular-nums text-sm">{formatCurrency(bundle.total_price)}</div>
+          {unitRate > 0 && (
+            <div className="text-[10px] text-gray-500 tabular-nums">
+              {formatCurrency(unitRate)}/{bundle.unit}
+            </div>
+          )}
         </div>
-        {expanded ? <ChevronDown className="w-4 h-4 text-gray-500" /> : <ChevronRight className="w-4 h-4 text-gray-600" />}
+        {expanded ? <ChevronDown className="w-4 h-4 text-gray-500 flex-shrink-0" /> : <ChevronRight className="w-4 h-4 text-gray-600 flex-shrink-0" />}
       </button>
       {expanded && (
-        <div className="px-4 pb-4 border-t border-white/[0.04] pt-3 space-y-2 animate-fade-in">
+        <div className="px-3 sm:px-4 pb-3 sm:pb-4 border-t border-white/[0.04] pt-3 space-y-2 animate-fade-in">
           <p className="text-xs text-gray-500 whitespace-pre-line leading-relaxed mb-3">{bundle.description_text}</p>
           <div className="grid grid-cols-2 gap-2">
-            <CostRow icon={Package} label="Material" value={bundle.material_cost} />
-            <CostRow icon={Wrench} label="Sundries" value={bundle.sundry_cost} />
-            <CostRow icon={HardHat} label="Labor" value={bundle.labor_cost} />
-            <CostRow icon={Truck} label="Freight" value={bundle.freight_cost} />
+            <CostRow icon={Package} label="Material" value={bundle.material_cost} flag={false} />
+            <CostRow icon={Wrench} label="Sundries" value={bundle.sundry_cost} flag={bundle.sundry_cost === 0} />
+            <CostRow icon={HardHat} label="Labor" value={bundle.labor_cost} flag={bundle.labor_cost === 0} />
+            <CostRow icon={Truck} label="Freight" value={bundle.freight_cost} flag={false} />
           </div>
+          {(bundle.sundry_cost === 0 || bundle.labor_cost === 0) && (
+            <div className="flex items-center gap-1.5 text-[10px] text-amber-500/70 mt-1">
+              <AlertTriangle className="w-3 h-3" />
+              {bundle.sundry_cost === 0 && bundle.labor_cost === 0
+                ? 'No sundries or labor calculated'
+                : bundle.labor_cost === 0 ? 'No labor calculated' : 'No sundries calculated'}
+              — verify type classification is correct
+            </div>
+          )}
         </div>
       )}
     </div>
   )
 }
 
-function CostRow({ icon: Icon, label, value }) {
+function CostRow({ icon: Icon, label, value, flag }) {
   return (
-    <div className="flex items-center gap-2 p-2.5 bg-white/[0.03] rounded-xl border border-white/[0.04]">
-      <Icon className="w-3.5 h-3.5 text-gray-500" />
-      <span className="text-xs text-gray-500 flex-1">{label}</span>
-      <span className="text-xs font-semibold text-gray-300 tabular-nums">{formatCurrency(value)}</span>
+    <div className={`flex items-center gap-2 p-2.5 rounded-xl border ${
+      flag ? 'bg-amber-500/[0.04] border-amber-500/[0.1]' : 'bg-white/[0.03] border-white/[0.04]'
+    }`}>
+      <Icon className={`w-3.5 h-3.5 ${flag ? 'text-amber-500/60' : 'text-gray-500'}`} />
+      <span className={`text-xs flex-1 ${flag ? 'text-amber-500/60' : 'text-gray-500'}`}>{label}</span>
+      <span className={`text-xs font-semibold tabular-nums ${
+        flag ? 'text-amber-500/60' : 'text-gray-300'
+      }`}>{formatCurrency(value)}</span>
+    </div>
+  )
+}
+
+function CategoryTotals({ bundles }) {
+  const totals = useMemo(() => {
+    let material = 0, sundry = 0, labor = 0, freight = 0
+    for (const b of bundles) {
+      material += b.material_cost || 0
+      sundry += b.sundry_cost || 0
+      labor += b.labor_cost || 0
+      freight += b.freight_cost || 0
+    }
+    return { material, sundry, labor, freight }
+  }, [bundles])
+
+  return (
+    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <CategoryCard icon={Package} label="Materials" value={totals.material} />
+      <CategoryCard icon={Wrench} label="Sundries" value={totals.sundry} flag={totals.sundry === 0} />
+      <CategoryCard icon={HardHat} label="Labor" value={totals.labor} flag={totals.labor === 0} />
+      <CategoryCard icon={Truck} label="Freight" value={totals.freight} />
+    </div>
+  )
+}
+
+function CategoryCard({ icon: Icon, label, value, flag }) {
+  return (
+    <div className={`p-3 rounded-xl border ${
+      flag ? 'border-amber-500/15 bg-amber-500/[0.04]' : 'border-white/[0.06] bg-white/[0.03]'
+    }`}>
+      <div className="flex items-center gap-2 mb-1">
+        <Icon className={`w-3.5 h-3.5 ${flag ? 'text-amber-500/60' : 'text-gray-500'}`} />
+        <span className={`text-[10px] uppercase tracking-wider font-bold ${flag ? 'text-amber-500/60' : 'text-gray-500'}`}>
+          {label}
+        </span>
+        {flag && <AlertTriangle className="w-3 h-3 text-amber-500/50" />}
+      </div>
+      <div className={`text-lg font-bold tabular-nums ${flag ? 'text-amber-400/70' : 'text-white'}`}>
+        {formatCompact(value)}
+      </div>
+    </div>
+  )
+}
+
+function TypeGroups({ bundles, expandedType, setExpandedType }) {
+  const groups = useMemo(() => {
+    const map = {}
+    for (const b of bundles) {
+      const t = b.material_type || 'unknown'
+      if (!map[t]) map[t] = { type: t, bundles: [], total: 0, count: 0 }
+      map[t].bundles.push(b)
+      map[t].total += b.total_price || 0
+      map[t].count++
+    }
+    return Object.values(map).sort((a, b) => b.total - a.total)
+  }, [bundles])
+
+  const flaggedBundles = useMemo(() => {
+    const flags = new Set()
+    for (const b of bundles) {
+      if (b.sundry_cost === 0 || b.labor_cost === 0) flags.add(b.bundle_name)
+    }
+    return flags
+  }, [bundles])
+
+  return (
+    <div className="space-y-4">
+      {groups.map(g => {
+        const isExpanded = expandedType === g.type
+        const groupFlags = g.bundles.filter(b => b.sundry_cost === 0 || b.labor_cost === 0).length
+        return (
+          <div key={g.type}>
+            <button
+              onClick={() => setExpandedType(isExpanded ? null : g.type)}
+              className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-white/[0.03] transition-colors text-left"
+            >
+              {isExpanded
+                ? <ChevronDown className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                : <ChevronRight className="w-4 h-4 text-gray-600 flex-shrink-0" />}
+              <span className="text-xs font-bold text-gray-400 uppercase tracking-wider flex-1">
+                {TYPE_LABELS[g.type] || g.type} ({g.count})
+              </span>
+              {groupFlags > 0 && (
+                <span className="text-[10px] text-amber-500/70 flex items-center gap-1">
+                  <AlertTriangle className="w-3 h-3" /> {groupFlags}
+                </span>
+              )}
+              <span className="text-sm font-bold text-white tabular-nums">{formatCurrency(g.total)}</span>
+            </button>
+            {isExpanded && (
+              <div className="space-y-2 mt-2 ml-2 sm:ml-4">
+                {g.bundles.map((b, i) => (
+                  <BundleCard key={i} bundle={b} index={i} hasFlag={flaggedBundles.has(b.bundle_name)} />
+                ))}
+              </div>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -102,8 +247,6 @@ function ExclusionsList({ jobId, api, exclusions: initialExclusions }) {
 
   const handleReset = async () => {
     try {
-      const data = await api.getExclusions(jobId)
-      // Load defaults by passing empty to get template
       await api.updateExclusions(jobId, [])
       const fresh = await api.getExclusions(jobId)
       setExclusions(fresh.exclusions || [])
@@ -170,17 +313,36 @@ function ExclusionsList({ jobId, api, exclusions: initialExclusions }) {
   )
 }
 
-export default function BidPreview({ job, api, onGoBack }) {
+export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
   const [calculating, setCalculating] = useState(false)
   const [bidData, setBidData] = useState(null)
   const [error, setError] = useState(null)
   const [markup, setMarkup] = useState(job.markup_pct ? (job.markup_pct * 100) : 0)
+  const [expandedType, setExpandedType] = useState(null)
+
+  // Load existing bid data from job on mount
+  useEffect(() => {
+    if (job.bid_data && job.bid_data.bundles?.length > 0) {
+      setBidData(job.bid_data)
+    }
+  }, [job.id])
 
   const unknownMaterials = job.materials?.filter(m =>
     !m.material_type || !VALID_TYPES.includes(m.material_type)
   ) || []
 
   const hasMaterialPricing = job?.materials?.some(m => m.unit_price > 0)
+
+  // Flags summary
+  const flagSummary = useMemo(() => {
+    if (!bidData?.bundles) return null
+    let zeroLabor = 0, zeroSundry = 0
+    for (const b of bidData.bundles) {
+      if (b.labor_cost === 0) zeroLabor++
+      if (b.sundry_cost === 0) zeroSundry++
+    }
+    return { zeroLabor, zeroSundry }
+  }, [bidData])
 
   const handleCalculate = async () => {
     setCalculating(true); setError(null)
@@ -191,6 +353,14 @@ export default function BidPreview({ job, api, onGoBack }) {
       setBidData(result)
     } catch (err) { setError(err.message) }
     finally { setCalculating(false) }
+  }
+
+  const handleClear = async () => {
+    try {
+      await api.clearBid(job.id)
+      setBidData(null)
+      onBidCleared?.()
+    } catch (err) { setError(err.message) }
   }
 
   if (!hasMaterialPricing) {
@@ -272,14 +442,30 @@ export default function BidPreview({ job, api, onGoBack }) {
             </div>
           </div>
 
-          {/* Line Items */}
+          {/* Cost Category Totals */}
+          <CategoryTotals bundles={bidData.bundles || []} />
+
+          {/* Flags bar */}
+          {flagSummary && (flagSummary.zeroLabor > 0 || flagSummary.zeroSundry > 0) && (
+            <div className="flex items-center gap-2 px-4 py-2.5 bg-amber-500/[0.06] border border-amber-500/15 rounded-xl text-xs text-amber-400">
+              <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+              {flagSummary.zeroLabor > 0 && <span>{flagSummary.zeroLabor} items with $0 labor</span>}
+              {flagSummary.zeroLabor > 0 && flagSummary.zeroSundry > 0 && <span className="text-amber-500/40">|</span>}
+              {flagSummary.zeroSundry > 0 && <span>{flagSummary.zeroSundry} items with $0 sundries</span>}
+              <span className="text-amber-500/60">— check type classifications</span>
+            </div>
+          )}
+
+          {/* Line Items Grouped by Type */}
           <div>
             <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em] mb-3">
-              Line Items ({bidData.bundles?.length || 0})
+              Line Items by Type ({bidData.bundles?.length || 0})
             </h3>
-            <div className="space-y-3">
-              {bidData.bundles?.map((b, i) => <BundleCard key={i} bundle={b} index={i} />)}
-            </div>
+            <TypeGroups
+              bundles={bidData.bundles || []}
+              expandedType={expandedType}
+              setExpandedType={setExpandedType}
+            />
           </div>
 
           {/* Totals */}
@@ -314,7 +500,11 @@ export default function BidPreview({ job, api, onGoBack }) {
           <ExclusionsList jobId={job.id} api={api} exclusions={bidData.exclusions} />
 
           {/* Actions */}
-          <div className="flex items-center justify-center gap-4 pt-2">
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4 pt-2">
+            <button onClick={handleClear}
+                    className="btn-ghost text-sm px-4 py-2.5 text-gray-500 hover:text-red-400">
+              Clear Bid
+            </button>
             <button onClick={handleCalculate} disabled={calculating}
                     className="btn-secondary text-sm px-5 py-2.5">
               {calculating ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}

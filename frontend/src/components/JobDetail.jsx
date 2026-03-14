@@ -483,7 +483,12 @@ export default function JobDetail() {
             <p className="text-sm text-gray-500 mb-6">
               Calculate sundries, labor, and freight, then generate the bid PDF.
             </p>
-            <BidPreview job={job} api={api} onGoBack={() => setStep('pricing')} />
+            <BidPreview job={job} api={api} onGoBack={() => setStep('pricing')}
+              onBidCleared={async () => {
+                const updated = await api.getJob(jobId)
+                setJob(updated)
+              }}
+            />
           </div>
         )}
       </div>

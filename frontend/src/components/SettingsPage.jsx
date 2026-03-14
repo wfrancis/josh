@@ -282,14 +282,14 @@ export default function SettingsPage() {
             <div>
               <h2 className="text-lg font-bold text-white">Labor Catalog</h2>
               <p className="text-sm text-gray-500 mt-1">
-                Upload your labor rate catalog Excel file. This sets the per-unit labor rates used when generating bids.
+                Upload your labor rate catalog (PDF or Excel). This sets the per-unit labor rates used when generating bids.
               </p>
             </div>
           </div>
           <FileUpload
-            accept=".xlsx,.xls,.csv"
+            accept=".pdf,.xlsx,.xls"
             label="Upload Labor Catalog"
-            description="Excel file with labor rates per material type"
+            description="PDF or Excel file with labor rates per material type"
             icon={FileSpreadsheet}
             onUpload={handleLaborUpload}
             onReset={() => setLaborSuccess(false)}

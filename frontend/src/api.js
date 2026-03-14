@@ -66,6 +66,7 @@ export const api = {
 
   // Bid
   generateBid: (jobId) => request(`/jobs/${jobId}/generate-bid`, { method: 'POST' }),
+  clearBid: (jobId) => request(`/jobs/${jobId}/bid`, { method: 'DELETE' }),
   getBidPdfUrl: (jobId) => `${BASE}/jobs/${jobId}/bid.pdf`,
 
   // Exclusions

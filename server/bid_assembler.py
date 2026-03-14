@@ -130,9 +130,12 @@ def assemble_bid(
         bundle_name = mat.get("item_code") or material_type
         bundles.append({
             "bundle_name": bundle_name,
+            "material_type": material_type,
             "description_text": description_text,
             "installed_qty": installed_qty,
             "unit": unit,
+            "waste_pct": waste_pct,
+            "unit_price": unit_price,
             "material_cost": material_cost,
             "sundry_cost": sundry_cost,
             "labor_cost": labor_cost,
