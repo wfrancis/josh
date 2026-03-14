@@ -290,48 +290,50 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
   return (
     <div className="overflow-x-auto">
       {materials.length > 5 && (
-        <div className="flex items-center gap-3 mb-4 flex-wrap">
-          <div className="relative flex-1 min-w-[200px]">
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3 mb-4">
+          <div className="relative flex-1 min-w-0">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-600" />
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Filter materials..."
-              className="w-full pl-9 pr-3 py-1.5 text-xs bg-white/[0.04] border border-white/[0.06] rounded-lg
+              className="w-full pl-9 pr-3 py-2 sm:py-1.5 text-sm sm:text-xs bg-white/[0.04] border border-white/[0.06] rounded-lg
                          text-gray-300 placeholder-gray-600 focus:outline-none focus:border-white/[0.12] transition-colors"
             />
           </div>
-          <select
-            value={typeFilter}
-            onChange={(e) => setTypeFilter(e.target.value)}
-            className="text-xs bg-white/[0.04] border border-white/[0.06] rounded-lg px-2.5 py-1.5
-                       text-gray-300 focus:outline-none focus:border-white/[0.12] transition-colors"
-          >
-            <option value="">All Types</option>
-            {VALID_TYPES.map(t => (
-              <option key={t} value={t}>{TYPE_LABELS[t] || t}</option>
-            ))}
-          </select>
-          {showPriceCol && (
-            <label className="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer select-none whitespace-nowrap">
-              <input
-                type="checkbox"
-                checked={unpricedOnly}
-                onChange={(e) => setUnpricedOnly(e.target.checked)}
-                className="accent-si-bright w-3.5 h-3.5 rounded"
-              />
-              Unpriced only
-            </label>
-          )}
-          {(searchQuery || typeFilter || unpricedOnly) && (
-            <button
-              onClick={() => { setSearchQuery(''); setTypeFilter(''); setUnpricedOnly(false) }}
-              className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
+          <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+            <select
+              value={typeFilter}
+              onChange={(e) => setTypeFilter(e.target.value)}
+              className="text-sm sm:text-xs bg-white/[0.04] border border-white/[0.06] rounded-lg px-2.5 py-2 sm:py-1.5
+                         text-gray-300 focus:outline-none focus:border-white/[0.12] transition-colors flex-1 sm:flex-none"
             >
-              Clear filters
-            </button>
-          )}
+              <option value="">All Types</option>
+              {VALID_TYPES.map(t => (
+                <option key={t} value={t}>{TYPE_LABELS[t] || t}</option>
+              ))}
+            </select>
+            {showPriceCol && (
+              <label className="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer select-none whitespace-nowrap">
+                <input
+                  type="checkbox"
+                  checked={unpricedOnly}
+                  onChange={(e) => setUnpricedOnly(e.target.checked)}
+                  className="accent-si-bright w-3.5 h-3.5 rounded"
+                />
+                Unpriced only
+              </label>
+            )}
+            {(searchQuery || typeFilter || unpricedOnly) && (
+              <button
+                onClick={() => { setSearchQuery(''); setTypeFilter(''); setUnpricedOnly(false) }}
+                className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
+              >
+                Clear filters
+              </button>
+            )}
+          </div>
         </div>
       )}
       {/* Status bar: completion + confidence warnings */}
@@ -375,19 +377,19 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
         <thead>
           <tr className="border-b border-white/[0.06]">
             {[
-              { label: 'Material', key: null, align: 'left' },
-              { label: 'Type', key: 'type', align: 'left' },
-              { label: 'Install Qty', key: 'install_qty', align: 'right' },
-              { label: 'Waste', key: 'waste', align: 'right' },
-              { label: 'Order Qty', key: 'order_qty', align: 'right' },
-              ...(showPriceCol ? [{ label: 'Unit Price', key: 'unit_price', align: 'right' }] : []),
-              { label: 'Extended', key: 'extended', align: 'right' },
-              ...(showDeleteCol ? [{ label: '', key: null, align: 'center' }] : []),
+              { label: 'Material', key: null, align: 'left', hide: '' },
+              { label: 'Type', key: 'type', align: 'left', hide: '' },
+              { label: 'Install Qty', key: 'install_qty', align: 'right', hide: 'hidden md:table-cell' },
+              { label: 'Waste', key: 'waste', align: 'right', hide: 'hidden lg:table-cell' },
+              { label: 'Order Qty', key: 'order_qty', align: 'right', hide: 'hidden md:table-cell' },
+              ...(showPriceCol ? [{ label: 'Unit Price', key: 'unit_price', align: 'right', hide: '' }] : []),
+              { label: 'Extended', key: 'extended', align: 'right', hide: '' },
+              ...(showDeleteCol ? [{ label: '', key: null, align: 'center', hide: '' }] : []),
             ].map((col, i) => (
               <th key={col.label || `col-${i}`}
                 onClick={col.key ? () => toggleSort(col.key) : undefined}
                 className={`py-3 px-2 sm:px-3 font-bold text-gray-500 text-[10px] uppercase tracking-[0.12em]
-                  text-${col.align} ${col.label === '' ? 'w-10' : ''}
+                  text-${col.align} ${col.label === '' ? 'w-10' : ''} ${col.hide}
                   ${col.key ? 'cursor-pointer hover:text-gray-300 select-none transition-colors' : ''}`}
               >
                 {col.label}
@@ -404,7 +406,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
             const rowBg = veryLowConf ? 'bg-red-500/[0.06]' : lowConf ? 'bg-amber-500/[0.06]' : ''
             return (
               <tr key={m.id || m._origIdx} className={`group hover:bg-white/[0.02] transition-colors ${rowBg}`}>
-                <td className="py-3 px-2 sm:px-3">
+                <td className="py-3 px-2 sm:px-3 max-w-0 sm:max-w-none">
                   {editable ? (
                     <EditableCell
                       value={m.description || m.item_code || ''}
@@ -412,11 +414,15 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                       className="font-medium text-gray-200"
                     />
                   ) : (
-                    <div className="font-medium text-gray-200">{m.description || m.item_code || '—'}</div>
+                    <div className="font-medium text-gray-200 truncate sm:whitespace-normal">{m.description || m.item_code || '—'}</div>
                   )}
                   {m.item_code && m.description && (
                     <div className="text-[11px] text-gray-600 mt-0.5">{m.item_code}</div>
                   )}
+                  {/* Show qty on mobile since column is hidden */}
+                  <div className="md:hidden text-[11px] text-gray-500 mt-0.5">
+                    {formatNumber(m.installed_qty)} {m.unit} · {((m.waste_pct || 0) * 100).toFixed(0)}% waste
+                  </div>
                 </td>
                 <td className="py-3 px-2 sm:px-3">
                   <TypeDropdown
@@ -426,7 +432,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     editable={editable}
                   />
                 </td>
-                <td className="py-3 px-2 sm:px-3 text-right tabular-nums text-gray-300">
+                <td className="hidden md:table-cell py-3 px-2 sm:px-3 text-right tabular-nums text-gray-300">
                   {editable ? (
                     <EditableCell
                       value={m.installed_qty}
@@ -438,7 +444,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   )}
                   {' '}<span className="text-gray-600 text-xs">{m.unit}</span>
                 </td>
-                <td className="py-3 px-2 sm:px-3 text-right tabular-nums text-gray-500">
+                <td className="hidden lg:table-cell py-3 px-2 sm:px-3 text-right tabular-nums text-gray-500">
                   {editable ? (
                     <EditableCell
                       value={((m.waste_pct || 0) * 100)}
@@ -449,7 +455,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     ((m.waste_pct || 0) * 100).toFixed(0)
                   )}%
                 </td>
-                <td className="py-3 px-2 sm:px-3 text-right tabular-nums text-gray-300">
+                <td className="hidden md:table-cell py-3 px-2 sm:px-3 text-right tabular-nums text-gray-300">
                   {editable ? (
                     <EditableCell
                       value={m.order_qty}
@@ -483,7 +489,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   <td className="py-3 px-1 text-center">
                     <button
                       onClick={() => deleteMaterial(m._origIdx)}
-                      className="p-1.5 rounded-lg text-gray-700 opacity-0 group-hover:opacity-100
+                      className="p-1.5 rounded-lg text-gray-700 opacity-100 sm:opacity-0 sm:group-hover:opacity-100
                                  hover:text-red-400 hover:bg-red-500/10 transition-all"
                       title="Remove material"
                     >

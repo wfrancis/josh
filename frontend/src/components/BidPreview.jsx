@@ -263,8 +263,8 @@ export default function BidPreview({ job, api, onGoBack }) {
       {bidData && (
         <div className="space-y-6 animate-fade-in">
           {/* Job Info Header */}
-          <div className="glass-card p-5">
-            <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm">
+          <div className="glass-card p-4 sm:p-5">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-1 sm:gap-y-2 text-sm">
               <div><span className="text-gray-600">Project:</span> <span className="text-gray-200 font-medium">{job.project_name}</span></div>
               {job.gc_name && <div><span className="text-gray-600">GC:</span> <span className="text-gray-200">{job.gc_name}</span></div>}
               {(job.city || job.state) && <div><span className="text-gray-600">Location:</span> <span className="text-gray-200">{[job.city, job.state].filter(Boolean).join(', ')}</span></div>}
@@ -283,7 +283,7 @@ export default function BidPreview({ job, api, onGoBack }) {
           </div>
 
           {/* Totals */}
-          <div className="glass-card p-6 relative overflow-hidden">
+          <div className="glass-card p-4 sm:p-6 relative overflow-hidden">
             <div className="absolute inset-0 bg-gradient-to-br from-si-orange/[0.04] to-transparent" />
             <div className="relative space-y-3">
               <div className="flex justify-between text-sm">

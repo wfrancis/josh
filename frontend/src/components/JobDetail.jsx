@@ -162,7 +162,7 @@ export default function JobDetail() {
         </button>
         <div className="flex-1">
           <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-extrabold text-white tracking-tight">{job.project_name}</h1>
+            <h1 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight">{job.project_name}</h1>
             <StatusBadge status={getJobStatus(job)} />
           </div>
           <div className="flex flex-wrap items-center gap-4 mt-2 text-sm text-gray-500">
@@ -248,7 +248,7 @@ export default function JobDetail() {
       </div>
 
       {/* Stepper */}
-      <div className="glass-card px-6 py-4 mb-8">
+      <div className="glass-card px-3 sm:px-6 py-3 sm:py-4 mb-6 sm:mb-8">
         <StepIndicator current={step} onStepClick={setStep} completedSteps={getCompletedSteps()} />
       </div>
 
@@ -265,9 +265,9 @@ export default function JobDetail() {
       <div className="animate-fade-in" key={step}>
         {step === 'info' && (
           <div className="space-y-6">
-            <div className="glass-card p-8">
+            <div className="glass-card p-4 sm:p-8">
               <h2 className="text-lg font-bold text-white mb-1">Upload RFMS Takeoff</h2>
-              <p className="text-sm text-gray-500 mb-6">
+              <p className="text-sm text-gray-500 mb-4 sm:mb-6">
                 Upload both RFMS pivot table files (.xlsx). Materials and waste factors are parsed automatically.
               </p>
 
@@ -381,7 +381,7 @@ export default function JobDetail() {
             </div>
 
             {job.materials?.length > 0 && (
-              <div className="glass-card p-6 animate-slide-up">
+              <div className="glass-card p-4 sm:p-6 animate-slide-up">
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em]">
                     Materials ({job.materials.length})
@@ -419,7 +419,7 @@ export default function JobDetail() {
               </div>
             ) : (
             <>
-            <div className="glass-card p-8">
+            <div className="glass-card p-4 sm:p-8">
               <h2 className="text-lg font-bold text-white mb-1">Vendor Quotes</h2>
               <p className="text-sm text-gray-500 mb-6">
                 Upload vendor quote PDFs. Pricing will be extracted automatically.
@@ -440,7 +440,7 @@ export default function JobDetail() {
             </div>
 
             {job.materials?.length > 0 && (
-              <div className="glass-card p-6">
+              <div className="glass-card p-4 sm:p-6">
                 <div className="flex items-center justify-between mb-5">
                   <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em]">
                     Set Material Pricing
@@ -478,7 +478,7 @@ export default function JobDetail() {
         )}
 
         {step === 'bid' && (
-          <div className="glass-card p-8">
+          <div className="glass-card p-4 sm:p-8">
             <h2 className="text-lg font-bold text-white mb-1">Generate Bid</h2>
             <p className="text-sm text-gray-500 mb-6">
               Calculate sundries, labor, and freight, then generate the bid PDF.

@@ -107,33 +107,56 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
 
           {/* Filter bar — matches MaterialsTable style */}
           {validProducts.length > 3 && (
-            <div className="flex items-center gap-3 mb-3 flex-wrap">
-              <div className="relative flex-1 min-w-[200px]">
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3 mb-3">
+              <div className="relative flex-1 min-w-0">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-600" />
                 <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
                   placeholder="Filter products..."
-                  className="w-full pl-9 pr-3 py-1.5 text-xs bg-white/[0.04] border border-white/[0.06] rounded-lg
+                  className="w-full pl-9 pr-3 py-2 sm:py-1.5 text-sm sm:text-xs bg-white/[0.04] border border-white/[0.06] rounded-lg
                              text-gray-300 placeholder-gray-600 focus:outline-none focus:border-white/[0.12] transition-colors" />
               </div>
-              {vendors.length > 1 && (
-                <select value={vendorFilter} onChange={e => setVendorFilter(e.target.value)}
-                  className="text-xs bg-white/[0.04] border border-white/[0.06] rounded-lg px-2.5 py-1.5
-                             text-gray-300 focus:outline-none focus:border-white/[0.12] transition-colors">
-                  <option value="">All Vendors</option>
-                  {vendors.map(v => <option key={v} value={v}>{v}</option>)}
-                </select>
-              )}
-              {(searchQuery || vendorFilter) && (
-                <button onClick={() => { setSearchQuery(''); setVendorFilter('') }}
-                  className="text-xs text-gray-600 hover:text-gray-400 transition-colors">
-                  Clear filters
-                </button>
-              )}
+              <div className="flex items-center gap-2 sm:gap-3">
+                {vendors.length > 1 && (
+                  <select value={vendorFilter} onChange={e => setVendorFilter(e.target.value)}
+                    className="text-sm sm:text-xs bg-white/[0.04] border border-white/[0.06] rounded-lg px-2.5 py-2 sm:py-1.5
+                               text-gray-300 focus:outline-none focus:border-white/[0.12] transition-colors flex-1 sm:flex-none">
+                    <option value="">All Vendors</option>
+                    {vendors.map(v => <option key={v} value={v}>{v}</option>)}
+                  </select>
+                )}
+                {(searchQuery || vendorFilter) && (
+                  <button onClick={() => { setSearchQuery(''); setVendorFilter('') }}
+                    className="text-xs text-gray-600 hover:text-gray-400 transition-colors whitespace-nowrap">
+                    Clear filters
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
-          {/* Product table */}
-          <div className="overflow-hidden rounded-lg border border-white/[0.06]">
+          {/* Product list — cards on mobile, table on desktop */}
+          {/* Mobile: card layout */}
+          <div className="sm:hidden space-y-2 max-h-[400px] overflow-y-auto">
+            {filteredProducts.map((p, i) => (
+              <div key={i} className="flex items-center justify-between gap-3 p-3 bg-white/[0.03] border border-white/[0.04] rounded-lg">
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm text-gray-200 truncate">{p.product_name || p.description || 'Unknown product'}</div>
+                  {p.vendor && <div className="text-[11px] text-gray-500 mt-0.5">{p.vendor}</div>}
+                </div>
+                {p.unit_price > 0 && (
+                  <div className="text-sm font-semibold text-si-bright tabular-nums whitespace-nowrap">
+                    ${(p.unit_price).toFixed(2)}<span className="text-gray-500 font-normal text-xs">/{p.unit || 'ea'}</span>
+                  </div>
+                )}
+              </div>
+            ))}
+            {filteredProducts.length === 0 && (searchQuery || vendorFilter) && (
+              <p className="text-xs text-gray-500 text-center py-6">No products match your filters</p>
+            )}
+          </div>
+
+          {/* Desktop: table layout */}
+          <div className="hidden sm:block overflow-hidden rounded-lg border border-white/[0.06]">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-white/[0.06]">
@@ -142,7 +165,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
                   <th className="py-2 px-3 text-right font-bold text-gray-500 text-[10px] uppercase tracking-[0.12em]">Unit Price</th>
                 </tr>
               </thead>
-              <tbody className="max-h-[400px] overflow-y-auto">
+              <tbody>
                 {filteredProducts.map((p, i) => (
                   <tr key={i} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
                     <td className="py-2 px-3">

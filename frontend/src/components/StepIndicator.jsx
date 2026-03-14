@@ -15,11 +15,11 @@ export default function StepIndicator({ current, onStepClick, completedSteps = [
         return (
           <div key={step.key} className="flex items-center">
             {i > 0 && (
-              <div className={`w-12 h-px ${isComplete ? 'bg-si-bright/40' : 'bg-white/[0.06]'}`} />
+              <div className={`w-4 sm:w-12 h-px ${isComplete ? 'bg-si-bright/40' : 'bg-white/[0.06]'}`} />
             )}
             <button
               onClick={() => onStepClick(step.key)}
-              className={`flex items-center gap-2.5 px-4 py-2 rounded-xl text-sm font-medium transition-all
+              className={`flex items-center gap-1.5 sm:gap-2.5 px-2 sm:px-4 py-2 rounded-xl text-sm font-medium transition-all
                 ${isActive
                   ? 'bg-si-bright/10 text-si-bright'
                   : isComplete
