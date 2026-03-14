@@ -19,7 +19,7 @@ export default function JobDetail() {
   const navigate = useNavigate()
   const [job, setJob] = useState(null)
   const [loading, setLoading] = useState(true)
-  const [step, setStep] = useState('info')
+  const [step, setStep] = useState('takeoff')
   const [rfmsLoading, setRfmsLoading] = useState(false)
   const [rfmsSuccess, setRfmsSuccess] = useState(false)
   const [stagedFiles, setStagedFiles] = useState([])
@@ -39,9 +39,8 @@ export default function JobDetail() {
       setNotes(data.notes || '')
       setNotesOpen(!!data.notes)
       if (data.materials?.length > 0) setRfmsSuccess(true)
-      if (data.bundles?.length > 0) setStep('bid')
-      else if (data.materials?.some(m => m.unit_price > 0)) setStep('pricing')
-      else if (data.materials?.length > 0) setStep('pricing')
+      if (data.bundles?.length > 0 || data.bid_data) setStep('bid')
+      else if (data.materials?.length > 0) setStep('takeoff')
     } catch (err) {
       setError(err.message)
     } finally {
@@ -72,7 +71,7 @@ export default function JobDetail() {
       setJob(updated)
       setRfmsSuccess(true)
       setStagedFiles([])
-      setTimeout(() => setStep('pricing'), 800)
+      // Stay on takeoff step — user reviews materials here
     } catch (err) {
       setError(err.message)
     } finally {
@@ -130,9 +129,8 @@ export default function JobDetail() {
 
   const getCompletedSteps = () => {
     const completed = []
-    if (job?.materials?.length > 0) completed.push('info')
-    if (job?.materials?.some(m => m.unit_price > 0)) completed.push('pricing')
-    if (job?.bundles?.length > 0) completed.push('bid')
+    if (job?.materials?.length > 0) completed.push('takeoff')
+    if (job?.bundles?.length > 0 || job?.bid_data) completed.push('bid')
     return completed
   }
 
@@ -263,12 +261,13 @@ export default function JobDetail() {
 
       {/* Step Content */}
       <div className="animate-fade-in" key={step}>
-        {step === 'info' && (
+        {step === 'takeoff' && (
           <div className="space-y-6">
+            {/* RFMS Upload */}
             <div className="glass-card p-4 sm:p-8">
               <h2 className="text-lg font-bold text-white mb-1">Upload RFMS Takeoff</h2>
               <p className="text-sm text-gray-500 mb-4 sm:mb-6">
-                Upload both RFMS pivot table files (.xlsx). Materials and waste factors are parsed automatically.
+                Upload RFMS pivot table files (.xlsx). Materials, waste factors, and pricing are applied automatically.
               </p>
 
               {rfmsSuccess ? (
@@ -380,6 +379,30 @@ export default function JobDetail() {
               )}
             </div>
 
+            {/* Vendor Quotes (optional, only shown after materials loaded) */}
+            {job.materials?.length > 0 && (
+              <div className="glass-card p-4 sm:p-8">
+                <h2 className="text-lg font-bold text-white mb-1">Vendor Quotes <span className="text-xs font-normal text-gray-500 ml-1">(optional)</span></h2>
+                <p className="text-sm text-gray-500 mb-6">
+                  Upload vendor quote PDFs to override internal pricing for specific items.
+                </p>
+                <QuoteUpload
+                  jobId={jobId}
+                  api={api}
+                  existingQuotes={job.quotes}
+                  onQuotesParsed={async () => {
+                    const updated = await api.getJob(jobId)
+                    setJob(updated)
+                  }}
+                  onQuotesCleared={async () => {
+                    const updated = await api.getJob(jobId)
+                    setJob(updated)
+                  }}
+                />
+              </div>
+            )}
+
+            {/* Materials Table */}
             {job.materials?.length > 0 && (
               <div className="glass-card p-4 sm:p-6 animate-slide-up">
                 <div className="flex items-center justify-between mb-4">
@@ -387,6 +410,12 @@ export default function JobDetail() {
                     Materials ({job.materials.length})
                   </h3>
                   <div className="flex items-center gap-2">
+                    {isDirty && (
+                      <span className="text-xs text-amber-400 flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                        Unsaved
+                      </span>
+                    )}
                     <a href={api.exportMaterialsCsvUrl(jobId)} download
                        className="btn-ghost text-xs px-2.5 py-1.5 text-gray-500 hover:text-gray-300"
                        title="Export CSV">
@@ -395,84 +424,24 @@ export default function JobDetail() {
                     </a>
                     <button onClick={handleSavePricing} disabled={saving} className="btn-secondary text-sm">
                       {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                      Save Changes
+                      Save
                     </button>
                   </div>
                 </div>
                 <MaterialsTable materials={job.materials} editable onUpdate={handleMaterialsUpdate} />
               </div>
             )}
-          </div>
-        )}
 
-        {step === 'pricing' && (
-          <div className="space-y-6">
-            {!job.materials?.length ? (
-              <div className="text-center py-16 glass-card">
-                <FileSpreadsheet className="w-12 h-12 text-gray-600 mx-auto mb-4" />
-                <p className="text-gray-400 font-medium">Upload your RFMS takeoff first</p>
-                <p className="text-sm text-gray-600 mt-1 mb-4">Materials need to be imported before adding pricing</p>
-                <button onClick={() => setStep('info')}
-                  className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-si-bright/10 border border-si-bright/20 text-si-bright text-sm font-medium hover:bg-si-bright/15 transition-colors">
-                  <ArrowLeft className="w-4 h-4" /> Go to Step 1
-                </button>
-              </div>
-            ) : (
-            <>
-            <div className="glass-card p-4 sm:p-8">
-              <h2 className="text-lg font-bold text-white mb-1">Vendor Quotes</h2>
-              <p className="text-sm text-gray-500 mb-6">
-                Upload vendor quote PDFs. Pricing will be extracted automatically.
-              </p>
-              <QuoteUpload
-                jobId={jobId}
-                api={api}
-                existingQuotes={job.quotes}
-                onQuotesParsed={async () => {
-                  const updated = await api.getJob(jobId)
-                  setJob(updated)
-                }}
-                onQuotesCleared={async () => {
-                  const updated = await api.getJob(jobId)
-                  setJob(updated)
-                }}
-              />
-            </div>
-
+            {/* Continue to Bid */}
             {job.materials?.length > 0 && (
-              <div className="glass-card p-4 sm:p-6">
-                <div className="flex items-center justify-between mb-5">
-                  <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em]">
-                    Set Material Pricing
-                  </h3>
-                  <div className="flex items-center gap-3">
-                    {isDirty && (
-                      <span className="text-xs text-amber-400 flex items-center gap-1">
-                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-                        Unsaved changes
-                      </span>
-                    )}
-                    <button onClick={handleSavePricing} disabled={saving} className="btn-secondary text-sm">
-                      {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                      Save Prices
-                    </button>
-                  </div>
-                </div>
-                <MaterialsTable materials={job.materials} onUpdate={handleMaterialsUpdate} />
-              </div>
-            )}
-
-            {job.materials?.some(m => m.unit_price > 0) && (
               <div className="text-center pt-2 animate-fade-in">
                 <button
-                  onClick={async () => { await handleSavePricing(); setStep('bid') }}
+                  onClick={async () => { if (isDirty) await handleSavePricing(); setStep('bid') }}
                   className="btn-primary"
                 >
-                  Save & Continue to Bid Generation
+                  Continue to Bid Generation
                 </button>
               </div>
-            )}
-            </>
             )}
           </div>
         )}
@@ -483,7 +452,7 @@ export default function JobDetail() {
             <p className="text-sm text-gray-500 mb-6">
               Calculate sundries, labor, and freight, then generate the bid PDF.
             </p>
-            <BidPreview job={job} api={api} onGoBack={() => setStep('pricing')}
+            <BidPreview job={job} api={api} onGoBack={() => setStep('takeoff')}
               onBidCleared={async () => {
                 const updated = await api.getJob(jobId)
                 setJob(updated)

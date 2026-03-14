@@ -1,19 +1,12 @@
 import { useState, useEffect } from 'react'
 import {
-  Settings, FileSpreadsheet, HardHat, Wrench, Info,
+  Settings, Info,
   Key, Brain, Layers, Loader2, Check, Eye, EyeOff,
   AlertTriangle
 } from 'lucide-react'
 import { api } from '../api'
-import FileUpload from './FileUpload'
 
 export default function SettingsPage() {
-  const [laborLoading, setLaborLoading] = useState(false)
-  const [laborSuccess, setLaborSuccess] = useState(false)
-  const [laborError, setLaborError] = useState(null)
-  const [laborCatalog, setLaborCatalog] = useState(null)
-  const [catalogLoading, setCatalogLoading] = useState(true)
-
   // AI Settings state
   const [settingsLoading, setSettingsLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -39,30 +32,6 @@ export default function SettingsPage() {
       .catch(console.error)
       .finally(() => setSettingsLoading(false))
   }, [])
-
-  // Load labor catalog on mount
-  useEffect(() => {
-    api.getLaborCatalog()
-      .then(data => setLaborCatalog(data))
-      .catch(() => setLaborCatalog({ entries: [], count: 0 }))
-      .finally(() => setCatalogLoading(false))
-  }, [])
-
-  const handleLaborUpload = async (file) => {
-    setLaborLoading(true)
-    setLaborError(null)
-    try {
-      await api.uploadLaborCatalog(file)
-      setLaborSuccess(true)
-      // Refresh the catalog preview
-      const data = await api.getLaborCatalog()
-      setLaborCatalog(data)
-    } catch (err) {
-      setLaborError(err.message)
-    } finally {
-      setLaborLoading(false)
-    }
-  }
 
   const handleSaveSettings = async () => {
     setSaving(true)
@@ -273,118 +242,13 @@ export default function SettingsPage() {
           )}
         </div>
 
-        {/* ── Labor Catalog ─────────────────────────────── */}
-        <div className="glass-card p-8">
-          <div className="flex items-start gap-4 mb-6">
-            <div className="w-11 h-11 rounded-xl bg-violet-500/10 flex items-center justify-center flex-shrink-0">
-              <HardHat className="w-5 h-5 text-violet-400" />
-            </div>
-            <div>
-              <h2 className="text-lg font-bold text-white">Labor Catalog</h2>
-              <p className="text-sm text-gray-500 mt-1">
-                Upload your labor rate catalog (PDF or Excel). This sets the per-unit labor rates used when generating bids.
-              </p>
-            </div>
-          </div>
-          <FileUpload
-            accept=".pdf,.xlsx,.xls"
-            label="Upload Labor Catalog"
-            description="PDF or Excel file with labor rates per material type"
-            icon={FileSpreadsheet}
-            onUpload={handleLaborUpload}
-            onReset={() => setLaborSuccess(false)}
-            loading={laborLoading}
-            success={laborSuccess}
-            successMessage="Labor catalog uploaded successfully"
-          />
-          {laborError && (
-            <div className="mt-3 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-400">
-              {laborError}
-            </div>
-          )}
-
-          {/* Labor Catalog Preview */}
-          {catalogLoading ? (
-            <div className="mt-4 flex items-center justify-center py-6">
-              <Loader2 className="w-4 h-4 text-gray-500 animate-spin" />
-            </div>
-          ) : laborCatalog && laborCatalog.count > 0 ? (
-            <div className="mt-4">
-              <div className="flex items-center gap-2 mb-3">
-                <span className="text-xs font-bold text-gray-500 uppercase tracking-[0.12em]">
-                  Loaded Rates
-                </span>
-                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-400">
-                  {laborCatalog.count} entries
-                </span>
-              </div>
-              <div className="overflow-x-auto max-h-64 overflow-y-auto rounded-xl border border-white/[0.06]">
-                <table className="w-full text-xs">
-                  <thead className="sticky top-0 bg-gray-900/95 backdrop-blur-sm">
-                    <tr className="border-b border-white/[0.06]">
-                      <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Type</th>
-                      <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Description</th>
-                      <th className="py-2 px-3 text-right font-bold text-gray-500 uppercase tracking-wider">Cost</th>
-                      <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Unit</th>
-                      <th className="py-2 px-3 text-right font-bold text-gray-500 uppercase tracking-wider">Markup</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-white/[0.03]">
-                    {laborCatalog.entries.map((entry, i) => (
-                      <tr key={i} className="hover:bg-white/[0.02] transition-colors">
-                        <td className="py-2 px-3 text-gray-300 font-medium">{entry.labor_type}</td>
-                        <td className="py-2 px-3 text-gray-400">{entry.description}</td>
-                        <td className="py-2 px-3 text-right tabular-nums text-gray-300">
-                          ${(entry.cost || 0).toFixed(2)}
-                        </td>
-                        <td className="py-2 px-3 text-gray-500">{entry.unit}</td>
-                        <td className="py-2 px-3 text-right tabular-nums text-gray-500">
-                          {entry.gpm_markup ? `${(entry.gpm_markup * 100).toFixed(0)}%` : '—'}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          ) : !catalogLoading && (
-            <div className="mt-4 text-center py-6 bg-white/[0.02] rounded-xl border border-white/[0.04]">
-              <HardHat className="w-8 h-8 text-gray-600 mx-auto mb-2 opacity-40" />
-              <p className="text-xs text-gray-500">No labor catalog loaded yet</p>
-            </div>
-          )}
-        </div>
-
-        {/* ── Business Rules Info ──────────────────────── */}
-        <div className="glass-card p-8">
-          <div className="flex items-start gap-4 mb-5">
-            <div className="w-11 h-11 rounded-xl bg-si-bright/10 flex items-center justify-center flex-shrink-0">
-              <Wrench className="w-5 h-5 text-si-bright" />
-            </div>
-            <div>
-              <h2 className="text-lg font-bold text-white">Business Rules</h2>
-              <p className="text-sm text-gray-500 mt-1">
-                Built-in calculations for waste factors, sundries, and freight.
-              </p>
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            {[
-              { label: 'Waste Factors', desc: 'Auto-applied per material type (carpet, LVT, tile, etc.)' },
-              { label: 'Sundry Rules', desc: 'Adhesive, seam sealer, transition strips auto-calculated' },
-              { label: 'Freight Rates', desc: 'Per-unit shipping costs based on material category' },
-              { label: 'Bid Templates', desc: 'Pre-written scope descriptions for each bundle type' },
-            ].map(item => (
-              <div key={item.label} className="p-4 bg-white/[0.03] rounded-xl border border-white/[0.04]">
-                <div className="text-sm font-semibold text-gray-200 mb-1">{item.label}</div>
-                <div className="text-xs text-gray-500 leading-relaxed">{item.desc}</div>
-              </div>
-            ))}
-          </div>
-          <div className="mt-4 flex items-start gap-2 px-4 py-3 bg-si-bright/[0.04] border border-si-bright/10 rounded-xl">
-            <Info className="w-4 h-4 text-si-bright flex-shrink-0 mt-0.5" />
-            <p className="text-xs text-gray-400 leading-relaxed">
-              These are configured in the server config. Edit waste factors, sundry rules, or freight rates there.
+        {/* ── Internal Rates Link ──────────────────────── */}
+        <div className="glass-card p-6">
+          <div className="flex items-center gap-3 text-gray-400">
+            <Info className="w-4 h-4 text-si-bright flex-shrink-0" />
+            <p className="text-sm">
+              Labor rates, material pricing, waste factors, sundries, and freight are managed on the{' '}
+              <a href="/internal-rates" className="text-si-bright hover:underline font-medium">Internal Rates</a> page.
             </p>
           </div>
         </div>

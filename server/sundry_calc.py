@@ -7,27 +7,32 @@ import math
 from config import SUNDRY_RULES
 
 
-def calculate_sundries(material_type: str, installed_qty: float) -> list[dict]:
+def _load_sundry_rules():
+    """Load sundry rules from DB, falling back to config.py defaults."""
+    try:
+        from models import get_company_rate
+        import json
+        data = get_company_rate("sundry_rules")
+        if data:
+            return json.loads(data)
+    except Exception:
+        pass
+    return SUNDRY_RULES
+
+
+def calculate_sundries(material_type: str, installed_qty: float, sundry_rules: dict = None) -> list[dict]:
     """
     Calculate sundry items needed for a given material type and quantity.
 
     Args:
         material_type: e.g. "unit_carpet_no_pattern", "unit_lvt", "floor_tile"
         installed_qty: the installed quantity (in the material's native unit)
-
-    Returns:
-        List of sundry items:
-        [
-            {
-                "sundry_name": str,
-                "qty": float,
-                "unit": str,
-                "notes": str | None,
-            },
-            ...
-        ]
+        sundry_rules: optional override for sundry rules (if None, loads from DB)
     """
-    rules = SUNDRY_RULES.get(material_type, [])
+    if sundry_rules is None:
+        sundry_rules = _load_sundry_rules()
+
+    rules = sundry_rules.get(material_type, [])
     if not rules:
         return []
 
@@ -40,14 +45,9 @@ def calculate_sundries(material_type: str, installed_qty: float) -> list[dict]:
         notes = rule.get("notes")
 
         if coverage is None or coverage <= 0:
-            # Special case: caulking or items without standard coverage
-            # Skip items that don't have a calculable coverage
             continue
 
-        # Apply waste to the installed qty for certain sundries (e.g. pad)
         effective_qty = installed_qty * (1 + waste) if waste else installed_qty
-
-        # Calculate how many units are needed
         qty_needed = math.ceil(effective_qty / coverage)
 
         unit_price = rule.get("unit_price", 0)
@@ -68,21 +68,16 @@ def calculate_sundries(material_type: str, installed_qty: float) -> list[dict]:
 def calculate_sundries_for_materials(materials: list[dict]) -> list[dict]:
     """
     Calculate sundries for a list of material line items.
-
-    Args:
-        materials: list of material dicts, each with at least
-                   "material_type", "installed_qty", and optionally "id" or "item_code"
-
-    Returns:
-        Flat list of sundry items, each tagged with material_id or item_code.
+    Loads sundry rules from DB once for efficiency.
     """
+    sundry_rules = _load_sundry_rules()
     all_sundries = []
     for mat in materials:
         material_type = mat.get("material_type", "")
         installed_qty = mat.get("installed_qty", 0)
         material_id = mat.get("id") or mat.get("item_code")
 
-        sundries = calculate_sundries(material_type, installed_qty)
+        sundries = calculate_sundries(material_type, installed_qty, sundry_rules)
         for s in sundries:
             s["material_id"] = material_id
         all_sundries.extend(sundries)

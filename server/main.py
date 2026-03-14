@@ -20,6 +20,10 @@ from models import (
     save_materials, save_sundries, save_labor, save_bundles,
     save_quotes, delete_quotes, search_all,
     get_settings, save_settings,
+    save_labor_catalog_entries, get_labor_catalog_entries,
+    save_price_list_entries, add_price_list_entry, update_price_list_entry,
+    delete_price_list_entry, get_price_list_entries,
+    get_company_rate, save_company_rate, get_all_company_rates,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
@@ -27,7 +31,7 @@ from sundry_calc import calculate_sundries_for_materials
 from labor_calc import calculate_labor_for_materials, load_labor_catalog, load_labor_catalog_from_pdf, get_labor_catalog
 from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf
-from config import WASTE_FACTORS
+from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="SI Bid Tool", version="1.0.0")
@@ -40,6 +44,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _match_price_list(material: dict, price_list: list[dict]) -> dict | None:
+    """Match a material to a price list entry by item_code, description, or material_type."""
+    item_code = (material.get("item_code") or "").strip().lower()
+    description = (material.get("description") or "").strip().lower()
+    material_type = (material.get("material_type") or "").strip().lower()
+
+    # Pass 1: exact item_code match against product_name
+    if item_code and len(item_code) >= 3:
+        for entry in price_list:
+            entry_name = (entry.get("product_name") or "").strip().lower()
+            if item_code == entry_name or item_code in entry_name or entry_name in item_code:
+                return entry
+
+    # Pass 2: description substring match
+    if description and len(description) >= 5:
+        for entry in price_list:
+            entry_name = (entry.get("product_name") or "").strip().lower()
+            if entry_name and len(entry_name) >= 5:
+                if entry_name in description or description in entry_name:
+                    return entry
+
+    # Pass 3: material_type match (weakest, gives generic pricing)
+    if material_type:
+        for entry in price_list:
+            if (entry.get("material_type") or "").strip().lower() == material_type:
+                return entry
+
+    return None
+
+
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 PDF_DIR = os.path.join(os.path.dirname(__file__), "generated_pdfs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -50,6 +84,7 @@ os.makedirs(PDF_DIR, exist_ok=True)
 def startup():
     init_db()
     _apply_openai_config()
+    _seed_company_rates()
 
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
@@ -273,13 +308,30 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
                 "unit": m.get("unit"),
             })
 
+    # Load waste factors from DB (falls back to config defaults)
+    import json as _json
+    _waste_data = get_company_rate("waste_factors")
+    _waste_factors = _json.loads(_waste_data) if _waste_data else WASTE_FACTORS
+
+    # Load price list for auto-pricing
+    _price_list = get_price_list_entries()
+
     # Apply waste factors to the final merged list
     materials = []
     for m in merged_raw:
         material_type = m.get("material_type", "unknown")
-        waste_pct = WASTE_FACTORS.get(material_type, 0)
+        waste_pct = _waste_factors.get(material_type, 0)
         installed_qty = m.get("installed_qty", m.get("qty", 0))
         order_qty = installed_qty * (1 + waste_pct)
+
+        # Auto-price from internal price list
+        unit_price = m.get("unit_price", 0)
+        vendor = m.get("vendor", "")
+        if not unit_price and _price_list:
+            matched = _match_price_list(m, _price_list)
+            if matched:
+                unit_price = matched["unit_price"]
+                vendor = matched.get("vendor", "")
 
         materials.append({
             "item_code": m.get("item_code"),
@@ -289,9 +341,9 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             "unit": m.get("unit"),
             "waste_pct": waste_pct,
             "order_qty": round(order_qty, 2),
-            "vendor": m.get("vendor", ""),
-            "unit_price": m.get("unit_price", 0),
-            "extended_cost": round(m.get("unit_price", 0) * round(order_qty, 2), 2),
+            "vendor": vendor,
+            "unit_price": unit_price,
+            "extended_cost": round(unit_price * round(order_qty, 2), 2),
             "ai_confidence": m.get("ai_confidence"),
         })
 
@@ -664,6 +716,206 @@ def api_search(q: str = ""):
     if not q or len(q) < 2:
         return {"jobs": [], "materials": []}
     return search_all(q)
+
+
+# ── Company Rates ────────────────────────────────────────────────────────────
+
+def _seed_company_rates():
+    """Seed company rates from config.py defaults if not yet in DB."""
+    import json as _json
+    for rate_type, default_data in [
+        ("sundry_rules", SUNDRY_RULES),
+        ("waste_factors", WASTE_FACTORS),
+        ("freight_rates", FREIGHT_RATES),
+    ]:
+        existing = get_company_rate(rate_type)
+        if existing is None:
+            save_company_rate(rate_type, _json.dumps(default_data))
+            print(f"[seed] Seeded {rate_type} from config.py defaults")
+
+
+@app.get("/api/company-rates")
+def api_get_all_company_rates():
+    """Get all company rates."""
+    return get_all_company_rates()
+
+
+@app.get("/api/company-rates/{rate_type}")
+def api_get_company_rate(rate_type: str):
+    """Get a specific company rate (sundry_rules, waste_factors, freight_rates)."""
+    import json as _json
+    data = get_company_rate(rate_type)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"Rate type '{rate_type}' not found")
+    return {"rate_type": rate_type, "data": _json.loads(data)}
+
+
+class CompanyRateUpdate(BaseModel):
+    data: dict
+
+
+@app.put("/api/company-rates/{rate_type}")
+def api_update_company_rate(rate_type: str, body: CompanyRateUpdate):
+    """Update a company rate."""
+    import json as _json
+    if rate_type not in ("sundry_rules", "waste_factors", "freight_rates"):
+        raise HTTPException(status_code=400, detail=f"Invalid rate type: {rate_type}")
+    save_company_rate(rate_type, _json.dumps(body.data))
+    return {"message": f"{rate_type} updated"}
+
+
+# ── Price List ───────────────────────────────────────────────────────────────
+
+@app.get("/api/price-list")
+def api_get_price_list():
+    """Get all price list entries."""
+    entries = get_price_list_entries()
+    return {"entries": entries, "count": len(entries)}
+
+
+class PriceListEntry(BaseModel):
+    product_name: str
+    material_type: Optional[str] = ""
+    unit: Optional[str] = ""
+    unit_price: Optional[float] = 0
+    vendor: Optional[str] = ""
+    notes: Optional[str] = ""
+
+
+@app.post("/api/price-list")
+def api_add_price_list_entry(body: PriceListEntry):
+    """Add a single price list entry."""
+    entry_id = add_price_list_entry(body.model_dump())
+    return {"id": entry_id, "message": "Entry added"}
+
+
+@app.put("/api/price-list/{entry_id}")
+def api_update_price_list_entry(entry_id: int, body: PriceListEntry):
+    """Update a price list entry."""
+    if not update_price_list_entry(entry_id, body.model_dump()):
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return {"message": "Entry updated"}
+
+
+@app.delete("/api/price-list/{entry_id}")
+def api_delete_price_list_entry(entry_id: int):
+    """Delete a price list entry."""
+    if not delete_price_list_entry(entry_id):
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return {"message": "Entry deleted"}
+
+
+class PriceListBulkUpload(BaseModel):
+    entries: list[dict]
+
+
+@app.post("/api/price-list/bulk")
+def api_bulk_upload_price_list(body: PriceListBulkUpload):
+    """Replace all price list entries (bulk upload)."""
+    save_price_list_entries(body.entries)
+    return {"message": "Price list updated", "count": len(body.entries)}
+
+
+@app.post("/api/price-list/upload")
+async def api_upload_price_list(file: UploadFile = File(...)):
+    """Upload price list from CSV or Excel file."""
+    import json as _json
+    file_path = os.path.join(UPLOAD_DIR, f"price_list_{file.filename}")
+    with open(file_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    entries = []
+
+    if ext == ".csv":
+        with open(file_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                entries.append({
+                    "product_name": row.get("product_name", row.get("Product Name", row.get("name", ""))),
+                    "material_type": row.get("material_type", row.get("Material Type", row.get("type", ""))),
+                    "unit": row.get("unit", row.get("Unit", "")),
+                    "unit_price": float(row.get("unit_price", row.get("Unit Price", row.get("price", 0))) or 0),
+                    "vendor": row.get("vendor", row.get("Vendor", "")),
+                    "notes": row.get("notes", row.get("Notes", "")),
+                })
+    elif ext in (".xlsx", ".xls"):
+        import openpyxl
+        wb = openpyxl.load_workbook(file_path, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        headers = [str(c.value or "").strip().lower() for c in ws[1]]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not any(row):
+                continue
+            row_dict = dict(zip(headers, row))
+            entries.append({
+                "product_name": str(row_dict.get("product_name", row_dict.get("product name", row_dict.get("name", ""))) or ""),
+                "material_type": str(row_dict.get("material_type", row_dict.get("material type", row_dict.get("type", ""))) or ""),
+                "unit": str(row_dict.get("unit", "") or ""),
+                "unit_price": float(row_dict.get("unit_price", row_dict.get("unit price", row_dict.get("price", 0))) or 0),
+                "vendor": str(row_dict.get("vendor", "") or ""),
+                "notes": str(row_dict.get("notes", "") or ""),
+            })
+        wb.close()
+    elif ext == ".pdf":
+        # Parse price list PDF using AI
+        settings = get_settings()
+        api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+        model = settings.get("openai_model", "gpt-5-mini")
+        entries = _parse_price_list_pdf(file_path, api_key, model)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Upload .csv, .xlsx, or .pdf")
+
+    if not entries:
+        raise HTTPException(status_code=400, detail="No entries found in uploaded file")
+
+    save_price_list_entries(entries)
+    return {"message": "Price list uploaded", "count": len(entries)}
+
+
+def _parse_price_list_pdf(file_path: str, api_key: str = None, model: str = "gpt-5-mini") -> list[dict]:
+    """Parse a price list PDF using AI."""
+    import pdfplumber
+    from openai import OpenAI
+
+    text_parts = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+    text = "\n".join(text_parts)
+    if not text.strip():
+        return []
+
+    client_kwargs = {}
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    client = OpenAI(**client_kwargs)
+
+    import json as _json
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": """You are parsing a material price list for a flooring/interiors company.
+Extract every product/material entry into a JSON array.
+
+For each entry, extract:
+- product_name: the product name or description
+- material_type: the flooring type if identifiable (e.g. "unit_lvt", "unit_carpet_no_pattern", "floor_tile", etc.)
+- unit: the unit of measure (SF, SY, LF, EA, etc.)
+- unit_price: the price per unit as a number
+- vendor: the vendor/manufacturer if shown
+- notes: any additional notes
+
+Return JSON: {"entries": [{"product_name": "...", "material_type": "...", "unit": "...", "unit_price": 0.00, "vendor": "...", "notes": "..."}, ...]}"""},
+            {"role": "user", "content": text},
+        ],
+        response_format={"type": "json_object"},
+    )
+    parsed = _json.loads(response.choices[0].message.content)
+    return parsed.get("entries", [])
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────

@@ -6,17 +6,32 @@ into bundled line items with descriptions and totals.
 from config import BID_TEMPLATES, WASTE_FACTORS, FREIGHT_RATES, EXCLUSIONS_TEMPLATE
 
 
-def _get_freight_rate(material_type: str) -> float:
+def _load_rates_from_db():
+    """Load waste factors and freight rates from DB, falling back to config defaults."""
+    try:
+        from models import get_company_rate
+        import json
+        waste_data = get_company_rate("waste_factors")
+        freight_data = get_company_rate("freight_rates")
+        waste = json.loads(waste_data) if waste_data else WASTE_FACTORS
+        freight = json.loads(freight_data) if freight_data else FREIGHT_RATES
+        return waste, freight
+    except Exception:
+        return WASTE_FACTORS, FREIGHT_RATES
+
+
+def _get_freight_rate(material_type: str, freight_rates: dict = None) -> float:
     """Look up freight rate for a material type. Returns 0 if none applies."""
-    # Map material types to freight rate keys
+    if freight_rates is None:
+        freight_rates = FREIGHT_RATES
     freight_map = {
         "cpt_tile": "cpt_tile",
         "corridor_broadloom": "broadloom",
-        "unit_lvt": "lvt_5mm",  # Default to 5mm; could be parameterized
+        "unit_lvt": "lvt_5mm",
     }
     key = freight_map.get(material_type)
     if key:
-        return FREIGHT_RATES.get(key, 0)
+        return freight_rates.get(key, 0)
     return 0
 
 
@@ -81,6 +96,9 @@ def assemble_bid(
     tax_rate = job_info.get("tax_rate", 0)
     markup_pct = job_info.get("markup_pct", 0) or 0
 
+    # Load rates from DB (falls back to config defaults)
+    db_waste_factors, db_freight_rates = _load_rates_from_db()
+
     # Index sundries and labor by material_id for fast lookup
     sundries_by_mat: dict[str, list[dict]] = {}
     for s in sundries:
@@ -97,7 +115,7 @@ def assemble_bid(
         material_type = mat.get("material_type", "unknown")
         installed_qty = mat.get("installed_qty", 0)
         unit = mat.get("unit", "")
-        waste_pct = mat.get("waste_pct") or WASTE_FACTORS.get(material_type, 0)
+        waste_pct = mat.get("waste_pct") or db_waste_factors.get(material_type, 0)
         unit_price = mat.get("unit_price", 0)
         mat_id = mat.get("id") or mat.get("item_code")
 
@@ -116,7 +134,7 @@ def assemble_bid(
         labor_cost = round(sum(l.get("extended_cost", 0) for l in mat_labor), 2)
 
         # Freight
-        freight_rate = _get_freight_rate(material_type)
+        freight_rate = _get_freight_rate(material_type, db_freight_rates)
         freight_cost = round(order_qty * freight_rate, 2)
 
         # Total for this bundle

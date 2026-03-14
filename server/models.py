@@ -117,6 +117,31 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS labor_catalog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                labor_type TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                cost REAL DEFAULT 0,
+                retail_display TEXT DEFAULT '',
+                unit TEXT DEFAULT '',
+                gpm_markup REAL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS price_list (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_name TEXT NOT NULL,
+                material_type TEXT DEFAULT '',
+                unit TEXT DEFAULT '',
+                unit_price REAL DEFAULT 0,
+                vendor TEXT DEFAULT '',
+                notes TEXT DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS company_rates (
+                rate_type TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );
         """)
         conn.commit()
         # Migrations for existing DBs
@@ -462,6 +487,163 @@ def search_all(query: str) -> dict:
                 "material_type": r["material_type"],
             })
         return {"jobs": jobs, "materials": list(mat_by_job.values())}
+    finally:
+        conn.close()
+
+
+# ── Labor Catalog ────────────────────────────────────────────────────────────
+
+def save_labor_catalog_entries(entries: list[dict]) -> None:
+    """Replace all labor catalog entries."""
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM labor_catalog")
+        for e in entries:
+            conn.execute("""
+                INSERT INTO labor_catalog
+                    (labor_type, description, cost, retail_display, unit, gpm_markup)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                e.get("labor_type", ""), e.get("description", ""),
+                e.get("cost", 0), e.get("retail_display", ""),
+                e.get("unit", ""), e.get("gpm_markup", 0)
+            ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_labor_catalog_entries() -> list[dict]:
+    """Get all labor catalog entries from DB."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute("SELECT * FROM labor_catalog ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ── Price List ───────────────────────────────────────────────────────────────
+
+def save_price_list_entries(entries: list[dict]) -> None:
+    """Replace all price list entries."""
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM price_list")
+        for e in entries:
+            conn.execute("""
+                INSERT INTO price_list
+                    (product_name, material_type, unit, unit_price, vendor, notes)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                e.get("product_name", ""), e.get("material_type", ""),
+                e.get("unit", ""), e.get("unit_price", 0),
+                e.get("vendor", ""), e.get("notes", "")
+            ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def add_price_list_entry(entry: dict) -> int:
+    """Add a single price list entry. Returns the id."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute("""
+            INSERT INTO price_list
+                (product_name, material_type, unit, unit_price, vendor, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            entry.get("product_name", ""), entry.get("material_type", ""),
+            entry.get("unit", ""), entry.get("unit_price", 0),
+            entry.get("vendor", ""), entry.get("notes", "")
+        ))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def update_price_list_entry(entry_id: int, entry: dict) -> bool:
+    """Update a price list entry. Returns True if found."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute("""
+            UPDATE price_list SET
+                product_name=?, material_type=?, unit=?, unit_price=?, vendor=?, notes=?
+            WHERE id=?
+        """, (
+            entry.get("product_name", ""), entry.get("material_type", ""),
+            entry.get("unit", ""), entry.get("unit_price", 0),
+            entry.get("vendor", ""), entry.get("notes", ""),
+            entry_id
+        ))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_price_list_entry(entry_id: int) -> bool:
+    """Delete a price list entry. Returns True if found."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute("DELETE FROM price_list WHERE id=?", (entry_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_price_list_entries() -> list[dict]:
+    """Get all price list entries."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute("SELECT * FROM price_list ORDER BY product_name").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ── Company Rates ────────────────────────────────────────────────────────────
+
+def get_company_rate(rate_type: str) -> Optional[str]:
+    """Get a company rate JSON blob by type."""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT data FROM company_rates WHERE rate_type=?", (rate_type,)).fetchone()
+        return row["data"] if row else None
+    finally:
+        conn.close()
+
+
+def save_company_rate(rate_type: str, data: str) -> None:
+    """Save a company rate JSON blob (upsert)."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO company_rates (rate_type, data) VALUES (?, ?) "
+            "ON CONFLICT(rate_type) DO UPDATE SET data=excluded.data",
+            (rate_type, data)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_all_company_rates() -> dict:
+    """Get all company rates as {rate_type: parsed_json}."""
+    import json as _json
+    conn = _get_conn()
+    try:
+        rows = conn.execute("SELECT rate_type, data FROM company_rates").fetchall()
+        result = {}
+        for r in rows:
+            try:
+                result[r["rate_type"]] = _json.loads(r["data"])
+            except (ValueError, TypeError):
+                result[r["rate_type"]] = r["data"]
+        return result
     finally:
         conn.close()
 

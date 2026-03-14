@@ -319,6 +319,7 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
   const [error, setError] = useState(null)
   const [markup, setMarkup] = useState(job.markup_pct ? (job.markup_pct * 100) : 0)
   const [expandedType, setExpandedType] = useState(null)
+  const [laborCatalogCount, setLaborCatalogCount] = useState(null)
 
   // Load existing bid data from job on mount
   useEffect(() => {
@@ -327,11 +328,19 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
     }
   }, [job.id])
 
+  // Pre-flight: check labor catalog
+  useEffect(() => {
+    api.getLaborCatalog()
+      .then(data => setLaborCatalogCount(data.count || 0))
+      .catch(() => setLaborCatalogCount(0))
+  }, [])
+
   const unknownMaterials = job.materials?.filter(m =>
     !m.material_type || !VALID_TYPES.includes(m.material_type)
   ) || []
 
   const hasMaterialPricing = job?.materials?.some(m => m.unit_price > 0)
+  const unpricedCount = job?.materials?.filter(m => !m.unit_price || m.unit_price === 0).length || 0
 
   // Flags summary
   const flagSummary = useMemo(() => {
@@ -347,6 +356,8 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
   const handleCalculate = async () => {
     setCalculating(true); setError(null)
     try {
+      // Auto-save materials + markup before generating
+      await api.updateMaterials(job.id, job.materials)
       await api.updateJob(job.id, { markup_pct: markup / 100 })
       await api.calculate(job.id)
       const result = await api.generateBid(job.id)
@@ -368,10 +379,10 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
       <div className="text-center py-16">
         <DollarSign className="w-12 h-12 text-gray-600 mx-auto mb-4" />
         <p className="text-gray-400 font-medium">Set material prices first</p>
-        <p className="text-sm text-gray-600 mt-1 mb-4">Enter unit prices in Quotes & Pricing before generating a bid</p>
+        <p className="text-sm text-gray-600 mt-1 mb-4">Enter unit prices in Takeoff & Pricing before generating a bid</p>
         {onGoBack && (
           <button onClick={onGoBack} className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-si-bright/10 border border-si-bright/20 text-si-bright text-sm font-medium hover:bg-si-bright/15 transition-colors">
-            Go to Quotes & Pricing
+            Go to Takeoff & Pricing
           </button>
         )}
       </div>
@@ -390,12 +401,31 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
           <p className="text-sm text-gray-500 mb-8 max-w-md mx-auto">
             This will calculate sundries, labor, and freight, then assemble your complete bid.
           </p>
+          {/* Pre-flight warnings */}
+          {laborCatalogCount === 0 && (
+            <div className="flex items-start gap-3 px-4 py-3 mb-4 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-400 max-w-md mx-auto text-left">
+              <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              <div>
+                <span className="font-medium">No labor catalog loaded</span>
+                <span className="text-red-500/80"> — all labor costs will be $0. <a href="/internal-rates" className="underline hover:text-red-300">Upload labor rates</a> before generating.</span>
+              </div>
+            </div>
+          )}
+          {unpricedCount > 0 && (
+            <div className="flex items-start gap-3 px-4 py-3 mb-4 bg-amber-500/10 border border-amber-500/20 rounded-xl text-sm text-amber-400 max-w-md mx-auto text-left">
+              <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              <div>
+                <span className="font-medium">{unpricedCount} material{unpricedCount !== 1 ? 's have' : ' has'} no price</span>
+                <span className="text-amber-500/80"> — material costs will be undercounted.</span>
+              </div>
+            </div>
+          )}
           {unknownMaterials.length > 0 && (
             <div className="flex items-start gap-3 px-4 py-3 mb-4 bg-amber-500/10 border border-amber-500/20 rounded-xl text-sm text-amber-400 max-w-md mx-auto text-left">
               <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
               <div>
                 <span className="font-medium">{unknownMaterials.length} material{unknownMaterials.length !== 1 ? 's have' : ' has'} unknown types</span>
-                <span className="text-amber-500/80"> — sundries and labor may not calculate correctly for these items.</span>
+                <span className="text-amber-500/80"> — sundries and labor may not calculate correctly.</span>
               </div>
             </div>
           )}

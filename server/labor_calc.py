@@ -12,10 +12,7 @@ import pdfplumber
 from openai import OpenAI
 
 from config import LABOR_QTY_RULES, WASTE_FACTORS
-
-
-# In-memory labor catalog (loaded from uploaded file)
-_labor_catalog: list[dict] = []
+from models import save_labor_catalog_entries, get_labor_catalog_entries
 
 LABOR_CATALOG_PROMPT = """You are parsing a labor rate catalog for a flooring/interiors contractor.
 Extract every labor line item from this document into a JSON array.
@@ -61,13 +58,9 @@ MATERIAL_TO_LABOR_MAP: dict[str, list[str]] = {
 
 def load_labor_catalog(file_path: str) -> list[dict]:
     """
-    Parse the Labor Catalog Excel file.
+    Parse the Labor Catalog Excel file and persist to database.
     Sheet1, columns A-F: Labor Type, Description, Cost, Retail Display, Unit, GPM Markup
-
-    Returns list of labor entries and stores them in module-level cache.
     """
-    global _labor_catalog
-
     wb = openpyxl.load_workbook(file_path, data_only=True)
     ws = wb[wb.sheetnames[0]]  # Sheet1
 
@@ -93,17 +86,14 @@ def load_labor_catalog(file_path: str) -> list[dict]:
         })
 
     wb.close()
-    _labor_catalog = catalog
+    save_labor_catalog_entries(catalog)
     return catalog
 
 
 def load_labor_catalog_from_pdf(file_path: str, api_key: str = None, model: str = "gpt-5-mini") -> list[dict]:
     """
-    Parse a Labor Catalog PDF using pdfplumber + OpenAI.
-    Returns list of labor entries and stores them in module-level cache.
+    Parse a Labor Catalog PDF using pdfplumber + OpenAI and persist to database.
     """
-    global _labor_catalog
-
     # Extract text from PDF
     text_parts = []
     with pdfplumber.open(file_path) as pdf:
@@ -148,7 +138,7 @@ def load_labor_catalog_from_pdf(file_path: str, api_key: str = None, model: str 
             "gpm_markup": _safe_float(entry.get("gpm_markup")),
         })
 
-    _labor_catalog = catalog
+    save_labor_catalog_entries(catalog)
     return catalog
 
 
@@ -161,13 +151,16 @@ def _safe_float(val) -> float:
         return 0.0
 
 
-def _find_labor_entry(material_type: str) -> Optional[dict]:
+def _find_labor_entry(material_type: str, catalog: list[dict] = None) -> Optional[dict]:
     """Find the best matching labor catalog entry for a material type."""
     keywords = MATERIAL_TO_LABOR_MAP.get(material_type, [])
     if not keywords:
         return None
 
-    for entry in _labor_catalog:
+    if catalog is None:
+        catalog = get_labor_catalog_entries()
+
+    for entry in catalog:
         entry_text = f"{entry['labor_type']} {entry['description']}".lower()
         for kw in keywords:
             if kw.lower() in entry_text:
@@ -245,13 +238,9 @@ def calculate_labor(
 def calculate_labor_for_materials(materials: list[dict]) -> list[dict]:
     """
     Calculate labor for a list of material line items.
-
-    Args:
-        materials: list of material dicts with material_type, installed_qty, waste_pct, etc.
-
-    Returns:
-        List of labor line items.
+    Loads labor catalog from DB once for efficiency.
     """
+    catalog = get_labor_catalog_entries()
     results = []
     for mat in materials:
         material_type = mat.get("material_type", "")
@@ -259,18 +248,36 @@ def calculate_labor_for_materials(materials: list[dict]) -> list[dict]:
         waste_pct = mat.get("waste_pct")
         material_id = mat.get("id") or mat.get("item_code")
 
-        labor = calculate_labor(
-            material_type=material_type,
-            installed_qty=installed_qty,
-            waste_pct=waste_pct,
-        )
-        if labor:
-            labor["material_id"] = material_id
-            results.append(labor)
+        entry = _find_labor_entry(material_type, catalog)
+        if not entry:
+            continue
+
+        if waste_pct is None:
+            waste_pct = WASTE_FACTORS.get(material_type, 0)
+
+        rule = _get_labor_qty_rule(material_type)
+        if rule == "with_waste":
+            labor_qty = installed_qty * (1 + waste_pct)
+        elif rule == "no_waste":
+            labor_qty = installed_qty
+        else:
+            labor_qty = installed_qty * (1 + waste_pct)
+
+        rate = entry["cost"]
+        extended_cost = labor_qty * rate
+
+        results.append({
+            "labor_description": f"{entry['labor_type']} - {entry['description']}",
+            "qty": round(labor_qty, 2),
+            "unit": entry["unit"],
+            "rate": rate,
+            "extended_cost": round(extended_cost, 2),
+            "material_id": material_id,
+        })
 
     return results
 
 
 def get_labor_catalog() -> list[dict]:
-    """Return the currently loaded labor catalog."""
-    return _labor_catalog
+    """Return the labor catalog from the database."""
+    return get_labor_catalog_entries()

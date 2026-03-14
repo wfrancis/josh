@@ -95,6 +95,23 @@ export const api = {
   // Search
   search: (q) => request('/search?q=' + encodeURIComponent(q)),
 
+  // Company Rates
+  getCompanyRates: () => request('/company-rates'),
+  getCompanyRate: (type) => request('/company-rates/' + type),
+  updateCompanyRate: (type, data) => request('/company-rates/' + type, { method: 'PUT', body: JSON.stringify({ data }) }),
+
+  // Price List
+  getPriceList: () => request('/price-list'),
+  addPriceListEntry: (entry) => request('/price-list', { method: 'POST', body: JSON.stringify(entry) }),
+  updatePriceListEntry: (id, entry) => request('/price-list/' + id, { method: 'PUT', body: JSON.stringify(entry) }),
+  deletePriceListEntry: (id) => request('/price-list/' + id, { method: 'DELETE' }),
+  uploadPriceList: (file) => {
+    const form = new FormData();
+    form.append('file', file);
+    return fetch(`${BASE}/price-list/upload`, { method: 'POST', body: form })
+      .then(r => { if (!r.ok) throw new Error('Upload failed'); return r.json(); });
+  },
+
   // Settings
   getSettings: () => request('/settings'),
   updateSettings: (data) => request('/settings', { method: 'POST', body: JSON.stringify(data) }),
