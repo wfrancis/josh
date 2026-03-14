@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from models import (
     init_db, save_job, load_job, list_jobs, delete_job,
     save_materials, save_sundries, save_labor, save_bundles,
+    save_quotes, delete_quotes, search_all,
     get_settings, save_settings,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
@@ -174,6 +175,27 @@ def api_update_notes(job_id: str, body: NotesUpdate):
     return {"message": "Notes saved"}
 
 
+class JobUpdate(BaseModel):
+    markup_pct: Optional[float] = None
+    project_name: Optional[str] = None
+    gc_name: Optional[str] = None
+    tax_rate: Optional[float] = None
+    unit_count: Optional[int] = None
+    salesperson: Optional[str] = None
+
+@app.put("/api/jobs/{job_id}")
+def api_update_job(job_id: str, body: JobUpdate):
+    """Update job fields."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    updates = body.model_dump(exclude_none=True)
+    for key, val in updates.items():
+        job[key] = val
+    save_job(job)
+    return {"message": "Job updated"}
+
+
 @app.post("/api/jobs/{job_id}/upload-rfms")
 async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile] = File(default=None)):
     """Upload one or more RFMS pivot tables, parse them, return merged materials."""
@@ -282,27 +304,92 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
     return {"job_info": rfms_job_info, "materials": materials}
 
 
+def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
+    """Try to match parsed quote products to existing materials by item_code."""
+    job = load_job(job_id)
+    if not job:
+        return 0
+    materials = job.get("materials", [])
+    if not materials:
+        return 0
+
+    matched = 0
+    updated = False
+    for mat in materials:
+        if mat.get("unit_price", 0) > 0:
+            continue  # Already priced, don't overwrite
+        item_code = (mat.get("item_code") or "").strip().lower()
+        description = (mat.get("description") or "").strip().lower()
+        if not item_code and not description:
+            continue
+
+        for prod in products:
+            if prod.get("error") or not prod.get("unit_price"):
+                continue
+            prod_name = (prod.get("product_name") or "").strip().lower()
+            prod_desc = (prod.get("description") or "").strip().lower()
+
+            # Match if item_code appears in product name/description
+            match = False
+            if item_code and len(item_code) >= 3:
+                if item_code in prod_name or item_code in prod_desc:
+                    match = True
+
+            if match:
+                mat["unit_price"] = prod["unit_price"]
+                mat["vendor"] = prod.get("vendor", "")
+                order_qty = mat.get("order_qty", 0)
+                mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
+                matched += 1
+                updated = True
+                break
+
+    if updated:
+        save_materials(job_id, materials)
+
+    return matched
+
+
 @app.post("/api/jobs/{job_id}/upload-quotes")
 async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     """Upload vendor quote files, parse them, return pricing."""
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    db_id = job["id"]
 
     all_products = []
     for upload in files:
-        file_path = os.path.join(UPLOAD_DIR, f"quote_{job['id']}_{upload.filename}")
+        file_path = os.path.join(UPLOAD_DIR, f"quote_{db_id}_{upload.filename}")
         with open(file_path, "wb") as f:
             content = await upload.read()
             f.write(content)
 
         try:
             products = parse_quote_file(file_path)
+            for p in products:
+                p["file_name"] = upload.filename
             all_products.extend(products)
         except Exception as e:
             all_products.append({"error": str(e), "file": upload.filename})
 
-    return {"products": all_products}
+    # Persist quotes to DB
+    save_quotes(db_id, all_products)
+
+    # Auto-match prices to materials
+    auto_matched = _auto_match_quotes(db_id, all_products)
+
+    return {"products": all_products, "auto_matched": auto_matched}
+
+
+@app.delete("/api/jobs/{job_id}/quotes")
+def api_clear_quotes(job_id: str):
+    """Clear all parsed quotes for a job."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    delete_quotes(job["id"])
+    return {"message": "Quotes cleared"}
 
 
 @app.post("/api/jobs/{job_id}/calculate")
@@ -392,6 +479,7 @@ def api_generate_bid(job_id: str):
         "tax_rate": job.get("tax_rate", 0),
         "unit_count": job.get("unit_count", 0),
         "salesperson": job.get("salesperson"),
+        "markup_pct": job.get("markup_pct", 0),
     }
 
     # Parse job-specific exclusions (stored as JSON string)
@@ -530,6 +618,14 @@ def api_get_labor_catalog():
     """Get the currently loaded labor catalog entries."""
     catalog = get_labor_catalog()
     return {"entries": catalog, "count": len(catalog)}
+
+
+@app.get("/api/search")
+def api_search(q: str = ""):
+    """Global search across jobs and materials."""
+    if not q or len(q) < 2:
+        return {"jobs": [], "materials": []}
+    return search_all(q)
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────

@@ -424,7 +424,19 @@ export default function JobDetail() {
               <p className="text-sm text-gray-500 mb-6">
                 Upload vendor quote PDFs. Pricing will be extracted automatically.
               </p>
-              <QuoteUpload jobId={jobId} api={api} />
+              <QuoteUpload
+                jobId={jobId}
+                api={api}
+                existingQuotes={job.quotes}
+                onQuotesParsed={async () => {
+                  const updated = await api.getJob(jobId)
+                  setJob(updated)
+                }}
+                onQuotesCleared={async () => {
+                  const updated = await api.getJob(jobId)
+                  setJob(updated)
+                }}
+              />
             </div>
 
             {job.materials?.length > 0 && (

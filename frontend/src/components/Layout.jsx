@@ -1,6 +1,7 @@
-import { useState } from 'react'
-import { Link, useLocation } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search } from 'lucide-react'
+import { api } from '../api'
 
 function NavItem({ to, icon: Icon, label, active, onClick }) {
   return (
@@ -20,6 +21,36 @@ function NavItem({ to, icon: Icon, label, active, onClick }) {
 }
 
 function SidebarContent({ location, onNavigate }) {
+  const navigate = useNavigate()
+  const [searchQuery, setSearchQuery] = useState('')
+  const [results, setResults] = useState(null)
+  const searchRef = useRef(null)
+
+  useEffect(() => {
+    if (!searchQuery || searchQuery.length < 2) { setResults(null); return }
+    const timer = setTimeout(async () => {
+      try {
+        const data = await api.search(searchQuery)
+        setResults(data)
+      } catch { setResults(null) }
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [searchQuery])
+
+  useEffect(() => {
+    function handleKey(e) {
+      if (e.key === 'Escape') { setSearchQuery(''); setResults(null) }
+    }
+    function handleClickOutside(e) {
+      if (searchRef.current && !searchRef.current.contains(e.target)) {
+        setResults(null)
+      }
+    }
+    document.addEventListener('keydown', handleKey)
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => { document.removeEventListener('keydown', handleKey); document.removeEventListener('mousedown', handleClickOutside) }
+  }, [])
+
   return (
     <>
       {/* Logo */}
@@ -35,6 +66,54 @@ function SidebarContent({ location, onNavigate }) {
             <span className="text-[10px] font-semibold tracking-[0.15em] text-gray-500 uppercase">Bid Tool</span>
           </div>
         </Link>
+      </div>
+
+      {/* Search */}
+      <div className="px-3 mb-4" ref={searchRef}>
+        <div className="relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-600" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search..."
+            className="w-full pl-9 pr-3 py-2 text-sm bg-white/[0.04] border border-white/[0.06] rounded-xl
+                       text-gray-300 placeholder-gray-600 focus:outline-none focus:border-white/[0.12]
+                       focus:bg-white/[0.06] transition-colors"
+          />
+        </div>
+        {results && (results.jobs?.length > 0 || results.materials?.length > 0) && (
+          <div className="mt-2 max-h-64 overflow-y-auto bg-[#0d1429] border border-white/[0.08] rounded-xl shadow-2xl">
+            {results.jobs?.length > 0 && (
+              <div>
+                <div className="px-3 pt-2 pb-1 text-[10px] font-bold text-gray-600 uppercase tracking-[0.15em]">Jobs</div>
+                {results.jobs.map((job) => (
+                  <button key={job.id} onClick={() => { navigate(`/jobs/${job.slug || job.id}`); setSearchQuery(''); setResults(null); onNavigate?.() }}
+                    className="w-full text-left px-3 py-2 hover:bg-white/[0.06] transition-colors">
+                    <div className="text-sm text-gray-200 truncate">{job.project_name}</div>
+                    {job.gc_name && <div className="text-xs text-gray-500">{job.gc_name}</div>}
+                  </button>
+                ))}
+              </div>
+            )}
+            {results.materials?.length > 0 && (
+              <div>
+                <div className="px-3 pt-2 pb-1 text-[10px] font-bold text-gray-600 uppercase tracking-[0.15em]">Materials</div>
+                {results.materials.map((group, i) => (
+                  <div key={i}>
+                    <div className="px-3 pt-1.5 pb-0.5 text-[10px] text-gray-500 truncate">{group.project_name}</div>
+                    {group.matches?.slice(0, 3).map((m, j) => (
+                      <button key={j} onClick={() => { navigate(`/jobs/${group.slug || group.job_id}`); setSearchQuery(''); setResults(null); onNavigate?.() }}
+                        className="w-full text-left px-3 py-1.5 hover:bg-white/[0.06] transition-colors">
+                        <div className="text-sm text-gray-200 truncate">{m.description || m.item_code}</div>
+                      </button>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Nav */}

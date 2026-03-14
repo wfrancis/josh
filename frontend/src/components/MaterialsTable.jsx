@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { Package, Trash2, Copy } from 'lucide-react'
+import { Package, Trash2, Search } from 'lucide-react'
 
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
@@ -149,6 +149,9 @@ function TypeDropdown({ currentType, confidence, onSelect, editable }) {
 
 export default function MaterialsTable({ materials, onUpdate, readOnly = false, editable = false }) {
   const [editingPriceId, setEditingPriceId] = useState(null)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [typeFilter, setTypeFilter] = useState('')
+  const [unpricedOnly, setUnpricedOnly] = useState(false)
 
   const updateMaterial = (idx, changes) => {
     const updated = materials.map((m, i) => {
@@ -182,19 +185,6 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
     updateMaterial(idx, { material_type: newType, ai_confidence: 1.0 })
   }
 
-  // Batch pricing: apply unit_price to all materials of the same type
-  const applyPriceToType = (materialType, unitPrice) => {
-    const updated = materials.map((m) => {
-      if (m.material_type !== materialType) return m
-      const orderQty = m.order_qty || 0
-      return {
-        ...m,
-        unit_price: unitPrice,
-        extended_cost: Math.round(orderQty * unitPrice * 100) / 100,
-      }
-    })
-    onUpdate?.(updated)
-  }
 
   if (!materials?.length) {
     return (
@@ -209,14 +199,70 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
   const showDeleteCol = editable
   const colCount = 6 + (showPriceCol ? 1 : 0) + (showDeleteCol ? 1 : 0)
 
-  // Count materials per type for batch pricing
-  const typeCounts = {}
-  materials.forEach(m => {
-    typeCounts[m.material_type] = (typeCounts[m.material_type] || 0) + 1
+
+
+  const displayMaterials = materials.map((m, i) => ({ ...m, _origIdx: i })).filter(m => {
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase()
+      const matches = (m.description || '').toLowerCase().includes(q) ||
+                      (m.item_code || '').toLowerCase().includes(q) ||
+                      (TYPE_LABELS[m.material_type] || m.material_type || '').toLowerCase().includes(q)
+      if (!matches) return false
+    }
+    if (typeFilter && m.material_type !== typeFilter) return false
+    if (unpricedOnly && (m.unit_price || 0) > 0) return false
+    return true
   })
+
+  const isFiltered = searchQuery || typeFilter || unpricedOnly
 
   return (
     <div className="overflow-x-auto">
+      {materials.length > 5 && (
+        <div className="flex items-center gap-3 mb-4 flex-wrap">
+          <div className="relative flex-1 min-w-[200px]">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-600" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Filter materials..."
+              className="w-full pl-9 pr-3 py-1.5 text-xs bg-white/[0.04] border border-white/[0.06] rounded-lg
+                         text-gray-300 placeholder-gray-600 focus:outline-none focus:border-white/[0.12] transition-colors"
+            />
+          </div>
+          <select
+            value={typeFilter}
+            onChange={(e) => setTypeFilter(e.target.value)}
+            className="text-xs bg-white/[0.04] border border-white/[0.06] rounded-lg px-2.5 py-1.5
+                       text-gray-300 focus:outline-none focus:border-white/[0.12] transition-colors"
+          >
+            <option value="">All Types</option>
+            {VALID_TYPES.map(t => (
+              <option key={t} value={t}>{TYPE_LABELS[t] || t}</option>
+            ))}
+          </select>
+          {showPriceCol && (
+            <label className="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer select-none whitespace-nowrap">
+              <input
+                type="checkbox"
+                checked={unpricedOnly}
+                onChange={(e) => setUnpricedOnly(e.target.checked)}
+                className="accent-si-bright w-3.5 h-3.5 rounded"
+              />
+              Unpriced only
+            </label>
+          )}
+          {(searchQuery || typeFilter || unpricedOnly) && (
+            <button
+              onClick={() => { setSearchQuery(''); setTypeFilter(''); setUnpricedOnly(false) }}
+              className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
+            >
+              Clear filters
+            </button>
+          )}
+        </div>
+      )}
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-white/[0.06]">
@@ -230,16 +276,15 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
           </tr>
         </thead>
         <tbody className="divide-y divide-white/[0.03]">
-          {materials.map((m, idx) => {
+          {displayMaterials.map((m) => {
             const hasPrice = m.unit_price > 0
-            const sameTypeCount = typeCounts[m.material_type] || 0
             return (
-              <tr key={m.id || idx} className="group hover:bg-white/[0.02] transition-colors">
+              <tr key={m.id || m._origIdx} className="group hover:bg-white/[0.02] transition-colors">
                 <td className="py-3 px-2 sm:px-3">
                   {editable ? (
                     <EditableCell
                       value={m.description || m.item_code || ''}
-                      onSave={(val) => updateMaterial(idx, { description: val })}
+                      onSave={(val) => updateMaterial(m._origIdx, { description: val })}
                       className="font-medium text-gray-200"
                     />
                   ) : (
@@ -253,7 +298,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   <TypeDropdown
                     currentType={m.material_type}
                     confidence={m.ai_confidence}
-                    onSelect={(t) => handleTypeChange(idx, t)}
+                    onSelect={(t) => handleTypeChange(m._origIdx, t)}
                     editable={editable}
                   />
                 </td>
@@ -262,7 +307,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     <EditableCell
                       value={m.installed_qty}
                       type="number"
-                      onSave={(val) => updateMaterial(idx, { installed_qty: val })}
+                      onSave={(val) => updateMaterial(m._origIdx, { installed_qty: val })}
                     />
                   ) : (
                     formatNumber(m.installed_qty)
@@ -274,7 +319,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     <EditableCell
                       value={((m.waste_pct || 0) * 100)}
                       type="number"
-                      onSave={(val) => updateMaterial(idx, { waste_pct: val / 100 })}
+                      onSave={(val) => updateMaterial(m._origIdx, { waste_pct: val / 100 })}
                     />
                   ) : (
                     ((m.waste_pct || 0) * 100).toFixed(0)
@@ -285,7 +330,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     <EditableCell
                       value={m.order_qty}
                       type="number"
-                      onSave={(val) => updateMaterial(idx, { order_qty: val })}
+                      onSave={(val) => updateMaterial(m._origIdx, { order_qty: val })}
                     />
                   ) : (
                     formatNumber(m.order_qty)
@@ -296,21 +341,11 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     <input
                       type="number" step="0.01" min="0"
                       value={m.unit_price || ''}
-                      onChange={(e) => handlePriceChange(idx, e.target.value)}
-                      onFocus={() => setEditingPriceId(idx)} onBlur={() => setEditingPriceId(null)}
+                      onChange={(e) => handlePriceChange(m._origIdx, e.target.value)}
+                      onFocus={() => setEditingPriceId(m._origIdx)} onBlur={() => setEditingPriceId(null)}
                       placeholder="0.00"
-                      className={`editable-cell w-24 ${!hasPrice && editingPriceId !== idx ? 'text-gray-600' : 'text-gray-100'}`}
+                      className={`editable-cell w-24 ${!hasPrice && editingPriceId !== m._origIdx ? 'text-gray-600' : 'text-gray-100'}`}
                     />
-                    {hasPrice && sameTypeCount > 1 && (
-                      <button
-                        onClick={() => applyPriceToType(m.material_type, m.unit_price)}
-                        className="flex items-center gap-1 text-[10px] text-gray-600 hover:text-si-bright mt-1 ml-auto transition-colors"
-                        title={`Apply $${m.unit_price} to all ${TYPE_LABELS[m.material_type] || m.material_type} materials`}
-                      >
-                        <Copy className="w-3 h-3" />
-                        Apply to {sameTypeCount} {TYPE_LABELS[m.material_type] || m.material_type}
-                      </button>
-                    )}
                   </td>
                 )}
                 <td className="py-3 px-2 sm:px-3 text-right tabular-nums font-medium">
@@ -323,7 +358,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                 {showDeleteCol && (
                   <td className="py-3 px-1 text-center">
                     <button
-                      onClick={() => deleteMaterial(idx)}
+                      onClick={() => deleteMaterial(m._origIdx)}
                       className="p-1.5 rounded-lg text-gray-700 opacity-0 group-hover:opacity-100
                                  hover:text-red-400 hover:bg-red-500/10 transition-all"
                       title="Remove material"
@@ -342,7 +377,12 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
               Material Total
             </td>
             <td className="py-3 px-2 sm:px-3 text-right tabular-nums font-bold text-white">
-              {formatCurrency(materials.reduce((sum, m) => sum + (m.extended_cost || 0), 0))}
+              {formatCurrency(displayMaterials.reduce((sum, m) => sum + (m.extended_cost || 0), 0))}
+              {isFiltered && (
+                <div className="text-[10px] text-gray-600 font-normal mt-0.5">
+                  of {formatCurrency(materials.reduce((sum, m) => sum + (m.extended_cost || 0), 0))} total
+                </div>
+              )}
             </td>
           </tr>
         </tfoot>

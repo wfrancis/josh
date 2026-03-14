@@ -1,8 +1,15 @@
 import { useState, useEffect } from 'react'
 import {
   Calculator, FileDown, Loader2, ChevronDown, ChevronRight,
-  Package, Wrench, HardHat, Truck, Ban, DollarSign, Plus, X, Save, RotateCcw
+  Package, Wrench, HardHat, Truck, Ban, DollarSign, Plus, X, Save, RotateCcw, AlertTriangle
 } from 'lucide-react'
+
+const VALID_TYPES = [
+  'unit_carpet_no_pattern', 'unit_carpet_pattern', 'unit_lvt', 'cpt_tile',
+  'corridor_broadloom', 'floor_tile', 'wall_tile', 'backsplash',
+  'tub_shower_surround', 'rubber_base', 'vct', 'rubber_tile',
+  'rubber_sheet', 'wood', 'tread_riser', 'transitions', 'waterproofing'
+]
 
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
@@ -167,12 +174,18 @@ export default function BidPreview({ job, api, onGoBack }) {
   const [calculating, setCalculating] = useState(false)
   const [bidData, setBidData] = useState(null)
   const [error, setError] = useState(null)
+  const [markup, setMarkup] = useState(job.markup_pct ? (job.markup_pct * 100) : 0)
+
+  const unknownMaterials = job.materials?.filter(m =>
+    !m.material_type || !VALID_TYPES.includes(m.material_type)
+  ) || []
 
   const hasMaterialPricing = job?.materials?.some(m => m.unit_price > 0)
 
   const handleCalculate = async () => {
     setCalculating(true); setError(null)
     try {
+      await api.updateJob(job.id, { markup_pct: markup / 100 })
       await api.calculate(job.id)
       const result = await api.generateBid(job.id)
       setBidData(result)
@@ -207,6 +220,31 @@ export default function BidPreview({ job, api, onGoBack }) {
           <p className="text-sm text-gray-500 mb-8 max-w-md mx-auto">
             This will calculate sundries, labor, and freight, then assemble your complete bid.
           </p>
+          {unknownMaterials.length > 0 && (
+            <div className="flex items-start gap-3 px-4 py-3 mb-4 bg-amber-500/10 border border-amber-500/20 rounded-xl text-sm text-amber-400 max-w-md mx-auto text-left">
+              <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              <div>
+                <span className="font-medium">{unknownMaterials.length} material{unknownMaterials.length !== 1 ? 's have' : ' has'} unknown types</span>
+                <span className="text-amber-500/80"> — sundries and labor may not calculate correctly for these items.</span>
+              </div>
+            </div>
+          )}
+          <div className="flex items-center gap-4 mb-4 justify-center">
+            <label className="text-sm text-gray-400 font-medium">Markup</label>
+            <div className="flex items-center gap-1">
+              <input
+                type="number"
+                step="0.5"
+                min="0"
+                max="100"
+                value={markup}
+                onChange={(e) => setMarkup(parseFloat(e.target.value) || 0)}
+                className="w-20 px-3 py-1.5 text-sm bg-white/[0.04] border border-white/[0.06] rounded-lg
+                           text-gray-200 text-right tabular-nums focus:outline-none focus:border-white/[0.12] transition-colors"
+              />
+              <span className="text-sm text-gray-500">%</span>
+            </div>
+          </div>
           <button onClick={handleCalculate} disabled={calculating}
                   className="btn-primary text-base px-8 py-3.5 glow-orange">
             {calculating ? (
@@ -252,6 +290,12 @@ export default function BidPreview({ job, api, onGoBack }) {
                 <span className="text-gray-500">Subtotal</span>
                 <span className="font-semibold text-gray-200 tabular-nums">{formatCurrency(bidData.subtotal)}</span>
               </div>
+              {bidData.markup_amount > 0 && (
+                <div className="flex justify-between text-sm">
+                  <span className="text-gray-400">Markup ({(bidData.markup_pct * 100).toFixed(1)}%)</span>
+                  <span className="text-gray-200 tabular-nums">{formatCurrency(bidData.markup_amount)}</span>
+                </div>
+              )}
               <div className="flex justify-between text-sm">
                 <span className="text-gray-500">Tax ({((bidData.tax_rate || 0) * 100).toFixed(1)}%)</span>
                 <span className="font-semibold text-gray-200 tabular-nums">{formatCurrency(bidData.tax_amount)}</span>

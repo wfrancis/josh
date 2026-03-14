@@ -101,6 +101,18 @@ def init_db() -> None:
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS job_quotes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                product_name TEXT,
+                vendor TEXT,
+                unit_price REAL DEFAULT 0,
+                unit TEXT,
+                description TEXT,
+                file_name TEXT,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -113,6 +125,7 @@ def init_db() -> None:
             ("slug", "ALTER TABLE jobs ADD COLUMN slug TEXT"),
             ("ai_confidence", "ALTER TABLE job_materials ADD COLUMN ai_confidence REAL"),
             ("exclusions", "ALTER TABLE jobs ADD COLUMN exclusions TEXT"),
+            ("markup_pct", "ALTER TABLE jobs ADD COLUMN markup_pct REAL DEFAULT 0"),
         ]:
             try:
                 conn.execute(sql)
@@ -157,7 +170,8 @@ def save_job(job_data: dict) -> int:
             conn.execute("""
                 UPDATE jobs SET
                     project_name=?, gc_name=?, address=?, city=?, state=?, zip=?,
-                    tax_rate=?, unit_count=?, salesperson=?, notes=?, slug=?, exclusions=?
+                    tax_rate=?, unit_count=?, salesperson=?, notes=?, slug=?, exclusions=?,
+                    markup_pct=?
                 WHERE id=?
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
@@ -165,21 +179,22 @@ def save_job(job_data: dict) -> int:
                 job_data.get("state"), job_data.get("zip"),
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
                 job_data.get("salesperson"), job_data.get("notes"), slug,
-                job_data.get("exclusions"), job_id
+                job_data.get("exclusions"), job_data.get("markup_pct", 0), job_id
             ))
         else:
             slug = _make_unique_slug(conn, slug)
             cur = conn.execute("""
                 INSERT INTO jobs (project_name, gc_name, address, city, state, zip,
-                                  tax_rate, unit_count, salesperson, notes, slug, exclusions, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  tax_rate, unit_count, salesperson, notes, slug, exclusions,
+                                  markup_pct, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
                 job_data.get("state"), job_data.get("zip"),
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
                 job_data.get("salesperson"), job_data.get("notes"), slug,
-                job_data.get("exclusions"),
+                job_data.get("exclusions"), job_data.get("markup_pct", 0),
                 datetime.now().isoformat()
             ))
             job_id = cur.lastrowid
@@ -276,6 +291,41 @@ def save_bundles(job_id: int, bundles: list[dict]) -> None:
         conn.close()
 
 
+def save_quotes(job_id: int, quotes: list[dict]) -> list[int]:
+    """Save parsed quote products for a job. Returns list of quote ids."""
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM job_quotes WHERE job_id=?", (job_id,))
+        ids = []
+        for q in quotes:
+            if q.get("error"):
+                continue  # Skip error entries
+            cur = conn.execute("""
+                INSERT INTO job_quotes
+                    (job_id, product_name, vendor, unit_price, unit, description, file_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                job_id, q.get("product_name"), q.get("vendor"),
+                q.get("unit_price", 0), q.get("unit"),
+                q.get("description"), q.get("file_name")
+            ))
+            ids.append(cur.lastrowid)
+        conn.commit()
+        return ids
+    finally:
+        conn.close()
+
+
+def delete_quotes(job_id: int) -> None:
+    """Delete all quotes for a job."""
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM job_quotes WHERE job_id=?", (job_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def delete_job(job_ref) -> bool:
     """Delete a job by ID or slug and all related data (cascading)."""
     conn = _get_conn()
@@ -319,6 +369,10 @@ def load_job(job_ref) -> Optional[dict]:
             dict(r) for r in
             conn.execute("SELECT * FROM job_bundles WHERE job_id=? ORDER BY id", (jid,)).fetchall()
         ]
+        job["quotes"] = [
+            dict(r) for r in
+            conn.execute("SELECT * FROM job_quotes WHERE job_id=? ORDER BY id", (jid,)).fetchall()
+        ]
         return job
     finally:
         conn.close()
@@ -345,6 +399,52 @@ def save_settings(settings: dict) -> None:
                 (key, str(value))
             )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def search_all(query: str) -> dict:
+    """Search jobs and materials by query string."""
+    conn = _get_conn()
+    try:
+        q = f"%{query}%"
+        jobs = [
+            dict(r) for r in
+            conn.execute(
+                """SELECT id, slug, project_name, gc_name, salesperson, city, state
+                   FROM jobs
+                   WHERE project_name LIKE ? OR gc_name LIKE ? OR salesperson LIKE ? OR city LIKE ?
+                   ORDER BY created_at DESC LIMIT 10""",
+                (q, q, q, q)
+            ).fetchall()
+        ]
+        mat_rows = conn.execute(
+            """SELECT m.job_id, m.item_code, m.description, m.material_type,
+                      j.project_name, j.slug
+               FROM job_materials m
+               JOIN jobs j ON m.job_id = j.id
+               WHERE m.description LIKE ? OR m.item_code LIKE ?
+               ORDER BY m.job_id DESC LIMIT 20""",
+            (q, q)
+        ).fetchall()
+        # Group materials by job
+        mat_by_job = {}
+        for r in mat_rows:
+            r = dict(r)
+            key = r["job_id"]
+            if key not in mat_by_job:
+                mat_by_job[key] = {
+                    "job_id": r["job_id"],
+                    "project_name": r["project_name"],
+                    "slug": r["slug"],
+                    "matches": []
+                }
+            mat_by_job[key]["matches"].append({
+                "item_code": r["item_code"],
+                "description": r["description"],
+                "material_type": r["material_type"],
+            })
+        return {"jobs": jobs, "materials": list(mat_by_job.values())}
     finally:
         conn.close()
 

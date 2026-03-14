@@ -79,6 +79,7 @@ def assemble_bid(
         }
     """
     tax_rate = job_info.get("tax_rate", 0)
+    markup_pct = job_info.get("markup_pct", 0) or 0
 
     # Index sundries and labor by material_id for fast lookup
     sundries_by_mat: dict[str, list[dict]] = {}
@@ -141,13 +142,17 @@ def assemble_bid(
         })
 
     subtotal = round(sum(b["total_price"] for b in bundles), 2)
-    tax_amount = round(subtotal * tax_rate, 2)
-    grand_total = round(subtotal + tax_amount, 2)
+    markup_amount = round(subtotal * markup_pct, 2) if markup_pct else 0
+    subtotal_with_markup = round(subtotal + markup_amount, 2)
+    tax_amount = round(subtotal_with_markup * tax_rate, 2)
+    grand_total = round(subtotal_with_markup + tax_amount, 2)
 
     return {
         "job_info": job_info,
         "bundles": bundles,
         "subtotal": subtotal,
+        "markup_pct": markup_pct,
+        "markup_amount": markup_amount,
         "tax_rate": tax_rate,
         "tax_amount": tax_amount,
         "grand_total": grand_total,

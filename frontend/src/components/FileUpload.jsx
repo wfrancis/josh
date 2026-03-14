@@ -53,9 +53,28 @@ export default function FileUpload({
         <input ref={inputRef} type="file" accept={accept} multiple={multiple}
                onChange={handleChange} className="hidden" />
         {loading ? (
-          <div className="flex flex-col items-center gap-3">
-            <Loader2 className="w-10 h-10 text-si-bright animate-spin" />
-            <p className="text-sm text-gray-400">Processing...</p>
+          <div className="flex flex-col items-center py-4">
+            <div className="relative w-16 h-16 mx-auto mb-5">
+              <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-si-bright/20 to-blue-500/20 animate-pulse" />
+              <div className="relative w-full h-full rounded-2xl bg-white/[0.04] flex items-center justify-center border border-white/[0.08]"
+                   style={{ animation: 'pulse-glow 2s ease-in-out infinite' }}>
+                <svg className="w-8 h-8 text-si-bright" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                  <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z" />
+                </svg>
+              </div>
+            </div>
+            <p className="text-sm font-medium text-white mb-1">AI is analyzing your files</p>
+            <div className="flex items-center justify-center gap-1 mb-4">
+              <span className="text-xs text-gray-500">Processing</span>
+              <span className="flex gap-0.5 ml-1">
+                <span className="ai-dot w-1 h-1 rounded-full bg-si-bright inline-block" />
+                <span className="ai-dot w-1 h-1 rounded-full bg-si-bright inline-block" />
+                <span className="ai-dot w-1 h-1 rounded-full bg-si-bright inline-block" />
+              </span>
+            </div>
+            <div className="w-48 h-1 mx-auto rounded-full overflow-hidden bg-white/[0.06]">
+              <div className="ai-thinking-bar h-full rounded-full" />
+            </div>
           </div>
         ) : (
           <>

@@ -85,6 +85,15 @@ export const api = {
       .then(r => { if (!r.ok) throw new Error('Upload failed'); return r.json(); });
   },
 
+  // Quotes
+  clearQuotes: (jobId) => request('/jobs/' + jobId + '/quotes', { method: 'DELETE' }),
+
+  // Jobs (update)
+  updateJob: (jobId, data) => request('/jobs/' + jobId, { method: 'PUT', body: JSON.stringify(data) }),
+
+  // Search
+  search: (q) => request('/search?q=' + encodeURIComponent(q)),
+
   // Settings
   getSettings: () => request('/settings'),
   updateSettings: (data) => request('/settings', { method: 'POST', body: JSON.stringify(data) }),
