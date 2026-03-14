@@ -1,11 +1,17 @@
-import { useState, useRef, useEffect } from 'react'
-import { Package, Trash2, Search } from 'lucide-react'
+import { useState, useRef, useEffect, useMemo } from 'react'
+import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle } from 'lucide-react'
 
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
 }
 function formatNumber(val, decimals = 2) {
   return (val || 0).toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
+}
+function formatCompact(val) {
+  if (!val) return '$0'
+  if (val >= 1000000) return `$${(val / 1000000).toFixed(1)}M`
+  if (val >= 1000) return `$${(val / 1000).toFixed(0)}K`
+  return `$${val.toFixed(0)}`
 }
 
 const TYPE_LABELS = {
@@ -42,11 +48,14 @@ const VALID_TYPES = [
 function ConfidenceDot({ confidence }) {
   if (confidence == null) return null
   let colorClass = 'bg-red-400'
-  if (confidence >= 0.9) colorClass = 'bg-emerald-400'
-  else if (confidence >= 0.7) colorClass = 'bg-amber-400'
+  let sizeClass = 'w-2.5 h-2.5'
+  if (confidence >= 0.9) { colorClass = 'bg-emerald-400'; sizeClass = 'w-2 h-2' }
+  else if (confidence >= 0.7) { colorClass = 'bg-amber-400'; sizeClass = 'w-2 h-2' }
+  else if (confidence >= 0.5) { colorClass = 'bg-amber-400'; sizeClass = 'w-2.5 h-2.5' }
+  // Low confidence gets larger dot
   return (
     <span
-      className={`inline-block w-2 h-2 rounded-full ${colorClass} flex-shrink-0`}
+      className={`inline-block ${sizeClass} rounded-full ${colorClass} flex-shrink-0`}
       title={`AI confidence: ${(confidence * 100).toFixed(0)}%`}
     />
   )
@@ -147,11 +156,20 @@ function TypeDropdown({ currentType, confidence, onSelect, editable }) {
   )
 }
 
+function SortIcon({ col, sortCol, sortDir }) {
+  if (sortCol !== col) return <span className="inline-block w-3 ml-0.5" />
+  return sortDir === 'asc'
+    ? <ChevronUp className="inline-block w-3 h-3 ml-0.5 text-si-bright" />
+    : <ChevronDown className="inline-block w-3 h-3 ml-0.5 text-si-bright" />
+}
+
 export default function MaterialsTable({ materials, onUpdate, readOnly = false, editable = false }) {
   const [editingPriceId, setEditingPriceId] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [typeFilter, setTypeFilter] = useState('')
   const [unpricedOnly, setUnpricedOnly] = useState(false)
+  const [sortCol, setSortCol] = useState(null)
+  const [sortDir, setSortDir] = useState('desc')
 
   const updateMaterial = (idx, changes) => {
     const updated = materials.map((m, i) => {
@@ -201,7 +219,37 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
 
 
 
-  const displayMaterials = materials.map((m, i) => ({ ...m, _origIdx: i })).filter(m => {
+  // Toggle sort: click same col cycles desc→asc→off, new col starts desc
+  const toggleSort = (col) => {
+    if (sortCol === col) {
+      if (sortDir === 'desc') setSortDir('asc')
+      else { setSortCol(null); setSortDir('desc') }
+    } else {
+      setSortCol(col); setSortDir('desc')
+    }
+  }
+
+  // Completion stats
+  const pricedCount = materials.filter(m => (m.unit_price || 0) > 0).length
+  const totalCount = materials.length
+  const pricePct = totalCount > 0 ? pricedCount / totalCount : 0
+
+  // Low confidence count
+  const lowConfidenceCount = materials.filter(m => m.ai_confidence != null && m.ai_confidence < 0.7).length
+
+  // Type subtotals (from all materials, not filtered)
+  const typeSummary = useMemo(() => {
+    const map = {}
+    materials.forEach(m => {
+      const t = m.material_type || 'unknown'
+      if (!map[t]) map[t] = { type: t, total: 0, count: 0 }
+      map[t].total += (m.extended_cost || 0)
+      map[t].count += 1
+    })
+    return Object.values(map).filter(s => s.total > 0).sort((a, b) => b.total - a.total)
+  }, [materials])
+
+  const filteredMaterials = materials.map((m, i) => ({ ...m, _origIdx: i })).filter(m => {
     if (searchQuery) {
       const q = searchQuery.toLowerCase()
       const matches = (m.description || '').toLowerCase().includes(q) ||
@@ -213,6 +261,29 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
     if (unpricedOnly && (m.unit_price || 0) > 0) return false
     return true
   })
+
+  // Apply sorting
+  const displayMaterials = useMemo(() => {
+    if (!sortCol) return filteredMaterials
+    const sorted = [...filteredMaterials]
+    const getVal = (m) => {
+      switch (sortCol) {
+        case 'type': return TYPE_LABELS[m.material_type] || m.material_type || ''
+        case 'install_qty': return m.installed_qty || 0
+        case 'waste': return m.waste_pct || 0
+        case 'order_qty': return m.order_qty || 0
+        case 'unit_price': return m.unit_price || 0
+        case 'extended': return m.extended_cost || 0
+        default: return 0
+      }
+    }
+    sorted.sort((a, b) => {
+      const va = getVal(a), vb = getVal(b)
+      if (typeof va === 'string') return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va)
+      return sortDir === 'asc' ? va - vb : vb - va
+    })
+    return sorted
+  }, [filteredMaterials, sortCol, sortDir])
 
   const isFiltered = searchQuery || typeFilter || unpricedOnly
 
@@ -263,23 +334,76 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
           )}
         </div>
       )}
+      {/* Status bar: completion + confidence warnings */}
+      {materials.length > 0 && (showPriceCol || lowConfidenceCount > 0) && (
+        <div className="flex items-center gap-4 mb-3 flex-wrap text-xs">
+          {showPriceCol && (
+            <span className={`font-medium ${pricePct >= 1 ? 'text-emerald-400' : pricePct >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}>
+              {pricedCount}/{totalCount} priced
+            </span>
+          )}
+          {lowConfidenceCount > 0 && (
+            <span className="flex items-center gap-1 text-amber-400">
+              <AlertTriangle className="w-3.5 h-3.5" />
+              {lowConfidenceCount} material{lowConfidenceCount !== 1 ? 's' : ''} with low AI confidence
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Type subtotals summary bar */}
+      {typeSummary.length > 1 && (
+        <div className="flex items-center gap-1.5 mb-3 flex-wrap">
+          {typeSummary.map(s => {
+            const color = TYPE_COLORS[s.type] || 'bg-gray-500/10 text-gray-400 border-gray-500/10'
+            const isActive = typeFilter === s.type
+            return (
+              <button key={s.type}
+                onClick={() => setTypeFilter(isActive ? '' : s.type)}
+                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] border transition-colors
+                  ${isActive ? 'ring-1 ring-white/20 brightness-125' : 'hover:brightness-110'} ${color}`}
+              >
+                <span className="font-medium">{TYPE_LABELS[s.type] || s.type}</span>
+                <span className="opacity-60">{formatCompact(s.total)}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-white/[0.06]">
-            {['Material', 'Type', 'Install Qty', 'Waste', 'Order Qty',
-              ...(showPriceCol ? ['Unit Price'] : []), 'Extended',
-              ...(showDeleteCol ? [''] : [])].map((h, i) => (
-              <th key={h || `col-${i}`} className={`py-3 px-2 sm:px-3 font-bold text-gray-500 text-[10px] uppercase tracking-[0.12em]
-                ${h === 'Material' || h === 'Type' ? 'text-left' : 'text-right'}
-                ${h === '' ? 'w-10' : ''}`}>{h}</th>
+            {[
+              { label: 'Material', key: null, align: 'left' },
+              { label: 'Type', key: 'type', align: 'left' },
+              { label: 'Install Qty', key: 'install_qty', align: 'right' },
+              { label: 'Waste', key: 'waste', align: 'right' },
+              { label: 'Order Qty', key: 'order_qty', align: 'right' },
+              ...(showPriceCol ? [{ label: 'Unit Price', key: 'unit_price', align: 'right' }] : []),
+              { label: 'Extended', key: 'extended', align: 'right' },
+              ...(showDeleteCol ? [{ label: '', key: null, align: 'center' }] : []),
+            ].map((col, i) => (
+              <th key={col.label || `col-${i}`}
+                onClick={col.key ? () => toggleSort(col.key) : undefined}
+                className={`py-3 px-2 sm:px-3 font-bold text-gray-500 text-[10px] uppercase tracking-[0.12em]
+                  text-${col.align} ${col.label === '' ? 'w-10' : ''}
+                  ${col.key ? 'cursor-pointer hover:text-gray-300 select-none transition-colors' : ''}`}
+              >
+                {col.label}
+                {col.key && <SortIcon col={col.key} sortCol={sortCol} sortDir={sortDir} />}
+              </th>
             ))}
           </tr>
         </thead>
         <tbody className="divide-y divide-white/[0.03]">
           {displayMaterials.map((m) => {
             const hasPrice = m.unit_price > 0
+            const lowConf = m.ai_confidence != null && m.ai_confidence < 0.7
+            const veryLowConf = m.ai_confidence != null && m.ai_confidence < 0.5
+            const rowBg = veryLowConf ? 'bg-red-500/[0.06]' : lowConf ? 'bg-amber-500/[0.06]' : ''
             return (
-              <tr key={m.id || m._origIdx} className="group hover:bg-white/[0.02] transition-colors">
+              <tr key={m.id || m._origIdx} className={`group hover:bg-white/[0.02] transition-colors ${rowBg}`}>
                 <td className="py-3 px-2 sm:px-3">
                   {editable ? (
                     <EditableCell
