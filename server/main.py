@@ -21,6 +21,8 @@ from models import (
     save_quotes, delete_quotes, search_all,
     get_settings, save_settings,
     save_labor_catalog_entries, get_labor_catalog_entries,
+    update_labor_catalog_entry, delete_labor_catalog_entry,
+    clear_labor_catalog, clear_price_list,
     save_price_list_entries, add_price_list_entry, update_price_list_entry,
     delete_price_list_entry, get_price_list_entries,
     get_company_rate, save_company_rate, get_all_company_rates,
@@ -710,6 +712,29 @@ def api_get_labor_catalog():
     return {"entries": catalog, "count": len(catalog)}
 
 
+@app.put("/api/labor-catalog/{entry_id}")
+def api_update_labor_catalog_entry(entry_id: int, body: dict):
+    """Update a single labor catalog entry."""
+    if not update_labor_catalog_entry(entry_id, body):
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return {"message": "Entry updated"}
+
+
+@app.delete("/api/labor-catalog/{entry_id}")
+def api_delete_labor_catalog_entry(entry_id: int):
+    """Delete a single labor catalog entry."""
+    if not delete_labor_catalog_entry(entry_id):
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return {"message": "Entry deleted"}
+
+
+@app.delete("/api/labor-catalog")
+def api_clear_labor_catalog():
+    """Clear all labor catalog entries."""
+    clear_labor_catalog()
+    return {"message": "Labor catalog cleared"}
+
+
 @app.get("/api/search")
 def api_search(q: str = ""):
     """Global search across jobs and materials."""
@@ -814,6 +839,13 @@ def api_bulk_upload_price_list(body: PriceListBulkUpload):
     """Replace all price list entries (bulk upload)."""
     save_price_list_entries(body.entries)
     return {"message": "Price list updated", "count": len(body.entries)}
+
+
+@app.delete("/api/price-list")
+def api_clear_price_list():
+    """Clear all price list entries."""
+    clear_price_list()
+    return {"message": "Price list cleared"}
 
 
 @app.post("/api/price-list/upload")

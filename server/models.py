@@ -523,6 +523,56 @@ def get_labor_catalog_entries() -> list[dict]:
         conn.close()
 
 
+def update_labor_catalog_entry(entry_id: int, data: dict) -> bool:
+    """Update a single labor catalog entry."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute("""
+            UPDATE labor_catalog SET labor_type=?, description=?, cost=?, retail_display=?, unit=?, gpm_markup=?
+            WHERE id=?
+        """, (
+            data.get("labor_type", ""), data.get("description", ""),
+            data.get("cost", 0), data.get("retail_display", ""),
+            data.get("unit", ""), data.get("gpm_markup", 0),
+            entry_id
+        ))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_labor_catalog_entry(entry_id: int) -> bool:
+    """Delete a single labor catalog entry."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute("DELETE FROM labor_catalog WHERE id=?", (entry_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def clear_labor_catalog() -> None:
+    """Delete all labor catalog entries."""
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM labor_catalog")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_price_list() -> None:
+    """Delete all price list entries."""
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM price_list")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ── Price List ───────────────────────────────────────────────────────────────
 
 def save_price_list_entries(entries: list[dict]) -> None:

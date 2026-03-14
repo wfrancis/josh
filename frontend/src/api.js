@@ -85,6 +85,9 @@ export const api = {
     return fetch(`${BASE}/labor-catalog/upload`, { method: 'POST', body: form })
       .then(r => { if (!r.ok) throw new Error('Upload failed'); return r.json(); });
   },
+  updateLaborCatalogEntry: (id, data) => request('/labor-catalog/' + id, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteLaborCatalogEntry: (id) => request('/labor-catalog/' + id, { method: 'DELETE' }),
+  clearLaborCatalog: () => request('/labor-catalog', { method: 'DELETE' }),
 
   // Quotes
   clearQuotes: (jobId) => request('/jobs/' + jobId + '/quotes', { method: 'DELETE' }),
@@ -111,6 +114,7 @@ export const api = {
     return fetch(`${BASE}/price-list/upload`, { method: 'POST', body: form })
       .then(r => { if (!r.ok) throw new Error('Upload failed'); return r.json(); });
   },
+  clearPriceList: () => request('/price-list', { method: 'DELETE' }),
 
   // Settings
   getSettings: () => request('/settings'),

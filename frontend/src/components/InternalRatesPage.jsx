@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import {
   DollarSign, HardHat, FileSpreadsheet, ShoppingCart, Droplets,
   Wrench, Truck, Loader2, Check, AlertTriangle, Plus, Trash2,
-  ChevronDown, ChevronRight, Info, X
+  ChevronDown, ChevronRight, X
 } from 'lucide-react'
 import { api } from '../api'
 import FileUpload from './FileUpload'
@@ -35,6 +35,10 @@ export default function InternalRatesPage() {
   const [laborError, setLaborError] = useState(null)
   const [laborCatalog, setLaborCatalog] = useState(null)
   const [catalogLoading, setCatalogLoading] = useState(true)
+  const [editedLabor, setEditedLabor] = useState([])
+  const [laborDirty, setLaborDirty] = useState(false)
+  const [laborSaving, setLaborSaving] = useState(false)
+  const [laborSaveSuccess, setLaborSaveSuccess] = useState(false)
 
   // Price List
   const [priceListLoading, setPriceListLoading] = useState(false)
@@ -46,6 +50,10 @@ export default function InternalRatesPage() {
   const [newEntry, setNewEntry] = useState({ product_name: '', material_type: '', unit: '', unit_price: '', vendor: '' })
   const [addingEntry, setAddingEntry] = useState(false)
   const [deletingId, setDeletingId] = useState(null)
+  const [editedPriceList, setEditedPriceList] = useState([])
+  const [priceListDirty, setPriceListDirty] = useState(false)
+  const [priceListSaving, setPriceListSaving] = useState(false)
+  const [priceListSaveSuccess, setPriceListSaveSuccess] = useState(false)
 
   // Waste Factors
   const [wasteFactors, setWasteFactors] = useState(null)
@@ -59,6 +67,10 @@ export default function InternalRatesPage() {
   const [sundryRules, setSundryRules] = useState(null)
   const [sundryLoading, setSundryLoading] = useState(true)
   const [expandedSundry, setExpandedSundry] = useState({})
+  const [editedSundry, setEditedSundry] = useState({})
+  const [sundrySaving, setSundrySaving] = useState(false)
+  const [sundrySaveSuccess, setSundrySaveSuccess] = useState(false)
+  const [sundryError, setSundryError] = useState(null)
 
   // Freight Rates
   const [freightRates, setFreightRates] = useState(null)
@@ -86,8 +98,8 @@ export default function InternalRatesPage() {
       .finally(() => setWasteLoading(false))
 
     api.getCompanyRate('sundry_rules')
-      .then(res => setSundryRules(res.data || {}))
-      .catch(() => setSundryRules({}))
+      .then(res => { setSundryRules(res.data || {}); setEditedSundry(res.data || {}) })
+      .catch(() => { setSundryRules({}); setEditedSundry({}) })
       .finally(() => setSundryLoading(false))
 
     api.getCompanyRate('freight_rates')
@@ -95,6 +107,107 @@ export default function InternalRatesPage() {
       .catch(() => { setFreightRates({}); setEditedFreight({}) })
       .finally(() => setFreightLoading(false))
   }, [])
+
+  // Sync edited state when data loads
+  useEffect(() => {
+    if (laborCatalog?.entries) setEditedLabor(laborCatalog.entries.map(e => ({ ...e })))
+  }, [laborCatalog])
+
+  useEffect(() => {
+    if (priceList?.entries) setEditedPriceList(priceList.entries.map(e => ({ ...e })))
+  }, [priceList])
+
+  // Labor edit handlers
+  const updateLaborEntry = (index, field, value) => {
+    setEditedLabor(prev => {
+      const updated = [...prev]
+      updated[index] = { ...updated[index], [field]: value }
+      return updated
+    })
+    setLaborDirty(true)
+  }
+
+  const handleLaborSaveAll = async () => {
+    setLaborSaving(true)
+    setLaborError(null)
+    try {
+      for (const entry of editedLabor) {
+        if (entry.id) await api.updateLaborCatalogEntry(entry.id, entry)
+      }
+      const data = await api.getLaborCatalog()
+      setLaborCatalog(data)
+      setLaborDirty(false)
+      setLaborSaveSuccess(true)
+      setTimeout(() => setLaborSaveSuccess(false), 3000)
+    } catch (err) {
+      setLaborError(err.message)
+    } finally {
+      setLaborSaving(false)
+    }
+  }
+
+  const handleDeleteLaborEntry = async (id) => {
+    try {
+      await api.deleteLaborCatalogEntry(id)
+      const data = await api.getLaborCatalog()
+      setLaborCatalog(data)
+    } catch (err) {
+      setLaborError(err.message)
+    }
+  }
+
+  const handleClearLabor = async () => {
+    if (!confirm('Clear all labor catalog entries? This cannot be undone.')) return
+    try {
+      await api.clearLaborCatalog()
+      setLaborCatalog({ entries: [], count: 0 })
+      setEditedLabor([])
+      setLaborDirty(false)
+    } catch (err) {
+      setLaborError(err.message)
+    }
+  }
+
+  // Price list edit handlers
+  const updatePriceListEntry = (index, field, value) => {
+    setEditedPriceList(prev => {
+      const updated = [...prev]
+      updated[index] = { ...updated[index], [field]: value }
+      return updated
+    })
+    setPriceListDirty(true)
+  }
+
+  const handlePriceListSaveAll = async () => {
+    setPriceListSaving(true)
+    setPriceListError(null)
+    try {
+      for (const entry of editedPriceList) {
+        if (entry.id) await api.updatePriceListEntry(entry.id, entry)
+      }
+      const data = await api.getPriceList()
+      setPriceList(data)
+      setPriceListDirty(false)
+      setPriceListSaveSuccess(true)
+      setTimeout(() => setPriceListSaveSuccess(false), 3000)
+    } catch (err) {
+      setPriceListError(err.message)
+    } finally {
+      setPriceListSaving(false)
+    }
+  }
+
+  const handleClearPriceList = async () => {
+    if (!confirm('Clear all price list entries? This cannot be undone.')) return
+    try {
+      await api.clearPriceList()
+      setPriceList({ entries: [], count: 0 })
+      setEditedPriceList([])
+      setPriceListDirty(false)
+    } catch (err) {
+      setPriceListError(err.message)
+    }
+  }
 
   // Handlers — Labor
   const handleLaborUpload = async (file) => {
@@ -194,10 +307,51 @@ export default function InternalRatesPage() {
     }
   }
 
+  // Handlers — Sundry Rules
+  const handleSundrySave = async () => {
+    setSundrySaving(true)
+    setSundryError(null)
+    setSundrySaveSuccess(false)
+    try {
+      await api.updateCompanyRate('sundry_rules', editedSundry)
+      setSundryRules(editedSundry)
+      setSundrySaveSuccess(true)
+      setTimeout(() => setSundrySaveSuccess(false), 3000)
+    } catch (err) {
+      setSundryError(err.message)
+    } finally {
+      setSundrySaving(false)
+    }
+  }
+
+  const updateSundryItem = (typeKey, index, field, value) => {
+    setEditedSundry(prev => {
+      const items = [...(prev[typeKey] || [])]
+      items[index] = { ...items[index], [field]: value }
+      return { ...prev, [typeKey]: items }
+    })
+  }
+
+  const addSundryItem = (typeKey) => {
+    setEditedSundry(prev => {
+      const items = [...(prev[typeKey] || []), { sundry_name: '', coverage: 0, unit: '', unit_price: 0 }]
+      return { ...prev, [typeKey]: items }
+    })
+  }
+
+  const removeSundryItem = (typeKey, index) => {
+    setEditedSundry(prev => {
+      const items = [...(prev[typeKey] || [])]
+      items.splice(index, 1)
+      return { ...prev, [typeKey]: items }
+    })
+  }
+
   const toggleSundrySection = (key) => {
     setExpandedSundry(prev => ({ ...prev, [key]: !prev[key] }))
   }
 
+  const sundryHasChanges = JSON.stringify(sundryRules) !== JSON.stringify(editedSundry)
   const wasteHasChanges = JSON.stringify(wasteFactors) !== JSON.stringify(editedWaste)
   const freightHasChanges = JSON.stringify(freightRates) !== JSON.stringify(editedFreight)
 
@@ -250,13 +404,23 @@ export default function InternalRatesPage() {
             </div>
           ) : laborCatalog && laborCatalog.count > 0 ? (
             <div className="mt-4">
-              <div className="flex items-center gap-2 mb-3">
-                <span className="text-xs font-bold text-gray-500 uppercase tracking-[0.12em]">
-                  Loaded Rates
-                </span>
-                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-400">
-                  {laborCatalog.count} entries
-                </span>
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold text-gray-500 uppercase tracking-[0.12em]">
+                    Loaded Rates
+                  </span>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-400">
+                    {laborCatalog.count} entries
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleClearLabor}
+                    className="btn-ghost text-xs px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-500/10 flex items-center gap-1.5"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" /> Clear All
+                  </button>
+                </div>
               </div>
               <div className="overflow-x-auto max-h-64 overflow-y-auto rounded-xl border border-white/[0.06]">
                 <table className="w-full text-xs">
@@ -266,25 +430,65 @@ export default function InternalRatesPage() {
                       <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Description</th>
                       <th className="py-2 px-3 text-right font-bold text-gray-500 uppercase tracking-wider">Cost</th>
                       <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Unit</th>
-                      <th className="py-2 px-3 text-right font-bold text-gray-500 uppercase tracking-wider">Markup</th>
+                      <th className="py-2 px-3 text-right font-bold text-gray-500 uppercase tracking-wider">Markup %</th>
+                      <th className="py-2 px-3 w-10"></th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/[0.03]">
-                    {laborCatalog.entries.map((entry, i) => (
-                      <tr key={i} className="hover:bg-white/[0.02] transition-colors">
-                        <td className="py-2 px-3 text-gray-300 font-medium">{entry.labor_type}</td>
-                        <td className="py-2 px-3 text-gray-400">{entry.description}</td>
-                        <td className="py-2 px-3 text-right tabular-nums text-gray-300">
-                          ${(entry.cost || 0).toFixed(2)}
+                    {editedLabor.map((entry, i) => (
+                      <tr key={entry.id || i} className="hover:bg-white/[0.02] transition-colors group">
+                        <td className="py-2 px-3 text-gray-300 font-medium">
+                          <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-300 font-medium cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                            value={entry.labor_type || ''}
+                            onChange={e => updateLaborEntry(i, 'labor_type', e.target.value)} />
                         </td>
-                        <td className="py-2 px-3 text-gray-500">{entry.unit}</td>
+                        <td className="py-2 px-3 text-gray-400">
+                          <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-400 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                            value={entry.description || ''}
+                            onChange={e => updateLaborEntry(i, 'description', e.target.value)} />
+                        </td>
+                        <td className="py-2 px-3 text-right tabular-nums text-gray-300">
+                          <input type="number" step="0.01" min="0" className="bg-transparent border-0 outline-none w-full text-xs text-right tabular-nums text-gray-300 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                            value={entry.cost ?? ''}
+                            onChange={e => updateLaborEntry(i, 'cost', e.target.value === '' ? 0 : parseFloat(e.target.value))} />
+                        </td>
+                        <td className="py-2 px-3 text-gray-500">
+                          <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-500 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                            value={entry.unit || ''}
+                            onChange={e => updateLaborEntry(i, 'unit', e.target.value)} />
+                        </td>
                         <td className="py-2 px-3 text-right tabular-nums text-gray-500">
-                          {entry.gpm_markup ? `${(entry.gpm_markup * 100).toFixed(0)}%` : '\u2014'}
+                          <input type="number" step="1" min="0" max="100" className="bg-transparent border-0 outline-none w-full text-xs text-right tabular-nums text-gray-500 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                            value={entry.gpm_markup != null ? Math.round(entry.gpm_markup * 100) : ''}
+                            onChange={e => updateLaborEntry(i, 'gpm_markup', e.target.value === '' ? 0 : parseFloat(e.target.value) / 100)} />
+                        </td>
+                        <td className="py-2 px-1">
+                          <button
+                            onClick={() => handleDeleteLaborEntry(entry.id)}
+                            className="p-1 rounded hover:bg-red-500/10 text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
                         </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
+              </div>
+              <div className="flex items-center gap-3 mt-3">
+                <button
+                  onClick={handleLaborSaveAll}
+                  disabled={laborSaving || !laborDirty}
+                  className="btn-primary text-xs"
+                >
+                  {laborSaving ? (
+                    <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Saving...</>
+                  ) : laborSaveSuccess ? (
+                    <><Check className="w-3.5 h-3.5" /> Saved</>
+                  ) : (
+                    'Save Changes'
+                  )}
+                </button>
               </div>
             </div>
           ) : !catalogLoading && (
@@ -345,13 +549,23 @@ export default function InternalRatesPage() {
                     </span>
                   )}
                 </div>
-                <button
-                  onClick={() => setShowAddRow(!showAddRow)}
-                  className="btn-ghost text-xs px-3 py-1.5 flex items-center gap-1.5"
-                >
-                  {showAddRow ? <X className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
-                  {showAddRow ? 'Cancel' : 'Add Entry'}
-                </button>
+                <div className="flex items-center gap-2">
+                  {priceList && priceList.count > 0 && (
+                    <button
+                      onClick={handleClearPriceList}
+                      className="btn-ghost text-xs px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-500/10 flex items-center gap-1.5"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Clear All
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setShowAddRow(!showAddRow)}
+                    className="btn-ghost text-xs px-3 py-1.5 flex items-center gap-1.5"
+                  >
+                    {showAddRow ? <X className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
+                    {showAddRow ? 'Cancel' : 'Add Entry'}
+                  </button>
+                </div>
               </div>
 
               {showAddRow && (
@@ -431,6 +645,7 @@ export default function InternalRatesPage() {
               )}
 
               {priceList && priceList.count > 0 ? (
+                <>
                 <div className="overflow-x-auto max-h-64 overflow-y-auto rounded-xl border border-white/[0.06]">
                   <table className="w-full text-xs">
                     <thead className="sticky top-0 bg-gray-900/95 backdrop-blur-sm">
@@ -444,15 +659,38 @@ export default function InternalRatesPage() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/[0.03]">
-                      {priceList.entries.map((entry) => (
-                        <tr key={entry.id} className="hover:bg-white/[0.02] transition-colors group">
-                          <td className="py-2 px-3 text-gray-300 font-medium">{entry.product_name}</td>
-                          <td className="py-2 px-3 text-gray-400">{TYPE_LABELS[entry.material_type] || entry.material_type || '\u2014'}</td>
-                          <td className="py-2 px-3 text-gray-500">{entry.unit || '\u2014'}</td>
-                          <td className="py-2 px-3 text-right tabular-nums text-gray-300">
-                            ${(entry.unit_price || 0).toFixed(2)}
+                      {editedPriceList.map((entry, i) => (
+                        <tr key={entry.id || i} className="hover:bg-white/[0.02] transition-colors group">
+                          <td className="py-2 px-3 text-gray-300 font-medium">
+                            <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-300 font-medium cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                              value={entry.product_name || ''}
+                              onChange={e => updatePriceListEntry(i, 'product_name', e.target.value)} />
                           </td>
-                          <td className="py-2 px-3 text-gray-500">{entry.vendor || '\u2014'}</td>
+                          <td className="py-2 px-3 text-gray-400">
+                            <select className="bg-transparent border-0 outline-none w-full text-xs text-gray-400 cursor-pointer focus:bg-white/[0.06] focus:rounded-md transition-colors appearance-none"
+                              value={entry.material_type || ''}
+                              onChange={e => updatePriceListEntry(i, 'material_type', e.target.value)}>
+                              <option value="">{TYPE_LABELS[entry.material_type] || entry.material_type || '\u2014'}</option>
+                              {MATERIAL_TYPES.map(t => (
+                                <option key={t} value={t}>{TYPE_LABELS[t]}</option>
+                              ))}
+                            </select>
+                          </td>
+                          <td className="py-2 px-3 text-gray-500">
+                            <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-500 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                              value={entry.unit || ''}
+                              onChange={e => updatePriceListEntry(i, 'unit', e.target.value)} />
+                          </td>
+                          <td className="py-2 px-3 text-right tabular-nums text-gray-300">
+                            <input type="number" step="0.01" min="0" className="bg-transparent border-0 outline-none w-full text-xs text-right tabular-nums text-gray-300 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                              value={entry.unit_price ?? ''}
+                              onChange={e => updatePriceListEntry(i, 'unit_price', e.target.value === '' ? 0 : parseFloat(e.target.value))} />
+                          </td>
+                          <td className="py-2 px-3 text-gray-500">
+                            <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-500 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                              value={entry.vendor || ''}
+                              onChange={e => updatePriceListEntry(i, 'vendor', e.target.value)} />
+                          </td>
                           <td className="py-2 px-1">
                             <button
                               onClick={() => handleDeleteEntry(entry.id)}
@@ -471,6 +709,22 @@ export default function InternalRatesPage() {
                     </tbody>
                   </table>
                 </div>
+                <div className="flex items-center gap-3 mt-3">
+                  <button
+                    onClick={handlePriceListSaveAll}
+                    disabled={priceListSaving || !priceListDirty}
+                    className="btn-primary text-xs"
+                  >
+                    {priceListSaving ? (
+                      <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Saving...</>
+                    ) : priceListSaveSuccess ? (
+                      <><Check className="w-3.5 h-3.5" /> Saved</>
+                    ) : (
+                      'Save Changes'
+                    )}
+                  </button>
+                </div>
+                </>
               ) : (
                 <div className="text-center py-6 bg-white/[0.02] rounded-xl border border-white/[0.04]">
                   <ShoppingCart className="w-8 h-8 text-gray-600 mx-auto mb-2 opacity-40" />
@@ -573,7 +827,7 @@ export default function InternalRatesPage() {
             <div>
               <h2 className="text-lg font-bold text-white">Sundry Rules</h2>
               <p className="text-sm text-gray-500 mt-1">
-                Auto-calculated sundry items (adhesive, seam sealer, transitions) per material type.
+                Sundry items (pad, adhesive, seam tape, transitions) auto-added per material type during bid calculation.
               </p>
             </div>
           </div>
@@ -582,73 +836,142 @@ export default function InternalRatesPage() {
             <div className="flex items-center justify-center py-8">
               <Loader2 className="w-5 h-5 text-gray-500 animate-spin" />
             </div>
-          ) : sundryRules && Object.keys(sundryRules).length > 0 ? (
-            <div className="space-y-2">
-              {Object.entries(sundryRules).map(([typeKey, items]) => {
-                const isExpanded = expandedSundry[typeKey]
-                const label = TYPE_LABELS[typeKey] || typeKey
-                const itemList = Array.isArray(items) ? items : []
-                return (
-                  <div key={typeKey} className="border border-white/[0.06] rounded-xl overflow-hidden">
-                    <button
-                      onClick={() => toggleSundrySection(typeKey)}
-                      className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/[0.02] transition-colors"
-                    >
-                      <div className="flex items-center gap-2">
-                        {isExpanded ? (
-                          <ChevronDown className="w-4 h-4 text-gray-500" />
-                        ) : (
-                          <ChevronRight className="w-4 h-4 text-gray-500" />
-                        )}
-                        <span className="text-sm font-medium text-gray-200">{label}</span>
-                      </div>
-                      <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-white/[0.06] text-gray-400">
-                        {itemList.length} {itemList.length === 1 ? 'item' : 'items'}
-                      </span>
-                    </button>
-                    {isExpanded && itemList.length > 0 && (
-                      <div className="border-t border-white/[0.06]">
-                        <table className="w-full text-xs">
-                          <thead>
-                            <tr className="border-b border-white/[0.04]">
-                              <th className="py-2 px-4 text-left font-bold text-gray-500 uppercase tracking-wider">Name</th>
-                              <th className="py-2 px-4 text-right font-bold text-gray-500 uppercase tracking-wider">Coverage</th>
-                              <th className="py-2 px-4 text-left font-bold text-gray-500 uppercase tracking-wider">Unit</th>
-                              <th className="py-2 px-4 text-right font-bold text-gray-500 uppercase tracking-wider">Unit Price</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-white/[0.03]">
-                            {itemList.map((item, i) => (
-                              <tr key={i} className="hover:bg-white/[0.02] transition-colors">
-                                <td className="py-2 px-4 text-gray-300 font-medium">{item.sundry_name || item.name || '\u2014'}</td>
-                                <td className="py-2 px-4 text-right tabular-nums text-gray-400">{item.coverage ?? '\u2014'}</td>
-                                <td className="py-2 px-4 text-gray-500">{item.unit || '\u2014'}</td>
-                                <td className="py-2 px-4 text-right tabular-nums text-gray-300">
-                                  {item.unit_price != null ? `$${Number(item.unit_price).toFixed(2)}` : '\u2014'}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-            </div>
+          ) : editedSundry && Object.keys(editedSundry).length > 0 ? (
+            <>
+              <div className="space-y-2">
+                {Object.entries(editedSundry).map(([typeKey, items]) => {
+                  const isExpanded = expandedSundry[typeKey]
+                  const label = TYPE_LABELS[typeKey] || typeKey
+                  const itemList = Array.isArray(items) ? items : []
+                  return (
+                    <div key={typeKey} className="border border-white/[0.06] rounded-xl overflow-hidden">
+                      <button
+                        onClick={() => toggleSundrySection(typeKey)}
+                        className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/[0.02] transition-colors"
+                      >
+                        <div className="flex items-center gap-2">
+                          {isExpanded ? (
+                            <ChevronDown className="w-4 h-4 text-gray-500" />
+                          ) : (
+                            <ChevronRight className="w-4 h-4 text-gray-500" />
+                          )}
+                          <span className="text-sm font-medium text-gray-200">{label}</span>
+                        </div>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-white/[0.06] text-gray-400">
+                          {itemList.length} {itemList.length === 1 ? 'item' : 'items'}
+                        </span>
+                      </button>
+                      {isExpanded && (
+                        <div className="border-t border-white/[0.06]">
+                          {itemList.length > 0 && (
+                            <table className="w-full text-xs">
+                              <thead>
+                                <tr className="border-b border-white/[0.04]">
+                                  <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Name</th>
+                                  <th className="py-2 px-3 text-right font-bold text-gray-500 uppercase tracking-wider w-24">Coverage</th>
+                                  <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider w-28">Unit</th>
+                                  <th className="py-2 px-3 text-right font-bold text-gray-500 uppercase tracking-wider w-28">Unit Price</th>
+                                  <th className="py-2 px-3 w-10"></th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-white/[0.03]">
+                                {itemList.map((item, i) => (
+                                  <tr key={i} className="hover:bg-white/[0.02] transition-colors group">
+                                    <td className="py-1.5 px-3">
+                                      <input
+                                        type="text"
+                                        className="input w-full text-xs"
+                                        value={item.sundry_name || ''}
+                                        onChange={e => updateSundryItem(typeKey, i, 'sundry_name', e.target.value)}
+                                      />
+                                    </td>
+                                    <td className="py-1.5 px-3">
+                                      <input
+                                        type="number"
+                                        step="1"
+                                        min="0"
+                                        className="input w-full text-xs text-right tabular-nums"
+                                        value={item.coverage ?? ''}
+                                        onChange={e => updateSundryItem(typeKey, i, 'coverage', e.target.value === '' ? 0 : parseFloat(e.target.value))}
+                                      />
+                                    </td>
+                                    <td className="py-1.5 px-3">
+                                      <input
+                                        type="text"
+                                        className="input w-full text-xs"
+                                        value={item.unit || ''}
+                                        onChange={e => updateSundryItem(typeKey, i, 'unit', e.target.value)}
+                                      />
+                                    </td>
+                                    <td className="py-1.5 px-3">
+                                      <div className="flex items-center gap-1">
+                                        <span className="text-gray-500 text-xs">$</span>
+                                        <input
+                                          type="number"
+                                          step="0.01"
+                                          min="0"
+                                          className="input w-full text-xs text-right tabular-nums"
+                                          value={item.unit_price ?? ''}
+                                          onChange={e => updateSundryItem(typeKey, i, 'unit_price', e.target.value === '' ? 0 : parseFloat(e.target.value))}
+                                        />
+                                      </div>
+                                    </td>
+                                    <td className="py-1.5 px-1">
+                                      <button
+                                        onClick={() => removeSundryItem(typeKey, i)}
+                                        className="p-1 rounded hover:bg-red-500/10 text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          )}
+                          <div className="px-3 py-2 border-t border-white/[0.04]">
+                            <button
+                              onClick={() => addSundryItem(typeKey)}
+                              className="btn-ghost text-[10px] px-2.5 py-1 flex items-center gap-1"
+                            >
+                              <Plus className="w-3 h-3" /> Add Sundry
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+
+              <div className="flex items-center gap-3 mt-4">
+                <button
+                  onClick={handleSundrySave}
+                  disabled={sundrySaving || !sundryHasChanges}
+                  className="btn-primary"
+                >
+                  {sundrySaving ? (
+                    <><Loader2 className="w-4 h-4 animate-spin" /> Saving...</>
+                  ) : sundrySaveSuccess ? (
+                    <><Check className="w-4 h-4" /> Saved</>
+                  ) : (
+                    'Save Sundry Rules'
+                  )}
+                </button>
+                {sundryError && (
+                  <span className="text-sm text-red-400 flex items-center gap-1.5">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    {sundryError}
+                  </span>
+                )}
+              </div>
+            </>
           ) : (
             <div className="text-center py-6 bg-white/[0.02] rounded-xl border border-white/[0.04]">
               <Wrench className="w-8 h-8 text-gray-600 mx-auto mb-2 opacity-40" />
               <p className="text-xs text-gray-500">No sundry rules configured</p>
             </div>
           )}
-
-          <div className="mt-4 flex items-start gap-2 px-4 py-3 bg-si-bright/[0.04] border border-si-bright/10 rounded-xl">
-            <Info className="w-4 h-4 text-si-bright flex-shrink-0 mt-0.5" />
-            <p className="text-xs text-gray-400 leading-relaxed">
-              Sundry rules are managed server-side. Contact support to modify sundry configurations.
-            </p>
-          </div>
         </div>
 
         {/* ── 5. Freight Rates ────────────────────────────── */}
