@@ -349,6 +349,36 @@ def save_quotes(job_id: int, quotes: list[dict]) -> list[int]:
         conn.close()
 
 
+def update_quote(quote_id: int, data: dict) -> bool:
+    """Update a single quote entry and return success."""
+    conn = _get_conn()
+    try:
+        fields = []
+        values = []
+        for key in ("product_name", "vendor", "unit_price", "unit", "description"):
+            if key in data:
+                fields.append(f"{key}=?")
+                values.append(data[key])
+        if not fields:
+            return False
+        values.append(quote_id)
+        conn.execute(f"UPDATE job_quotes SET {', '.join(fields)} WHERE id=?", values)
+        conn.commit()
+        return conn.total_changes > 0
+    finally:
+        conn.close()
+
+
+def get_quote_job_id(quote_id: int) -> int | None:
+    """Get the job_id for a quote entry."""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT job_id FROM job_quotes WHERE id=?", (quote_id,)).fetchone()
+        return row["job_id"] if row else None
+    finally:
+        conn.close()
+
+
 def delete_quotes(job_id: int) -> None:
     """Delete all quotes for a job."""
     conn = _get_conn()

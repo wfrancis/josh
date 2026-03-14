@@ -9,7 +9,6 @@ import { api } from '../api'
 import StepIndicator from './StepIndicator'
 
 import MaterialsTable from './MaterialsTable'
-import QuoteUpload from './QuoteUpload'
 import BidPreview from './BidPreview'
 import StatusBadge, { getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
@@ -379,28 +378,6 @@ export default function JobDetail() {
               )}
             </div>
 
-            {/* Vendor Quotes (optional, only shown after materials loaded) */}
-            {job.materials?.length > 0 && (
-              <div className="glass-card p-4 sm:p-8">
-                <h2 className="text-lg font-bold text-white mb-1">Vendor Quotes <span className="text-xs font-normal text-gray-500 ml-1">(optional)</span></h2>
-                <p className="text-sm text-gray-500 mb-6">
-                  Upload vendor quote PDFs to override internal pricing for specific items.
-                </p>
-                <QuoteUpload
-                  jobId={jobId}
-                  api={api}
-                  existingQuotes={job.quotes}
-                  onQuotesParsed={async () => {
-                    const updated = await api.getJob(jobId)
-                    setJob(updated)
-                  }}
-                  onQuotesCleared={async () => {
-                    const updated = await api.getJob(jobId)
-                    setJob(updated)
-                  }}
-                />
-              </div>
-            )}
 
             {/* Materials Table */}
             {job.materials?.length > 0 && (

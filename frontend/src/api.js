@@ -91,6 +91,7 @@ export const api = {
 
   // Quotes
   clearQuotes: (jobId) => request('/jobs/' + jobId + '/quotes', { method: 'DELETE' }),
+  updateQuote: (quoteId, data) => request('/quotes/' + quoteId, { method: 'PUT', body: JSON.stringify(data) }),
 
   // Jobs (update)
   updateJob: (jobId, data) => request('/jobs/' + jobId, { method: 'PUT', body: JSON.stringify(data) }),

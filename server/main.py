@@ -9,7 +9,7 @@ import shutil
 import tempfile
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from models import (
     init_db, save_job, load_job, list_jobs, delete_job,
     save_materials, save_sundries, save_labor, save_bundles,
-    save_quotes, delete_quotes, search_all,
+    save_quotes, delete_quotes, update_quote, get_quote_job_id, search_all,
     get_settings, save_settings,
     save_labor_catalog_entries, get_labor_catalog_entries,
     update_labor_catalog_entry, delete_labor_catalog_entry,
@@ -370,8 +370,6 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
     matched = 0
     updated = False
     for mat in materials:
-        if mat.get("unit_price", 0) > 0:
-            continue  # Already priced, don't overwrite
         item_code = (mat.get("item_code") or "").strip().lower()
         description = (mat.get("description") or "").strip().lower()
         if not item_code and not description:
@@ -444,6 +442,21 @@ def api_clear_quotes(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     delete_quotes(job["id"])
     return {"message": "Quotes cleared"}
+
+
+@app.put("/api/quotes/{quote_id}")
+def api_update_quote(quote_id: int, body: dict = Body(...)):
+    """Update a single quote entry and re-match against materials."""
+    job_id = get_quote_job_id(quote_id)
+    if not job_id:
+        raise HTTPException(status_code=404, detail="Quote not found")
+    update_quote(quote_id, body)
+    # Re-run auto-match so the updated price flows to materials
+    job = load_job(job_id)
+    if job:
+        quotes = job.get("quotes", [])
+        _auto_match_quotes(job_id, quotes)
+    return {"ok": True}
 
 
 @app.post("/api/jobs/{job_id}/calculate")

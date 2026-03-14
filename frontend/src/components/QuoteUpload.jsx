@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { FileText, Package, AlertTriangle, CheckCircle2, Trash2, Search } from 'lucide-react'
 import FileUpload from './FileUpload'
 import ConfirmDialog from './ConfirmDialog'
@@ -10,6 +10,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
   const [error, setError] = useState(null)
   const [confirmDialog, setConfirmDialog] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
+  const saveTimers = useRef({})
   const [vendorFilter, setVendorFilter] = useState('')
 
   // Populate from existing quotes on load
@@ -49,7 +50,31 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
     })
   }
 
-  const validProducts = products.filter(p => !p.error)
+  const updateProduct = (idx, field, value) => {
+    setProducts(prev => {
+      const updated = [...prev]
+      updated[idx] = { ...updated[idx], [field]: value }
+      const product = updated[idx]
+      // Debounced save to DB
+      if (product.id) {
+        clearTimeout(saveTimers.current[product.id])
+        saveTimers.current[product.id] = setTimeout(async () => {
+          try {
+            await api.updateQuote(product.id, { [field]: value })
+            // Refresh job to pick up re-matched materials
+            onQuotesParsed?.()
+          } catch (err) {
+            console.error('Failed to save quote:', err)
+          }
+        }, 600)
+      }
+      return updated
+    })
+  }
+
+  const validProducts = useMemo(() =>
+    products.map((p, idx) => ({ ...p, _idx: idx })).filter(p => !p.error),
+    [products])
   const vendors = useMemo(() => [...new Set(validProducts.map(p => p.vendor).filter(Boolean))].sort(), [validProducts])
   const filteredProducts = useMemo(() => {
     let filtered = validProducts
@@ -137,17 +162,26 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
           {/* Product list — cards on mobile, table on desktop */}
           {/* Mobile: card layout */}
           <div className="sm:hidden space-y-2 max-h-[400px] overflow-y-auto">
-            {filteredProducts.map((p, i) => (
-              <div key={i} className="flex items-center justify-between gap-3 p-3 bg-white/[0.03] border border-white/[0.04] rounded-lg">
+            {filteredProducts.map((p) => (
+              <div key={p._idx} className="flex items-center justify-between gap-3 p-3 bg-white/[0.03] border border-white/[0.04] rounded-lg">
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm text-gray-200 truncate">{p.product_name || p.description || 'Unknown product'}</div>
-                  {p.vendor && <div className="text-[11px] text-gray-500 mt-0.5">{p.vendor}</div>}
+                  <input type="text"
+                    className="bg-transparent border-0 outline-none w-full text-sm text-gray-200 cursor-text focus:bg-white/[0.06] focus:rounded-md transition-colors"
+                    value={p.product_name || p.description || ''}
+                    onChange={e => updateProduct(p._idx, 'product_name', e.target.value)} />
+                  <input type="text"
+                    className="bg-transparent border-0 outline-none w-full text-[11px] text-gray-500 mt-0.5 cursor-text focus:bg-white/[0.06] focus:rounded-md transition-colors"
+                    value={p.vendor || ''}
+                    onChange={e => updateProduct(p._idx, 'vendor', e.target.value)} />
                 </div>
-                {p.unit_price > 0 && (
-                  <div className="text-sm font-semibold text-si-bright tabular-nums whitespace-nowrap">
-                    ${(p.unit_price).toFixed(2)}<span className="text-gray-500 font-normal text-xs">/{p.unit || 'ea'}</span>
-                  </div>
-                )}
+                <div className="flex items-center gap-0.5 flex-shrink-0">
+                  <span className="text-sm font-semibold text-si-bright">$</span>
+                  <input type="number" step="0.01" min="0"
+                    className="bg-transparent border-0 outline-none w-16 text-sm font-semibold text-si-bright text-right tabular-nums cursor-text focus:bg-white/[0.06] focus:rounded-md transition-colors"
+                    value={p.unit_price ?? ''}
+                    onChange={e => updateProduct(p._idx, 'unit_price', e.target.value === '' ? 0 : parseFloat(e.target.value))} />
+                  <span className="text-gray-500 text-xs">/{p.unit || 'ea'}</span>
+                </div>
               </div>
             ))}
             {filteredProducts.length === 0 && (searchQuery || vendorFilter) && (
@@ -166,20 +200,29 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
                 </tr>
               </thead>
               <tbody>
-                {filteredProducts.map((p, i) => (
-                  <tr key={i} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
+                {filteredProducts.map((p) => (
+                  <tr key={p._idx} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
                     <td className="py-2 px-3">
-                      <div className="text-sm text-gray-200 truncate max-w-[400px]">
-                        {p.product_name || p.description || 'Unknown product'}
-                      </div>
+                      <input type="text"
+                        className="bg-transparent border-0 outline-none w-full text-sm text-gray-200 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                        value={p.product_name || p.description || ''}
+                        onChange={e => updateProduct(p._idx, 'product_name', e.target.value)} />
                     </td>
-                    <td className="py-2 px-3 text-xs text-gray-500 whitespace-nowrap">{p.vendor || '—'}</td>
-                    <td className="py-2 px-3 text-right tabular-nums whitespace-nowrap">
-                      {p.unit_price > 0 ? (
-                        <span className="text-sm font-semibold text-si-bright">${(p.unit_price).toFixed(2)}<span className="text-gray-500 font-normal">/{p.unit || 'ea'}</span></span>
-                      ) : (
-                        <span className="text-xs text-gray-600">—</span>
-                      )}
+                    <td className="py-2 px-3">
+                      <input type="text"
+                        className="bg-transparent border-0 outline-none w-full text-xs text-gray-500 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                        value={p.vendor || ''}
+                        onChange={e => updateProduct(p._idx, 'vendor', e.target.value)} />
+                    </td>
+                    <td className="py-2 px-3 text-right">
+                      <div className="flex items-center justify-end gap-0.5">
+                        <span className="text-sm font-semibold text-si-bright">$</span>
+                        <input type="number" step="0.01" min="0"
+                          className="bg-transparent border-0 outline-none w-20 text-sm font-semibold text-si-bright text-right tabular-nums cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
+                          value={p.unit_price ?? ''}
+                          onChange={e => updateProduct(p._idx, 'unit_price', e.target.value === '' ? 0 : parseFloat(e.target.value))} />
+                        <span className="text-gray-500 text-xs">/{p.unit || 'ea'}</span>
+                      </div>
                     </td>
                   </tr>
                 ))}
