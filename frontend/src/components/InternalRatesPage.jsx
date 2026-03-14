@@ -670,10 +670,13 @@ export default function InternalRatesPage() {
                             <select className="bg-transparent border-0 outline-none w-full text-xs text-gray-400 cursor-pointer focus:bg-white/[0.06] focus:rounded-md transition-colors appearance-none"
                               value={entry.material_type || ''}
                               onChange={e => updatePriceListEntry(i, 'material_type', e.target.value)}>
-                              <option value="">{TYPE_LABELS[entry.material_type] || entry.material_type || '\u2014'}</option>
+                              <option value="">— Select type —</option>
                               {MATERIAL_TYPES.map(t => (
                                 <option key={t} value={t}>{TYPE_LABELS[t]}</option>
                               ))}
+                              {entry.material_type && !MATERIAL_TYPES.includes(entry.material_type) && (
+                                <option value={entry.material_type}>{entry.material_type}</option>
+                              )}
                             </select>
                           </td>
                           <td className="py-2 px-3 text-gray-500">

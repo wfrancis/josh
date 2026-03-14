@@ -503,13 +503,8 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
         installed_qty = merged.get("installed_qty", 0)
         unit_price = merged.get("unit_price", 0)
 
-        # Trust order_qty from frontend if provided and > 0
-        frontend_order_qty = m.get("order_qty")
-        if frontend_order_qty and frontend_order_qty > 0:
-            order_qty = frontend_order_qty
-        else:
-            order_qty = installed_qty * (1 + waste_pct)
-
+        # Always recompute order_qty from source values to avoid rounding drift
+        order_qty = installed_qty * (1 + waste_pct)
         extended_cost = order_qty * unit_price
 
         merged["order_qty"] = round(order_qty, 2)

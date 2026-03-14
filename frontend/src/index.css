@@ -22,7 +22,8 @@
            hover:from-orange-500 hover:to-orange-700 hover:shadow-[0_4px_16px_rgba(255,95,0,0.3)]
            active:from-orange-600 active:to-orange-800
            transition-all duration-150 cursor-pointer
-           focus:outline-none focus:ring-2 focus:ring-si-orange/40 focus:ring-offset-2 focus:ring-offset-[#0A0F1E];
+           focus:outline-none focus:ring-2 focus:ring-si-orange/40 focus:ring-offset-2 focus:ring-offset-[#0A0F1E]
+           disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:from-si-orange disabled:hover:to-orange-600 disabled:hover:shadow-[0_1px_2px_rgba(0,0,0,0.4),inset_0_1px_0_rgba(255,255,255,0.12)];
   }
   .btn-secondary {
     @apply inline-flex items-center justify-center gap-2 px-5 py-2.5
