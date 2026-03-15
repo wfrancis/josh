@@ -292,9 +292,14 @@ class JobUpdate(BaseModel):
     markup_pct: Optional[float] = None
     project_name: Optional[str] = None
     gc_name: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip: Optional[str] = None
     tax_rate: Optional[float] = None
     unit_count: Optional[int] = None
     salesperson: Optional[str] = None
+    notes: Optional[str] = None
     architect: Optional[str] = None
     designer: Optional[str] = None
 

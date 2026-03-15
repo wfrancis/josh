@@ -3,7 +3,8 @@ import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, Building2, MapPin, User, Percent, Hash,
   Loader2, FileSpreadsheet, Save, AlertTriangle, Trash2,
-  StickyNote, ChevronDown, ChevronUp, Cpu, CheckCircle2, X, Upload, Download, Copy
+  StickyNote, ChevronDown, ChevronUp, Cpu, CheckCircle2, X, Upload, Download, Copy,
+  Pencil
 } from 'lucide-react'
 import { api } from '../api'
 import StepIndicator from './StepIndicator'
@@ -33,6 +34,9 @@ export default function JobDetail() {
   const [confirmDialog, setConfirmDialog] = useState(null)
   const [isDirty, setIsDirty] = useState(false)
   const [quotePanel, setQuotePanel] = useState(null) // null | 'request' | 'upload'
+  const [editing, setEditing] = useState(false)
+  const [editForm, setEditForm] = useState({})
+  const [editSaving, setEditSaving] = useState(false)
 
   const loadJob = async () => {
     try {
@@ -52,6 +56,55 @@ export default function JobDetail() {
 
   useEffect(() => { loadJob() }, [jobId])
   useEffect(() => { api.getSettings().then(setAiSettings).catch(() => {}) }, [])
+
+  const startEditing = () => {
+    setEditForm({
+      project_name: job.project_name || '',
+      gc_name: job.gc_name || '',
+      address: job.address || '',
+      city: job.city || '',
+      state: job.state || '',
+      zip: job.zip || '',
+      salesperson: job.salesperson || '',
+      tax_rate: job.tax_rate ? (job.tax_rate * 100).toFixed(1) : '',
+      unit_count: job.unit_count || '',
+      architect: job.architect || '',
+      designer: job.designer || '',
+    })
+    setEditing(true)
+  }
+
+  const cancelEditing = () => {
+    setEditing(false)
+    setEditForm({})
+  }
+
+  const saveEditing = async () => {
+    setEditSaving(true)
+    try {
+      const updates = {
+        project_name: editForm.project_name || job.project_name,
+        gc_name: editForm.gc_name || null,
+        address: editForm.address || null,
+        city: editForm.city || null,
+        state: editForm.state || null,
+        zip: editForm.zip || null,
+        salesperson: editForm.salesperson || null,
+        tax_rate: editForm.tax_rate ? parseFloat(editForm.tax_rate) / 100 : 0,
+        unit_count: editForm.unit_count ? parseInt(editForm.unit_count) : 0,
+        architect: editForm.architect || null,
+        designer: editForm.designer || null,
+      }
+      await api.updateJob(jobId, updates)
+      const updated = await api.getJob(jobId)
+      setJob(updated)
+      setEditing(false)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setEditSaving(false)
+    }
+  }
 
   useEffect(() => {
     const handler = (e) => {
@@ -161,47 +214,157 @@ export default function JobDetail() {
           <ArrowLeft className="w-5 h-5" />
         </button>
         <div className="flex-1">
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight">{job.project_name}</h1>
-            <StatusBadge status={getJobStatus(job)} />
-          </div>
-          <div className="flex flex-wrap items-center gap-4 mt-2 text-sm text-gray-500">
-            {job.gc_name && (
-              <span className="flex items-center gap-1.5">
-                <Building2 className="w-3.5 h-3.5" /> {job.gc_name}
-              </span>
-            )}
-            {(job.city || job.state) && (
-              <span className="flex items-center gap-1.5">
-                <MapPin className="w-3.5 h-3.5" />
-                {[job.address, job.city, job.state, job.zip].filter(Boolean).join(', ')}
-              </span>
-            )}
-            {job.salesperson && (
-              <span className="flex items-center gap-1.5">
-                <User className="w-3.5 h-3.5" /> {job.salesperson}
-              </span>
-            )}
-            {job.tax_rate > 0 && (
-              <span className="flex items-center gap-1.5">
-                <Percent className="w-3.5 h-3.5" /> {(job.tax_rate * 100).toFixed(1)}% tax
-              </span>
-            )}
-            {job.unit_count > 0 && (
-              <span className="flex items-center gap-1.5">
-                <Hash className="w-3.5 h-3.5" /> {job.unit_count} units
-              </span>
-            )}
-            {aiSettings && (
-              <span className="flex items-center gap-1.5">
-                <Cpu className="w-3.5 h-3.5" /> {aiSettings.openai_model} · {aiSettings.multi_pass_count}x
-              </span>
-            )}
-          </div>
+          {editing ? (
+            /* ── Edit Mode ── */
+            <div className="space-y-4">
+              <div className="flex items-center gap-3">
+                <input
+                  type="text"
+                  value={editForm.project_name}
+                  onChange={e => setEditForm(f => ({ ...f, project_name: e.target.value }))}
+                  className="text-xl sm:text-2xl font-extrabold text-white tracking-tight bg-transparent border-b-2 border-si-bright/50 focus:border-si-bright outline-none w-full pb-1"
+                  placeholder="Project Name"
+                  autoFocus
+                />
+                <StatusBadge status={getJobStatus(job)} />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                <label className="block">
+                  <span className="text-xs text-gray-500 mb-1 block">General Contractor</span>
+                  <input type="text" value={editForm.gc_name} onChange={e => setEditForm(f => ({ ...f, gc_name: e.target.value }))}
+                    className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                    placeholder="GC Name" />
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-500 mb-1 block">Address</span>
+                  <input type="text" value={editForm.address} onChange={e => setEditForm(f => ({ ...f, address: e.target.value }))}
+                    className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                    placeholder="Street Address" />
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  <label className="block col-span-1">
+                    <span className="text-xs text-gray-500 mb-1 block">City</span>
+                    <input type="text" value={editForm.city} onChange={e => setEditForm(f => ({ ...f, city: e.target.value }))}
+                      className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                      placeholder="City" />
+                  </label>
+                  <label className="block col-span-1">
+                    <span className="text-xs text-gray-500 mb-1 block">State</span>
+                    <input type="text" value={editForm.state} onChange={e => setEditForm(f => ({ ...f, state: e.target.value }))}
+                      className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                      placeholder="ST" />
+                  </label>
+                  <label className="block col-span-1">
+                    <span className="text-xs text-gray-500 mb-1 block">ZIP</span>
+                    <input type="text" value={editForm.zip} onChange={e => setEditForm(f => ({ ...f, zip: e.target.value }))}
+                      className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                      placeholder="ZIP" />
+                  </label>
+                </div>
+                <label className="block">
+                  <span className="text-xs text-gray-500 mb-1 block">Salesperson</span>
+                  <input type="text" value={editForm.salesperson} onChange={e => setEditForm(f => ({ ...f, salesperson: e.target.value }))}
+                    className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                    placeholder="Salesperson" />
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-500 mb-1 block">Tax Rate (%)</span>
+                  <input type="number" step="0.1" value={editForm.tax_rate} onChange={e => setEditForm(f => ({ ...f, tax_rate: e.target.value }))}
+                    className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                    placeholder="0.0" />
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-500 mb-1 block">Unit Count</span>
+                  <input type="number" value={editForm.unit_count} onChange={e => setEditForm(f => ({ ...f, unit_count: e.target.value }))}
+                    className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                    placeholder="0" />
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-500 mb-1 block">Architect</span>
+                  <input type="text" value={editForm.architect} onChange={e => setEditForm(f => ({ ...f, architect: e.target.value }))}
+                    className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                    placeholder="Architect" />
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-500 mb-1 block">Designer</span>
+                  <input type="text" value={editForm.designer} onChange={e => setEditForm(f => ({ ...f, designer: e.target.value }))}
+                    className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                    placeholder="Designer" />
+                </label>
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={saveEditing} disabled={editSaving || !editForm.project_name?.trim()}
+                  className="btn-primary text-sm px-4 py-2 flex items-center gap-2">
+                  {editSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                  Save Changes
+                </button>
+                <button onClick={cancelEditing} className="btn-ghost text-sm px-4 py-2">Cancel</button>
+              </div>
+            </div>
+          ) : (
+            /* ── Display Mode ── */
+            <>
+              <div className="flex items-center gap-3">
+                <h1 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight">{job.project_name}</h1>
+                <StatusBadge status={getJobStatus(job)} />
+              </div>
+              <div className="flex flex-wrap items-center gap-4 mt-2 text-sm text-gray-500">
+                {job.gc_name && (
+                  <span className="flex items-center gap-1.5">
+                    <Building2 className="w-3.5 h-3.5" /> {job.gc_name}
+                  </span>
+                )}
+                {(job.city || job.state) && (
+                  <span className="flex items-center gap-1.5">
+                    <MapPin className="w-3.5 h-3.5" />
+                    {[job.address, job.city, job.state, job.zip].filter(Boolean).join(', ')}
+                  </span>
+                )}
+                {job.salesperson && (
+                  <span className="flex items-center gap-1.5">
+                    <User className="w-3.5 h-3.5" /> {job.salesperson}
+                  </span>
+                )}
+                {job.tax_rate > 0 && (
+                  <span className="flex items-center gap-1.5">
+                    <Percent className="w-3.5 h-3.5" /> {(job.tax_rate * 100).toFixed(1)}% tax
+                  </span>
+                )}
+                {job.unit_count > 0 && (
+                  <span className="flex items-center gap-1.5">
+                    <Hash className="w-3.5 h-3.5" /> {job.unit_count} units
+                  </span>
+                )}
+                {aiSettings && (
+                  <span className="flex items-center gap-1.5">
+                    <Cpu className="w-3.5 h-3.5" /> {aiSettings.openai_model} · {aiSettings.multi_pass_count}x
+                  </span>
+                )}
+              </div>
+            </>
+          )}
         </div>
         <div className="flex items-center gap-1">
+          {!editing && (
+            <button
+              onClick={startEditing}
+              className="btn-ghost p-2 mt-0.5 text-gray-500 hover:text-si-bright hover:bg-si-bright/10"
+              title="Edit job details"
+            >
+              <Pencil className="w-5 h-5" />
+            </button>
+          )}
           <button
-            onClick={() => api.duplicateJob(jobId).then(r => navigate(`/jobs/${r.slug || r.id}`))}
+            onClick={() => setConfirmDialog({
+              title: 'Duplicate Job',
+              message: `This will create a copy of "${job.project_name}" with all materials, pricing, and settings. The new job will start as a Draft.`,
+              confirmLabel: 'Duplicate Job',
+              confirmVariant: 'info',
+              onConfirm: () => {
+                setConfirmDialog(null)
+                api.duplicateJob(jobId).then(r => navigate(`/jobs/${r.slug || r.id}`)).catch(err => setError(err.message))
+              }
+            })}
             className="btn-ghost p-2 mt-0.5 text-gray-500 hover:text-si-bright hover:bg-si-bright/10"
             title="Duplicate job"
           >
@@ -210,7 +373,7 @@ export default function JobDetail() {
         <button
           onClick={() => setConfirmDialog({
             title: 'Delete Job',
-            message: `Delete "${job.project_name}"? All materials, pricing, and bid data will be permanently removed.`,
+            message: `Are you sure you want to delete "${job.project_name}"? All materials, pricing, quotes, and bid data will be permanently removed. This cannot be undone.`,
             confirmLabel: 'Delete Job',
             confirmVariant: 'danger',
             onConfirm: () => {
