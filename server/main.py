@@ -30,6 +30,7 @@ from models import (
     list_vendors, get_vendor, update_vendor, search_vendor_prices,
     get_price_history, import_vendor_prices_csv,
     create_notification, get_notifications, mark_notification_read,
+    log_activity, get_activity, add_comment, get_comments,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
@@ -209,6 +210,7 @@ def api_create_job(job: JobCreate):
     """Create a new job."""
     job_id = save_job(job.model_dump())
     created = load_job(job_id)
+    log_activity(job_id, "job_created", f"Job '{body.project_name}' created")
     return {"id": job_id, "slug": created.get("slug", ""), "message": "Job created"}
 
 
@@ -274,6 +276,7 @@ def api_duplicate_job(job_id: str):
         save_materials(new_id, copied)
 
     created = load_job(new_id)
+    log_activity(new_id, "job_created", f"Duplicated from '{job['project_name']}'", {"source_job_id": job["id"]})
     return {"id": new_id, "slug": created.get("slug", "")}
 
 
@@ -285,6 +288,7 @@ def api_update_notes(job_id: str, body: NotesUpdate):
         raise HTTPException(status_code=404, detail="Job not found")
     job["notes"] = body.notes
     save_job(job)
+    log_activity(job["id"], "notes_updated", "Notes updated")
     return {"message": "Notes saved"}
 
 
@@ -310,9 +314,17 @@ def api_update_job(job_id: str, body: JobUpdate):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     updates = body.model_dump(exclude_none=True)
+    changes = {}
+    for key, val in updates.items():
+        old_val = job.get(key)
+        if old_val != val:
+            changes[key] = {"old": old_val, "new": val}
     for key, val in updates.items():
         job[key] = val
     save_job(job)
+    if changes:
+        changed_keys = ", ".join(changes.keys())
+        log_activity(job["id"], "job_updated", f"Updated {changed_keys}", {"changes": changes})
     return {"message": "Job updated"}
 
 
@@ -446,6 +458,9 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
     for mat, mid in zip(materials, material_ids):
         mat["id"] = mid
 
+    file_names = [f.filename for f in files if hasattr(f, 'filename')]
+    log_activity(db_id, "rfms_uploaded", f"Uploaded {len(file_names)} RFMS file(s), {len(materials)} materials parsed", {"files": file_names, "material_count": len(materials)})
+
     return {"job_info": rfms_job_info, "materials": materials}
 
 
@@ -526,6 +541,10 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     # Save to vendor pricing database
     save_vendor_prices_from_quotes(db_id, all_products)
 
+    file_names = [u.filename for u in files if hasattr(u, 'filename')]
+    vendors_found = list(set(p.get("vendor", "Unknown") for p in all_products if p.get("vendor")))
+    log_activity(db_id, "quotes_uploaded", f"Uploaded {len(file_names)} quote file(s), {len(all_products)} products, {auto_matched} auto-matched", {"files": file_names, "vendors": vendors_found, "product_count": len(all_products), "auto_matched": auto_matched})
+
     return {"products": all_products, "auto_matched": auto_matched}
 
 
@@ -536,6 +555,7 @@ def api_clear_quotes(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     delete_quotes(job["id"])
+    log_activity(job["id"], "quotes_cleared", "All vendor quotes cleared")
     return {"message": "Quotes cleared"}
 
 
@@ -551,6 +571,7 @@ def api_update_quote(quote_id: int, body: dict = Body(...)):
     if job:
         quotes = job.get("quotes", [])
         _auto_match_quotes(job_id, quotes)
+    log_activity(job_id, "quote_updated", f"Quote #{quote_id} updated")
     return {"ok": True}
 
 
@@ -570,6 +591,8 @@ def api_calculate(job_id: str):
     # Calculate labor
     labor_items = calculate_labor_for_materials(materials)
     save_labor(job["id"], labor_items)
+
+    log_activity(job["id"], "bid_calculated", f"Calculated {len(sundries)} sundries and {len(labor_items)} labor items")
 
     return {"sundries": sundries, "labor": labor_items}
 
@@ -609,6 +632,8 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
     material_ids = save_materials(job["id"], updated)
     for mat, mid in zip(updated, material_ids):
         mat["id"] = mid
+
+    log_activity(job["id"], "materials_updated", f"Updated pricing for {len(body.materials)} materials")
 
     return {"materials": updated}
 
@@ -672,6 +697,10 @@ def api_generate_bid(job_id: str):
     pdf_path = os.path.join(PDF_DIR, f"bid_{job['id']}.pdf")
     generate_bid_pdf(bid_data, pdf_path)
 
+    bundle_count = len(bid_data.get("bundles", []))
+    grand_total = bid_data.get("grand_total", 0)
+    log_activity(job["id"], "bid_generated", f"Bid generated: {bundle_count} bundles, total ${grand_total:,.2f}", {"bundle_count": bundle_count, "grand_total": grand_total})
+
     return bid_data
 
 
@@ -685,6 +714,7 @@ def api_clear_bid(job_id: str):
     save_job(job)
     # Clear bundles too
     save_bundles(job["id"], [])
+    log_activity(job["id"], "bid_cleared", "Bid data cleared")
     return {"message": "Bid cleared"}
 
 
@@ -746,6 +776,8 @@ def api_update_exclusions(job_id: str, body: ExclusionsUpdate):
         raise HTTPException(status_code=404, detail="Job not found")
     job["exclusions"] = _json.dumps(body.exclusions)
     save_job(job)
+    excl_count = len(body.exclusions) if body.exclusions else 0
+    log_activity(job["id"], "exclusions_updated", f"Updated exclusions ({excl_count} items)")
     return {"message": "Exclusions saved", "exclusions": body.exclusions}
 
 
@@ -1170,6 +1202,37 @@ async def api_get_notifications(unread_only: bool = True):
 async def api_mark_notification_read(notification_id: int):
     mark_notification_read(notification_id)
     return {"ok": True}
+
+
+# ── Activity & Comments ──────────────────────────────────────────────────────
+
+@app.get("/api/jobs/{job_id}/activity")
+def api_get_activity(job_id: str):
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return get_activity(job["id"])
+
+
+@app.get("/api/jobs/{job_id}/comments")
+def api_get_comments(job_id: str):
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return get_comments(job["id"])
+
+
+class CommentCreate(BaseModel):
+    text: str
+
+@app.post("/api/jobs/{job_id}/comments")
+def api_add_comment(job_id: str, body: CommentCreate):
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    comment = add_comment(job["id"], body.text)
+    log_activity(job["id"], "comment_added", "Comment added", {"text": body.text})
+    return comment
 
 
 # ── Static Files (React frontend) ────────────────────────────────────────────

@@ -190,6 +190,24 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS job_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS job_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
         """)
         conn.commit()
         # Migrations for existing DBs
@@ -221,6 +239,8 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_vendor_prices_job ON vendor_prices(job_id)",
             "CREATE INDEX IF NOT EXISTS idx_vendor_prices_date ON vendor_prices(quote_date)",
             "CREATE INDEX IF NOT EXISTS idx_vendors_name ON vendors(name)",
+            "CREATE INDEX IF NOT EXISTS idx_job_activity_job ON job_activity(job_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_job_comments_job ON job_comments(job_id, created_at DESC)",
         ]:
             try:
                 conn.execute(idx_sql)
@@ -1152,5 +1172,76 @@ def mark_notification_read(notification_id: int) -> bool:
         cur = conn.execute("UPDATE notifications SET read=1 WHERE id=?", (notification_id,))
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ── Activity Log ─────────────────────────────────────────────────────────────
+
+def log_activity(job_id: int, action: str, summary: str, detail: dict = None) -> int:
+    """Record an activity event for a job."""
+    import json as _json
+    conn = _get_conn()
+    try:
+        detail_str = _json.dumps(detail) if detail else None
+        cur = conn.execute(
+            "INSERT INTO job_activity (job_id, action, summary, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+            (job_id, action, summary, detail_str, datetime.now().isoformat())
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_activity(job_id: int, limit: int = 50) -> list[dict]:
+    """Fetch activity log for a job, newest first."""
+    import json as _json
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM job_activity WHERE job_id=? ORDER BY created_at DESC LIMIT ?",
+            (job_id, limit)
+        ).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            if d.get("detail"):
+                try:
+                    d["detail"] = _json.loads(d["detail"])
+                except (ValueError, TypeError):
+                    pass
+            results.append(d)
+        return results
+    finally:
+        conn.close()
+
+
+# ── Job Comments ─────────────────────────────────────────────────────────────
+
+def add_comment(job_id: int, text: str) -> dict:
+    """Add a comment to a job. Returns the created comment."""
+    conn = _get_conn()
+    try:
+        now = datetime.now().isoformat()
+        cur = conn.execute(
+            "INSERT INTO job_comments (job_id, text, created_at) VALUES (?, ?, ?)",
+            (job_id, text, now)
+        )
+        conn.commit()
+        return {"id": cur.lastrowid, "job_id": job_id, "text": text, "created_at": now}
+    finally:
+        conn.close()
+
+
+def get_comments(job_id: int) -> list[dict]:
+    """Fetch comments for a job, newest first."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM job_comments WHERE job_id=? ORDER BY created_at DESC",
+            (job_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()
