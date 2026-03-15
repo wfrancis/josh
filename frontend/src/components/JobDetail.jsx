@@ -15,6 +15,7 @@ import QuoteUpload from './QuoteUpload'
 import QuoteRequest from './QuoteRequest'
 import StatusBadge, { getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
+import ActivityLog from './ActivityLog'
 
 export default function JobDetail() {
   const { jobId } = useParams()
@@ -671,6 +672,8 @@ export default function JobDetail() {
           </div>
         )}
       </div>
+
+      <ActivityLog jobId={job.id} />
 
       <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
     </div>

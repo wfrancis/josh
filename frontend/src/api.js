@@ -145,4 +145,9 @@ export const api = {
   // Notifications
   getNotifications: (unreadOnly = true) => request('/notifications?unread_only=' + unreadOnly),
   markNotificationRead: (id) => request('/notifications/' + id + '/read', { method: 'PUT' }),
+
+  // Activity Log & Comments
+  getActivity: (jobId) => request('/jobs/' + jobId + '/activity'),
+  getComments: (jobId) => request('/jobs/' + jobId + '/comments'),
+  addComment: (jobId, text) => request('/jobs/' + jobId + '/comments', { method: 'POST', body: JSON.stringify({ text }) }),
 };
