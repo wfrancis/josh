@@ -28,8 +28,8 @@ from models import (
     get_company_rate, save_company_rate, get_all_company_rates,
     get_or_create_vendor, save_vendor_prices_from_quotes,
     list_vendors, get_vendor, update_vendor, search_vendor_prices,
-    get_price_history, create_notification, get_notifications,
-    mark_notification_read,
+    get_price_history, import_vendor_prices_csv,
+    create_notification, get_notifications, mark_notification_read,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
@@ -1137,6 +1137,15 @@ async def api_update_vendor(vendor_id: int, request: Request):
 @app.get("/api/vendor-prices")
 async def api_search_vendor_prices(vendor: str = None, product: str = None, limit: int = 50):
     return search_vendor_prices(vendor, product, limit)
+
+
+@app.post("/api/vendor-prices/import")
+async def api_import_vendor_prices(file: UploadFile = File(...)):
+    """Bulk import vendor prices from CSV. Accepts partial data - only product_name and unit_price required."""
+    contents = await file.read()
+    text = contents.decode('utf-8-sig')  # handle BOM
+    result = import_vendor_prices_csv(text)
+    return result
 
 
 @app.get("/api/materials/price-history")

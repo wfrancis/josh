@@ -6,6 +6,7 @@ Tables: jobs, job_materials, job_sundries, job_labor, job_bundles.
 import sqlite3
 import os
 import re
+import io
 from datetime import datetime
 from typing import Optional
 
@@ -1049,6 +1050,62 @@ def get_price_history(item_code: str = None, product: str = None, exclude_job_id
             "latest": records[0] if records else None,
             "records": records,
         }
+    finally:
+        conn.close()
+
+
+def import_vendor_prices_csv(text: str) -> dict:
+    """Bulk import vendor prices from CSV text. Accepts partial data."""
+    import csv as _csv
+    reader = _csv.DictReader(io.StringIO(text))
+    conn = _get_conn()
+    try:
+        imported = 0
+        errors = []
+        for i, row in enumerate(reader, 2):
+            product_name = (row.get('product_name', '') or row.get('product', '') or row.get('description', '') or '').strip()
+            price_str = row.get('unit_price', '') or row.get('price', '') or row.get('cost', '') or ''
+
+            if not product_name:
+                errors.append(f"Row {i}: missing product name")
+                continue
+            try:
+                unit_price = float(str(price_str).replace('$', '').replace(',', '').strip())
+            except (ValueError, TypeError):
+                errors.append(f"Row {i}: invalid price '{price_str}'")
+                continue
+
+            vendor_name = (row.get('vendor_name', '') or row.get('vendor', '') or '').strip()
+            vendor_id = None
+            if vendor_name:
+                # Inline vendor lookup/create using same connection to avoid lock
+                vrow = conn.execute("SELECT id FROM vendors WHERE name=?", (vendor_name,)).fetchone()
+                if vrow:
+                    vendor_id = vrow["id"]
+                else:
+                    now = datetime.now().isoformat()
+                    cur = conn.execute(
+                        "INSERT INTO vendors (name, created_at, updated_at) VALUES (?, ?, ?)",
+                        (vendor_name, now, now)
+                    )
+                    vendor_id = cur.lastrowid
+
+            normalized = _normalize_product(product_name)
+            conn.execute("""
+                INSERT INTO vendor_prices (product_name, unit_price, vendor_id, vendor_name,
+                    product_normalized, unit, quantity, lead_time, notes, quote_date, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """, (
+                product_name, unit_price, vendor_id, vendor_name or '', normalized,
+                (row.get('unit', '') or '').strip(),
+                float(row.get('quantity', 0) or 0) if row.get('quantity') else None,
+                (row.get('lead_time', '') or '').strip() or None,
+                (row.get('notes', '') or '').strip() or None,
+                (row.get('quote_date', '') or '').strip() or None,
+            ))
+            imported += 1
+        conn.commit()
+        return {"imported": imported, "errors": errors}
     finally:
         conn.close()
 

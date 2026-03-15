@@ -131,6 +131,12 @@ export const api = {
     const qs = new URLSearchParams(params).toString()
     return request('/vendor-prices' + (qs ? '?' + qs : ''))
   },
+  importVendorPrices: (file) => {
+    const form = new FormData();
+    form.append('file', file);
+    return fetch(`${BASE}/vendor-prices/import`, { method: 'POST', body: form })
+      .then(r => { if (!r.ok) throw new Error('Import failed'); return r.json(); });
+  },
   getPriceHistory: (params = {}) => {
     const qs = new URLSearchParams(params).toString()
     return request('/materials/price-history' + (qs ? '?' + qs : ''))

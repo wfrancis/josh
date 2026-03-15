@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle } from 'lucide-react'
+import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store } from 'lucide-react'
 
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
@@ -419,6 +419,12 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   {m.item_code && m.description && (
                     <div className="text-[11px] text-gray-600 mt-0.5">{m.item_code}</div>
                   )}
+                  {m.vendor && (
+                    <div className="flex items-center gap-1 mt-0.5">
+                      <Store className="w-3 h-3 text-emerald-500/70" />
+                      <span className="text-[10px] text-emerald-500/70">{m.vendor}</span>
+                    </div>
+                  )}
                   {/* Show qty on mobile since column is hidden */}
                   <div className="md:hidden text-[11px] text-gray-500 mt-0.5">
                     {formatNumber(m.installed_qty)} {m.unit} · {((m.waste_pct || 0) * 100).toFixed(0)}% waste
@@ -468,14 +474,19 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                 </td>
                 {showPriceCol && (
                   <td className="py-3 px-2 sm:px-3 text-right">
-                    <input
-                      type="number" step="0.01" min="0"
-                      value={m.unit_price || ''}
-                      onChange={(e) => handlePriceChange(m._origIdx, e.target.value)}
-                      onFocus={() => setEditingPriceId(m._origIdx)} onBlur={() => setEditingPriceId(null)}
-                      placeholder="0.00"
-                      className={`editable-cell w-24 ${!hasPrice && editingPriceId !== m._origIdx ? 'text-gray-600' : 'text-gray-100'}`}
-                    />
+                    <div className="flex items-center justify-end gap-1.5">
+                      {m.quote_status === 'needs_quote' && (
+                        <span className="w-2 h-2 rounded-full bg-amber-400/80 flex-shrink-0" title="Needs quote" />
+                      )}
+                      <input
+                        type="number" step="0.01" min="0"
+                        value={m.unit_price || ''}
+                        onChange={(e) => handlePriceChange(m._origIdx, e.target.value)}
+                        onFocus={() => setEditingPriceId(m._origIdx)} onBlur={() => setEditingPriceId(null)}
+                        placeholder="0.00"
+                        className={`editable-cell w-24 ${!hasPrice && editingPriceId !== m._origIdx ? 'text-gray-600' : 'text-gray-100'}`}
+                      />
+                    </div>
                   </td>
                 )}
                 <td className="py-3 px-2 sm:px-3 text-right tabular-nums font-medium">
