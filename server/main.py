@@ -26,6 +26,10 @@ from models import (
     save_price_list_entries, add_price_list_entry, update_price_list_entry,
     delete_price_list_entry, get_price_list_entries,
     get_company_rate, save_company_rate, get_all_company_rates,
+    get_or_create_vendor, save_vendor_prices_from_quotes,
+    list_vendors, get_vendor, update_vendor, search_vendor_prices,
+    get_price_history, create_notification, get_notifications,
+    mark_notification_read,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
@@ -34,6 +38,8 @@ from labor_calc import calculate_labor_for_materials, load_labor_catalog, load_l
 from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf
 from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE
+from email_agent import compose_quote_request, send_email, generate_quote_request_text
+from inbox_monitor import InboxMonitor
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="SI Bid Tool", version="1.0.0")
@@ -82,11 +88,75 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(PDF_DIR, exist_ok=True)
 
 
+_inbox_monitor: InboxMonitor | None = None
+
+
+def _start_inbox_monitor():
+    """Start the inbox monitor if email automation is enabled."""
+    global _inbox_monitor
+    import json as _json
+    settings = get_settings()
+    if settings.get("email_automation_enabled") != "true":
+        return
+    try:
+        config = _json.loads(settings.get("email_config", "{}"))
+    except Exception:
+        return
+    imap_host = config.get("imap_host")
+    imap_port = int(config.get("imap_port", 993))
+    email_addr = config.get("email_address")
+    email_pass = config.get("email_password")
+    if not all([imap_host, email_addr, email_pass]):
+        return
+
+    def on_quote_received(temp_files, sender_email, subject):
+        """Callback when inbox monitor detects a vendor response."""
+        for fpath in temp_files:
+            try:
+                products = parse_quote_file(fpath)
+                if not products:
+                    continue
+                # Try to find the job by project name from subject
+                from models import search_all
+                results = search_all(subject[:50])
+                if results.get("jobs"):
+                    job_id = results["jobs"][0]["id"]
+                    save_quotes(job_id, products)
+                    from models import _auto_match_quotes
+                    matched = _auto_match_quotes(job_id)
+                    save_vendor_prices_from_quotes(job_id, products)
+                    vendor_name = products[0].get("vendor", sender_email)
+                    create_notification(
+                        job_id, "quote_received",
+                        f"Quote received from {vendor_name} — {len(products)} products parsed, {matched} auto-matched"
+                    )
+            except Exception as e:
+                print(f"[InboxMonitor] Error processing {fpath}: {e}")
+
+    if _inbox_monitor and _inbox_monitor.is_running:
+        _inbox_monitor.stop()
+
+    _inbox_monitor = InboxMonitor(
+        imap_config={
+            "host": imap_host,
+            "port": imap_port,
+            "username": email_addr,
+            "password": email_pass,
+            "use_ssl": imap_port == 993,
+        },
+        on_quote_received=on_quote_received,
+        poll_interval=300,
+    )
+    _inbox_monitor.start()
+    print(f"[InboxMonitor] Started monitoring {email_addr}")
+
+
 @app.on_event("startup")
 def startup():
     init_db()
     _apply_openai_config()
     _seed_company_rates()
+    _start_inbox_monitor()
 
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
@@ -102,6 +172,8 @@ class JobCreate(BaseModel):
     unit_count: int = 0
     salesperson: Optional[str] = None
     notes: Optional[str] = None
+    architect: Optional[str] = None
+    designer: Optional[str] = None
 
 
 class MaterialUpdate(BaseModel):
@@ -120,6 +192,8 @@ class SettingsUpdate(BaseModel):
     openai_api_key: Optional[str] = None
     openai_model: Optional[str] = None
     multi_pass_count: Optional[int] = None
+    email_automation_enabled: Optional[str] = None
+    email_config: Optional[str] = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -185,6 +259,8 @@ def api_duplicate_job(job_id: str):
         "salesperson": job.get("salesperson"),
         "notes": job.get("notes"),
         "exclusions": job.get("exclusions"),
+        "architect": job.get("architect"),
+        "designer": job.get("designer"),
     }
     new_id = save_job(new_job)
 
@@ -219,6 +295,8 @@ class JobUpdate(BaseModel):
     tax_rate: Optional[float] = None
     unit_count: Optional[int] = None
     salesperson: Optional[str] = None
+    architect: Optional[str] = None
+    designer: Optional[str] = None
 
 @app.put("/api/jobs/{job_id}")
 def api_update_job(job_id: str, body: JobUpdate):
@@ -290,6 +368,8 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         "unit_count": job.get("unit_count", 0),
         "salesperson": job.get("salesperson"),
         "notes": job.get("notes"),
+        "architect": job.get("architect"),
+        "designer": job.get("designer"),
     }
     save_job(job_update)
 
@@ -335,6 +415,11 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
                 unit_price = matched["unit_price"]
                 vendor = matched.get("vendor", "")
 
+        # Set quote_status for unpriced materials
+        quote_status = m.get("quote_status")
+        if not unit_price and not quote_status:
+            quote_status = "needs_quote"
+
         materials.append({
             "item_code": m.get("item_code"),
             "description": m.get("description"),
@@ -347,6 +432,7 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             "unit_price": unit_price,
             "extended_cost": round(unit_price * round(order_qty, 2), 2),
             "ai_confidence": m.get("ai_confidence"),
+            "quote_status": quote_status,
         })
 
     material_ids = save_materials(db_id, materials)
@@ -430,6 +516,9 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
 
     # Auto-match prices to materials
     auto_matched = _auto_match_quotes(db_id, all_products)
+
+    # Save to vendor pricing database
+    save_vendor_prices_from_quotes(db_id, all_products)
 
     return {"products": all_products, "auto_matched": auto_matched}
 
@@ -977,6 +1066,8 @@ def api_get_settings():
         "openai_api_key_masked": masked,
         "openai_model": settings.get("openai_model", "gpt-5-mini"),
         "multi_pass_count": int(settings.get("multi_pass_count", "2")),
+        "email_automation_enabled": settings.get("email_automation_enabled", "false"),
+        "email_config": settings.get("email_config", ""),
     }
 
 
@@ -994,11 +1085,19 @@ def api_update_settings(body: SettingsUpdate):
         if body.multi_pass_count < 1 or body.multi_pass_count > 5:
             raise HTTPException(status_code=400, detail="Multi-pass count must be between 1 and 5")
         updates["multi_pass_count"] = str(body.multi_pass_count)
+    # Email automation settings
+    if body.email_automation_enabled is not None:
+        updates["email_automation_enabled"] = body.email_automation_enabled
+    if body.email_config is not None:
+        updates["email_config"] = body.email_config
     if updates:
         save_settings(updates)
         # Apply API key and model to quote parser
         settings = get_settings()
         _apply_openai_config(settings)
+        # Restart inbox monitor if email settings changed
+        if body.email_automation_enabled is not None or body.email_config is not None:
+            _start_inbox_monitor()
     return {"message": "Settings updated", **api_get_settings()}
 
 
@@ -1011,6 +1110,51 @@ def _apply_openai_config(settings: dict = None):
     passes = int(settings.get("multi_pass_count", "2"))
     print(f"[openai_config] api_key={'set' if api_key else 'MISSING'}, model={model}, passes={passes}")
     set_openai_config(api_key=api_key, model=model, num_passes=passes)
+
+
+# ── Vendor Pricing Intelligence ───────────────────────────────────────────────
+
+@app.get("/api/vendors")
+async def api_list_vendors():
+    return list_vendors()
+
+
+@app.get("/api/vendors/{vendor_id}")
+async def api_get_vendor(vendor_id: int):
+    v = get_vendor(vendor_id)
+    if not v:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    return v
+
+
+@app.put("/api/vendors/{vendor_id}")
+async def api_update_vendor(vendor_id: int, request: Request):
+    data = await request.json()
+    update_vendor(vendor_id, data)
+    return {"ok": True}
+
+
+@app.get("/api/vendor-prices")
+async def api_search_vendor_prices(vendor: str = None, product: str = None, limit: int = 50):
+    return search_vendor_prices(vendor, product, limit)
+
+
+@app.get("/api/materials/price-history")
+async def api_price_history(item_code: str = None, product: str = None, exclude_job: int = None):
+    return get_price_history(item_code, product, exclude_job)
+
+
+# ── Notifications ────────────────────────────────────────────────────────────
+
+@app.get("/api/notifications")
+async def api_get_notifications(unread_only: bool = True):
+    return get_notifications(unread_only)
+
+
+@app.put("/api/notifications/{notification_id}/read")
+async def api_mark_notification_read(notification_id: int):
+    mark_notification_read(notification_id)
+    return {"ok": True}
 
 
 # ── Static Files (React frontend) ────────────────────────────────────────────

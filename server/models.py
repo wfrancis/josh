@@ -142,6 +142,53 @@ def init_db() -> None:
                 rate_type TEXT PRIMARY KEY,
                 data TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS vendors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                contact_name TEXT,
+                contact_title TEXT,
+                contact_email TEXT,
+                contact_phone TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS vendor_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_name TEXT NOT NULL,
+                unit_price REAL NOT NULL,
+                vendor_id INTEGER,
+                vendor_name TEXT DEFAULT '',
+                job_id INTEGER,
+                job_quote_id INTEGER,
+                product_normalized TEXT,
+                unit TEXT DEFAULT '',
+                freight_per_unit REAL,
+                total_per_unit REAL,
+                quantity REAL,
+                lead_time TEXT,
+                quote_date TEXT,
+                quote_valid_until TEXT,
+                file_name TEXT,
+                won_bid INTEGER DEFAULT 0,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (vendor_id) REFERENCES vendors(id) ON DELETE SET NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL,
+                FOREIGN KEY (job_quote_id) REFERENCES job_quotes(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                read INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
         """)
         conn.commit()
         # Migrations for existing DBs
@@ -152,12 +199,33 @@ def init_db() -> None:
             ("exclusions", "ALTER TABLE jobs ADD COLUMN exclusions TEXT"),
             ("markup_pct", "ALTER TABLE jobs ADD COLUMN markup_pct REAL DEFAULT 0"),
             ("bid_data", "ALTER TABLE jobs ADD COLUMN bid_data TEXT"),
+            ("architect", "ALTER TABLE jobs ADD COLUMN architect TEXT"),
+            ("designer", "ALTER TABLE jobs ADD COLUMN designer TEXT"),
+            ("quote_status", "ALTER TABLE job_materials ADD COLUMN quote_status TEXT"),
+            ("quoted_at", "ALTER TABLE job_quotes ADD COLUMN quoted_at TEXT"),
+            ("jq_freight", "ALTER TABLE job_quotes ADD COLUMN freight REAL"),
+            ("jq_lead_time", "ALTER TABLE job_quotes ADD COLUMN lead_time TEXT"),
+            ("jq_notes", "ALTER TABLE job_quotes ADD COLUMN notes TEXT"),
         ]:
             try:
                 conn.execute(sql)
                 conn.commit()
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+        # Indexes for vendor_prices
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_vendor_prices_vendor ON vendor_prices(vendor_id)",
+            "CREATE INDEX IF NOT EXISTS idx_vendor_prices_product ON vendor_prices(product_normalized)",
+            "CREATE INDEX IF NOT EXISTS idx_vendor_prices_job ON vendor_prices(job_id)",
+            "CREATE INDEX IF NOT EXISTS idx_vendor_prices_date ON vendor_prices(quote_date)",
+            "CREATE INDEX IF NOT EXISTS idx_vendors_name ON vendors(name)",
+        ]:
+            try:
+                conn.execute(idx_sql)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
         # Backfill slugs for any jobs missing them
         rows = conn.execute("SELECT id, project_name FROM jobs WHERE slug IS NULL OR slug = ''").fetchall()
@@ -202,7 +270,7 @@ def save_job(job_data: dict) -> int:
                 UPDATE jobs SET
                     project_name=?, gc_name=?, address=?, city=?, state=?, zip=?,
                     tax_rate=?, unit_count=?, salesperson=?, notes=?, slug=?, exclusions=?,
-                    markup_pct=?, bid_data=?
+                    markup_pct=?, bid_data=?, architect=?, designer=?
                 WHERE id=?
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
@@ -211,15 +279,16 @@ def save_job(job_data: dict) -> int:
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
                 job_data.get("salesperson"), job_data.get("notes"), slug,
                 job_data.get("exclusions"), job_data.get("markup_pct", 0),
-                bid_data_val, job_id
+                bid_data_val, job_data.get("architect"), job_data.get("designer"),
+                job_id
             ))
         else:
             slug = _make_unique_slug(conn, slug)
             cur = conn.execute("""
                 INSERT INTO jobs (project_name, gc_name, address, city, state, zip,
                                   tax_rate, unit_count, salesperson, notes, slug, exclusions,
-                                  markup_pct, bid_data, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  markup_pct, bid_data, architect, designer, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
@@ -227,7 +296,7 @@ def save_job(job_data: dict) -> int:
                 job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
                 job_data.get("salesperson"), job_data.get("notes"), slug,
                 job_data.get("exclusions"), job_data.get("markup_pct", 0),
-                bid_data_val,
+                bid_data_val, job_data.get("architect"), job_data.get("designer"),
                 datetime.now().isoformat()
             ))
             job_id = cur.lastrowid
@@ -248,14 +317,15 @@ def save_materials(job_id: int, materials: list[dict]) -> list[int]:
             cur = conn.execute("""
                 INSERT INTO job_materials
                     (job_id, item_code, description, material_type, installed_qty,
-                     unit, waste_pct, order_qty, vendor, unit_price, extended_cost, ai_confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     unit, waste_pct, order_qty, vendor, unit_price, extended_cost, ai_confidence,
+                     quote_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_id, m.get("item_code"), m.get("description"),
                 m.get("material_type"), m.get("installed_qty", 0),
                 m.get("unit"), m.get("waste_pct", 0), m.get("order_qty", 0),
                 m.get("vendor"), m.get("unit_price", 0), m.get("extended_cost", 0),
-                m.get("ai_confidence")
+                m.get("ai_confidence"), m.get("quote_status")
             ))
             ids.append(cur.lastrowid)
         conn.commit()
@@ -335,12 +405,15 @@ def save_quotes(job_id: int, quotes: list[dict]) -> list[int]:
                 continue  # Skip error entries
             cur = conn.execute("""
                 INSERT INTO job_quotes
-                    (job_id, product_name, vendor, unit_price, unit, description, file_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (job_id, product_name, vendor, unit_price, unit, description, file_name,
+                     quoted_at, freight, lead_time, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_id, q.get("product_name"), q.get("vendor"),
                 q.get("unit_price", 0), q.get("unit"),
-                q.get("description"), q.get("file_name")
+                q.get("description"), q.get("file_name"),
+                datetime.now().isoformat(),
+                q.get("freight"), q.get("lead_time"), q.get("notes")
             ))
             ids.append(cur.lastrowid)
         conn.commit()
@@ -744,5 +817,281 @@ def list_jobs() -> list[dict]:
             d["bundles"] = [{}] * d.pop("bundle_count", 0)
             results.append(d)
         return results
+    finally:
+        conn.close()
+
+
+# ── Vendor Pricing Intelligence ──────────────────────────────────────────────
+
+def _normalize_product(name: str) -> str:
+    """Normalize product name for matching."""
+    s = (name or '').lower().strip()
+    s = re.sub(r'[^\w\s]', '', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def get_or_create_vendor(name: str) -> int:
+    """Get vendor by name or create. Returns vendor id."""
+    conn = _get_conn()
+    try:
+        name = (name or '').strip()
+        if not name:
+            return None
+        row = conn.execute("SELECT id FROM vendors WHERE name=?", (name,)).fetchone()
+        if row:
+            return row["id"]
+        now = datetime.now().isoformat()
+        cur = conn.execute(
+            "INSERT INTO vendors (name, created_at, updated_at) VALUES (?, ?, ?)",
+            (name, now, now)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def save_vendor_prices_from_quotes(job_id: int, products: list[dict]) -> int:
+    """Save parsed quote products to vendor_prices. Returns count saved."""
+    conn = _get_conn()
+    try:
+        count = 0
+        now = datetime.now().isoformat()
+        for p in products:
+            if p.get("error"):
+                continue
+            product_name = p.get("product_name")
+            unit_price = p.get("unit_price")
+            if not product_name or not unit_price:
+                continue
+
+            vendor_name = (p.get("vendor") or "").strip()
+            vendor_id = None
+            if vendor_name:
+                # get_or_create_vendor opens its own connection, so do it outside
+                pass
+
+            product_normalized = _normalize_product(product_name)
+            freight = p.get("freight")
+            total = unit_price + (freight or 0)
+
+            conn.execute("""
+                INSERT INTO vendor_prices
+                    (product_name, unit_price, vendor_name, job_id,
+                     product_normalized, unit, freight_per_unit, total_per_unit,
+                     quantity, lead_time, quote_date, file_name, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                product_name, unit_price, vendor_name, job_id,
+                product_normalized, p.get("unit", ""), freight, total,
+                p.get("quantity"), p.get("lead_time"),
+                now, p.get("file_name"), p.get("notes"), now
+            ))
+            count += 1
+        conn.commit()
+
+        # Now link vendor_ids (separate pass to avoid nested connections)
+        rows = conn.execute(
+            "SELECT id, vendor_name FROM vendor_prices WHERE job_id=? AND vendor_id IS NULL AND vendor_name != ''",
+            (job_id,)
+        ).fetchall()
+        vendor_cache = {}
+        for row in rows:
+            vname = row["vendor_name"]
+            if vname not in vendor_cache:
+                # Look up or create vendor
+                vrow = conn.execute("SELECT id FROM vendors WHERE name=?", (vname,)).fetchone()
+                if vrow:
+                    vendor_cache[vname] = vrow["id"]
+                else:
+                    vnow = datetime.now().isoformat()
+                    vcur = conn.execute(
+                        "INSERT INTO vendors (name, created_at, updated_at) VALUES (?, ?, ?)",
+                        (vname, vnow, vnow)
+                    )
+                    vendor_cache[vname] = vcur.lastrowid
+            conn.execute("UPDATE vendor_prices SET vendor_id=? WHERE id=?",
+                         (vendor_cache[vname], row["id"]))
+        conn.commit()
+
+        return count
+    finally:
+        conn.close()
+
+
+def list_vendors() -> list[dict]:
+    """List all vendors with last quote date."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT v.*,
+                   (SELECT MAX(vp.quote_date) FROM vendor_prices vp WHERE vp.vendor_id = v.id) AS last_quote_date,
+                   (SELECT COUNT(*) FROM vendor_prices vp WHERE vp.vendor_id = v.id) AS price_count
+            FROM vendors v
+            ORDER BY v.name
+        """).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_vendor(vendor_id: int) -> dict | None:
+    """Get vendor by ID with recent prices."""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
+        if not row:
+            return None
+        vendor = dict(row)
+        prices = conn.execute("""
+            SELECT vp.*, j.project_name AS job_name
+            FROM vendor_prices vp
+            LEFT JOIN jobs j ON vp.job_id = j.id
+            WHERE vp.vendor_id=?
+            ORDER BY vp.created_at DESC
+            LIMIT 50
+        """, (vendor_id,)).fetchall()
+        vendor["prices"] = [dict(r) for r in prices]
+        return vendor
+    finally:
+        conn.close()
+
+
+def update_vendor(vendor_id: int, data: dict) -> bool:
+    """Update vendor contact info."""
+    conn = _get_conn()
+    try:
+        fields = []
+        values = []
+        for key in ("name", "contact_name", "contact_title", "contact_email", "contact_phone", "notes"):
+            if key in data:
+                fields.append(f"{key}=?")
+                values.append(data[key])
+        if not fields:
+            return False
+        fields.append("updated_at=?")
+        values.append(datetime.now().isoformat())
+        values.append(vendor_id)
+        cur = conn.execute(f"UPDATE vendors SET {', '.join(fields)} WHERE id=?", values)
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def search_vendor_prices(vendor: str = None, product: str = None, limit: int = 50) -> list[dict]:
+    """Search vendor prices by vendor name and/or product."""
+    conn = _get_conn()
+    try:
+        clauses = []
+        params = []
+        if vendor:
+            clauses.append("vp.vendor_name LIKE ?")
+            params.append(f"%{vendor}%")
+        if product:
+            normalized = _normalize_product(product)
+            clauses.append("vp.product_normalized LIKE ?")
+            params.append(f"%{normalized}%")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = conn.execute(f"""
+            SELECT vp.*, j.project_name AS job_name
+            FROM vendor_prices vp
+            LEFT JOIN jobs j ON vp.job_id = j.id
+            {where}
+            ORDER BY vp.created_at DESC
+            LIMIT ?
+        """, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_price_history(item_code: str = None, product: str = None, exclude_job_id: int = None) -> dict:
+    """Get historical pricing for a product. Returns {min, max, avg, latest, records}."""
+    conn = _get_conn()
+    try:
+        clauses = []
+        params = []
+        if item_code:
+            normalized = _normalize_product(item_code)
+            clauses.append("vp.product_normalized LIKE ?")
+            params.append(f"%{normalized}%")
+        if product:
+            normalized = _normalize_product(product)
+            clauses.append("vp.product_normalized LIKE ?")
+            params.append(f"%{normalized}%")
+        if exclude_job_id:
+            clauses.append("vp.job_id != ?")
+            params.append(exclude_job_id)
+        if not clauses:
+            return {"min": None, "max": None, "avg": None, "latest": None, "records": []}
+
+        where = f"WHERE {' AND '.join(clauses)}"
+        rows = conn.execute(f"""
+            SELECT vp.*, j.project_name AS job_name
+            FROM vendor_prices vp
+            LEFT JOIN jobs j ON vp.job_id = j.id
+            {where}
+            ORDER BY vp.created_at DESC
+            LIMIT 20
+        """, params).fetchall()
+        records = [dict(r) for r in rows]
+        if not records:
+            return {"min": None, "max": None, "avg": None, "latest": None, "records": []}
+
+        prices = [r["unit_price"] for r in records if r.get("unit_price")]
+        return {
+            "min": min(prices) if prices else None,
+            "max": max(prices) if prices else None,
+            "avg": round(sum(prices) / len(prices), 2) if prices else None,
+            "latest": records[0] if records else None,
+            "records": records,
+        }
+    finally:
+        conn.close()
+
+
+# ── Notifications ────────────────────────────────────────────────────────────
+
+def create_notification(job_id: int, ntype: str, message: str) -> int:
+    """Create a notification. Returns notification id."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            "INSERT INTO notifications (job_id, type, message, created_at) VALUES (?, ?, ?, ?)",
+            (job_id, ntype, message, datetime.now().isoformat())
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_notifications(unread_only: bool = True) -> list[dict]:
+    """Get notifications, optionally only unread."""
+    conn = _get_conn()
+    try:
+        if unread_only:
+            rows = conn.execute(
+                "SELECT * FROM notifications WHERE read=0 ORDER BY created_at DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50"
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_notification_read(notification_id: int) -> bool:
+    """Mark a notification as read."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute("UPDATE notifications SET read=1 WHERE id=?", (notification_id,))
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()

@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import {
   Settings, Info,
   Key, Brain, Layers, Loader2, Check, Eye, EyeOff,
-  AlertTriangle
+  AlertTriangle, Mail, Server, Bell, ToggleLeft, ToggleRight
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -20,6 +20,16 @@ export default function SettingsPage() {
   const [model, setModel] = useState('gpt-5-mini')
   const [multiPassCount, setMultiPassCount] = useState(2)
 
+  // Email automation state
+  const [emailEnabled, setEmailEnabled] = useState(false)
+  const [emailSaving, setEmailSaving] = useState(false)
+  const [emailSaveSuccess, setEmailSaveSuccess] = useState(false)
+  const [emailConfig, setEmailConfig] = useState({
+    smtp_host: '', smtp_port: '587', imap_host: '', imap_port: '993',
+    email_address: '', email_password: '', sender_name: '', sender_signature: '',
+    notify_quote_received: true, notify_all_quotes_received: true,
+  })
+
   // Load settings on mount
   useEffect(() => {
     api.getSettings()
@@ -28,6 +38,11 @@ export default function SettingsPage() {
         setApiKeyMasked(data.openai_api_key_masked)
         setModel(data.openai_model || 'gpt-5-mini')
         setMultiPassCount(data.multi_pass_count || 2)
+        // Email automation settings
+        if (data.email_automation_enabled === 'true') setEmailEnabled(true)
+        if (data.email_config) {
+          try { setEmailConfig(prev => ({ ...prev, ...JSON.parse(data.email_config) })) } catch {}
+        }
       })
       .catch(console.error)
       .finally(() => setSettingsLoading(false))
@@ -240,6 +255,164 @@ export default function SettingsPage() {
               </div>
             </div>
           )}
+        </div>
+
+        {/* ── Quote Email Automation ──────────────────── */}
+        <div className="glass-card p-8">
+          <div className="flex items-start gap-4 mb-6">
+            <div className="w-11 h-11 rounded-xl bg-blue-500/10 flex items-center justify-center flex-shrink-0">
+              <Mail className="w-5 h-5 text-blue-400" />
+            </div>
+            <div className="flex-1">
+              <h2 className="text-lg font-bold text-white">Quote Email Automation</h2>
+              <p className="text-sm text-gray-500 mt-1">
+                When enabled, AI will compose and send quote requests, and monitor your inbox for vendor responses.
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-5">
+            {/* SMTP Settings */}
+            <div>
+              <label className="label flex items-center gap-2">
+                <Server className="w-3.5 h-3.5" />
+                SMTP (Sending Emails)
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <input className="input" placeholder="SMTP server (e.g., smtp.gmail.com)"
+                  value={emailConfig.smtp_host}
+                  onChange={e => setEmailConfig(c => ({ ...c, smtp_host: e.target.value }))} />
+                <input className="input" placeholder="Port (587)" type="number"
+                  value={emailConfig.smtp_port}
+                  onChange={e => setEmailConfig(c => ({ ...c, smtp_port: e.target.value }))} />
+              </div>
+            </div>
+
+            {/* IMAP Settings */}
+            <div>
+              <label className="label flex items-center gap-2">
+                <Server className="w-3.5 h-3.5" />
+                IMAP (Monitoring Inbox)
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <input className="input" placeholder="IMAP server (e.g., imap.gmail.com)"
+                  value={emailConfig.imap_host}
+                  onChange={e => setEmailConfig(c => ({ ...c, imap_host: e.target.value }))} />
+                <input className="input" placeholder="Port (993)" type="number"
+                  value={emailConfig.imap_port}
+                  onChange={e => setEmailConfig(c => ({ ...c, imap_port: e.target.value }))} />
+              </div>
+            </div>
+
+            {/* Credentials */}
+            <div>
+              <label className="label flex items-center gap-2">
+                <Key className="w-3.5 h-3.5" />
+                Email Credentials
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <input className="input" placeholder="Email address"
+                  value={emailConfig.email_address}
+                  onChange={e => setEmailConfig(c => ({ ...c, email_address: e.target.value }))} />
+                <input className="input" type="password" placeholder="App password"
+                  value={emailConfig.email_password}
+                  onChange={e => setEmailConfig(c => ({ ...c, email_password: e.target.value }))} />
+              </div>
+            </div>
+
+            {/* Sender Info */}
+            <div>
+              <label className="label">Sender Name</label>
+              <input className="input" placeholder="e.g., Josh Dann"
+                value={emailConfig.sender_name}
+                onChange={e => setEmailConfig(c => ({ ...c, sender_name: e.target.value }))} />
+            </div>
+            <div>
+              <label className="label">Email Signature</label>
+              <textarea className="input min-h-[80px] resize-y" placeholder="Company signature block..."
+                value={emailConfig.sender_signature}
+                onChange={e => setEmailConfig(c => ({ ...c, sender_signature: e.target.value }))} />
+            </div>
+
+            {/* Notifications */}
+            <div>
+              <label className="label flex items-center gap-2">
+                <Bell className="w-3.5 h-3.5" />
+                Notifications
+              </label>
+              <div className="space-y-2">
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" checked={emailConfig.notify_quote_received}
+                    onChange={e => setEmailConfig(c => ({ ...c, notify_quote_received: e.target.checked }))}
+                    className="rounded border-gray-600 bg-transparent text-si-bright focus:ring-si-bright/40" />
+                  <span className="text-sm text-gray-300">Notify when a vendor quote is received</span>
+                </label>
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" checked={emailConfig.notify_all_quotes_received}
+                    onChange={e => setEmailConfig(c => ({ ...c, notify_all_quotes_received: e.target.checked }))}
+                    className="rounded border-gray-600 bg-transparent text-si-bright focus:ring-si-bright/40" />
+                  <span className="text-sm text-gray-300">Notify when all quotes received for a job</span>
+                </label>
+              </div>
+            </div>
+
+            {/* Enable Toggle */}
+            {(() => {
+              const canEnable = emailConfig.smtp_host && emailConfig.imap_host &&
+                emailConfig.email_address && emailConfig.email_password
+              return (
+                <div className={`p-4 rounded-xl border ${emailEnabled ? 'border-emerald-500/30 bg-emerald-500/[0.04]' : 'border-white/[0.06] bg-white/[0.02]'}`}>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="text-sm font-semibold text-white">Enable Email Automation</span>
+                      {!canEnable && (
+                        <p className="text-xs text-amber-400 mt-1">Fill in SMTP, IMAP, email, and password to enable</p>
+                      )}
+                    </div>
+                    <button
+                      disabled={!canEnable}
+                      onClick={() => setEmailEnabled(!emailEnabled)}
+                      className={`transition-colors ${!canEnable ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'}`}
+                    >
+                      {emailEnabled
+                        ? <ToggleRight className="w-10 h-10 text-emerald-400" />
+                        : <ToggleLeft className="w-10 h-10 text-gray-600" />
+                      }
+                    </button>
+                  </div>
+                </div>
+              )
+            })()}
+
+            {/* Save Email Settings */}
+            <button
+              onClick={async () => {
+                setEmailSaving(true)
+                try {
+                  await api.updateSettings({
+                    email_automation_enabled: emailEnabled ? 'true' : 'false',
+                    email_config: JSON.stringify(emailConfig),
+                  })
+                  setEmailSaveSuccess(true)
+                  setTimeout(() => setEmailSaveSuccess(false), 3000)
+                } catch (err) {
+                  setSaveError(err.message)
+                } finally {
+                  setEmailSaving(false)
+                }
+              }}
+              disabled={emailSaving}
+              className="btn-primary"
+            >
+              {emailSaving ? (
+                <><Loader2 className="w-4 h-4 animate-spin" /> Saving...</>
+              ) : emailSaveSuccess ? (
+                <><Check className="w-4 h-4" /> Saved</>
+              ) : (
+                'Save Email Settings'
+              )}
+            </button>
+          </div>
         </div>
 
         {/* ── Internal Rates Link ──────────────────────── */}

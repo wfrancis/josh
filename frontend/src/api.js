@@ -120,4 +120,23 @@ export const api = {
   // Settings
   getSettings: () => request('/settings'),
   updateSettings: (data) => request('/settings', { method: 'POST', body: JSON.stringify(data) }),
+
+  // Vendors
+  listVendors: () => request('/vendors'),
+  getVendor: (id) => request('/vendors/' + id),
+  updateVendor: (id, data) => request('/vendors/' + id, { method: 'PUT', body: JSON.stringify(data) }),
+
+  // Vendor Prices / History
+  searchVendorPrices: (params = {}) => {
+    const qs = new URLSearchParams(params).toString()
+    return request('/vendor-prices' + (qs ? '?' + qs : ''))
+  },
+  getPriceHistory: (params = {}) => {
+    const qs = new URLSearchParams(params).toString()
+    return request('/materials/price-history' + (qs ? '?' + qs : ''))
+  },
+
+  // Notifications
+  getNotifications: (unreadOnly = true) => request('/notifications?unread_only=' + unreadOnly),
+  markNotificationRead: (id) => request('/notifications/' + id + '/read', { method: 'PUT' }),
 };

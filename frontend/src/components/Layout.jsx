@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell } from 'lucide-react'
 import { api } from '../api'
 
 function NavItem({ to, icon: Icon, label, active, onClick }) {
@@ -137,6 +137,71 @@ function SidebarContent({ location, onNavigate }) {
   )
 }
 
+function NotificationBell() {
+  const [notifications, setNotifications] = useState([])
+  const [open, setOpen] = useState(false)
+  const bellRef = useRef(null)
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    const load = () => api.getNotifications(true).then(setNotifications).catch(() => {})
+    load()
+    const interval = setInterval(load, 30000) // poll every 30s
+    return () => clearInterval(interval)
+  }, [])
+
+  useEffect(() => {
+    if (!open) return
+    const handleClick = (e) => { if (bellRef.current && !bellRef.current.contains(e.target)) setOpen(false) }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [open])
+
+  const unreadCount = notifications.length
+
+  const handleRead = async (n) => {
+    await api.markNotificationRead(n.id).catch(() => {})
+    setNotifications(prev => prev.filter(x => x.id !== n.id))
+    if (n.job_id) {
+      navigate(`/jobs/${n.job_id}`)
+      setOpen(false)
+    }
+  }
+
+  return (
+    <div className="relative" ref={bellRef}>
+      <button onClick={() => setOpen(!open)} className="relative p-1.5 text-gray-500 hover:text-gray-300 transition-colors">
+        <Bell className="w-5 h-5" />
+        {unreadCount > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 w-4 h-4 rounded-full bg-si-orange text-white text-[9px] font-bold flex items-center justify-center">
+            {unreadCount > 9 ? '9+' : unreadCount}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-2 w-80 bg-[#0d1429] border border-white/[0.08] rounded-xl shadow-2xl z-50 overflow-hidden">
+          <div className="px-4 py-3 border-b border-white/[0.06]">
+            <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">Notifications</span>
+          </div>
+          {notifications.length === 0 ? (
+            <div className="px-4 py-6 text-center text-xs text-gray-500">No new notifications</div>
+          ) : (
+            <div className="max-h-64 overflow-y-auto">
+              {notifications.map(n => (
+                <button key={n.id} onClick={() => handleRead(n)}
+                  className="w-full text-left px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.03] last:border-b-0">
+                  <p className="text-sm text-gray-200">{n.message}</p>
+                  <p className="text-[10px] text-gray-500 mt-1">{new Date(n.created_at).toLocaleString()}</p>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Layout({ children }) {
   const location = useLocation()
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -144,8 +209,11 @@ export default function Layout({ children }) {
   return (
     <div className="min-h-screen flex">
       {/* ── Desktop Sidebar ──────────────────────────── */}
-      <aside className="hidden md:flex w-[260px] flex-shrink-0 bg-[#080C19] border-r border-white/[0.04] flex-col">
+      <aside className="hidden md:flex w-[260px] flex-shrink-0 bg-[#080C19] border-r border-white/[0.04] flex-col relative">
         <SidebarContent location={location} onNavigate={() => {}} />
+        <div className="absolute top-6 right-5">
+          <NotificationBell />
+        </div>
       </aside>
 
       {/* ── Mobile Sidebar Overlay ────────────────────── */}
@@ -171,12 +239,13 @@ export default function Layout({ children }) {
           <button onClick={() => setMobileOpen(true)} className="p-1.5 text-gray-400 hover:text-white">
             <Menu className="w-5 h-5" />
           </button>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-1">
             <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-si-orange to-orange-600 flex items-center justify-center">
               <HardHat className="w-3.5 h-3.5 text-white" />
             </div>
             <span className="text-sm font-bold text-white tracking-wide">STANDARD</span>
           </div>
+          <NotificationBell />
         </div>
         {/* Ambient glow */}
         <div className="fixed top-0 left-0 md:left-[260px] right-0 h-[400px] pointer-events-none z-0

@@ -10,6 +10,8 @@ import StepIndicator from './StepIndicator'
 
 import MaterialsTable from './MaterialsTable'
 import BidPreview from './BidPreview'
+import QuoteUpload from './QuoteUpload'
+import QuoteRequest from './QuoteRequest'
 import StatusBadge, { getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
 
@@ -30,6 +32,7 @@ export default function JobDetail() {
   const [aiSettings, setAiSettings] = useState(null)
   const [confirmDialog, setConfirmDialog] = useState(null)
   const [isDirty, setIsDirty] = useState(false)
+  const [quotePanel, setQuotePanel] = useState(null) // null | 'request' | 'upload'
 
   const loadJob = async () => {
     try {
@@ -408,6 +411,73 @@ export default function JobDetail() {
                 <MaterialsTable materials={job.materials} editable onUpdate={handleMaterialsUpdate} />
               </div>
             )}
+
+            {/* Vendor Quotes Section */}
+            {job.materials?.length > 0 && (() => {
+              const unpricedCount = job.materials.filter(m => !m.unit_price || m.unit_price === 0).length
+              return unpricedCount > 0 || job.quotes?.length > 0 ? (
+                <div className="glass-card p-4 sm:p-6 animate-slide-up">
+                  {/* Unpriced banner */}
+                  {unpricedCount > 0 && (
+                    <div className="flex items-center gap-3 px-4 py-3 mb-4 bg-amber-500/10 border border-amber-500/20 rounded-xl">
+                      <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
+                      <span className="text-sm text-amber-300">
+                        <strong>{unpricedCount}</strong> of {job.materials.length} materials need vendor pricing
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Action buttons */}
+                  {!quotePanel && (
+                    <div className="flex items-center gap-3">
+                      <button
+                        onClick={() => setQuotePanel('request')}
+                        className="btn-secondary text-sm flex items-center gap-2"
+                      >
+                        <Copy className="w-4 h-4" />
+                        Request Quotes
+                      </button>
+                      <button
+                        onClick={() => setQuotePanel('upload')}
+                        className="btn-secondary text-sm flex items-center gap-2"
+                      >
+                        <Upload className="w-4 h-4" />
+                        Upload Vendor Response
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Quote Request Panel */}
+                  {quotePanel === 'request' && (
+                    <QuoteRequest
+                      job={job}
+                      materials={job.materials}
+                      onClose={() => setQuotePanel(null)}
+                    />
+                  )}
+
+                  {/* Quote Upload Panel */}
+                  {quotePanel === 'upload' && (
+                    <div>
+                      <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-sm font-bold text-white">Upload Vendor Response</h3>
+                        <button onClick={() => setQuotePanel(null)}
+                          className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
+                          Close
+                        </button>
+                      </div>
+                      <QuoteUpload
+                        jobId={job.id}
+                        api={api}
+                        existingQuotes={job.quotes || []}
+                        onQuotesParsed={() => loadJob()}
+                        onQuotesCleared={() => loadJob()}
+                      />
+                    </div>
+                  )}
+                </div>
+              ) : null
+            })()}
 
             {/* Continue to Bid */}
             {job.materials?.length > 0 && (

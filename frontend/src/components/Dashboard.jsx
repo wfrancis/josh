@@ -46,7 +46,8 @@ function EmptyState({ onCreate }) {
 /* ── Create Job Modal ──────────────────────────────────── */
 function CreateJobModal({ open, onClose, onCreated }) {
   const [form, setForm] = useState({
-    project_name: '', gc_name: '', address: '', city: '', state: '', zip: '',
+    project_name: '', gc_name: '', architect: '', designer: '',
+    address: '', city: '', state: '', zip: '',
     tax_rate: 0, unit_count: 0, salesperson: '',
   })
   const [saving, setSaving] = useState(false)
@@ -95,6 +96,16 @@ function CreateJobModal({ open, onClose, onCreated }) {
               <div>
                 <label className="label">Salesperson</label>
                 <input className="input" value={form.salesperson} onChange={set('salesperson')} placeholder="Your name" />
+              </div>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="label">Architect</label>
+                <input className="input" value={form.architect} onChange={set('architect')} placeholder="Architect firm" />
+              </div>
+              <div>
+                <label className="label">Designer</label>
+                <input className="input" value={form.designer} onChange={set('designer')} placeholder="Design firm" />
               </div>
             </div>
             <div>
