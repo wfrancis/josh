@@ -476,6 +476,7 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             if match:
                 mat["unit_price"] = prod["unit_price"]
                 mat["vendor"] = prod.get("vendor", "")
+                mat["quote_status"] = "quoted"
                 order_qty = mat.get("order_qty", 0)
                 mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
                 matched += 1
@@ -1179,9 +1180,13 @@ if _static_root:
     # SPA catch-all: serve index.html for any non-API route
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
+        # Return 404 for undefined API routes instead of SPA HTML
+        if full_path.startswith("api/"):
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=404, content={"detail": "Not found"})
         # If the file exists in static dir, serve it directly
         file_path = os.path.join(_static_root, full_path)
         if full_path and os.path.isfile(file_path):
             return FileResponse(file_path)
-        # Otherwise serve index.html for client-side routing (no cache so deploys are instant)
+        # Otherwise serve index.html for client-side routing
         return FileResponse(os.path.join(_static_root, "index.html"), headers={"Cache-Control": "no-cache, no-store, must-revalidate"})

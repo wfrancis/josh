@@ -927,7 +927,7 @@ def list_vendors() -> list[dict]:
     try:
         rows = conn.execute("""
             SELECT v.*,
-                   (SELECT MAX(vp.quote_date) FROM vendor_prices vp WHERE vp.vendor_id = v.id) AS last_quote_date,
+                   (SELECT MAX(vp.created_at) FROM vendor_prices vp WHERE vp.vendor_id = v.id) AS last_quote_date,
                    (SELECT COUNT(*) FROM vendor_prices vp WHERE vp.vendor_id = v.id) AS price_count
             FROM vendors v
             ORDER BY v.name
@@ -983,6 +983,8 @@ def update_vendor(vendor_id: int, data: dict) -> bool:
 
 def search_vendor_prices(vendor: str = None, product: str = None, limit: int = 50) -> list[dict]:
     """Search vendor prices by vendor name and/or product."""
+    if not vendor and not product:
+        return []
     conn = _get_conn()
     try:
         clauses = []
