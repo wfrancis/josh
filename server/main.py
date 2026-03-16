@@ -28,9 +28,11 @@ from models import (
     get_company_rate, save_company_rate, get_all_company_rates,
     get_or_create_vendor, save_vendor_prices_from_quotes,
     list_vendors, get_vendor, update_vendor, search_vendor_prices,
+    create_vendor, delete_vendor,
     get_price_history, import_vendor_prices_csv,
     create_notification, get_notifications, mark_notification_read,
     log_activity, get_activity, add_comment, get_comments,
+    create_quote_request, list_quote_requests, update_quote_request, delete_quote_request,
     _normalize_product, _get_conn,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
@@ -213,6 +215,14 @@ def api_create_job(job: JobCreate):
     created = load_job(job_id)
     log_activity(job_id, "job_created", f"Job '{body.project_name}' created")
     return {"id": job_id, "slug": created.get("slug", ""), "message": "Job created"}
+
+
+def _resolve_job_id(job_id: str) -> int:
+    """Resolve a job_id string (could be slug or numeric ID) to a numeric DB id."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job["id"]
 
 
 @app.get("/api/jobs/{job_id}")
@@ -1317,11 +1327,28 @@ async def api_get_vendor(vendor_id: int):
     return v
 
 
+@app.post("/api/vendors")
+async def api_create_vendor(request: Request):
+    data = await request.json()
+    try:
+        vendor = create_vendor(data)
+        return vendor
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.put("/api/vendors/{vendor_id}")
 async def api_update_vendor(vendor_id: int, request: Request):
     data = await request.json()
     update_vendor(vendor_id, data)
     return {"ok": True}
+
+
+@app.delete("/api/vendors/{vendor_id}")
+async def api_delete_vendor(vendor_id: int):
+    if delete_vendor(vendor_id):
+        return {"ok": True}
+    raise HTTPException(status_code=404, detail="Vendor not found")
 
 
 @app.get("/api/vendor-prices")
@@ -1341,6 +1368,275 @@ async def api_import_vendor_prices(file: UploadFile = File(...)):
 @app.get("/api/materials/price-history")
 async def api_price_history(item_code: str = None, product: str = None, exclude_job: int = None):
     return get_price_history(item_code, product, exclude_job)
+
+
+# ── Quote Requests ───────────────────────────────────────────────────────────
+
+@app.post("/api/jobs/{job_id}/quote-requests")
+async def api_create_quote_request(job_id: str, request: Request):
+    db_id = _resolve_job_id(job_id)
+    data = await request.json()
+    vendor_name = data.get("vendor_name", "").strip()
+    if not vendor_name:
+        raise HTTPException(status_code=400, detail="vendor_name is required")
+    qr = create_quote_request(
+        job_id=db_id,
+        vendor_name=vendor_name,
+        material_ids=data.get("material_ids", []),
+        request_text=data.get("request_text", ""),
+        vendor_id=data.get("vendor_id"),
+    )
+    return qr
+
+
+@app.get("/api/jobs/{job_id}/quote-requests")
+async def api_list_quote_requests(job_id: str):
+    db_id = _resolve_job_id(job_id)
+    return list_quote_requests(db_id)
+
+
+@app.put("/api/quote-requests/{request_id}")
+async def api_update_quote_request(request_id: int, request: Request):
+    data = await request.json()
+    update_quote_request(request_id, **data)
+    return {"ok": True}
+
+
+@app.delete("/api/quote-requests/{request_id}")
+async def api_delete_quote_request(request_id: int):
+    if delete_quote_request(request_id):
+        return {"ok": True}
+    raise HTTPException(status_code=404, detail="Quote request not found")
+
+
+# ── AI: Vendor Detection & Quote Text ────────────────────────────────────────
+
+@app.post("/api/jobs/{job_id}/detect-vendors")
+async def api_detect_vendors(job_id: str):
+    """Use AI to detect manufacturer/vendor from material descriptions."""
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    materials = job.get("materials", [])
+    if not materials:
+        return {"vendors": {}, "materials": []}
+
+    # Build list of materials needing vendor detection
+    needs_detection = []
+    for i, m in enumerate(materials):
+        needs_detection.append({
+            "index": i,
+            "item_code": m.get("item_code", ""),
+            "description": m.get("description", ""),
+            "material_type": m.get("material_type", ""),
+            "vendor": m.get("vendor", ""),
+        })
+
+    settings = get_settings()
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+    model = settings.get("openai_model", "gpt-5-mini")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured")
+
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+
+    # Also get known vendors for context
+    known_vendors = list_vendors()
+    vendor_names = [v["name"] for v in known_vendors]
+
+    prompt = f"""You are a commercial flooring industry expert. Identify the manufacturer/vendor for each material based on product names, brand names, and industry knowledge.
+
+Known vendors in our system: {', '.join(vendor_names) if vendor_names else 'None yet'}
+
+Materials:
+{chr(10).join(f'{m["index"]}. [{m["item_code"]}] {m["description"]} (type: {m["material_type"]}, current vendor: {m["vendor"]})' for m in needs_detection)}
+
+For each material, identify the manufacturer. Common flooring manufacturers include:
+Shaw, Mohawk, Interface, Mannington, Daltile, Johnsonite, Armstrong, Tarkett, Forbo, Patcraft, J+J Flooring, Karndean, COREtec, etc.
+
+Return ONLY a JSON array: [{{"index": 0, "vendor": "Manufacturer Name"}}]
+If you cannot determine the vendor, set vendor to empty string "".
+Match to our known vendors list when possible (use exact name match)."""
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        import json
+        raw_content = response.choices[0].message.content
+        result = json.loads(raw_content)
+        # The JSON object response might wrap the array in various keys
+        if isinstance(result, list):
+            detections = result
+        else:
+            detections = []
+            # Try common wrapper keys
+            for key in ("vendors", "results", "detections", "materials", "data", "result"):
+                if key in result and isinstance(result[key], list):
+                    detections = result[key]
+                    break
+            # Handle dict-of-objects format: {"0": {"index": 0, "vendor": "X"}, ...}
+            if not detections and all(k.isdigit() for k in result.keys()):
+                detections = [v for _, v in sorted(result.items(), key=lambda x: int(x[0]))]
+
+        # Build vendor groups
+        vendor_groups = {}
+        for det in detections:
+            idx = det.get("index", -1)
+            vendor = (det.get("vendor") or "").strip()
+            if 0 <= idx < len(materials):
+                materials[idx]["vendor"] = vendor
+            if vendor:
+                vendor_groups.setdefault(vendor, []).append(idx)
+
+        # Save updated vendor fields back to job
+        save_materials(db_id, materials)
+
+        return {"detections": detections, "vendor_groups": vendor_groups}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI vendor detection failed: {str(e)}")
+
+
+@app.post("/api/jobs/{job_id}/generate-quote-text")
+async def api_generate_quote_text(job_id: str, request: Request):
+    """Use AI to generate professional quote request text for a vendor."""
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    data = await request.json()
+    vendor_name = data.get("vendor_name", "")
+    material_indices = data.get("material_indices", [])
+
+    materials = job.get("materials", [])
+    selected = [materials[i] for i in material_indices if 0 <= i < len(materials)]
+    if not selected:
+        raise HTTPException(status_code=400, detail="No materials selected")
+
+    # Get past vendor prices for context
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT product_name, unit_price, unit, created_at
+               FROM vendor_prices WHERE vendor_name LIKE ? AND unit_price > 0
+               ORDER BY created_at DESC LIMIT 20""",
+            (f"%{vendor_name}%",)
+        ).fetchall()
+        past_prices = [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+    settings = get_settings()
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+    model = settings.get("openai_model", "gpt-5-mini")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured")
+
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+
+    mat_lines = []
+    for i, m in enumerate(selected, 1):
+        qty = round((m.get("order_qty") or m.get("installed_qty") or 0) * 100) / 100
+        desc = m.get("description", m.get("item_code", "Unknown"))
+        item_code = m.get("item_code", "")
+        unit = m.get("unit", "")
+        mat_lines.append(f"{i}. {desc}\n   Item: {item_code} | Qty: {qty:,.2f} {unit}")
+
+    location_parts = [job.get("address"), job.get("city"), job.get("state"), job.get("zip")]
+    location = ", ".join(p for p in location_parts if p)
+
+    past_context = ""
+    if past_prices:
+        past_context = f"\n\nPast pricing from {vendor_name} (for reference, DO NOT include in the email):\n"
+        for pp in past_prices[:5]:
+            past_context += f"  - {pp['product_name']}: ${pp['unit_price']}/{pp.get('unit', 'unit')} ({pp.get('created_at', '')[:10]})\n"
+
+    prompt = f"""Write a professional Request for Pricing email body for a commercial flooring project.
+This is being sent to {vendor_name}.
+
+Project: {job.get('project_name', '')}
+Architect: {job.get('architect', '')}
+Designer: {job.get('designer', '')}
+Location: {location}
+GC: {job.get('gc_name', '')}
+
+Materials requiring pricing ({len(selected)} items):
+{chr(10).join(mat_lines)}
+{past_context}
+
+Write a clean, professional email body. Requirements:
+- Number each material for easy reference
+- Include quantities and units
+- Ask for: unit pricing, freight/delivery, lead times, and quote validity period
+- Be professional but not overly formal — this is a normal vendor relationship
+- Use proper flooring industry terminology
+- Keep it concise — vendors receive many of these
+- Do NOT include subject line, greeting name, or signature — just the body text
+- Start with a brief intro about the project"""
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.choices[0].message.content.strip()
+        return {"text": text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI quote text generation failed: {str(e)}")
+
+
+@app.post("/api/vendors/suggest-contacts")
+async def api_suggest_vendor_contacts(request: Request):
+    """Use AI to suggest contact info for vendors."""
+    data = await request.json()
+    vendor_names = data.get("vendor_names", [])
+    if not vendor_names:
+        return {"suggestions": []}
+
+    settings = get_settings()
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+    model = settings.get("openai_model", "gpt-5-mini")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured")
+
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+
+    prompt = f"""You are a commercial flooring industry expert. For each flooring manufacturer/vendor listed below,
+provide helpful contact information and suggestions for finding a sales rep.
+
+Vendors:
+{chr(10).join(f'- {name}' for name in vendor_names)}
+
+For each vendor, provide:
+1. Their website URL (if a well-known manufacturer)
+2. How to find a local sales rep (e.g., "visit interface.com/find-a-rep")
+3. A general contact email if publicly known
+4. What products they're known for (e.g., "carpet tile", "LVT", "rubber base")
+5. Any helpful notes for a flooring estimator
+
+Return ONLY a JSON array:
+[{{"vendor": "Name", "website": "url", "find_rep_url": "url or instruction", "general_email": "email or empty", "products": "what they sell", "notes": "helpful tip"}}]"""
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        import json
+        result = json.loads(response.choices[0].message.content)
+        suggestions = result if isinstance(result, list) else result.get("suggestions", result.get("vendors", []))
+        return {"suggestions": suggestions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI vendor suggestion failed: {str(e)}")
 
 
 # ── Notifications ────────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@ import AllJobs from './components/AllJobs'
 import JobDetail from './components/JobDetail'
 import SettingsPage from './components/SettingsPage'
 import InternalRatesPage from './components/InternalRatesPage'
+import VendorContactsPage from './components/VendorContactsPage'
 
 export default function App() {
   return (
@@ -14,6 +15,7 @@ export default function App() {
         <Route path="/jobs" element={<AllJobs />} />
         <Route path="/jobs/:jobId" element={<JobDetail />} />
         <Route path="/internal-rates" element={<InternalRatesPage />} />
+        <Route path="/vendor-contacts" element={<VendorContactsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Routes>
     </Layout>

@@ -124,7 +124,10 @@ export const api = {
   // Vendors
   listVendors: () => request('/vendors'),
   getVendor: (id) => request('/vendors/' + id),
+  createVendor: (data) => request('/vendors', { method: 'POST', body: JSON.stringify(data) }),
   updateVendor: (id, data) => request('/vendors/' + id, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteVendor: (id) => request('/vendors/' + id, { method: 'DELETE' }),
+  suggestVendorContacts: (vendorNames) => request('/vendors/suggest-contacts', { method: 'POST', body: JSON.stringify({ vendor_names: vendorNames }) }),
 
   // Vendor Prices / History
   searchVendorPrices: (params = {}) => {
@@ -148,6 +151,16 @@ export const api = {
 
   // AI Price Estimation
   estimatePrice: (jobId, materialIdx) => request(`/jobs/${jobId}/materials/${materialIdx}/estimate-price`, { method: 'POST' }),
+
+  // Quote Requests
+  listQuoteRequests: (jobId) => request('/jobs/' + jobId + '/quote-requests'),
+  createQuoteRequest: (jobId, data) => request('/jobs/' + jobId + '/quote-requests', { method: 'POST', body: JSON.stringify(data) }),
+  updateQuoteRequest: (id, data) => request('/quote-requests/' + id, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteQuoteRequest: (id) => request('/quote-requests/' + id, { method: 'DELETE' }),
+
+  // AI: Vendor Detection & Quote Text
+  detectVendors: (jobId) => request('/jobs/' + jobId + '/detect-vendors', { method: 'POST' }),
+  generateQuoteText: (jobId, data) => request('/jobs/' + jobId + '/generate-quote-text', { method: 'POST', body: JSON.stringify(data) }),
 
   // Activity Log & Comments
   getActivity: (jobId) => request('/jobs/' + jobId + '/activity'),

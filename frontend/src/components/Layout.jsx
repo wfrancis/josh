@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell, Building2 } from 'lucide-react'
 import { api } from '../api'
 
 function NavItem({ to, icon: Icon, label, active, onClick }) {
@@ -128,6 +128,7 @@ function SidebarContent({ location, onNavigate }) {
       {/* Bottom section */}
       <div className="px-3 pb-4 space-y-1">
         <NavItem to="/internal-rates" icon={DollarSign} label="Internal Rates" active={location.pathname === '/internal-rates'} onClick={onNavigate} />
+        <NavItem to="/vendor-contacts" icon={Building2} label="Vendor Contacts" active={location.pathname === '/vendor-contacts'} onClick={onNavigate} />
         <NavItem to="/settings" icon={Settings} label="Settings" active={location.pathname === '/settings'} onClick={onNavigate} />
         <div className="px-3 pt-2 text-[10px] text-gray-600">
           v1.0 · Standard Interiors

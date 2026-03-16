@@ -208,6 +208,20 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS quote_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                vendor_id INTEGER,
+                vendor_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                material_ids TEXT NOT NULL,
+                request_text TEXT,
+                sent_at TEXT,
+                received_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
         """)
         conn.commit()
         # Migrations for existing DBs
@@ -944,6 +958,45 @@ def save_vendor_prices_from_quotes(job_id: int, products: list[dict]) -> int:
         conn.close()
 
 
+def create_vendor(data: dict) -> dict:
+    """Create a new vendor. Returns the created vendor dict."""
+    conn = _get_conn()
+    try:
+        now = datetime.now().isoformat()
+        name = (data.get("name") or "").strip()
+        if not name:
+            raise ValueError("Vendor name is required")
+        # Check for existing vendor with same name
+        existing = conn.execute("SELECT id FROM vendors WHERE name=?", (name,)).fetchone()
+        if existing:
+            raise ValueError(f"Vendor '{name}' already exists")
+        cur = conn.execute(
+            """INSERT INTO vendors (name, contact_name, contact_title, contact_email, contact_phone, notes, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (name, data.get("contact_name", ""), data.get("contact_title", ""),
+             data.get("contact_email", ""), data.get("contact_phone", ""),
+             data.get("notes", ""), now, now)
+        )
+        conn.commit()
+        vendor_id = cur.lastrowid
+        row = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def delete_vendor(vendor_id: int) -> bool:
+    """Delete a vendor and its associated vendor_prices."""
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM vendor_prices WHERE vendor_id=?", (vendor_id,))
+        cur = conn.execute("DELETE FROM vendors WHERE id=?", (vendor_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def list_vendors() -> list[dict]:
     """List all vendors with last quote date."""
     conn = _get_conn()
@@ -1246,5 +1299,80 @@ def get_comments(job_id: int) -> list[dict]:
             (job_id,)
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# --------------- Quote Requests ---------------
+
+def create_quote_request(job_id: int, vendor_name: str, material_ids: list,
+                         request_text: str = "", vendor_id: int = None) -> dict:
+    """Create a quote request record."""
+    conn = _get_conn()
+    try:
+        now = datetime.now().isoformat()
+        import json
+        cur = conn.execute(
+            """INSERT INTO quote_requests (job_id, vendor_id, vendor_name, status, material_ids, request_text, created_at)
+               VALUES (?, ?, ?, 'draft', ?, ?, ?)""",
+            (job_id, vendor_id, vendor_name, json.dumps(material_ids), request_text, now)
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM quote_requests WHERE id=?", (cur.lastrowid,)).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def list_quote_requests(job_id: int) -> list[dict]:
+    """List all quote requests for a job."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM quote_requests WHERE job_id=? ORDER BY created_at DESC",
+            (job_id,)
+        ).fetchall()
+        import json
+        results = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["material_ids"] = json.loads(d["material_ids"])
+            except (json.JSONDecodeError, TypeError):
+                d["material_ids"] = []
+            results.append(d)
+        return results
+    finally:
+        conn.close()
+
+
+def update_quote_request(request_id: int, **fields) -> bool:
+    """Update a quote request (status, sent_at, received_at, request_text)."""
+    conn = _get_conn()
+    try:
+        allowed = {"status", "sent_at", "received_at", "request_text", "vendor_name", "vendor_id"}
+        updates = []
+        values = []
+        for k, v in fields.items():
+            if k in allowed:
+                updates.append(f"{k}=?")
+                values.append(v)
+        if not updates:
+            return False
+        values.append(request_id)
+        cur = conn.execute(f"UPDATE quote_requests SET {', '.join(updates)} WHERE id=?", values)
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_quote_request(request_id: int) -> bool:
+    """Delete a quote request."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute("DELETE FROM quote_requests WHERE id=?", (request_id,))
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()

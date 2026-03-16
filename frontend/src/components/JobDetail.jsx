@@ -12,7 +12,7 @@ import StepIndicator from './StepIndicator'
 import MaterialsTable from './MaterialsTable'
 import BidPreview from './BidPreview'
 import QuoteUpload from './QuoteUpload'
-import QuoteRequest from './QuoteRequest'
+import VendorQuoteFlow from './VendorQuoteFlow'
 import StatusBadge, { getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
 import ActivityLog from './ActivityLog'
@@ -594,17 +594,6 @@ export default function JobDetail() {
                     </div>
                   )}
 
-                  {/* Quote Request Panel */}
-                  {quotePanel === 'request' && (
-                    <QuoteRequest
-                      key={quotePreSelectedIds ? quotePreSelectedIds.join(',') : 'all'}
-                      job={job}
-                      materials={job.materials}
-                      onClose={() => { setQuotePanel(null); setQuotePreSelectedIds(null) }}
-                      preSelectedIds={quotePreSelectedIds}
-                    />
-                  )}
-
                   {/* Quote Upload Panel */}
                   {quotePanel === 'upload' && (
                     <div>
@@ -664,9 +653,7 @@ export default function JobDetail() {
                       setQuoteCopied(false)
                     }}
                     onRequestAllQuotes={() => {
-                      setQuotePreSelectedIds(null)
                       setQuotePanel('request')
-                      setTimeout(() => quoteSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
                     }}
                     onAiEstimate={async (materialIdx) => {
                       try {
@@ -724,6 +711,15 @@ export default function JobDetail() {
       <ActivityLog jobId={job.id} />
 
       <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
+
+      {/* Vendor Quote Flow Modal — rendered outside animated containers to avoid transform containing block issues */}
+      {quotePanel === 'request' && job && (
+        <VendorQuoteFlow
+          job={job}
+          onClose={() => { setQuotePanel(null); setQuotePreSelectedIds(null) }}
+          onQuoteRequestCreated={() => loadJob()}
+        />
+      )}
 
       {/* Single-material quote request modal */}
       {quoteMaterial && job && (() => {
