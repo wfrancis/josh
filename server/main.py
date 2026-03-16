@@ -688,13 +688,19 @@ def _link_upload_to_requests(job_id: int, products: list[dict]):
     import datetime
     now = datetime.datetime.utcnow().isoformat()
 
+    import re
+    def _normalize_vendor(name):
+        """Normalize vendor name for fuzzy matching: lowercase, strip punctuation, collapse spaces."""
+        return re.sub(r'[^a-z0-9 ]', '', name.lower()).strip()
+
     for req in requests:
         if req.get("received_at"):
             continue  # already marked received
-        req_vendor = (req.get("vendor_name") or "").strip().lower()
+        req_vendor = _normalize_vendor(req.get("vendor_name") or "")
         # Fuzzy match: check if any uploaded vendor name contains or is contained by the request vendor
         for uv in upload_vendors:
-            if req_vendor in uv or uv in req_vendor or req_vendor == uv:
+            uv_norm = _normalize_vendor(uv)
+            if req_vendor in uv_norm or uv_norm in req_vendor or req_vendor == uv_norm:
                 update_quote_request(req["id"], status="received", received_at=now)
                 break
 

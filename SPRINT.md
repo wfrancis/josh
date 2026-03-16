@@ -75,11 +75,16 @@ AI-powered vendor-grouped quote requests with tracking. Three phases: Vendor Con
 | 2D. `MaterialsTable.jsx` status badges | ✅ Done | "Requested from X" (blue) / "Quoted by X" (green) badges on unpriced materials |
 
 ### Phase 2 Verification Checklist
-- [ ] Upload vendor quote PDF → AI matches products to materials
-- [ ] System prompts to link upload to existing quote request
+- [x] Upload vendor quote PDF → AI matches products to materials (Daltile: 22 products, 5 auto-matched)
+- [x] System auto-links upload to existing quote request (Daltile + Ann Sacks auto-marked "received")
 - [x] QuoteTracker shows status per vendor (waiting/overdue/received)
 - [x] MaterialsTable shows "Requested from X" badges
 - [ ] "Follow Up" generates AI-written follow-up message
+
+### Phase 2 Bug Fixes
+| Bug | Status | Notes |
+|-----|--------|-------|
+| Vendor name fuzzy match fails on hyphens | ✅ Fixed | Normalize names: strip punctuation before comparing ("Dal-Tile" → "daltile") |
 
 ---
 
