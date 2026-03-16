@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store, Mail, DollarSign, Sparkles, XCircle } from 'lucide-react'
+import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store, Mail, DollarSign, Sparkles, XCircle, Info } from 'lucide-react'
 
 function round2(val) { return Math.round((val || 0) * 100) / 100 }
 function formatCurrency(val) {
@@ -515,12 +515,13 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
         <thead className="sticky top-0 z-10 bg-[#0c0c14]">
           <tr className="border-b border-white/[0.06]">
             {[
-              { label: 'Material', key: null, align: 'left', hide: '' },
-              { label: 'Type', key: 'type', align: 'left', hide: '' },
-              { label: 'Install Qty', key: 'install_qty', align: 'right', hide: 'hidden md:table-cell' },
-              { label: 'Waste', key: 'waste', align: 'right', hide: 'hidden lg:table-cell' },
-              { label: 'Order Qty', key: 'order_qty', align: 'right', hide: 'hidden md:table-cell' },
-              { label: 'Total', key: 'extended', align: 'right', hide: '' },
+              { label: 'Material', key: null, align: 'left', hide: '', tooltip: 'Material description or item code' },
+              { label: 'Type', key: 'type', align: 'left', hide: '', tooltip: 'Material type or category' },
+              { label: 'Install Qty', key: 'install_qty', align: 'right', hide: 'hidden md:table-cell', tooltip: 'Quantity needed for installation' },
+              { label: 'Waste', key: 'waste', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Waste factor percentage added to install quantity' },
+              { label: 'Order Qty', key: 'order_qty', align: 'right', hide: 'hidden md:table-cell', tooltip: 'Quantity to order (install qty + waste)' },
+              ...(onRequestQuote ? [{ label: 'Internal Price', key: 'known_price', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Price from your warehouse inventory or past vendor quotes' }] : []),
+              { label: 'Total', key: 'extended', align: 'right', hide: '', tooltip: 'Your bid price for this line item' },
               ...(showDeleteCol ? [{ label: '', key: null, align: 'center', hide: '' }] : []),
             ].map((col, i) => (
               <th key={col.label || `col-${i}`}
@@ -529,8 +530,18 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   text-${col.align} ${col.label === '' ? 'w-10' : ''} ${col.hide}
                   ${col.key ? 'cursor-pointer hover:text-gray-300 select-none transition-colors' : ''}`}
               >
-                {col.label}
-                {col.key && <SortIcon col={col.key} sortCol={sortCol} sortDir={sortDir} />}
+                <span className="inline-flex items-center gap-1">
+                  {col.label}
+                  {col.key && <SortIcon col={col.key} sortCol={sortCol} sortDir={sortDir} />}
+                  {col.tooltip && (
+                    <span className="relative group/tip">
+                      <Info className="w-3 h-3 text-gray-600 hover:text-gray-400 transition-colors" />
+                      <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2.5 py-1.5 rounded-lg bg-gray-900 border border-white/10 text-[11px] text-gray-300 font-normal normal-case tracking-normal whitespace-nowrap opacity-0 pointer-events-none group-hover/tip:opacity-100 transition-opacity z-50 shadow-lg">
+                        {col.tooltip}
+                      </span>
+                    </span>
+                  )}
+                </span>
               </th>
             ))}
           </tr>
@@ -609,6 +620,20 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     formatNumber(m.order_qty)
                   )}
                 </td>
+                {onRequestQuote && (
+                  <td className="hidden lg:table-cell py-3 px-2 sm:px-3 text-right tabular-nums text-xs">
+                    {m.known_price ? (
+                      <div>
+                        <span className="text-emerald-300 font-medium">{formatCurrency(m.known_price)}</span>
+                        <span className={`block text-[10px] ${m.known_price_source === 'vendor_history' ? 'text-sky-500/60' : 'text-emerald-500/60'}`}>
+                          {m.known_price_source === 'vendor_history' ? m.known_price_vendor || 'Past Quote' : 'In Stock'}
+                        </span>
+                      </div>
+                    ) : (
+                      <span className="text-gray-700">—</span>
+                    )}
+                  </td>
+                )}
                 <td className="py-3 px-2 sm:px-3 text-right tabular-nums font-medium">
                   {onRequestQuote ? (
                     <PriceActionMenu

@@ -31,6 +31,7 @@ from models import (
     get_price_history, import_vendor_prices_csv,
     create_notification, get_notifications, mark_notification_read,
     log_activity, get_activity, add_comment, get_comments,
+    _normalize_product, _get_conn,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
@@ -220,7 +221,56 @@ def api_get_job(job_id: str):
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Enrich materials with known prices from price list and vendor history
+    _enrich_known_prices(job)
     return job
+
+
+def _enrich_known_prices(job: dict):
+    """Add known_price field to each material from price list and vendor price history."""
+    materials = job.get("materials", [])
+    if not materials:
+        return
+    price_list = get_price_list_entries()
+
+    # Build a map of normalized vendor prices (latest price per product)
+    conn = _get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT product_normalized, unit_price, vendor_name, unit,
+                   MAX(created_at) as latest_date
+            FROM vendor_prices
+            WHERE unit_price > 0
+            GROUP BY product_normalized
+            ORDER BY latest_date DESC
+        """).fetchall()
+        vendor_map = {r["product_normalized"]: dict(r) for r in rows}
+    finally:
+        conn.close()
+
+    for mat in materials:
+        item_code = (mat.get("item_code") or "").strip().lower()
+        description = (mat.get("description") or "").strip().lower()
+
+        # Check price list first
+        pl_match = _match_price_list(mat, price_list)
+        if pl_match and pl_match.get("unit_price"):
+            order_qty = mat.get("order_qty") or mat.get("installed_qty") or 1
+            mat["known_price"] = round(pl_match["unit_price"] * order_qty, 2)
+            mat["known_price_source"] = "price_list"
+            mat["known_price_vendor"] = pl_match.get("vendor", "")
+            continue
+
+        # Check vendor price history
+        normalized = _normalize_product(item_code or description)
+        if normalized and len(normalized) >= 3:
+            for key, vp in vendor_map.items():
+                if normalized in key or key in normalized:
+                    order_qty = mat.get("order_qty") or mat.get("installed_qty") or 1
+                    mat["known_price"] = round(vp["unit_price"] * order_qty, 2)
+                    mat["known_price_source"] = "vendor_history"
+                    mat["known_price_vendor"] = vp.get("vendor_name", "")
+                    break
 
 
 @app.post("/api/jobs/bulk-delete")
@@ -441,7 +491,7 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             "item_code": m.get("item_code"),
             "description": m.get("description"),
             "material_type": material_type,
-            "installed_qty": installed_qty,
+            "installed_qty": round(installed_qty, 2),
             "unit": m.get("unit"),
             "waste_pct": waste_pct,
             "order_qty": round(order_qty, 2),

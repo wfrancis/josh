@@ -60,7 +60,7 @@ export default function QuoteRequest({ job, materials, onClose, preSelectedIds =
       const parts = [m.item_code, m.description].filter(Boolean)
       let line = parts.join(' - ')
       const qty = m.installed_qty || m.order_qty || 0
-      if (qty) line += ` — ${qty} ${m.unit || ''}`
+      if (qty) line += ` — ${Math.round(qty * 100) / 100} ${m.unit || ''}`
       lines.push(`• ${line}`)
     }
 
@@ -158,7 +158,7 @@ export default function QuoteRequest({ job, materials, onClose, preSelectedIds =
                 </span>
               </div>
               <span className="text-[10px] text-gray-500 flex-shrink-0">
-                {m.installed_qty || m.order_qty || '?'} {m.unit || ''}
+                {Math.round((m.installed_qty || m.order_qty || 0) * 100) / 100 || '?'} {m.unit || ''}
               </span>
             </label>
           ))}

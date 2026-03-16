@@ -205,7 +205,7 @@ def generate_quote_request_text(job: dict, materials: list[dict]) -> str:
         parts = [p for p in [item, desc] if p]
         line = " - ".join(parts)
         if qty:
-            line += f" — {qty} {unit}"
+            line += f" — {round(qty, 2)} {unit}"
         lines.append(f"• {line}")
 
     lines.append("")
