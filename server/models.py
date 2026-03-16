@@ -226,6 +226,8 @@ def init_db() -> None:
             ("jq_lead_time", "ALTER TABLE job_quotes ADD COLUMN lead_time TEXT"),
             ("jq_notes", "ALTER TABLE job_quotes ADD COLUMN notes TEXT"),
             ("price_source", "ALTER TABLE job_materials ADD COLUMN price_source TEXT"),
+            ("activity_user", "ALTER TABLE job_activity ADD COLUMN user TEXT DEFAULT 'System'"),
+            ("comment_user", "ALTER TABLE job_comments ADD COLUMN user TEXT DEFAULT 'System'"),
         ]:
             try:
                 conn.execute(sql)
@@ -1179,15 +1181,15 @@ def mark_notification_read(notification_id: int) -> bool:
 
 # ── Activity Log ─────────────────────────────────────────────────────────────
 
-def log_activity(job_id: int, action: str, summary: str, detail: dict = None) -> int:
+def log_activity(job_id: int, action: str, summary: str, detail: dict = None, user: str = "System") -> int:
     """Record an activity event for a job."""
     import json as _json
     conn = _get_conn()
     try:
         detail_str = _json.dumps(detail) if detail else None
         cur = conn.execute(
-            "INSERT INTO job_activity (job_id, action, summary, detail, created_at) VALUES (?, ?, ?, ?, ?)",
-            (job_id, action, summary, detail_str, datetime.now().isoformat())
+            "INSERT INTO job_activity (job_id, action, summary, detail, created_at, user) VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, action, summary, detail_str, datetime.now().isoformat(), user)
         )
         conn.commit()
         return cur.lastrowid
@@ -1220,17 +1222,17 @@ def get_activity(job_id: int, limit: int = 50) -> list[dict]:
 
 # ── Job Comments ─────────────────────────────────────────────────────────────
 
-def add_comment(job_id: int, text: str) -> dict:
+def add_comment(job_id: int, text: str, user: str = "System") -> dict:
     """Add a comment to a job. Returns the created comment."""
     conn = _get_conn()
     try:
         now = datetime.now().isoformat()
         cur = conn.execute(
-            "INSERT INTO job_comments (job_id, text, created_at) VALUES (?, ?, ?)",
-            (job_id, text, now)
+            "INSERT INTO job_comments (job_id, text, created_at, user) VALUES (?, ?, ?, ?)",
+            (job_id, text, now, user)
         )
         conn.commit()
-        return {"id": cur.lastrowid, "job_id": job_id, "text": text, "created_at": now}
+        return {"id": cur.lastrowid, "job_id": job_id, "text": text, "created_at": now, "user": user}
     finally:
         conn.close()
 

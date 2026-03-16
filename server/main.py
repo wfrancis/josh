@@ -497,6 +497,7 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
                 mat["unit_price"] = prod["unit_price"]
                 mat["vendor"] = prod.get("vendor", "")
                 mat["quote_status"] = "quoted"
+                mat["price_source"] = "vendor_quote"
                 order_qty = mat.get("order_qty", 0)
                 mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
                 matched += 1
@@ -726,7 +727,7 @@ The price should be per {m.get('unit', 'unit')}. Be conservative — estimate on
         materials[material_idx] = m
         save_materials(job["id"], materials)
 
-        log_activity(job["id"], "materials_updated",
+        log_activity(job["id"], "ai_estimate",
                      f"AI estimated price for {m.get('item_code', m.get('description', 'material'))}: ${estimated_price:.2f}/{m.get('unit', 'unit')}")
 
         return {

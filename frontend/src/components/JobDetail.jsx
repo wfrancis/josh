@@ -595,6 +595,7 @@ export default function JobDetail() {
                   {/* Quote Request Panel */}
                   {quotePanel === 'request' && (
                     <QuoteRequest
+                      key={quotePreSelectedIds ? quotePreSelectedIds.join(',') : 'all'}
                       job={job}
                       materials={job.materials}
                       onClose={() => { setQuotePanel(null); setQuotePreSelectedIds(null) }}

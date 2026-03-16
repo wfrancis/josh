@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store, Mail, DollarSign, Sparkles } from 'lucide-react'
+import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store, Mail, DollarSign, Sparkles, XCircle } from 'lucide-react'
 
+function round2(val) { return Math.round((val || 0) * 100) / 100 }
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
 }
@@ -156,9 +157,12 @@ function TypeDropdown({ currentType, confidence, onSelect, editable }) {
   )
 }
 
-function PriceActionMenu({ material, onRequestQuote, onEnterPrice, onAiEstimate, estimating }) {
+function PriceActionMenu({ material, onRequestQuote, onSetTotal, onAiEstimate, onClearPrice, estimating, hasPrice, extendedCost, priceSource }) {
   const [open, setOpen] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [editValue, setEditValue] = useState('')
   const menuRef = useRef(null)
+  const inputRef = useRef(null)
 
   useEffect(() => {
     if (!open) return
@@ -169,23 +173,85 @@ function PriceActionMenu({ material, onRequestQuote, onEnterPrice, onAiEstimate,
     return () => document.removeEventListener('mousedown', handleClick)
   }, [open])
 
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus()
+      inputRef.current.select()
+    }
+  }, [editing])
+
+  const handleSubmitTotal = () => {
+    const val = parseFloat(editValue)
+    if (val > 0) {
+      onSetTotal(val)
+    }
+    setEditing(false)
+    setEditValue('')
+  }
+
+  if (editing) {
+    return (
+      <div className="inline-flex items-center gap-1">
+        <span className="text-gray-500 text-sm">$</span>
+        <input
+          ref={inputRef}
+          type="number" step="0.01" min="0"
+          value={editValue}
+          onChange={e => setEditValue(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') handleSubmitTotal()
+            if (e.key === 'Escape') { setEditing(false); setEditValue('') }
+          }}
+          onBlur={handleSubmitTotal}
+          placeholder={extendedCost ? String(Math.round(extendedCost)) : '0'}
+          className="editable-cell w-28 text-right text-gray-100"
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="relative inline-block" ref={menuRef}>
-      <button
-        onClick={() => setOpen(!open)}
-        disabled={estimating}
-        className={`text-xs font-medium px-2 py-0.5 rounded-md transition-colors ${
-          estimating
-            ? 'bg-si-bright/10 text-si-bright animate-pulse'
-            : 'bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
-        }`}
-      >
-        {estimating ? 'Estimating...' : 'Need Price'}
-      </button>
+      {estimating ? (
+        <span className="text-xs font-medium px-2 py-0.5 rounded-md bg-si-bright/10 text-si-bright animate-pulse">
+          Estimating...
+        </span>
+      ) : hasPrice ? (
+        <button
+          onClick={() => setOpen(!open)}
+          className={`cursor-pointer hover:opacity-80 transition-opacity ${
+            priceSource === 'ai_estimate' ? 'text-violet-300' :
+            priceSource === 'vendor_quote' ? 'text-sky-300' :
+            priceSource === 'manual' ? 'text-emerald-300' :
+            'text-white'
+          }`}
+        >
+          {formatCurrency(extendedCost)}
+          {priceSource && priceSource !== 'none' && (
+            <span className={`block text-[10px] font-normal ${
+              priceSource === 'ai_estimate' ? 'text-violet-400/60' :
+              priceSource === 'vendor_quote' ? 'text-sky-400/60' :
+              priceSource === 'manual' ? 'text-emerald-400/60' :
+              'text-gray-500'
+            }`}>
+              {priceSource === 'ai_estimate' ? 'AI est.' :
+               priceSource === 'vendor_quote' ? 'Vendor' :
+               priceSource === 'manual' ? 'Manual' : ''}
+            </span>
+          )}
+        </button>
+      ) : (
+        <button
+          onClick={() => setOpen(!open)}
+          className="text-xs font-medium px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 transition-colors"
+        >
+          Need Price
+        </button>
+      )}
       {open && !estimating && (
-        <div className="absolute right-0 top-full mt-1 z-50 w-48 bg-gray-900 border border-white/[0.1] rounded-xl shadow-2xl py-1">
+        <div className="absolute right-0 top-full mt-1 z-50 w-52 bg-gray-900 border border-white/[0.1] rounded-xl shadow-2xl py-1">
           <button
-            onClick={() => { onEnterPrice(); setOpen(false) }}
+            onClick={() => { setOpen(false); setEditValue(extendedCost ? String(Math.round(extendedCost * 100) / 100) : ''); setEditing(true) }}
             className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2 text-gray-300"
           >
             <DollarSign className="w-3.5 h-3.5 text-emerald-400" />
@@ -205,6 +271,18 @@ function PriceActionMenu({ material, onRequestQuote, onEnterPrice, onAiEstimate,
             <Sparkles className="w-3.5 h-3.5 text-violet-400" />
             AI Estimate Price
           </button>
+          {hasPrice && (
+            <>
+              <div className="border-t border-white/[0.06] my-1" />
+              <button
+                onClick={() => { onClearPrice(); setOpen(false) }}
+                className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2 text-red-400/70"
+              >
+                <XCircle className="w-3.5 h-3.5" />
+                Clear Price
+              </button>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -219,7 +297,6 @@ function SortIcon({ col, sortCol, sortDir }) {
 }
 
 export default function MaterialsTable({ materials, onUpdate, readOnly = false, editable = false, onRequestQuote, onRequestAllQuotes, onAiEstimate }) {
-  const [editingPriceId, setEditingPriceId] = useState(null)
   const [estimatingIdx, setEstimatingIdx] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [typeFilter, setTypeFilter] = useState('')
@@ -251,9 +328,6 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
     onUpdate?.(materials.filter((_, i) => i !== idx))
   }
 
-  const handlePriceChange = (idx, value) => {
-    updateMaterial(idx, { unit_price: parseFloat(value) || 0 })
-  }
 
   const handleTypeChange = (idx, newType) => {
     updateMaterial(idx, { material_type: newType, ai_confidence: 1.0 })
@@ -269,9 +343,8 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
     )
   }
 
-  const showPriceCol = !readOnly && !editable
   const showDeleteCol = editable
-  const colCount = 6 + (showPriceCol ? 1 : 0) + (showDeleteCol ? 1 : 0)
+  const colCount = 6 + (showDeleteCol ? 1 : 0)
 
 
 
@@ -370,7 +443,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                 <option key={t} value={t}>{TYPE_LABELS[t] || t}</option>
               ))}
             </select>
-            {showPriceCol && (
+            {onRequestQuote && (
               <label className="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer select-none whitespace-nowrap">
                 <input
                   type="checkbox"
@@ -393,9 +466,9 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
         </div>
       )}
       {/* Status bar: completion + confidence warnings */}
-      {materials.length > 0 && (showPriceCol || lowConfidenceCount > 0 || (pricedCount < totalCount && onRequestAllQuotes)) && (
+      {materials.length > 0 && (onRequestQuote || lowConfidenceCount > 0 || (pricedCount < totalCount && onRequestAllQuotes)) && (
         <div className="flex items-center gap-4 mb-3 flex-wrap text-xs">
-          {(showPriceCol || pricedCount < totalCount) && (
+          {(onRequestQuote || pricedCount < totalCount) && (
             <span className={`font-medium ${pricePct >= 1 ? 'text-emerald-400' : pricePct >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}>
               {pricedCount}/{totalCount} priced
             </span>
@@ -447,8 +520,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
               { label: 'Install Qty', key: 'install_qty', align: 'right', hide: 'hidden md:table-cell' },
               { label: 'Waste', key: 'waste', align: 'right', hide: 'hidden lg:table-cell' },
               { label: 'Order Qty', key: 'order_qty', align: 'right', hide: 'hidden md:table-cell' },
-              ...(showPriceCol ? [{ label: 'Unit Price', key: 'unit_price', align: 'right', hide: '' }] : []),
-              { label: 'Extended', key: 'extended', align: 'right', hide: '' },
+              { label: 'Total', key: 'extended', align: 'right', hide: '' },
               ...(showDeleteCol ? [{ label: '', key: null, align: 'center', hide: '' }] : []),
             ].map((col, i) => (
               <th key={col.label || `col-${i}`}
@@ -537,43 +609,18 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     formatNumber(m.order_qty)
                   )}
                 </td>
-                {showPriceCol && (
-                  <td className="py-3 px-2 sm:px-3 text-right">
-                    <div className="flex items-center justify-end gap-1.5">
-                      {m.quote_status === 'needs_quote' && (
-                        <span className="w-2 h-2 rounded-full bg-amber-400/80 flex-shrink-0" title="Needs quote" />
-                      )}
-                      <input
-                        type="number" step="0.01" min="0"
-                        data-price-idx={m._origIdx}
-                        value={m.unit_price || ''}
-                        onChange={(e) => handlePriceChange(m._origIdx, e.target.value)}
-                        onFocus={() => setEditingPriceId(m._origIdx)} onBlur={() => setEditingPriceId(null)}
-                        placeholder="0.00"
-                        className={`editable-cell w-24 ${!hasPrice && editingPriceId !== m._origIdx ? 'text-gray-600' : 'text-gray-100'}`}
-                      />
-                    </div>
-                  </td>
-                )}
                 <td className="py-3 px-2 sm:px-3 text-right tabular-nums font-medium">
-                  {hasPrice ? (
-                    <span className={`${m.price_source === 'ai_estimate' ? 'text-violet-300' : 'text-white'}`}>
-                      {formatCurrency(m.extended_cost)}
-                      {m.price_source === 'ai_estimate' && (
-                        <span className="block text-[10px] text-violet-400/60 font-normal">AI est.</span>
-                      )}
-                    </span>
-                  ) : onRequestQuote ? (
+                  {onRequestQuote ? (
                     <PriceActionMenu
                       material={m}
+                      hasPrice={hasPrice}
+                      extendedCost={m.extended_cost}
+                      priceSource={m.price_source}
                       estimating={estimatingIdx === m._origIdx}
-                      onEnterPrice={() => {
-                        setEditingPriceId(m._origIdx)
-                        // Focus the price input for this row
-                        setTimeout(() => {
-                          const input = document.querySelector(`[data-price-idx="${m._origIdx}"]`)
-                          if (input) input.focus()
-                        }, 50)
+                      onSetTotal={(total) => {
+                        const orderQty = m.order_qty || m.installed_qty || 1
+                        const unitPrice = orderQty > 0 ? round2(total / orderQty) : total
+                        updateMaterial(m._origIdx, { unit_price: unitPrice, extended_cost: round2(total), price_source: 'manual' })
                       }}
                       onRequestQuote={() => onRequestQuote(m)}
                       onAiEstimate={async () => {
@@ -585,7 +632,12 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                           setEstimatingIdx(null)
                         }
                       }}
+                      onClearPrice={() => {
+                        updateMaterial(m._origIdx, { unit_price: 0, extended_cost: 0, price_source: null })
+                      }}
                     />
+                  ) : hasPrice ? (
+                    <span className="text-white">{formatCurrency(m.extended_cost)}</span>
                   ) : (
                     <span className="text-gray-600">—</span>
                   )}
