@@ -160,6 +160,7 @@ export const api = {
 
   // AI: Vendor Detection & Quote Text
   detectVendors: (jobId) => request('/jobs/' + jobId + '/detect-vendors', { method: 'POST' }),
+  suggestVendors: (jobId, materialIndices) => request('/jobs/' + jobId + '/suggest-vendors', { method: 'POST', body: JSON.stringify({ material_indices: materialIndices }) }),
   generateQuoteText: (jobId, data) => request('/jobs/' + jobId + '/generate-quote-text', { method: 'POST', body: JSON.stringify(data) }),
 
   // Activity Log & Comments

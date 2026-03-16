@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store, Mail, DollarSign, Sparkles, XCircle, Info } from 'lucide-react'
+import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store, Mail, DollarSign, Sparkles, XCircle, Info, Clock, Check } from 'lucide-react'
 
 function round2(val) { return Math.round((val || 0) * 100) / 100 }
 function formatCurrency(val) {
@@ -296,13 +296,25 @@ function SortIcon({ col, sortCol, sortDir }) {
     : <ChevronDown className="inline-block w-3 h-3 ml-0.5 text-si-bright" />
 }
 
-export default function MaterialsTable({ materials, onUpdate, readOnly = false, editable = false, onRequestQuote, onRequestAllQuotes, onAiEstimate }) {
+export default function MaterialsTable({ materials, onUpdate, readOnly = false, editable = false, onRequestQuote, onRequestAllQuotes, onAiEstimate, quoteRequests = [] }) {
   const [estimatingIdx, setEstimatingIdx] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [typeFilter, setTypeFilter] = useState('')
   const [unpricedOnly, setUnpricedOnly] = useState(false)
   const [sortCol, setSortCol] = useState(null)
   const [sortDir, setSortDir] = useState('desc')
+
+  // Build quote request lookup: material_id -> { vendor_name, status, sent_at, received_at }
+  const quoteStatusMap = useMemo(() => {
+    const map = {}
+    for (const req of quoteRequests) {
+      const status = req.received_at ? 'received' : req.sent_at ? 'sent' : 'draft'
+      for (const matId of (req.material_ids || [])) {
+        map[matId] = { vendor_name: req.vendor_name, status, sent_at: req.sent_at, received_at: req.received_at }
+      }
+    }
+    return map
+  }, [quoteRequests])
 
   const updateMaterial = (idx, changes) => {
     const updated = materials.map((m, i) => {
@@ -571,6 +583,22 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     <div className="flex items-center gap-1 mt-0.5">
                       <Store className="w-3 h-3 text-emerald-500/70" />
                       <span className="text-[10px] text-emerald-500/70">{m.vendor}</span>
+                    </div>
+                  )}
+                  {/* Quote request status badge */}
+                  {!hasPrice && quoteStatusMap[m.id] && (
+                    <div className="flex items-center gap-1 mt-0.5">
+                      {quoteStatusMap[m.id].status === 'sent' ? (
+                        <>
+                          <Clock className="w-3 h-3 text-blue-400/70" />
+                          <span className="text-[10px] text-blue-400/70">Requested from {quoteStatusMap[m.id].vendor_name}</span>
+                        </>
+                      ) : quoteStatusMap[m.id].status === 'received' ? (
+                        <>
+                          <Check className="w-3 h-3 text-emerald-400/70" />
+                          <span className="text-[10px] text-emerald-400/70">Quoted by {quoteStatusMap[m.id].vendor_name}</span>
+                        </>
+                      ) : null}
                     </div>
                   )}
                   {/* Show qty on mobile since column is hidden */}

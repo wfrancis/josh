@@ -1306,16 +1306,17 @@ def get_comments(job_id: int) -> list[dict]:
 # --------------- Quote Requests ---------------
 
 def create_quote_request(job_id: int, vendor_name: str, material_ids: list,
-                         request_text: str = "", vendor_id: int = None) -> dict:
+                         request_text: str = "", vendor_id: int = None,
+                         status: str = "draft", sent_at: str = None) -> dict:
     """Create a quote request record."""
     conn = _get_conn()
     try:
         now = datetime.now().isoformat()
         import json
         cur = conn.execute(
-            """INSERT INTO quote_requests (job_id, vendor_id, vendor_name, status, material_ids, request_text, created_at)
-               VALUES (?, ?, ?, 'draft', ?, ?, ?)""",
-            (job_id, vendor_id, vendor_name, json.dumps(material_ids), request_text, now)
+            """INSERT INTO quote_requests (job_id, vendor_id, vendor_name, status, material_ids, request_text, sent_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, vendor_id, vendor_name, status, json.dumps(material_ids), request_text, sent_at, now)
         )
         conn.commit()
         row = conn.execute("SELECT * FROM quote_requests WHERE id=?", (cur.lastrowid,)).fetchone()

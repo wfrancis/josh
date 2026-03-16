@@ -525,7 +525,9 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
 
 
 def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
-    """Try to match parsed quote products to existing materials by item_code."""
+    """Try to match parsed quote products to existing materials.
+    Phase 1: exact item_code matching (fast, no AI).
+    Phase 2: AI fuzzy matching for remaining unmatched items."""
     job = load_job(job_id)
     if not job:
         return 0
@@ -535,19 +537,26 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
 
     matched = 0
     updated = False
-    for mat in materials:
+    matched_mat_indices = set()
+    matched_prod_indices = set()
+
+    # Phase 1: Fast exact item_code matching
+    for mat_idx, mat in enumerate(materials):
+        if mat.get("unit_price") and mat["unit_price"] > 0:
+            continue  # already priced
         item_code = (mat.get("item_code") or "").strip().lower()
         description = (mat.get("description") or "").strip().lower()
         if not item_code and not description:
             continue
 
-        for prod in products:
+        for prod_idx, prod in enumerate(products):
+            if prod_idx in matched_prod_indices:
+                continue
             if prod.get("error") or not prod.get("unit_price"):
                 continue
             prod_name = (prod.get("product_name") or "").strip().lower()
             prod_desc = (prod.get("description") or "").strip().lower()
 
-            # Match if item_code appears in product name/description
             match = False
             if item_code and len(item_code) >= 3:
                 if item_code in prod_name or item_code in prod_desc:
@@ -562,12 +571,132 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
                 mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
                 matched += 1
                 updated = True
+                matched_mat_indices.add(mat_idx)
+                matched_prod_indices.add(prod_idx)
                 break
+
+    # Phase 2: AI fuzzy matching for remaining unmatched
+    unmatched_mats = [(i, m) for i, m in enumerate(materials) if i not in matched_mat_indices and (not m.get("unit_price") or m["unit_price"] == 0)]
+    unmatched_prods = [(i, p) for i, p in enumerate(products) if i not in matched_prod_indices and not p.get("error") and p.get("unit_price")]
+
+    if unmatched_mats and unmatched_prods:
+        ai_matched = _ai_match_quotes(unmatched_mats, unmatched_prods)
+        for mat_idx, prod_idx in ai_matched:
+            mat = materials[mat_idx]
+            prod = products[prod_idx]
+            mat["unit_price"] = prod["unit_price"]
+            mat["vendor"] = prod.get("vendor", "")
+            mat["quote_status"] = "quoted"
+            mat["price_source"] = "vendor_quote"
+            order_qty = mat.get("order_qty", 0)
+            mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
+            matched += 1
+            updated = True
 
     if updated:
         save_materials(job_id, materials)
 
+    # Also try to link to open quote requests
+    _link_upload_to_requests(job_id, products)
+
     return matched
+
+
+def _ai_match_quotes(unmatched_mats: list, unmatched_prods: list) -> list:
+    """Use AI to fuzzy-match vendor products to job materials."""
+    settings = get_settings()
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+    model = settings.get("openai_model", "gpt-5-mini")
+    if not api_key:
+        return []
+
+    try:
+        import openai, json
+        client = openai.OpenAI(api_key=api_key)
+
+        mat_lines = []
+        for i, (idx, m) in enumerate(unmatched_mats):
+            mat_lines.append(f"M{i}: [{m.get('item_code', '')}] {m.get('description', '')} (type: {m.get('material_type', '')})")
+
+        prod_lines = []
+        for i, (idx, p) in enumerate(unmatched_prods):
+            prod_lines.append(f"P{i}: {p.get('product_name', '')} — {p.get('description', '')} (vendor: {p.get('vendor', '')}, ${p.get('unit_price', 0)}/{p.get('unit', 'unit')})")
+
+        prompt = f"""Match vendor-quoted products to our job materials. These are commercial flooring products.
+
+Our unmatched materials:
+{chr(10).join(mat_lines)}
+
+Vendor quoted products:
+{chr(10).join(prod_lines)}
+
+Match products to materials based on: brand name, product line, color, style number, dimensions.
+Only match if you are 80%+ confident they are the same product.
+
+Return ONLY a JSON array: [{{"material": "M0", "product": "P0", "confidence": 0.95}}]
+Return empty array [] if no confident matches."""
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(response.choices[0].message.content)
+
+        # Parse result
+        matches_raw = result if isinstance(result, list) else result.get("matches", result.get("results", result.get("data", [])))
+        if not isinstance(matches_raw, list):
+            matches_raw = []
+
+        pairs = []
+        for m in matches_raw:
+            conf = m.get("confidence", 0)
+            if conf < 0.8:
+                continue
+            mat_ref = m.get("material", "")
+            prod_ref = m.get("product", "")
+            try:
+                mat_local_idx = int(mat_ref.replace("M", ""))
+                prod_local_idx = int(prod_ref.replace("P", ""))
+                if 0 <= mat_local_idx < len(unmatched_mats) and 0 <= prod_local_idx < len(unmatched_prods):
+                    pairs.append((unmatched_mats[mat_local_idx][0], unmatched_prods[prod_local_idx][0]))
+            except (ValueError, IndexError):
+                continue
+
+        return pairs
+    except Exception as e:
+        print(f"AI quote matching failed (non-fatal): {e}")
+        return []
+
+
+def _link_upload_to_requests(job_id: int, products: list[dict]):
+    """Auto-link uploaded vendor quotes to open quote requests."""
+    requests = list_quote_requests(job_id)
+    if not requests:
+        return
+
+    # Detect vendors from uploaded products
+    upload_vendors = set()
+    for p in products:
+        v = (p.get("vendor") or "").strip()
+        if v:
+            upload_vendors.add(v.lower())
+
+    if not upload_vendors:
+        return
+
+    import datetime
+    now = datetime.datetime.utcnow().isoformat()
+
+    for req in requests:
+        if req.get("received_at"):
+            continue  # already marked received
+        req_vendor = (req.get("vendor_name") or "").strip().lower()
+        # Fuzzy match: check if any uploaded vendor name contains or is contained by the request vendor
+        for uv in upload_vendors:
+            if req_vendor in uv or uv in req_vendor or req_vendor == uv:
+                update_quote_request(req["id"], status="received", received_at=now)
+                break
 
 
 @app.post("/api/jobs/{job_id}/upload-quotes")
@@ -1379,12 +1508,16 @@ async def api_create_quote_request(job_id: str, request: Request):
     vendor_name = data.get("vendor_name", "").strip()
     if not vendor_name:
         raise HTTPException(status_code=400, detail="vendor_name is required")
+    status = data.get("status", "draft")
+    sent_at = data.get("sent_at")
     qr = create_quote_request(
         job_id=db_id,
         vendor_name=vendor_name,
         material_ids=data.get("material_ids", []),
         request_text=data.get("request_text", ""),
         vendor_id=data.get("vendor_id"),
+        status=status,
+        sent_at=sent_at,
     )
     return qr
 
@@ -1513,10 +1646,14 @@ async def api_generate_quote_text(job_id: str, request: Request):
     data = await request.json()
     vendor_name = data.get("vendor_name", "")
     material_indices = data.get("material_indices", [])
+    is_follow_up = data.get("follow_up", False)
+    days_since_sent = data.get("days_since_sent", 0)
 
     materials = job.get("materials", [])
     selected = [materials[i] for i in material_indices if 0 <= i < len(materials)]
-    if not selected:
+
+    # For follow-ups, we don't need materials selected
+    if not selected and not is_follow_up:
         raise HTTPException(status_code=400, detail="No materials selected")
 
     # Get past vendor prices for context
@@ -1558,7 +1695,22 @@ async def api_generate_quote_text(job_id: str, request: Request):
         for pp in past_prices[:5]:
             past_context += f"  - {pp['product_name']}: ${pp['unit_price']}/{pp.get('unit', 'unit')} ({pp.get('created_at', '')[:10]})\n"
 
-    prompt = f"""Write a professional Request for Pricing email body for a commercial flooring project.
+    if is_follow_up:
+        prompt = f"""Write a polite but firm follow-up email to {vendor_name} regarding a Request for Pricing we sent {days_since_sent} days ago.
+
+Project: {job.get('project_name', '')}
+Location: {location}
+GC: {job.get('gc_name', '')}
+
+Requirements:
+- Reference the original request sent {days_since_sent} days ago
+- Politely ask for a status update on pricing
+- Mention we need pricing to complete our bid
+- Be professional, concise, and not passive-aggressive
+- Do NOT include subject line, greeting name, or signature — just the body text
+- Keep it to 3-4 sentences"""
+    else:
+        prompt = f"""Write a professional Request for Pricing email body for a commercial flooring project.
 This is being sent to {vendor_name}.
 
 Project: {job.get('project_name', '')}
@@ -1590,6 +1742,105 @@ Write a clean, professional email body. Requirements:
         return {"text": text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI quote text generation failed: {str(e)}")
+
+
+@app.post("/api/jobs/{job_id}/suggest-vendors")
+async def api_suggest_vendors(job_id: str, request: Request):
+    """AI suggests which vendor to contact for unassigned materials based on history."""
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    data = await request.json()
+    material_indices = data.get("material_indices", [])
+    materials = job.get("materials", [])
+    unassigned = []
+    for i in material_indices:
+        if 0 <= i < len(materials):
+            m = materials[i]
+            unassigned.append({
+                "index": i,
+                "item_code": m.get("item_code", ""),
+                "description": m.get("description", ""),
+                "material_type": m.get("material_type", ""),
+            })
+
+    if not unassigned:
+        return {"suggestions": []}
+
+    # Build vendor history context from vendor_prices
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT vendor_name, product_name, product_normalized, unit_price, unit
+               FROM vendor_prices
+               WHERE unit_price > 0
+               ORDER BY created_at DESC LIMIT 200"""
+        ).fetchall()
+        vendor_history = {}
+        for r in rows:
+            vn = r["vendor_name"]
+            if vn not in vendor_history:
+                vendor_history[vn] = []
+            if len(vendor_history[vn]) < 10:
+                vendor_history[vn].append(r["product_name"])
+    finally:
+        conn.close()
+
+    known_vendors = list_vendors()
+    vendor_summary = []
+    for v in known_vendors:
+        products = vendor_history.get(v["name"], [])
+        vendor_summary.append(f"- {v['name']}: {', '.join(products[:5]) if products else 'no quote history'}")
+
+    settings = get_settings()
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+    model = settings.get("openai_model", "gpt-5-mini")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured")
+
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+
+    prompt = f"""You are a commercial flooring industry expert. Given these unassigned materials and our vendor history, suggest which vendor to contact for each material.
+
+Unassigned materials:
+{chr(10).join(f'{m["index"]}. [{m["item_code"]}] {m["description"]} (type: {m["material_type"]})' for m in unassigned)}
+
+Known vendors and what they've quoted before:
+{chr(10).join(vendor_summary) if vendor_summary else 'No vendor history yet.'}
+
+For each material, suggest the most likely vendor based on:
+1. Product name/brand recognition (e.g., "Johnsonite" in the name = Johnsonite vendor)
+2. Material type (carpet tile → Interface/Shaw, LVT → Shaw/Mannington, rubber base → Johnsonite)
+3. Past vendor history matches
+
+Return ONLY a JSON array: [{{"material_index": 0, "suggested_vendor": "Vendor Name", "reason": "brief reason"}}]
+If you cannot suggest a vendor, omit that material from the array."""
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        import json
+        result = json.loads(response.choices[0].message.content)
+        if isinstance(result, list):
+            suggestions = result
+        else:
+            suggestions = []
+            for key in ("suggestions", "results", "data", "result", "materials"):
+                if key in result and isinstance(result[key], list):
+                    suggestions = result[key]
+                    break
+            if not suggestions and all(k.isdigit() for k in result.keys()):
+                suggestions = [v for _, v in sorted(result.items(), key=lambda x: int(x[0]))]
+
+        return {"suggestions": suggestions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI vendor suggestion failed: {str(e)}")
 
 
 @app.post("/api/vendors/suggest-contacts")

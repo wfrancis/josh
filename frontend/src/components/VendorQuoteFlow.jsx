@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import {
   X, Sparkles, Loader2, Copy, Check, ChevronDown, ChevronRight,
-  Mail, Building2, Clock, Send
+  Mail, Building2, Clock, Send, ExternalLink
 } from 'lucide-react'
 import { api } from '../api'
 import VendorPicker from './VendorPicker'
@@ -27,6 +27,8 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
   const [sentVendors, setSentVendors] = useState(new Set())
   const [error, setError] = useState(null)
   const [existingRequests, setExistingRequests] = useState([])
+  const [vendorSuggestions, setVendorSuggestions] = useState({}) // materialOrigIdx -> {suggested_vendor, reason}
+  const [suggestingVendors, setSuggestingVendors] = useState(false)
 
   // Load known vendors + existing quote requests on mount
   useEffect(() => {
@@ -137,6 +139,8 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
         vendor_id: vendorObj?.id || null,
         material_ids: materialIds,
         request_text: generatedText[vendorName] || '',
+        status: 'sent',
+        sent_at: new Date().toISOString(),
       })
       // Mark as sent
       setSentVendors(prev => new Set([...prev, vendorName]))
@@ -153,6 +157,34 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
     setMaterials(prev => {
       const next = [...prev]
       next[materialOrigIdx] = { ...next[materialOrigIdx], vendor: newVendorName }
+      return next
+    })
+  }
+
+  // Suggest vendors for unassigned materials
+  const handleSuggestVendors = async (unassignedMats) => {
+    setSuggestingVendors(true)
+    try {
+      const indices = unassignedMats.map(m => m._origIdx)
+      const result = await api.suggestVendors(job.id, indices)
+      const sugMap = {}
+      for (const s of (result.suggestions || [])) {
+        sugMap[s.material_index] = s
+      }
+      setVendorSuggestions(sugMap)
+    } catch (err) {
+      console.error('Vendor suggestion failed:', err)
+      setError(err.message)
+    } finally {
+      setSuggestingVendors(false)
+    }
+  }
+
+  const applyVendorSuggestion = (materialOrigIdx, vendorName) => {
+    handleReassignVendor(materialOrigIdx, vendorName)
+    setVendorSuggestions(prev => {
+      const next = { ...prev }
+      delete next[materialOrigIdx]
       return next
     })
   }
@@ -287,35 +319,81 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
                     <div className="space-y-1">
                       {vendorMats.map((m, i) => {
                         const qty = Math.round((m.order_qty || m.installed_qty || 0) * 100) / 100
+                        const suggestion = isUnassigned ? vendorSuggestions[m._origIdx] : null
                         return (
-                          <div key={m.id || i} className="flex items-center gap-3 text-xs py-1">
-                            <span className="text-gray-500 w-5 text-right flex-shrink-0">{i + 1}.</span>
-                            <span className="text-gray-300 flex-1 min-w-0 truncate">
-                              {m.item_code && <span className="text-gray-500 mr-1">{m.item_code}</span>}
-                              {m.description || 'Unknown material'}
-                            </span>
-                            <span className="text-gray-500 flex-shrink-0 tabular-nums">
-                              {qty.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} {m.unit || ''}
-                            </span>
+                          <div key={m.id || i}>
+                            <div className="flex items-center gap-3 text-xs py-1">
+                              <span className="text-gray-500 w-5 text-right flex-shrink-0">{i + 1}.</span>
+                              <span className="text-gray-300 flex-1 min-w-0 truncate">
+                                {m.item_code && <span className="text-gray-500 mr-1">{m.item_code}</span>}
+                                {m.description || 'Unknown material'}
+                              </span>
+                              <span className="text-gray-500 flex-shrink-0 tabular-nums">
+                                {qty.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} {m.unit || ''}
+                              </span>
+                            </div>
+                            {/* Manual vendor assignment for unassigned materials */}
+                            {isUnassigned && (
+                              <div className="ml-8 mt-0.5 mb-1 flex items-center gap-2 flex-wrap">
+                                {suggestion && (
+                                  <>
+                                    <span className="text-[10px] text-violet-400 flex items-center gap-1">
+                                      <Sparkles className="w-3 h-3" />
+                                      AI suggests: <span className="font-medium text-violet-300">{suggestion.suggested_vendor}</span>
+                                    </span>
+                                    <span className="text-[10px] text-gray-600">{suggestion.reason}</span>
+                                    <button
+                                      onClick={() => applyVendorSuggestion(m._origIdx, suggestion.suggested_vendor)}
+                                      className="text-[10px] text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 px-1.5 py-0.5 rounded"
+                                    >
+                                      Apply
+                                    </button>
+                                    <span className="text-[10px] text-gray-600">or</span>
+                                  </>
+                                )}
+                                <VendorPicker
+                                  value=""
+                                  vendors={vendors}
+                                  onChange={(name) => handleReassignVendor(m._origIdx, name)}
+                                  onCreateVendor={async (name) => {
+                                    const v = await api.createVendor({ name })
+                                    setVendors(prev => [...prev, v])
+                                    return v
+                                  }}
+                                  placeholder={suggestion ? 'Assign manually...' : 'Assign vendor...'}
+                                  className="w-40"
+                                />
+                              </div>
+                            )}
                           </div>
                         )
                       })}
                     </div>
 
-                    {/* Unassigned: show vendor picker */}
+                    {/* Unassigned: show vendor picker + AI suggestions */}
                     {isUnassigned && (
                       <div className="bg-amber-500/5 border border-amber-500/10 rounded-lg p-3 space-y-2">
                         <p className="text-xs text-amber-300">
-                          These materials need a vendor assignment. Use AI detection above or assign manually.
+                          These materials need a vendor assignment. Use AI to suggest vendors or re-run detection.
                         </p>
-                        <button
-                          onClick={handleDetectVendors}
-                          disabled={detecting}
-                          className="text-xs text-violet-400 hover:text-violet-300 flex items-center gap-1.5"
-                        >
-                          {detecting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
-                          Re-run AI Detection
-                        </button>
+                        <div className="flex items-center gap-3">
+                          <button
+                            onClick={() => handleSuggestVendors(vendorMats)}
+                            disabled={suggestingVendors}
+                            className="text-xs text-violet-400 hover:text-violet-300 flex items-center gap-1.5 bg-violet-500/10 px-2.5 py-1.5 rounded-lg"
+                          >
+                            {suggestingVendors ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+                            AI Suggest Vendors
+                          </button>
+                          <button
+                            onClick={handleDetectVendors}
+                            disabled={detecting}
+                            className="text-xs text-gray-400 hover:text-gray-300 flex items-center gap-1.5"
+                          >
+                            {detecting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+                            Re-run Detection
+                          </button>
+                        </div>
                       </div>
                     )}
 
@@ -345,18 +423,35 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
                             )}
                           </button>
 
+                          {/* Open in Email — mailto link */}
+                          {contact?.contact_email && (
+                            <a
+                              href={`mailto:${contact.contact_email}?subject=${encodeURIComponent(`Request for Pricing — ${job.project_name || 'Project'}`)}&body=${encodeURIComponent(generatedText[vendorName] || '')}`}
+                              onClick={() => {
+                                // Auto-mark sent when they click email
+                                if (!isSent) handleMarkSent(vendorName, vendorMats)
+                              }}
+                              className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-medium bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 transition-colors"
+                            >
+                              <ExternalLink className="w-4 h-4" />
+                              Email
+                            </a>
+                          )}
+
                           {/* Mark Sent button */}
                           <button
                             onClick={() => handleMarkSent(vendorName, vendorMats)}
-                            disabled={isMarkingSent}
-                            className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-medium bg-white/[0.06] text-gray-300 hover:bg-white/[0.1] hover:text-white transition-colors"
+                            disabled={isMarkingSent || isSent}
+                            className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-medium bg-white/[0.06] text-gray-300 hover:bg-white/[0.1] hover:text-white transition-colors disabled:opacity-50"
                           >
                             {isMarkingSent ? (
                               <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : isSent ? (
+                              <Check className="w-4 h-4 text-emerald-400" />
                             ) : (
                               <Send className="w-4 h-4" />
                             )}
-                            Mark Sent
+                            {isSent ? 'Sent' : 'Mark Sent'}
                           </button>
                         </div>
                       </div>

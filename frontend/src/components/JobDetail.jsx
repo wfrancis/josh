@@ -13,6 +13,7 @@ import MaterialsTable from './MaterialsTable'
 import BidPreview from './BidPreview'
 import QuoteUpload from './QuoteUpload'
 import VendorQuoteFlow from './VendorQuoteFlow'
+import QuoteTracker from './QuoteTracker'
 import StatusBadge, { getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
 import ActivityLog from './ActivityLog'
@@ -42,6 +43,7 @@ export default function JobDetail() {
   const [editing, setEditing] = useState(false)
   const [editForm, setEditForm] = useState({})
   const [editSaving, setEditSaving] = useState(false)
+  const [quoteRequests, setQuoteRequests] = useState([])
 
   const loadJob = async () => {
     try {
@@ -52,6 +54,8 @@ export default function JobDetail() {
       if (data.materials?.length > 0) setRfmsSuccess(true)
       if (data.bundles?.length > 0 || data.bid_data) setStep('bid')
       else if (data.materials?.length > 0) setStep('takeoff')
+      // Load quote requests for status tracking
+      api.listQuoteRequests(data.id).then(setQuoteRequests).catch(console.error)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -574,6 +578,9 @@ export default function JobDetail() {
                     </div>
                   )}
 
+                  {/* Quote Tracker — always visible when requests exist */}
+                  <QuoteTracker job={job} onRefresh={loadJob} />
+
                   {/* Action buttons */}
                   {!quotePanel && (
                     <div className="flex items-center gap-3">
@@ -647,6 +654,7 @@ export default function JobDetail() {
                   <MaterialsTable
                     materials={job.materials}
                     editable
+                    quoteRequests={quoteRequests}
                     onUpdate={handleMaterialsUpdate}
                     onRequestQuote={(material) => {
                       setQuoteMaterial(material)
