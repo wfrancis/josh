@@ -37,6 +37,8 @@ export default function JobDetail() {
   const [isDirty, setIsDirty] = useState(false)
   const [quotePanel, setQuotePanel] = useState(null) // null | 'request' | 'upload'
   const [quotePreSelectedIds, setQuotePreSelectedIds] = useState(null)
+  const [quoteMaterial, setQuoteMaterial] = useState(null) // single-material quote modal
+  const [quoteCopied, setQuoteCopied] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editForm, setEditForm] = useState({})
   const [editSaving, setEditSaving] = useState(false)
@@ -658,9 +660,8 @@ export default function JobDetail() {
                     editable
                     onUpdate={handleMaterialsUpdate}
                     onRequestQuote={(material) => {
-                      setQuotePreSelectedIds([material.id])
-                      setQuotePanel('request')
-                      setTimeout(() => quoteSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+                      setQuoteMaterial(material)
+                      setQuoteCopied(false)
                     }}
                     onRequestAllQuotes={() => {
                       setQuotePreSelectedIds(null)
@@ -723,6 +724,83 @@ export default function JobDetail() {
       <ActivityLog jobId={job.id} />
 
       <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
+
+      {/* Single-material quote request modal */}
+      {quoteMaterial && job && (() => {
+        const m = quoteMaterial
+        const qty = Math.round((m.installed_qty || m.order_qty || 0) * 100) / 100
+        const desc = [m.item_code, m.description].filter(Boolean).join(' - ')
+        const lines = [
+          `Project: ${job.project_name || ''}`,
+          ...(job.architect ? [`Architect: ${job.architect}`] : []),
+          ...(job.designer ? [`Designer: ${job.designer}`] : []),
+          ...([job.address, job.city, job.state, job.zip].filter(Boolean).length
+            ? [`Location: ${[job.address, job.city, job.state, job.zip].filter(Boolean).join(', ')}`]
+            : []),
+          ...(job.gc_name ? [`GC: ${job.gc_name}`] : []),
+          '',
+          'We are bidding the above project and need pricing on the following material:',
+          '',
+          `• ${desc}${qty ? ` — ${qty} ${m.unit || ''}` : ''}`,
+          '',
+          'Please include unit pricing, freight, and lead times.',
+          'Thank you!',
+        ]
+        const text = lines.join('\n')
+        const handleCopy = async () => {
+          try {
+            await navigator.clipboard.writeText(text)
+          } catch {
+            const ta = document.createElement('textarea')
+            ta.value = text
+            document.body.appendChild(ta)
+            ta.select()
+            document.execCommand('copy')
+            document.body.removeChild(ta)
+          }
+          setQuoteCopied(true)
+          setTimeout(() => setQuoteCopied(false), 3000)
+        }
+        return (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setQuoteMaterial(null)}>
+            <div className="bg-[#12121a] border border-white/10 rounded-2xl shadow-2xl max-w-lg w-full p-6 space-y-4" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Copy className="w-4 h-4 text-si-bright" />
+                  <h3 className="text-sm font-bold text-white">Quote Request</h3>
+                </div>
+                <button onClick={() => setQuoteMaterial(null)} className="text-gray-500 hover:text-gray-300 transition-colors">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2">
+                <p className="text-sm text-gray-200 font-medium truncate">{desc}</p>
+                <p className="text-xs text-gray-500 mt-0.5">{qty} {m.unit || ''}</p>
+              </div>
+
+              <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
+                <pre className="text-xs text-gray-300 whitespace-pre-wrap font-sans leading-relaxed">{text}</pre>
+              </div>
+
+              <button
+                onClick={handleCopy}
+                className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 ${
+                  quoteCopied
+                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                    : 'bg-gradient-to-b from-si-orange to-orange-600 text-white shadow-[0_1px_2px_rgba(0,0,0,0.4)] hover:from-orange-500 hover:to-orange-700'
+                }`}
+              >
+                {quoteCopied ? (
+                  <><CheckCircle2 className="w-4 h-4" /> Copied to Clipboard</>
+                ) : (
+                  <><Copy className="w-4 h-4" /> Copy Quote Request</>
+                )}
+              </button>
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }
