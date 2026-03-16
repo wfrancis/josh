@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store } from 'lucide-react'
+import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store, Mail, DollarSign, Sparkles } from 'lucide-react'
 
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
@@ -156,6 +156,61 @@ function TypeDropdown({ currentType, confidence, onSelect, editable }) {
   )
 }
 
+function PriceActionMenu({ material, onRequestQuote, onEnterPrice, onAiEstimate, estimating }) {
+  const [open, setOpen] = useState(false)
+  const menuRef = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    const handleClick = (e) => {
+      if (menuRef.current && !menuRef.current.contains(e.target)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [open])
+
+  return (
+    <div className="relative inline-block" ref={menuRef}>
+      <button
+        onClick={() => setOpen(!open)}
+        disabled={estimating}
+        className={`text-xs font-medium px-2 py-0.5 rounded-md transition-colors ${
+          estimating
+            ? 'bg-si-bright/10 text-si-bright animate-pulse'
+            : 'bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
+        }`}
+      >
+        {estimating ? 'Estimating...' : 'Need Price'}
+      </button>
+      {open && !estimating && (
+        <div className="absolute right-0 top-full mt-1 z-50 w-48 bg-gray-900 border border-white/[0.1] rounded-xl shadow-2xl py-1">
+          <button
+            onClick={() => { onEnterPrice(); setOpen(false) }}
+            className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2 text-gray-300"
+          >
+            <DollarSign className="w-3.5 h-3.5 text-emerald-400" />
+            Enter Price
+          </button>
+          <button
+            onClick={() => { onRequestQuote(material); setOpen(false) }}
+            className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2 text-gray-300"
+          >
+            <Mail className="w-3.5 h-3.5 text-si-bright" />
+            Request Vendor Quote
+          </button>
+          <button
+            onClick={() => { onAiEstimate(); setOpen(false) }}
+            className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2 text-gray-300"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-violet-400" />
+            AI Estimate Price
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function SortIcon({ col, sortCol, sortDir }) {
   if (sortCol !== col) return <span className="inline-block w-3 ml-0.5" />
   return sortDir === 'asc'
@@ -163,8 +218,9 @@ function SortIcon({ col, sortCol, sortDir }) {
     : <ChevronDown className="inline-block w-3 h-3 ml-0.5 text-si-bright" />
 }
 
-export default function MaterialsTable({ materials, onUpdate, readOnly = false, editable = false }) {
+export default function MaterialsTable({ materials, onUpdate, readOnly = false, editable = false, onRequestQuote, onRequestAllQuotes, onAiEstimate }) {
   const [editingPriceId, setEditingPriceId] = useState(null)
+  const [estimatingIdx, setEstimatingIdx] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [typeFilter, setTypeFilter] = useState('')
   const [unpricedOnly, setUnpricedOnly] = useState(false)
@@ -337,9 +393,9 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
         </div>
       )}
       {/* Status bar: completion + confidence warnings */}
-      {materials.length > 0 && (showPriceCol || lowConfidenceCount > 0) && (
+      {materials.length > 0 && (showPriceCol || lowConfidenceCount > 0 || (pricedCount < totalCount && onRequestAllQuotes)) && (
         <div className="flex items-center gap-4 mb-3 flex-wrap text-xs">
-          {showPriceCol && (
+          {(showPriceCol || pricedCount < totalCount) && (
             <span className={`font-medium ${pricePct >= 1 ? 'text-emerald-400' : pricePct >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}>
               {pricedCount}/{totalCount} priced
             </span>
@@ -349,6 +405,15 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
               <AlertTriangle className="w-3.5 h-3.5" />
               {lowConfidenceCount} material{lowConfidenceCount !== 1 ? 's' : ''} with low AI confidence
             </span>
+          )}
+          {pricedCount < totalCount && onRequestAllQuotes && (
+            <button
+              onClick={onRequestAllQuotes}
+              className="flex items-center gap-1 text-si-bright hover:text-si-bright/80 font-medium transition-colors ml-auto"
+            >
+              <Mail className="w-3.5 h-3.5" />
+              Request quotes for all {totalCount - pricedCount} unpriced
+            </button>
           )}
         </div>
       )}
@@ -374,7 +439,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
       )}
 
       <table className="w-full text-sm">
-        <thead>
+        <thead className="sticky top-0 z-10 bg-[#0c0c14]">
           <tr className="border-b border-white/[0.06]">
             {[
               { label: 'Material', key: null, align: 'left', hide: '' },
@@ -403,7 +468,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
             const hasPrice = m.unit_price > 0
             const lowConf = m.ai_confidence != null && m.ai_confidence < 0.7
             const veryLowConf = m.ai_confidence != null && m.ai_confidence < 0.5
-            const rowBg = veryLowConf ? 'bg-red-500/[0.06]' : lowConf ? 'bg-amber-500/[0.06]' : ''
+            const rowBg = !hasPrice ? 'bg-amber-500/[0.04] border-l-2 border-l-amber-500/40' : veryLowConf ? 'bg-red-500/[0.06]' : lowConf ? 'bg-amber-500/[0.06]' : ''
             return (
               <tr key={m.id || m._origIdx} className={`group hover:bg-white/[0.02] transition-colors ${rowBg}`}>
                 <td className="py-3 px-2 sm:px-3 max-w-0 sm:max-w-none">
@@ -480,6 +545,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                       )}
                       <input
                         type="number" step="0.01" min="0"
+                        data-price-idx={m._origIdx}
                         value={m.unit_price || ''}
                         onChange={(e) => handlePriceChange(m._origIdx, e.target.value)}
                         onFocus={() => setEditingPriceId(m._origIdx)} onBlur={() => setEditingPriceId(null)}
@@ -491,7 +557,35 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                 )}
                 <td className="py-3 px-2 sm:px-3 text-right tabular-nums font-medium">
                   {hasPrice ? (
-                    <span className="text-white">{formatCurrency(m.extended_cost)}</span>
+                    <span className={`${m.price_source === 'ai_estimate' ? 'text-violet-300' : 'text-white'}`}>
+                      {formatCurrency(m.extended_cost)}
+                      {m.price_source === 'ai_estimate' && (
+                        <span className="block text-[10px] text-violet-400/60 font-normal">AI est.</span>
+                      )}
+                    </span>
+                  ) : onRequestQuote ? (
+                    <PriceActionMenu
+                      material={m}
+                      estimating={estimatingIdx === m._origIdx}
+                      onEnterPrice={() => {
+                        setEditingPriceId(m._origIdx)
+                        // Focus the price input for this row
+                        setTimeout(() => {
+                          const input = document.querySelector(`[data-price-idx="${m._origIdx}"]`)
+                          if (input) input.focus()
+                        }, 50)
+                      }}
+                      onRequestQuote={() => onRequestQuote(m)}
+                      onAiEstimate={async () => {
+                        if (!onAiEstimate) return
+                        setEstimatingIdx(m._origIdx)
+                        try {
+                          await onAiEstimate(m._origIdx)
+                        } finally {
+                          setEstimatingIdx(null)
+                        }
+                      }}
+                    />
                   ) : (
                     <span className="text-gray-600">—</span>
                   )}

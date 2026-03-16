@@ -9,9 +9,9 @@ import { Copy, Check, Mail, Package, ChevronDown, ChevronUp } from 'lucide-react
  *   materials: all job materials (component filters to unpriced)
  *   onClose: callback to close the panel
  */
-export default function QuoteRequest({ job, materials, onClose }) {
+export default function QuoteRequest({ job, materials, onClose, preSelectedIds = null }) {
   const [copied, setCopied] = useState(false)
-  const [selectedIds, setSelectedIds] = useState(null) // null = all selected
+  const [selectedIds, setSelectedIds] = useState(preSelectedIds ? new Set(preSelectedIds) : null) // null = all selected
 
   // Filter to unpriced materials
   const unpricedMaterials = useMemo(() =>

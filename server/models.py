@@ -225,6 +225,7 @@ def init_db() -> None:
             ("jq_freight", "ALTER TABLE job_quotes ADD COLUMN freight REAL"),
             ("jq_lead_time", "ALTER TABLE job_quotes ADD COLUMN lead_time TEXT"),
             ("jq_notes", "ALTER TABLE job_quotes ADD COLUMN notes TEXT"),
+            ("price_source", "ALTER TABLE job_materials ADD COLUMN price_source TEXT"),
         ]:
             try:
                 conn.execute(sql)
@@ -339,14 +340,14 @@ def save_materials(job_id: int, materials: list[dict]) -> list[int]:
                 INSERT INTO job_materials
                     (job_id, item_code, description, material_type, installed_qty,
                      unit, waste_pct, order_qty, vendor, unit_price, extended_cost, ai_confidence,
-                     quote_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     quote_status, price_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_id, m.get("item_code"), m.get("description"),
                 m.get("material_type"), m.get("installed_qty", 0),
                 m.get("unit"), m.get("waste_pct", 0), m.get("order_qty", 0),
                 m.get("vendor"), m.get("unit_price", 0), m.get("extended_cost", 0),
-                m.get("ai_confidence"), m.get("quote_status")
+                m.get("ai_confidence"), m.get("quote_status"), m.get("price_source")
             ))
             ids.append(cur.lastrowid)
         conn.commit()

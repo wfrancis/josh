@@ -638,6 +638,107 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
     return {"materials": updated}
 
 
+@app.post("/api/jobs/{job_id}/materials/{material_idx}/estimate-price")
+def api_estimate_price(job_id: str, material_idx: int):
+    """Use AI to estimate a material's unit price based on its description."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    materials = job.get("materials", [])
+    if material_idx < 0 or material_idx >= len(materials):
+        raise HTTPException(status_code=404, detail="Material not found")
+
+    m = materials[material_idx]
+    settings = get_settings()
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+    model = settings.get("openai_model", "gpt-5-mini")
+
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured")
+
+    import openai
+    import json as _json
+
+    # Check price history and price list for existing data to inform the estimate
+    history = get_price_history(item_code=m.get("item_code"), product=m.get("description"))
+    price_list = get_price_list_entries()
+    price_list_match = None
+    item_code_lower = (m.get("item_code") or "").lower()
+    desc_lower = (m.get("description") or "").lower()
+    for entry in price_list:
+        ename = (entry.get("product_name") or "").lower()
+        if item_code_lower and item_code_lower in ename:
+            price_list_match = entry
+            break
+        if desc_lower and ename and ename in desc_lower:
+            price_list_match = entry
+            break
+
+    # Build context for AI
+    context_lines = []
+    if history.get("records"):
+        context_lines.append(f"Price history: min=${history['min']}, max=${history['max']}, avg=${history['avg']}")
+        latest = history["latest"]
+        if latest:
+            context_lines.append(f"Latest quote: ${latest.get('unit_price')} from {latest.get('vendor_name', 'unknown')} ({latest.get('created_at', '')})")
+    if price_list_match:
+        context_lines.append(f"Internal price list: ${price_list_match.get('unit_price')} per {price_list_match.get('unit', 'unit')}")
+
+    history_context = "\n".join(context_lines) if context_lines else "No historical pricing data available."
+
+    client = openai.OpenAI(api_key=api_key)
+
+    prompt = f"""Estimate the unit price for this flooring/interior material.
+Return JSON: {{"estimated_price": <number>, "confidence": <0-1>, "reasoning": "<brief>"}}
+
+Material: {m.get('description', '')}
+Item Code: {m.get('item_code', '')}
+Type: {m.get('material_type', '')}
+Unit: {m.get('unit', '')}
+Order Qty: {m.get('order_qty', 0)}
+
+Historical Data:
+{history_context}
+
+If historical data is available, weight it heavily in your estimate. Otherwise, base your estimate on typical commercial flooring/interior material pricing.
+The price should be per {m.get('unit', 'unit')}. Be conservative — estimate on the higher side."""
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a commercial flooring estimator. Return only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        result = _json.loads(response.choices[0].message.content)
+        estimated_price = float(result.get("estimated_price", 0))
+        confidence = float(result.get("confidence", 0.5))
+        reasoning = result.get("reasoning", "")
+
+        # Update the material with the AI estimate
+        m["unit_price"] = round(estimated_price, 2)
+        m["price_source"] = "ai_estimate"
+        m["order_qty"] = round(m.get("installed_qty", 0) * (1 + m.get("waste_pct", 0)), 2)
+        m["extended_cost"] = round(m["order_qty"] * m["unit_price"], 2)
+        materials[material_idx] = m
+        save_materials(job["id"], materials)
+
+        log_activity(job["id"], "materials_updated",
+                     f"AI estimated price for {m.get('item_code', m.get('description', 'material'))}: ${estimated_price:.2f}/{m.get('unit', 'unit')}")
+
+        return {
+            "estimated_price": estimated_price,
+            "confidence": confidence,
+            "reasoning": reasoning,
+            "material": m,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI estimation failed: {e}")
+
+
 @app.post("/api/jobs/{job_id}/generate-bid")
 def api_generate_bid(job_id: str):
     """Assemble bid + generate PDF, return bid data."""

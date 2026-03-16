@@ -146,6 +146,9 @@ export const api = {
   getNotifications: (unreadOnly = true) => request('/notifications?unread_only=' + unreadOnly),
   markNotificationRead: (id) => request('/notifications/' + id + '/read', { method: 'PUT' }),
 
+  // AI Price Estimation
+  estimatePrice: (jobId, materialIdx) => request(`/jobs/${jobId}/materials/${materialIdx}/estimate-price`, { method: 'POST' }),
+
   // Activity Log & Comments
   getActivity: (jobId) => request('/jobs/' + jobId + '/activity'),
   getComments: (jobId) => request('/jobs/' + jobId + '/comments'),
