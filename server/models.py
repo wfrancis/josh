@@ -1421,13 +1421,17 @@ def update_quote_request(request_id: int, **fields) -> bool:
     """Update a quote request (status, sent_at, received_at, request_text)."""
     conn = _get_conn()
     try:
-        allowed = {"status", "sent_at", "received_at", "request_text", "vendor_name", "vendor_id"}
+        allowed = {"status", "sent_at", "received_at", "request_text", "vendor_name", "vendor_id", "material_ids"}
         updates = []
         values = []
         for k, v in fields.items():
             if k in allowed:
                 updates.append(f"{k}=?")
-                values.append(v)
+                if k == "material_ids" and isinstance(v, list):
+                    import json as _json
+                    values.append(_json.dumps(v))
+                else:
+                    values.append(v)
         if not updates:
             return False
         values.append(request_id)

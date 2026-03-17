@@ -305,12 +305,21 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
   const [sortDir, setSortDir] = useState('desc')
 
   // Build quote request lookup: material_id -> { vendor_name, status, sent_at, received_at }
+  // Supports both old format (plain IDs) and new format ({id, item_code} objects)
   const quoteStatusMap = useMemo(() => {
-    const map = {}
+    const map = {} // keyed by material ID and item_code
     for (const req of quoteRequests) {
       const status = req.received_at ? 'received' : req.sent_at ? 'sent' : 'draft'
-      for (const matId of (req.material_ids || [])) {
-        map[matId] = { vendor_name: req.vendor_name, status, sent_at: req.sent_at, received_at: req.received_at }
+      const info = { vendor_name: req.vendor_name, status, sent_at: req.sent_at, received_at: req.received_at }
+      for (const entry of (req.material_ids || [])) {
+        if (entry && typeof entry === 'object') {
+          // New format: {id, item_code}
+          if (entry.id) map[entry.id] = info
+          if (entry.item_code) map[`ic:${entry.item_code.toLowerCase()}`] = info
+        } else {
+          // Old format: plain number or string
+          map[entry] = info
+        }
       }
     }
     return map
@@ -586,21 +595,25 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     </div>
                   )}
                   {/* Quote request status badge */}
-                  {!hasPrice && quoteStatusMap[m.id] && (
-                    <div className="flex items-center gap-1 mt-0.5">
-                      {quoteStatusMap[m.id].status === 'sent' ? (
-                        <>
-                          <Clock className="w-3 h-3 text-blue-400/70" />
-                          <span className="text-[10px] text-blue-400/70">Requested from {quoteStatusMap[m.id].vendor_name}</span>
-                        </>
-                      ) : quoteStatusMap[m.id].status === 'received' ? (
-                        <>
-                          <Check className="w-3 h-3 text-emerald-400/70" />
-                          <span className="text-[10px] text-emerald-400/70">Quoted by {quoteStatusMap[m.id].vendor_name}</span>
-                        </>
-                      ) : null}
-                    </div>
-                  )}
+                  {(() => {
+                    const qs = quoteStatusMap[m.id] || (m.item_code ? quoteStatusMap[`ic:${m.item_code.toLowerCase()}`] : null)
+                    if (!qs || hasPrice) return null
+                    return (
+                      <div className="flex items-center gap-1 mt-0.5">
+                        {qs.status === 'sent' ? (
+                          <>
+                            <Clock className="w-3 h-3 text-blue-400/70" />
+                            <span className="text-[10px] text-blue-400/70">Requested from {qs.vendor_name}</span>
+                          </>
+                        ) : qs.status === 'received' ? (
+                          <>
+                            <Check className="w-3 h-3 text-emerald-400/70" />
+                            <span className="text-[10px] text-emerald-400/70">Quoted by {qs.vendor_name}</span>
+                          </>
+                        ) : null}
+                      </div>
+                    )
+                  })()}
                   {/* Show qty on mobile since column is hidden */}
                   <div className="md:hidden text-[11px] text-gray-500 mt-0.5">
                     {formatNumber(m.installed_qty)} {m.unit} · {((m.waste_pct || 0) * 100).toFixed(0)}% waste

@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   Building2, Plus, Trash2, Loader2, Check, Save, Sparkles,
   ChevronDown, ChevronRight, ExternalLink, X, Search,
@@ -7,6 +8,7 @@ import {
 import { api } from '../api'
 
 export default function VendorContactsPage() {
+  const [searchParams, setSearchParams] = useSearchParams()
   const [vendors, setVendors] = useState([])
   const [loading, setLoading] = useState(true)
   const [edited, setEdited] = useState([])
@@ -38,6 +40,18 @@ export default function VendorContactsPage() {
   }
 
   useEffect(() => { loadVendors() }, [])
+
+  // Auto-expand vendor from URL parameter (e.g., ?vendor=Ann+Sacks)
+  useEffect(() => {
+    const vendorParam = searchParams.get('vendor')
+    if (vendorParam && edited.length > 0 && !expandedId) {
+      const match = edited.find(v => v.name.toLowerCase() === vendorParam.toLowerCase())
+      if (match) {
+        handleExpand(match)
+        setSearchParams({}, { replace: true }) // clear param after expanding
+      }
+    }
+  }, [edited, searchParams])
 
   const updateField = (idx, field, value) => {
     setEdited(prev => {

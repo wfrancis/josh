@@ -160,7 +160,7 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
     setMarkingSent(vendorName)
     try {
       const vendorObj = vendors.find(v => v.name === vendorName)
-      const materialIds = vendorMaterials.map(m => m.id).filter(Boolean)
+      const materialIds = vendorMaterials.map(m => ({ id: m.id, item_code: m.item_code || '' })).filter(m => m.id)
       await api.createQuoteRequest(job.id, {
         vendor_name: vendorName,
         vendor_id: vendorObj?.id || null,

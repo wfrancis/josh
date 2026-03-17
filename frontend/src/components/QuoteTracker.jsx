@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import {
   Clock, Check, AlertTriangle, Send, RefreshCw, Loader2,
   ChevronDown, ChevronRight, Trash2, Mail, Sparkles, ExternalLink,
-  Phone, User
+  Phone, User, Building2, X, TrendingUp, Package, FileText, Upload
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -23,6 +23,7 @@ export default function QuoteTracker({ job, onRefresh }) {
   const [followUpText, setFollowUpText] = useState(null)
   const [vendorDetails, setVendorDetails] = useState({}) // keyed by vendor_name
   const [vendorLoading, setVendorLoading] = useState(null)
+  const [detailModal, setDetailModal] = useState(null) // vendor name for detail modal
 
   const loadVendorDetail = async (vendorName, vendorId) => {
     if (vendorDetails[vendorName]) return // already loaded
@@ -100,8 +101,14 @@ export default function QuoteTracker({ job, onRefresh }) {
   const handleResend = async (req) => {
     setResendingId(req.id)
     try {
-      const materialIndices = (req.material_ids || []).map(id => {
-        const mat = (job.materials || []).find(m => m.id === id)
+      const materialIndices = (req.material_ids || []).map(entry => {
+        const isObj = entry && typeof entry === 'object'
+        const numId = isObj ? entry.id : entry
+        const itemCode = isObj ? entry.item_code : null
+        let mat = (job.materials || []).find(m => m.id === numId)
+        if (!mat && itemCode) {
+          mat = (job.materials || []).find(m => m.item_code && m.item_code.toLowerCase() === itemCode.toLowerCase())
+        }
         return mat ? (job.materials || []).indexOf(mat) : -1
       }).filter(i => i >= 0)
 
@@ -173,14 +180,29 @@ export default function QuoteTracker({ job, onRefresh }) {
   // Get material info for a request (with id for scrolling)
   const getMaterials = (req) => {
     const ids = req.material_ids || []
-    return ids.map(id => {
-      // Handle both string and number IDs
-      const numId = typeof id === 'string' ? parseInt(id, 10) : id
-      const mat = (job.materials || []).find(m => m.id === numId || m.id === id)
+    // material_ids can be:
+    //   - plain numbers (old format): [123, 456]
+    //   - objects with item_code (new format): [{id: 123, item_code: "F109"}, ...]
+    //   - strings: ["123", "456"]
+    return ids.map(entry => {
+      const isObj = entry && typeof entry === 'object'
+      const numId = isObj ? entry.id : (typeof entry === 'string' ? parseInt(entry, 10) : entry)
+      const itemCode = isObj ? entry.item_code : null
+
+      // Try to find material: first by ID, then by item_code
+      let mat = (job.materials || []).find(m => m.id === numId || m.id === entry)
+      if (!mat && itemCode) {
+        mat = (job.materials || []).find(m => m.item_code && m.item_code.toLowerCase() === itemCode.toLowerCase())
+      }
+
       return {
-        id: numId,
-        name: mat ? (mat.description || mat.item_code || `#${numId}`) : `#${numId}`,
-        item_code: mat?.item_code || '',
+        id: mat?.id || numId,
+        name: mat ? (mat.description || mat.item_code || `#${numId}`) : (itemCode || `#${numId}`),
+        item_code: mat?.item_code || itemCode || '',
+        hasPrice: mat ? (mat.unit_price || 0) > 0 : false,
+        priceSource: mat?.price_source || null,
+        unitPrice: mat?.unit_price || 0,
+        vendor: mat?.vendor || '',
       }
     })
   }
@@ -199,6 +221,8 @@ export default function QuoteTracker({ job, onRefresh }) {
     waiting: { icon: Clock, color: 'text-blue-400', bg: 'bg-blue-500/10', label: 'Waiting', border: 'border-blue-500/20' },
     overdue: { icon: AlertTriangle, color: 'text-amber-400', bg: 'bg-amber-500/10', label: 'Overdue', border: 'border-amber-500/20' },
     received: { icon: Check, color: 'text-emerald-400', bg: 'bg-emerald-500/10', label: 'Received', border: 'border-emerald-500/20' },
+    received_partial: { icon: AlertTriangle, color: 'text-amber-400', bg: 'bg-amber-500/10', label: 'Partial', border: 'border-amber-500/20' },
+    received_none: { icon: AlertTriangle, color: 'text-red-400', bg: 'bg-red-500/10', label: 'No Prices', border: 'border-red-500/20' },
   }
 
   // Summary stats
@@ -251,9 +275,19 @@ export default function QuoteTracker({ job, onRefresh }) {
           const isExpanded = expandedId === req.id
           const days = getDaysSinceSent(req)
           const mats = getMaterials(req)
+          const pricedCount = mats.filter(m => m.hasPrice).length
+          const totalCount = mats.length
+
+          // Override config for received based on pricing completeness
+          let effectiveConfig = config
+          if (status === 'received' && totalCount > 0) {
+            if (pricedCount === 0) effectiveConfig = statusConfig.received_none
+            else if (pricedCount < totalCount) effectiveConfig = statusConfig.received_partial
+          }
+          const EffectiveIcon = effectiveConfig.icon
 
           return (
-            <div key={req.id} className={`rounded-xl border ${config.border} ${config.bg} transition-colors`}>
+            <div key={req.id} className={`rounded-xl border ${effectiveConfig.border} ${effectiveConfig.bg} transition-colors`}>
               {/* Row header */}
               <div
                 className="flex items-center gap-3 px-4 py-2.5 cursor-pointer"
@@ -283,9 +317,15 @@ export default function QuoteTracker({ job, onRefresh }) {
                 </div>
 
                 {/* Status pill */}
-                <div className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium ${config.color} ${config.bg}`}>
-                  <StatusIcon className="w-3 h-3" />
-                  {config.label}
+                <div className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium ${effectiveConfig.color} ${effectiveConfig.bg}`}>
+                  <EffectiveIcon className="w-3 h-3" />
+                  {status === 'received'
+                    ? (pricedCount === totalCount && totalCount > 0
+                        ? `All ${totalCount} priced`
+                        : pricedCount === 0 && totalCount > 0
+                          ? `0/${totalCount} priced`
+                          : `${pricedCount}/${totalCount} priced`)
+                    : config.label}
                   {status === 'waiting' && days > 0 && ` (${days}d)`}
                   {status === 'overdue' && ` (${days}d)`}
                 </div>
@@ -345,18 +385,24 @@ export default function QuoteTracker({ job, onRefresh }) {
                           </span>
                         )}
                         {vd.contact_email && (
-                          <a href={`mailto:${vd.contact_email}`} className="flex items-center gap-1.5 text-xs text-blue-400 hover:text-blue-300 transition-colors">
+                          <a href={`mailto:${vd.contact_email}`} className="flex items-center gap-1.5 text-xs text-blue-400 hover:text-blue-300 transition-colors" onClick={e => e.stopPropagation()}>
                             <Mail className="w-3 h-3" /> {vd.contact_email}
                           </a>
                         )}
                         {vd.contact_phone && (
-                          <a href={`tel:${vd.contact_phone}`} className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-300 transition-colors">
+                          <a href={`tel:${vd.contact_phone}`} className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-300 transition-colors" onClick={e => e.stopPropagation()}>
                             <Phone className="w-3 h-3" /> {vd.contact_phone}
                           </a>
                         )}
                         {!vd.contact_name && !vd.contact_email && !vd.contact_phone && (
                           <span className="text-[11px] text-gray-600 italic">No contact info on file</span>
                         )}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setDetailModal(req.vendor_name) }}
+                          className="flex items-center gap-1 text-[10px] text-gray-500 hover:text-si-orange transition-colors ml-auto"
+                        >
+                          <Building2 className="w-3 h-3" /> View Details
+                        </button>
                       </div>
                     )
                     return null
@@ -364,7 +410,21 @@ export default function QuoteTracker({ job, onRefresh }) {
 
                   {/* Materials — clickable, scrolls to row */}
                   <div className="pt-2">
-                    <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider mb-1">Requested Materials</p>
+                    {(() => {
+                      const pricedCount = mats.filter(m => m.hasPrice).length
+                      const totalCount = mats.length
+                      const allPriced = pricedCount === totalCount
+                      return (
+                        <div className="flex items-center gap-2 mb-1">
+                          <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider">Requested Materials</p>
+                          {status === 'received' && totalCount > 0 && (
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded ${allPriced ? 'text-emerald-400 bg-emerald-500/10' : 'text-amber-400 bg-amber-500/10'}`}>
+                              {allPriced ? `All ${totalCount} priced` : `${pricedCount}/${totalCount} priced`}
+                            </span>
+                          )}
+                        </div>
+                      )
+                    })()}
                     <div className="space-y-0.5">
                       {mats.map((mat, i) => (
                         <button
@@ -372,13 +432,72 @@ export default function QuoteTracker({ job, onRefresh }) {
                           onClick={() => scrollToMaterial(mat.id)}
                           className="w-full text-left text-xs text-gray-400 hover:text-si-orange truncate flex items-center gap-1 group transition-colors"
                         >
+                          {mat.hasPrice ? (
+                            <Check className="w-3 h-3 text-emerald-400 flex-shrink-0" />
+                          ) : (
+                            <span className="w-3 h-3 flex items-center justify-center flex-shrink-0 text-amber-400/60">—</span>
+                          )}
                           <span className="text-gray-600 mr-1 flex-shrink-0">{i + 1}.</span>
                           {mat.item_code && <span className="text-gray-500 flex-shrink-0">{mat.item_code} —</span>}
-                          <span className="truncate group-hover:underline">{mat.name}</span>
+                          <span className={`truncate group-hover:underline ${!mat.hasPrice && status === 'received' ? 'text-amber-400/70' : ''}`}>{mat.name}</span>
+                          {mat.hasPrice && mat.unitPrice > 0 && (
+                            <span className="text-emerald-400/60 text-[10px] font-mono flex-shrink-0 ml-auto">${mat.unitPrice.toFixed(2)}</span>
+                          )}
                         </button>
                       ))}
                     </div>
                   </div>
+
+                  {/* Vendor Response — uploaded quote products */}
+                  {status === 'received' && (() => {
+                    const vendorQuotes = (job.quotes || []).filter(q =>
+                      (q.vendor || '').toLowerCase().includes(req.vendor_name.toLowerCase()) ||
+                      req.vendor_name.toLowerCase().includes((q.vendor || '').toLowerCase().split(',')[0].trim())
+                    )
+                    if (vendorQuotes.length === 0) return null
+                    const fileName = vendorQuotes[0]?.file_name
+                    return (
+                      <details className="group" open>
+                        <summary className="text-[10px] font-bold text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-400 flex items-center gap-1">
+                          <Upload className="w-3 h-3" /> Vendor Response ({vendorQuotes.length} products)
+                          {fileName && <span className="text-gray-700 font-normal normal-case ml-1">— {fileName}</span>}
+                          <ChevronRight className="w-3 h-3 group-open:rotate-90 transition-transform" />
+                        </summary>
+                        <div className="mt-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] overflow-hidden">
+                          <table className="w-full text-xs">
+                            <thead>
+                              <tr className="border-b border-white/[0.06] text-gray-600">
+                                <th className="text-left py-1.5 pl-3 pr-2 font-medium">Product</th>
+                                <th className="text-right py-1.5 px-2 font-medium">Price</th>
+                                <th className="text-left py-1.5 px-2 font-medium">Unit</th>
+                                {vendorQuotes.some(q => q.lead_time) && <th className="text-left py-1.5 px-2 font-medium">Lead Time</th>}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {vendorQuotes.map((q, i) => (
+                                <tr key={i} className="border-t border-white/[0.03] hover:bg-white/[0.02]">
+                                  <td className="py-1.5 pl-3 pr-2 text-gray-300 max-w-[200px] truncate">{q.product_name || q.description}</td>
+                                  <td className="py-1.5 px-2 text-right text-emerald-400 font-mono">${(q.unit_price || 0).toFixed(2)}</td>
+                                  <td className="py-1.5 px-2 text-gray-500">{q.unit || '—'}</td>
+                                  {vendorQuotes.some(vq => vq.lead_time) && <td className="py-1.5 px-2 text-gray-500">{q.lead_time || '—'}</td>}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          {vendorQuotes[0]?.freight && (
+                            <div className="px-3 py-1.5 border-t border-white/[0.06] text-[10px] text-gray-500">
+                              Freight: {vendorQuotes[0].freight}
+                            </div>
+                          )}
+                          {vendorQuotes[0]?.notes && (
+                            <div className="px-3 py-1.5 border-t border-white/[0.03] text-[10px] text-gray-500 italic">
+                              {vendorQuotes[0].notes}
+                            </div>
+                          )}
+                        </div>
+                      </details>
+                    )
+                  })()}
 
                   {/* Request email text — collapsible */}
                   {req.request_text && (
@@ -443,6 +562,180 @@ export default function QuoteTracker({ job, onRefresh }) {
             </div>
           )
         })}
+      </div>
+
+      {/* Vendor detail modal */}
+      {detailModal && vendorDetails[detailModal] && (
+        <VendorDetailModal
+          vendor={vendorDetails[detailModal]}
+          onClose={() => setDetailModal(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+
+function VendorDetailModal({ vendor, onClose }) {
+  const formatDate = (d) => d ? (d || '').slice(0, 10) : '—'
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-[#12121a] border border-white/10 rounded-2xl shadow-2xl max-w-3xl w-full max-h-[85vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.06] sticky top-0 bg-[#12121a] z-10">
+          <div className="flex items-center gap-3">
+            <Building2 className="w-5 h-5 text-si-accent" />
+            <h2 className="text-lg font-bold text-white">{vendor.name}</h2>
+          </div>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-300 p-2 rounded-xl hover:bg-white/[0.06] transition-colors">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="px-6 py-4 space-y-5">
+          {/* Contact + KPIs row */}
+          <div className="flex gap-4 flex-wrap">
+            <div className="flex-1 min-w-[220px] bg-white/[0.03] rounded-xl p-4 border border-white/[0.06]">
+              <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider mb-2">Contact</p>
+              <div className="space-y-1.5">
+                <p className="text-sm text-white font-semibold">{vendor.contact_name || '—'}</p>
+                {vendor.contact_title && <p className="text-[11px] text-gray-500">{vendor.contact_title}</p>}
+                {vendor.contact_email && (
+                  <a href={`mailto:${vendor.contact_email}`} className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1.5">
+                    <Mail className="w-3 h-3" /> {vendor.contact_email}
+                  </a>
+                )}
+                {vendor.contact_phone && (
+                  <a href={`tel:${vendor.contact_phone}`} className="text-xs text-gray-400 hover:text-gray-300 flex items-center gap-1.5">
+                    <Phone className="w-3 h-3" /> {vendor.contact_phone}
+                  </a>
+                )}
+                {vendor.notes && <p className="text-[11px] text-gray-500 mt-2 italic">{vendor.notes}</p>}
+              </div>
+            </div>
+
+            {vendor.stats && (
+              <div className="flex gap-3 flex-wrap">
+                <div className="bg-white/[0.03] rounded-xl p-3 border border-white/[0.06] min-w-[90px] text-center">
+                  <p className="text-lg font-bold text-white">{vendor.stats.total_products_quoted}</p>
+                  <p className="text-[10px] text-gray-500 uppercase">Products</p>
+                </div>
+                <div className="bg-white/[0.03] rounded-xl p-3 border border-white/[0.06] min-w-[90px] text-center">
+                  <p className="text-lg font-bold text-white">{vendor.stats.total_requests}</p>
+                  <p className="text-[10px] text-gray-500 uppercase">Requests</p>
+                </div>
+                <div className="bg-white/[0.03] rounded-xl p-3 border border-white/[0.06] min-w-[90px] text-center">
+                  <p className={`text-lg font-bold ${vendor.stats.response_rate != null ? (vendor.stats.response_rate >= 80 ? 'text-emerald-400' : vendor.stats.response_rate >= 50 ? 'text-amber-400' : 'text-red-400') : 'text-gray-600'}`}>
+                    {vendor.stats.response_rate != null ? `${vendor.stats.response_rate}%` : '—'}
+                  </p>
+                  <p className="text-[10px] text-gray-500 uppercase">Response</p>
+                </div>
+                <div className="bg-white/[0.03] rounded-xl p-3 border border-white/[0.06] min-w-[90px] text-center">
+                  <p className="text-lg font-bold text-white">
+                    {vendor.stats.avg_response_days != null ? `${vendor.stats.avg_response_days}d` : '—'}
+                  </p>
+                  <p className="text-[10px] text-gray-500 uppercase">Avg Time</p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Product categories */}
+          {vendor.categories?.length > 0 && (
+            <div>
+              <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider mb-2 flex items-center gap-1">
+                <Package className="w-3 h-3" /> Products They Supply
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {vendor.categories.map((cat, i) => (
+                  <span key={i} className="text-[11px] bg-white/[0.06] text-gray-300 px-2.5 py-1 rounded-lg border border-white/[0.06] flex items-center gap-1.5">
+                    {cat.product_normalized || 'Other'}
+                    <span className="text-gray-500">×{cat.count}</span>
+                    {cat.avg_price > 0 && <span className="text-emerald-400 font-mono text-[10px]">~${cat.avg_price}</span>}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Price history + Quote requests */}
+          <div className="flex gap-4 flex-wrap">
+            <div className="flex-1 min-w-[280px]">
+              <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider mb-2 flex items-center gap-1">
+                <TrendingUp className="w-3 h-3" /> Price History ({vendor.prices?.length || 0})
+              </p>
+              {vendor.prices?.length > 0 ? (
+                <div className="max-h-52 overflow-y-auto rounded-lg border border-white/[0.06] bg-white/[0.02]">
+                  <table className="w-full text-xs">
+                    <thead className="sticky top-0 bg-[#12121a]">
+                      <tr className="text-gray-600 border-b border-white/[0.06]">
+                        <th className="text-left py-1.5 pl-3 pr-2 font-medium">Product</th>
+                        <th className="text-right py-1.5 px-2 font-medium">Price</th>
+                        <th className="text-left py-1.5 px-2 font-medium">Unit</th>
+                        <th className="text-left py-1.5 px-2 font-medium">Job</th>
+                        <th className="text-left py-1.5 pl-2 pr-3 font-medium">Date</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {vendor.prices.map((p, i) => (
+                        <tr key={i} className="border-t border-white/[0.03] text-gray-400 hover:bg-white/[0.02]">
+                          <td className="py-1.5 pl-3 pr-2 text-gray-300 max-w-[160px] truncate">{p.product_name}</td>
+                          <td className="py-1.5 px-2 text-right text-emerald-400 font-mono">${(p.unit_price || 0).toFixed(2)}</td>
+                          <td className="py-1.5 px-2">{p.unit || '—'}</td>
+                          <td className="py-1.5 px-2 text-gray-500 max-w-[100px] truncate">{p.job_name || '—'}</td>
+                          <td className="py-1.5 pl-2 pr-3 text-gray-500">{formatDate(p.created_at)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-xs text-gray-600 py-3 px-3 bg-white/[0.02] rounded-lg border border-white/[0.06]">No quotes from this vendor yet.</p>
+              )}
+            </div>
+
+            <div className="w-[280px] flex-shrink-0">
+              <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider mb-2 flex items-center gap-1">
+                <FileText className="w-3 h-3" /> Quote Requests ({vendor.quote_requests?.length || 0})
+              </p>
+              {vendor.quote_requests?.length > 0 ? (
+                <div className="space-y-1.5 max-h-52 overflow-y-auto">
+                  {vendor.quote_requests.map((qr, i) => {
+                    const st = qr.received_at ? 'received' : qr.sent_at ? 'sent' : 'draft'
+                    const daysSince = qr.sent_at ? Math.floor((Date.now() - new Date(qr.sent_at).getTime()) / 86400000) : null
+                    const responseTime = (qr.sent_at && qr.received_at) ?
+                      Math.round((new Date(qr.received_at).getTime() - new Date(qr.sent_at).getTime()) / 86400000 * 10) / 10 : null
+                    return (
+                      <div key={i} className="flex items-center gap-2 text-xs bg-white/[0.02] rounded-lg px-3 py-2 border border-white/[0.06]">
+                        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                          st === 'received' ? 'bg-emerald-400' : st === 'sent' ? (daysSince > 3 ? 'bg-amber-400' : 'bg-blue-400') : 'bg-gray-500'
+                        }`} />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-gray-300 truncate">{qr.job_name || 'Unknown Job'}</p>
+                          <p className="text-[10px] text-gray-500">
+                            {st === 'received' && responseTime != null && `Responded in ${responseTime}d`}
+                            {st === 'sent' && daysSince != null && (daysSince > 3 ? `⚠ ${daysSince}d, no response` : `Sent ${daysSince}d ago`)}
+                            {st === 'draft' && 'Draft — not sent'}
+                          </p>
+                        </div>
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                          st === 'received' ? 'text-emerald-400 bg-emerald-500/10' :
+                          st === 'sent' ? (daysSince > 3 ? 'text-amber-400 bg-amber-500/10' : 'text-blue-400 bg-blue-500/10') :
+                          'text-gray-500 bg-gray-500/10'
+                        }`}>
+                          {st === 'received' ? 'Received' : st === 'sent' ? (daysSince > 3 ? 'Overdue' : 'Waiting') : 'Draft'}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <p className="text-xs text-gray-600 py-3 px-3 bg-white/[0.02] rounded-lg border border-white/[0.06]">No quote requests yet.</p>
+              )}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   )

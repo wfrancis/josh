@@ -232,15 +232,19 @@ def api_get_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     # Enrich materials with known prices from price list and vendor history
-    _enrich_known_prices(job)
+    applied = _enrich_known_prices(job)
+    if applied:
+        save_materials(job["id"], job["materials"])
     return job
 
 
 def _enrich_known_prices(job: dict):
-    """Add known_price field to each material from price list and vendor price history."""
+    """Add known_price field to each material from price list and vendor price history.
+    Auto-applies prices to unpriced materials. Returns count of newly applied prices."""
     materials = job.get("materials", [])
+    applied_count = 0
     if not materials:
-        return
+        return 0
     price_list = get_price_list_entries()
 
     # Build a map of normalized vendor prices (latest price per product)
@@ -259,6 +263,9 @@ def _enrich_known_prices(job: dict):
         conn.close()
 
     for mat in materials:
+        if mat.get("unit_price") and mat["unit_price"] > 0:
+            continue  # already has a price, skip
+
         item_code = (mat.get("item_code") or "").strip().lower()
         description = (mat.get("description") or "").strip().lower()
 
@@ -269,6 +276,13 @@ def _enrich_known_prices(job: dict):
             mat["known_price"] = round(pl_match["unit_price"] * order_qty, 2)
             mat["known_price_source"] = "price_list"
             mat["known_price_vendor"] = pl_match.get("vendor", "")
+            # Auto-apply known price to material
+            mat["unit_price"] = pl_match["unit_price"]
+            mat["extended_cost"] = mat["known_price"]
+            mat["price_source"] = "price_list"
+            mat["vendor"] = pl_match.get("vendor", mat.get("vendor", ""))
+            mat["quote_status"] = "quoted"
+            applied_count += 1
             continue
 
         # Check vendor price history
@@ -280,7 +294,16 @@ def _enrich_known_prices(job: dict):
                     mat["known_price"] = round(vp["unit_price"] * order_qty, 2)
                     mat["known_price_source"] = "vendor_history"
                     mat["known_price_vendor"] = vp.get("vendor_name", "")
+                    # Auto-apply known price to material
+                    mat["unit_price"] = vp["unit_price"]
+                    mat["extended_cost"] = mat["known_price"]
+                    mat["price_source"] = "vendor_quote"
+                    mat["vendor"] = vp.get("vendor_name", mat.get("vendor", ""))
+                    mat["quote_status"] = "quoted"
+                    applied_count += 1
                     break
+
+    return applied_count
 
 
 @app.post("/api/jobs/bulk-delete")
@@ -670,10 +693,11 @@ Return empty array [] if no confident matches."""
 
 
 def _link_upload_to_requests(job_id: int, products: list[dict]):
-    """Auto-link uploaded vendor quotes to open quote requests."""
+    """Detect which open quote requests match uploaded vendor quotes.
+    Returns list of matched requests for frontend confirmation."""
     requests = list_quote_requests(job_id)
     if not requests:
-        return
+        return []
 
     # Detect vendors from uploaded products
     upload_vendors = set()
@@ -683,26 +707,29 @@ def _link_upload_to_requests(job_id: int, products: list[dict]):
             upload_vendors.add(v.lower())
 
     if not upload_vendors:
-        return
-
-    import datetime
-    now = datetime.datetime.utcnow().isoformat()
+        return []
 
     import re
     def _normalize_vendor(name):
         """Normalize vendor name for fuzzy matching: lowercase, strip punctuation, collapse spaces."""
         return re.sub(r'[^a-z0-9 ]', '', name.lower()).strip()
 
+    matched = []
     for req in requests:
         if req.get("received_at"):
             continue  # already marked received
         req_vendor = _normalize_vendor(req.get("vendor_name") or "")
-        # Fuzzy match: check if any uploaded vendor name contains or is contained by the request vendor
         for uv in upload_vendors:
             uv_norm = _normalize_vendor(uv)
             if req_vendor in uv_norm or uv_norm in req_vendor or req_vendor == uv_norm:
-                update_quote_request(req["id"], status="received", received_at=now)
+                matched.append({
+                    "request_id": req["id"],
+                    "vendor_name": req.get("vendor_name", ""),
+                    "sent_at": req.get("sent_at", ""),
+                })
                 break
+
+    return matched
 
 
 @app.post("/api/jobs/{job_id}/upload-quotes")
@@ -737,11 +764,14 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     # Save to vendor pricing database
     save_vendor_prices_from_quotes(db_id, all_products)
 
+    # Detect matching quote requests (don't auto-link — frontend will confirm)
+    linked_requests = _link_upload_to_requests(db_id, all_products)
+
     file_names = [u.filename for u in files if hasattr(u, 'filename')]
     vendors_found = list(set(p.get("vendor", "Unknown") for p in all_products if p.get("vendor")))
     log_activity(db_id, "quotes_uploaded", f"Uploaded {len(file_names)} quote file(s), {len(all_products)} products, {auto_matched} auto-matched", {"files": file_names, "vendors": vendors_found, "product_count": len(all_products), "auto_matched": auto_matched})
 
-    return {"products": all_products, "auto_matched": auto_matched}
+    return {"products": all_products, "auto_matched": auto_matched, "linked_requests": linked_requests}
 
 
 @app.delete("/api/jobs/{job_id}/quotes")

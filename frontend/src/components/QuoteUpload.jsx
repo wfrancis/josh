@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { FileText, Package, AlertTriangle, CheckCircle2, Trash2, Search } from 'lucide-react'
+import { FileText, Package, AlertTriangle, CheckCircle2, Trash2, Search, Link2, Check, X } from 'lucide-react'
 import FileUpload from './FileUpload'
 import ConfirmDialog from './ConfirmDialog'
 
@@ -12,6 +12,8 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
   const [searchQuery, setSearchQuery] = useState('')
   const saveTimers = useRef({})
   const [vendorFilter, setVendorFilter] = useState('')
+  const [linkedRequests, setLinkedRequests] = useState([]) // requests matched to this upload
+  const [linkingId, setLinkingId] = useState(null)
 
   // Populate from existing quotes on load
   useEffect(() => {
@@ -27,9 +29,30 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
       const result = await api.uploadQuotes(jobId, fileList)
       setProducts(result.products || [])
       setAutoMatched(result.auto_matched || 0)
+      setLinkedRequests(result.linked_requests || [])
       onQuotesParsed?.(result.products || [], result.auto_matched || 0)
     } catch (err) { setError(err.message) }
     finally { setLoading(false) }
+  }
+
+  const handleConfirmLink = async (req) => {
+    setLinkingId(req.request_id)
+    try {
+      await api.updateQuoteRequest(req.request_id, {
+        status: 'received',
+        received_at: new Date().toISOString(),
+      })
+      setLinkedRequests(prev => prev.filter(r => r.request_id !== req.request_id))
+      onQuotesParsed?.() // refresh job to update QuoteTracker
+    } catch (err) {
+      console.error('Failed to link request:', err)
+    } finally {
+      setLinkingId(null)
+    }
+  }
+
+  const handleDismissLink = (reqId) => {
+    setLinkedRequests(prev => prev.filter(r => r.request_id !== reqId))
   }
 
   const handleClear = () => {
@@ -108,6 +131,42 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
         <div className="flex items-center gap-2 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-400">
           <AlertTriangle className="w-4 h-4 flex-shrink-0" /> {error}
           <button onClick={() => setError(null)} className="ml-auto text-red-500/60 hover:text-red-400 text-xs">dismiss</button>
+        </div>
+      )}
+
+      {/* Link-to-request confirmation banners */}
+      {linkedRequests.length > 0 && (
+        <div className="space-y-2">
+          {linkedRequests.map(req => {
+            const sentDate = req.sent_at ? new Date(req.sent_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : null
+            return (
+              <div key={req.request_id} className="flex items-center gap-3 px-4 py-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl">
+                <Link2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                <div className="flex-1 min-w-0 text-sm">
+                  <span className="text-gray-300">This looks like a response from </span>
+                  <span className="text-white font-semibold">{req.vendor_name}</span>
+                  {sentDate && (
+                    <span className="text-gray-400">. Link to your request from {sentDate}?</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-1.5 flex-shrink-0">
+                  <button
+                    onClick={() => handleConfirmLink(req)}
+                    disabled={linkingId === req.request_id}
+                    className="text-xs bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 px-2.5 py-1.5 rounded-lg flex items-center gap-1 transition-colors"
+                  >
+                    <Check className="w-3 h-3" /> Link
+                  </button>
+                  <button
+                    onClick={() => handleDismissLink(req.request_id)}
+                    className="text-xs text-gray-600 hover:text-gray-400 p-1.5 rounded-lg transition-colors"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              </div>
+            )
+          })}
         </div>
       )}
 
