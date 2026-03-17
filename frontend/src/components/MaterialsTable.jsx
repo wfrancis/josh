@@ -565,7 +565,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
             const veryLowConf = m.ai_confidence != null && m.ai_confidence < 0.5
             const rowBg = !hasPrice ? 'bg-amber-500/[0.04] border-l-2 border-l-amber-500/40' : veryLowConf ? 'bg-red-500/[0.06]' : lowConf ? 'bg-amber-500/[0.06]' : ''
             return (
-              <tr key={m.id || m._origIdx} className={`group hover:bg-white/[0.02] transition-colors ${rowBg}`}>
+              <tr key={m.id || m._origIdx} data-material-id={m.id} className={`group hover:bg-white/[0.02] transition-all ${rowBg}`}>
                 <td className="py-3 px-2 sm:px-3 max-w-0 sm:max-w-none">
                   {editable ? (
                     <EditableCell

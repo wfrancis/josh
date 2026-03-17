@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import {
   Building2, Plus, Trash2, Loader2, Check, Save, Sparkles,
-  ChevronDown, ChevronRight, ExternalLink, X, Search
+  ChevronDown, ChevronRight, ExternalLink, X, Search,
+  Clock, Mail, Phone, TrendingUp, Package, FileText, Send
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -376,8 +377,8 @@ function VendorRow({ vendor, idx, updateField, onDelete, deleting, expanded, onT
         {/* Name */}
         <td className="px-4 py-2">
           <div className="flex items-center gap-2">
-            <button onClick={onToggleExpand} className="text-gray-500 hover:text-gray-300 flex-shrink-0">
-              {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+            <button onClick={onToggleExpand} className="text-gray-500 hover:text-gray-300 flex-shrink-0 p-1.5 -m-1.5 rounded-lg hover:bg-white/[0.06] transition-colors" title={expanded ? 'Collapse' : 'Expand vendor details'}>
+              {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
             </button>
             <input
               value={vendor.name || ''}
@@ -423,9 +424,9 @@ function VendorRow({ vendor, idx, updateField, onDelete, deleting, expanded, onT
             className="bg-transparent border-0 outline-none text-gray-400 w-full min-w-[120px] placeholder-gray-700 focus:bg-white/[0.06] focus:rounded px-1 -mx-1 text-xs"
           />
         </td>
-        {/* Quote count */}
-        <td className="px-3 py-2 text-right">
-          <span className="text-xs text-gray-500">{vendor.price_count || 0}</span>
+        {/* Quote count — also clickable to expand */}
+        <td className="px-3 py-2 text-right cursor-pointer" onClick={onToggleExpand}>
+          <span className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{vendor.price_count || 0}</span>
         </td>
         {/* Delete */}
         <td className="px-2 py-2">
@@ -466,48 +467,166 @@ function VendorRow({ vendor, idx, updateField, onDelete, deleting, expanded, onT
         </tr>
       )}
 
-      {/* Expanded detail: price history */}
+      {/* Expanded detail: vendor drill-down */}
       {expanded && (
         <tr className="border-b border-white/[0.03]">
-          <td colSpan={7} className="px-4 py-3 bg-white/[0.01]">
+          <td colSpan={7} className="p-0 bg-white/[0.01]">
             {detailLoading ? (
-              <div className="flex items-center gap-2 text-gray-500 text-xs py-2">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading price history...
+              <div className="flex items-center gap-2 text-gray-500 text-xs py-6 px-6">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading vendor details...
               </div>
-            ) : detail?.prices?.length > 0 ? (
-              <div>
-                <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">
-                  Recent Quotes ({detail.prices.length})
-                </p>
-                <div className="max-h-40 overflow-y-auto">
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="text-gray-600">
-                        <th className="text-left py-1 pr-3 font-medium">Product</th>
-                        <th className="text-right py-1 px-3 font-medium">Unit Price</th>
-                        <th className="text-left py-1 px-3 font-medium hidden sm:table-cell">Unit</th>
-                        <th className="text-left py-1 px-3 font-medium hidden md:table-cell">Job</th>
-                        <th className="text-left py-1 pl-3 font-medium">Date</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {detail.prices.map((p, i) => (
-                        <tr key={i} className="border-t border-white/[0.03] text-gray-400">
-                          <td className="py-1.5 pr-3 text-gray-300 max-w-[200px] truncate">{p.product_name}</td>
-                          <td className="py-1.5 px-3 text-right text-emerald-400 font-mono">
-                            ${(p.unit_price || 0).toFixed(2)}
-                          </td>
-                          <td className="py-1.5 px-3 hidden sm:table-cell">{p.unit || '—'}</td>
-                          <td className="py-1.5 px-3 hidden md:table-cell text-gray-500">{p.job_name || '—'}</td>
-                          <td className="py-1.5 pl-3 text-gray-500">{(p.created_at || '').slice(0, 10)}</td>
-                        </tr>
+            ) : detail ? (
+              <div className="px-6 py-4 space-y-4">
+                {/* Contact card + KPI stats row */}
+                <div className="flex gap-4 flex-wrap">
+                  {/* Contact card */}
+                  <div className="flex-1 min-w-[240px] bg-white/[0.03] rounded-xl p-4 border border-white/[0.06]">
+                    <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider mb-2">Contact</p>
+                    <div className="space-y-1.5">
+                      <p className="text-sm text-white font-semibold">{vendor.contact_name || '—'}</p>
+                      {vendor.contact_title && <p className="text-[11px] text-gray-500">{vendor.contact_title}</p>}
+                      {vendor.contact_email && (
+                        <a href={`mailto:${vendor.contact_email}`} className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1.5">
+                          <Mail className="w-3 h-3" /> {vendor.contact_email}
+                        </a>
+                      )}
+                      {vendor.contact_phone && (
+                        <a href={`tel:${vendor.contact_phone}`} className="text-xs text-gray-400 hover:text-gray-300 flex items-center gap-1.5">
+                          <Phone className="w-3 h-3" /> {vendor.contact_phone}
+                        </a>
+                      )}
+                      {vendor.notes && <p className="text-[11px] text-gray-500 mt-2 italic">{vendor.notes}</p>}
+                    </div>
+                  </div>
+
+                  {/* KPI stats */}
+                  {detail.stats && (
+                    <div className="flex gap-3 flex-wrap">
+                      <div className="bg-white/[0.03] rounded-xl p-3 border border-white/[0.06] min-w-[100px] text-center">
+                        <p className="text-lg font-bold text-white">{detail.stats.total_products_quoted}</p>
+                        <p className="text-[10px] text-gray-500 uppercase">Products Quoted</p>
+                      </div>
+                      <div className="bg-white/[0.03] rounded-xl p-3 border border-white/[0.06] min-w-[100px] text-center">
+                        <p className="text-lg font-bold text-white">{detail.stats.total_requests}</p>
+                        <p className="text-[10px] text-gray-500 uppercase">Quotes Requested</p>
+                      </div>
+                      <div className="bg-white/[0.03] rounded-xl p-3 border border-white/[0.06] min-w-[100px] text-center">
+                        <p className={`text-lg font-bold ${detail.stats.response_rate != null ? (detail.stats.response_rate >= 80 ? 'text-emerald-400' : detail.stats.response_rate >= 50 ? 'text-amber-400' : 'text-red-400') : 'text-gray-600'}`}>
+                          {detail.stats.response_rate != null ? `${detail.stats.response_rate}%` : '—'}
+                        </p>
+                        <p className="text-[10px] text-gray-500 uppercase">Response Rate</p>
+                      </div>
+                      <div className="bg-white/[0.03] rounded-xl p-3 border border-white/[0.06] min-w-[100px] text-center">
+                        <p className="text-lg font-bold text-white">
+                          {detail.stats.avg_response_days != null ? `${detail.stats.avg_response_days}d` : '—'}
+                        </p>
+                        <p className="text-[10px] text-gray-500 uppercase">Avg Response</p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Product categories */}
+                {detail.categories?.length > 0 && (
+                  <div>
+                    <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider mb-2 flex items-center gap-1">
+                      <Package className="w-3 h-3" /> Products They Supply
+                    </p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {detail.categories.map((cat, i) => (
+                        <span key={i} className="text-[11px] bg-white/[0.06] text-gray-300 px-2.5 py-1 rounded-lg border border-white/[0.06] flex items-center gap-1.5">
+                          {cat.product_normalized || 'Other'}
+                          <span className="text-gray-500">×{cat.count}</span>
+                          {cat.avg_price > 0 && <span className="text-emerald-400 font-mono text-[10px]">~${cat.avg_price}</span>}
+                        </span>
                       ))}
-                    </tbody>
-                  </table>
+                    </div>
+                  </div>
+                )}
+
+                {/* Two-column: Price History + Quote Requests */}
+                <div className="flex gap-4 flex-wrap">
+                  {/* Price history by job */}
+                  <div className="flex-1 min-w-[300px]">
+                    <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider mb-2 flex items-center gap-1">
+                      <TrendingUp className="w-3 h-3" /> Price History ({detail.prices?.length || 0} products)
+                    </p>
+                    {detail.prices?.length > 0 ? (
+                      <div className="max-h-52 overflow-y-auto rounded-lg border border-white/[0.06] bg-white/[0.02]">
+                        <table className="w-full text-xs">
+                          <thead className="sticky top-0 bg-[#12121a]">
+                            <tr className="text-gray-600 border-b border-white/[0.06]">
+                              <th className="text-left py-1.5 pl-3 pr-2 font-medium">Product</th>
+                              <th className="text-right py-1.5 px-2 font-medium">Price</th>
+                              <th className="text-left py-1.5 px-2 font-medium">Unit</th>
+                              <th className="text-left py-1.5 px-2 font-medium">Job</th>
+                              <th className="text-left py-1.5 pl-2 pr-3 font-medium">Date</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {detail.prices.map((p, i) => (
+                              <tr key={i} className="border-t border-white/[0.03] text-gray-400 hover:bg-white/[0.02]">
+                                <td className="py-1.5 pl-3 pr-2 text-gray-300 max-w-[180px] truncate">{p.product_name}</td>
+                                <td className="py-1.5 px-2 text-right text-emerald-400 font-mono">
+                                  ${(p.unit_price || 0).toFixed(2)}
+                                </td>
+                                <td className="py-1.5 px-2">{p.unit || '—'}</td>
+                                <td className="py-1.5 px-2 text-gray-500 max-w-[120px] truncate">{p.job_name || '—'}</td>
+                                <td className="py-1.5 pl-2 pr-3 text-gray-500">{(p.created_at || '').slice(0, 10)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-gray-600 py-3 px-3 bg-white/[0.02] rounded-lg border border-white/[0.06]">No quotes uploaded from this vendor yet.</p>
+                    )}
+                  </div>
+
+                  {/* Quote request history */}
+                  <div className="w-[320px] flex-shrink-0">
+                    <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider mb-2 flex items-center gap-1">
+                      <FileText className="w-3 h-3" /> Quote Requests ({detail.quote_requests?.length || 0})
+                    </p>
+                    {detail.quote_requests?.length > 0 ? (
+                      <div className="space-y-1.5 max-h-52 overflow-y-auto">
+                        {detail.quote_requests.map((qr, i) => {
+                          const status = qr.received_at ? 'received' : qr.sent_at ? 'sent' : 'draft'
+                          const daysSince = qr.sent_at ? Math.floor((Date.now() - new Date(qr.sent_at).getTime()) / 86400000) : null
+                          const responseTime = (qr.sent_at && qr.received_at) ?
+                            Math.round((new Date(qr.received_at).getTime() - new Date(qr.sent_at).getTime()) / 86400000 * 10) / 10 : null
+                          return (
+                            <div key={i} className="flex items-center gap-2 text-xs bg-white/[0.02] rounded-lg px-3 py-2 border border-white/[0.06]">
+                              <span className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                                status === 'received' ? 'bg-emerald-400' : status === 'sent' ? (daysSince > 3 ? 'bg-amber-400' : 'bg-blue-400') : 'bg-gray-500'
+                              }`} />
+                              <div className="flex-1 min-w-0">
+                                <p className="text-gray-300 truncate">{qr.job_name || 'Unknown Job'}</p>
+                                <p className="text-[10px] text-gray-500">
+                                  {status === 'received' && responseTime != null && `Responded in ${responseTime}d`}
+                                  {status === 'sent' && daysSince != null && (daysSince > 3 ? `⚠ ${daysSince}d, no response` : `Sent ${daysSince}d ago`)}
+                                  {status === 'draft' && 'Draft — not sent'}
+                                </p>
+                              </div>
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                                status === 'received' ? 'text-emerald-400 bg-emerald-500/10' :
+                                status === 'sent' ? (daysSince > 3 ? 'text-amber-400 bg-amber-500/10' : 'text-blue-400 bg-blue-500/10') :
+                                'text-gray-500 bg-gray-500/10'
+                              }`}>
+                                {status === 'received' ? 'Received' : status === 'sent' ? (daysSince > 3 ? 'Overdue' : 'Waiting') : 'Draft'}
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-gray-600 py-3 px-3 bg-white/[0.02] rounded-lg border border-white/[0.06]">No quote requests for this vendor yet.</p>
+                    )}
+                  </div>
                 </div>
               </div>
             ) : (
-              <p className="text-xs text-gray-600 py-2">No price history for this vendor yet.</p>
+              <p className="text-xs text-gray-600 py-4 px-6">No data available for this vendor.</p>
             )}
           </td>
         </tr>

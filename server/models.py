@@ -1014,22 +1014,92 @@ def list_vendors() -> list[dict]:
 
 
 def get_vendor(vendor_id: int) -> dict | None:
-    """Get vendor by ID with recent prices."""
+    """Get vendor by ID with recent prices, quote stats, and request history."""
     conn = _get_conn()
     try:
         row = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
         if not row:
             return None
         vendor = dict(row)
+        vendor_name = vendor["name"]
+
+        # Price history grouped by job
         prices = conn.execute("""
             SELECT vp.*, j.project_name AS job_name
             FROM vendor_prices vp
             LEFT JOIN jobs j ON vp.job_id = j.id
             WHERE vp.vendor_id=?
             ORDER BY vp.created_at DESC
-            LIMIT 50
+            LIMIT 100
         """, (vendor_id,)).fetchall()
         vendor["prices"] = [dict(r) for r in prices]
+
+        # Also get prices matched by vendor name (some prices linked by name not ID)
+        name_prices = conn.execute("""
+            SELECT vp.*, j.project_name AS job_name
+            FROM vendor_prices vp
+            LEFT JOIN jobs j ON vp.job_id = j.id
+            WHERE vp.vendor_name LIKE ? AND (vp.vendor_id IS NULL OR vp.vendor_id != ?)
+            ORDER BY vp.created_at DESC
+            LIMIT 50
+        """, (f"%{vendor_name}%", vendor_id)).fetchall()
+        # Merge, avoiding duplicates
+        existing_ids = {p["id"] for p in vendor["prices"]}
+        for p in name_prices:
+            pd = dict(p)
+            if pd["id"] not in existing_ids:
+                vendor["prices"].append(pd)
+
+        # Product categories summary
+        categories = conn.execute("""
+            SELECT product_normalized, COUNT(*) as count,
+                   ROUND(AVG(unit_price), 2) as avg_price,
+                   unit
+            FROM vendor_prices
+            WHERE vendor_id=? OR vendor_name LIKE ?
+            GROUP BY product_normalized
+            ORDER BY count DESC
+            LIMIT 20
+        """, (vendor_id, f"%{vendor_name}%")).fetchall()
+        vendor["categories"] = [dict(c) for c in categories]
+
+        # Quote request history with job names
+        quote_requests = conn.execute("""
+            SELECT qr.*, j.project_name AS job_name
+            FROM quote_requests qr
+            LEFT JOIN jobs j ON qr.job_id = j.id
+            WHERE qr.vendor_id=? OR qr.vendor_name LIKE ?
+            ORDER BY qr.created_at DESC
+            LIMIT 30
+        """, (vendor_id, f"%{vendor_name}%")).fetchall()
+        vendor["quote_requests"] = [dict(qr) for qr in quote_requests]
+
+        # KPI stats
+        total_requests = len(vendor["quote_requests"])
+        sent_requests = [qr for qr in vendor["quote_requests"] if qr.get("sent_at")]
+        received_requests = [qr for qr in vendor["quote_requests"] if qr.get("received_at")]
+        response_times = []
+        for qr in vendor["quote_requests"]:
+            if qr.get("sent_at") and qr.get("received_at"):
+                from datetime import datetime
+                try:
+                    sent = datetime.fromisoformat(qr["sent_at"].replace("Z", "+00:00"))
+                    recv = datetime.fromisoformat(qr["received_at"].replace("Z", "+00:00"))
+                    days = (recv - sent).total_seconds() / 86400
+                    response_times.append(round(days, 1))
+                except:
+                    pass
+
+        vendor["stats"] = {
+            "total_requests": total_requests,
+            "sent_count": len(sent_requests),
+            "received_count": len(received_requests),
+            "response_rate": round(len(received_requests) / len(sent_requests) * 100) if sent_requests else None,
+            "avg_response_days": round(sum(response_times) / len(response_times), 1) if response_times else None,
+            "total_products_quoted": len(vendor["prices"]),
+            "product_categories": len(vendor["categories"]),
+        }
+
         return vendor
     finally:
         conn.close()

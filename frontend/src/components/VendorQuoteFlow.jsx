@@ -104,9 +104,30 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
       })
       setGeneratedText(prev => ({ ...prev, [vendorName]: result.text }))
       setExpandedVendor(vendorName)
+      // Auto-copy to clipboard on generate (with timeout to prevent hanging)
+      try {
+        const clipPromise = navigator.clipboard.writeText(result.text)
+        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
+        await Promise.race([clipPromise, timeoutPromise])
+        setCopied(vendorName)
+        setTimeout(() => setCopied(null), 4000)
+      } catch {
+        try {
+          const ta = document.createElement('textarea')
+          ta.value = result.text
+          document.body.appendChild(ta)
+          ta.select()
+          document.execCommand('copy')
+          document.body.removeChild(ta)
+          setCopied(vendorName)
+          setTimeout(() => setCopied(null), 4000)
+        } catch {
+          // Clipboard not available — text is still shown for manual copy
+        }
+      }
     } catch (err) {
       console.error('Quote text generation failed:', err)
-      setError(err.message)
+      setError(err?.message || String(err))
     } finally {
       setGeneratingFor(null)
     }
@@ -116,14 +137,20 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
     const text = generatedText[vendorName]
     if (!text) return
     try {
-      await navigator.clipboard.writeText(text)
+      const clipPromise = navigator.clipboard.writeText(text)
+      const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
+      await Promise.race([clipPromise, timeoutPromise])
     } catch {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
+      try {
+        const ta = document.createElement('textarea')
+        ta.value = text
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand('copy')
+        document.body.removeChild(ta)
+      } catch {
+        // Clipboard not available
+      }
     }
     setCopied(vendorName)
     setTimeout(() => setCopied(null), 4000)
@@ -209,7 +236,7 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
               <p className="text-xs text-gray-500">{totalUnpriced} unpriced materials across {vendorGroups.length} vendor{vendorGroups.length !== 1 ? 's' : ''}</p>
             </div>
           </div>
-          <button onClick={onClose} className="text-gray-500 hover:text-gray-300 transition-colors p-1.5 -mr-1.5 rounded-lg hover:bg-white/[0.06]">
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-300 transition-colors p-2.5 -mr-2 rounded-xl hover:bg-white/[0.06]">
             <X className="w-5 h-5" />
           </button>
         </div>
