@@ -1640,10 +1640,24 @@ def _build_vendor_memory() -> dict:
             if pn and pn not in product_hints:
                 product_hints[pn] = row["vendor_name"]
 
+        # Vendor catalog: what products each vendor sells (for AI context)
+        vendor_catalog = {}
+        for row in conn.execute("""
+            SELECT vendor_name, product_name
+            FROM vendor_prices
+            WHERE vendor_name IS NOT NULL AND product_name IS NOT NULL
+            ORDER BY vendor_name, product_name
+        """).fetchall():
+            vn = row["vendor_name"]
+            # Resolve through aliases
+            canonical = aliases.get(vn.lower().replace("-", "").replace(" ", ""), vn)
+            vendor_catalog.setdefault(canonical, []).append(row["product_name"])
+
         return {
             "known_names": [v["name"] for v in vendors],
             "aliases": aliases,
             "product_hints": product_hints,
+            "vendor_catalog": vendor_catalog,
         }
     finally:
         conn.close()
@@ -1749,6 +1763,7 @@ async def api_detect_vendors(job_id: str):
     aliases = memory["aliases"]
     known_names = memory["known_names"]
     product_hints = memory["product_hints"]
+    vendor_catalog = memory["vendor_catalog"]
 
     vendor_groups = {}
     needs_ai = []  # indices still unresolved after regex+memory
@@ -1837,21 +1852,33 @@ async def api_detect_vendors(job_id: str):
                 line += '  [UNASSIGNED]'
             mat_lines.append(line)
 
+        # Build vendor catalog context for AI
+        catalog_lines = []
+        for vname, products in sorted(vendor_catalog.items()):
+            # Deduplicate and limit to 10 products per vendor
+            unique = list(dict.fromkeys(products))[:10]
+            catalog_lines.append(f"  {vname}: {', '.join(unique)}")
+        catalog_ctx = "\n".join(catalog_lines) if catalog_lines else "  (no price history yet)"
+
         prompt = (
             f"You are a commercial flooring industry expert reviewing vendor assignments for a material list.\n\n"
-            f"Known vendors: {', '.join(known_names) if known_names else 'None yet'}\n\n"
-            f"Materials (some pre-assigned by our system, some unassigned):\n"
+            f"KNOWN VENDORS AND WHAT THEY SELL:\n{catalog_ctx}\n\n"
+            f"Other known vendors (no price history yet): "
+            f"{', '.join(n for n in known_names if n not in vendor_catalog) or 'None'}\n\n"
+            f"MATERIALS TO REVIEW:\n"
             f"{chr(10).join(mat_lines)}\n\n"
             f"YOUR JOB:\n"
-            f"1. VERIFY pre-assigned vendors — if the description clearly says a different vendor, correct it\n"
-            f"2. FILL IN unassigned items — identify the vendor from the description if possible\n"
-            f"3. SKIP items that are genuinely generic (transitions, trims, TBD specs) — set vendor to ''\n\n"
+            f"1. VERIFY pre-assigned vendors — if the description clearly says a different vendor, CORRECT it\n"
+            f"2. FILL IN unassigned items — identify vendor from the description\n"
+            f"3. CHECK CONSISTENCY — if 5 items are 'Interface - Woven Gradience' and 1 similar item got assigned differently, flag it\n"
+            f"4. USE PRODUCT KNOWLEDGE — match product names/styles to known vendor catalogs above\n"
+            f"5. SKIP genuinely generic items (transitions, trims with no vendor name, TBD specs)\n\n"
             f"RULES:\n"
             f"- Description is the source of truth. Format is usually 'ItemCode - VendorName - Product - ...'\n"
             f"- Only OVERRIDE a pre-assigned vendor if you have clear evidence it's wrong\n"
             f"- Include 'evidence': exact text from the description proving the vendor\n"
-            f"- For corrections, include 'correction': true\n\n"
-            f'Return JSON: {{"results": [{{"index": 0, "vendor": "Name", "evidence": "exact text", "correction": false}}]}}\n'
+            f"- For corrections, set 'correction': true and explain WHY in 'reason'\n\n"
+            f'Return JSON: {{"results": [{{"index": 0, "vendor": "Name", "evidence": "exact text", "correction": false, "reason": ""}}]}}\n'
             f"Only include items where you're adding a vendor OR correcting a wrong one. Skip confirmed-correct items."
         )
 
@@ -1912,6 +1939,36 @@ async def api_detect_vendors(job_id: str):
     # Clean up any leftover regex candidates
     for m in materials:
         m.pop("_regex_candidate", None)
+
+    # ── Learning: save new vendor-product associations for future jobs ──
+    # When AI fills in or corrects a vendor, learn the association
+    conn = _get_conn()
+    try:
+        for i, m in enumerate(materials):
+            if method_log.get(i) in ("ai", "ai_corrected") and m.get("vendor"):
+                item_code = (m.get("item_code") or "").strip()
+                desc = m.get("description", "")
+                product_name = desc[:100] if desc else item_code
+                normalized = _normalize_product(item_code or desc)
+                if normalized:
+                    # Check if this product-vendor pair already exists
+                    existing = conn.execute(
+                        "SELECT id FROM vendor_prices WHERE product_normalized=? AND vendor_name=? LIMIT 1",
+                        (normalized, m["vendor"])
+                    ).fetchone()
+                    if not existing:
+                        vendor_id = conn.execute(
+                            "SELECT id FROM vendors WHERE name=? LIMIT 1", (m["vendor"],)
+                        ).fetchone()
+                        conn.execute("""
+                            INSERT INTO vendor_prices (product_name, product_normalized, vendor_name, vendor_id, job_id, unit_price, unit, quote_date, notes, created_at)
+                            VALUES (?, ?, ?, ?, ?, 0, '', datetime('now'), 'Auto-learned from AI vendor detection', datetime('now'))
+                        """, (product_name, normalized, m["vendor"], vendor_id["id"] if vendor_id else None, db_id))
+        conn.commit()
+    except Exception as e:
+        print(f"Learning save failed: {e}")
+    finally:
+        conn.close()
 
     # Save updated vendor fields
     save_materials(db_id, materials)
