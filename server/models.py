@@ -847,7 +847,9 @@ def list_jobs() -> list[dict]:
     try:
         rows = conn.execute(
             """SELECT j.id, j.slug, j.project_name, j.gc_name, j.salesperson, j.city, j.state, j.created_at,
-                      (SELECT COUNT(*) FROM job_bundles b WHERE b.job_id = j.id) AS bundle_count
+                      (SELECT COUNT(*) FROM job_bundles b WHERE b.job_id = j.id) AS bundle_count,
+                      (SELECT COUNT(*) FROM job_materials m WHERE m.job_id = j.id) AS material_count,
+                      (SELECT COUNT(*) FROM job_materials m WHERE m.job_id = j.id AND m.unit_price > 0) AS priced_count
                FROM jobs j ORDER BY j.created_at DESC"""
         ).fetchall()
         results = []
@@ -855,6 +857,11 @@ def list_jobs() -> list[dict]:
             d = dict(r)
             # Add bundles field for frontend compatibility
             d["bundles"] = [{}] * d.pop("bundle_count", 0)
+            # Add materials summary for status calculation
+            mc = d.pop("material_count", 0)
+            pc = d.pop("priced_count", 0)
+            if mc > 0:
+                d["materials"] = [{"unit_price": 1}] * pc + [{"unit_price": 0}] * (mc - pc)
             results.append(d)
         return results
     finally:
@@ -995,6 +1002,23 @@ def delete_vendor(vendor_id: int) -> bool:
         cur = conn.execute("DELETE FROM vendors WHERE id=?", (vendor_id,))
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def merge_vendors(keep_id: int, merge_ids: list[int]) -> bool:
+    """Merge multiple vendor records into one. Reassigns vendor_prices and quote_requests, then deletes the duplicates."""
+    conn = _get_conn()
+    try:
+        for mid in merge_ids:
+            if mid == keep_id:
+                continue
+            conn.execute("UPDATE vendor_prices SET vendor_id=? WHERE vendor_id=?", (keep_id, mid))
+            conn.execute("UPDATE quote_requests SET vendor_id=? WHERE vendor_id=?", (keep_id, mid))
+            conn.execute("UPDATE job_materials SET vendor=(SELECT name FROM vendors WHERE id=?) WHERE vendor=(SELECT name FROM vendors WHERE id=?)", (keep_id, mid))
+            conn.execute("DELETE FROM vendors WHERE id=?", (mid,))
+        conn.commit()
+        return True
     finally:
         conn.close()
 

@@ -524,12 +524,18 @@ export default function QuoteTracker({ job, onRefresh, onUploadQuote }) {
                                 Prices applied from vendor history{responseFile ? ` and uploaded file (${responseFile})` : ''}:
                               </p>
                               <div className="space-y-0.5">
-                                {pricedMats.map((mat, i) => (
+                                {pricedMats.map((mat, i) => {
+                                  // Show item_code if it's a real code (not just vendor name), otherwise show description
+                                  const label = mat.item_code && mat.item_code.toLowerCase() !== req.vendor_name.toLowerCase()
+                                    ? `${mat.item_code} — ${mat.name.replace(/^.*? - /, '').substring(0, 50)}`
+                                    : mat.name.substring(0, 60)
+                                  return (
                                   <div key={i} className="flex items-center justify-between text-xs">
-                                    <span className="text-gray-400 truncate mr-2">{mat.item_code || mat.name}</span>
+                                    <span className="text-gray-400 truncate mr-2">{label}</span>
                                     <span className="text-emerald-400 font-mono flex-shrink-0">${mat.unitPrice.toFixed(2)}</span>
                                   </div>
-                                ))}
+                                  )
+                                })}
                               </div>
                             </div>
                           )}

@@ -1522,6 +1522,17 @@ async def api_delete_vendor(vendor_id: int):
     raise HTTPException(status_code=404, detail="Vendor not found")
 
 
+@app.post("/api/vendors/merge")
+async def api_merge_vendors(body: dict):
+    keep_id = body.get("keep_id")
+    merge_ids = body.get("merge_ids", [])
+    if not keep_id or not merge_ids:
+        raise HTTPException(status_code=400, detail="keep_id and merge_ids required")
+    from models import merge_vendors
+    merge_vendors(keep_id, merge_ids)
+    return {"ok": True}
+
+
 @app.get("/api/vendor-prices")
 async def api_search_vendor_prices(vendor: str = None, product: str = None, limit: int = 50):
     return search_vendor_prices(vendor, product, limit)
