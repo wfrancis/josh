@@ -242,6 +242,8 @@ def init_db() -> None:
             ("price_source", "ALTER TABLE job_materials ADD COLUMN price_source TEXT"),
             ("activity_user", "ALTER TABLE job_activity ADD COLUMN user TEXT DEFAULT 'System'"),
             ("comment_user", "ALTER TABLE job_comments ADD COLUMN user TEXT DEFAULT 'System'"),
+            ("qr_response_file", "ALTER TABLE quote_requests ADD COLUMN response_file TEXT"),
+            ("qr_response_notes", "ALTER TABLE quote_requests ADD COLUMN response_notes TEXT"),
         ]:
             try:
                 conn.execute(sql)
@@ -1421,7 +1423,7 @@ def update_quote_request(request_id: int, **fields) -> bool:
     """Update a quote request (status, sent_at, received_at, request_text)."""
     conn = _get_conn()
     try:
-        allowed = {"status", "sent_at", "received_at", "request_text", "vendor_name", "vendor_id", "material_ids"}
+        allowed = {"status", "sent_at", "received_at", "request_text", "vendor_name", "vendor_id", "material_ids", "response_file", "response_notes"}
         updates = []
         values = []
         for k, v in fields.items():

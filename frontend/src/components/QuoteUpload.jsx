@@ -41,6 +41,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
       await api.updateQuoteRequest(req.request_id, {
         status: 'received',
         received_at: new Date().toISOString(),
+        response_file: req.response_file || '',
       })
       setLinkedRequests(prev => prev.filter(r => r.request_id !== req.request_id))
       onQuotesParsed?.() // refresh job to update QuoteTracker

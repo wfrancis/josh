@@ -448,50 +448,90 @@ export default function QuoteTracker({ job, onRefresh }) {
                     </div>
                   </div>
 
-                  {/* Vendor Response — uploaded quote products */}
+                  {/* Vendor Response — uploaded quote file and/or pricing source */}
                   {status === 'received' && (() => {
+                    // Find uploaded quotes matching this vendor
                     const vendorQuotes = (job.quotes || []).filter(q =>
                       (q.vendor || '').toLowerCase().includes(req.vendor_name.toLowerCase()) ||
                       req.vendor_name.toLowerCase().includes((q.vendor || '').toLowerCase().split(',')[0].trim())
                     )
-                    if (vendorQuotes.length === 0) return null
-                    const fileName = vendorQuotes[0]?.file_name
+                    const responseFile = req.response_file || vendorQuotes[0]?.file_name || null
+                    const hasUploadedQuotes = vendorQuotes.length > 0
+                    const pricedMats = mats.filter(m => m.hasPrice)
+                    const hasPricing = pricedMats.length > 0
+
+                    // Show response section if we have uploaded quotes OR a response file OR any pricing
+                    if (!hasUploadedQuotes && !responseFile && !hasPricing) return null
+
                     return (
                       <details className="group" open>
                         <summary className="text-[10px] font-bold text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-400 flex items-center gap-1">
-                          <Upload className="w-3 h-3" /> Vendor Response ({vendorQuotes.length} products)
-                          {fileName && <span className="text-gray-700 font-normal normal-case ml-1">— {fileName}</span>}
-                          <ChevronRight className="w-3 h-3 group-open:rotate-90 transition-transform" />
+                          <Upload className="w-3 h-3" /> Vendor Response
+                          {hasUploadedQuotes && <span className="text-gray-600 font-normal normal-case">({vendorQuotes.length} products)</span>}
+                          {responseFile && <span className="text-gray-700 font-normal normal-case ml-1">— {responseFile}</span>}
+                          <ChevronRight className="w-3 h-3 group-open:rotate-90 transition-transform ml-auto" />
                         </summary>
-                        <div className="mt-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] overflow-hidden">
-                          <table className="w-full text-xs">
-                            <thead>
-                              <tr className="border-b border-white/[0.06] text-gray-600">
-                                <th className="text-left py-1.5 pl-3 pr-2 font-medium">Product</th>
-                                <th className="text-right py-1.5 px-2 font-medium">Price</th>
-                                <th className="text-left py-1.5 px-2 font-medium">Unit</th>
-                                {vendorQuotes.some(q => q.lead_time) && <th className="text-left py-1.5 px-2 font-medium">Lead Time</th>}
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {vendorQuotes.map((q, i) => (
-                                <tr key={i} className="border-t border-white/[0.03] hover:bg-white/[0.02]">
-                                  <td className="py-1.5 pl-3 pr-2 text-gray-300 max-w-[200px] truncate">{q.product_name || q.description}</td>
-                                  <td className="py-1.5 px-2 text-right text-emerald-400 font-mono">${(q.unit_price || 0).toFixed(2)}</td>
-                                  <td className="py-1.5 px-2 text-gray-500">{q.unit || '—'}</td>
-                                  {vendorQuotes.some(vq => vq.lead_time) && <td className="py-1.5 px-2 text-gray-500">{q.lead_time || '—'}</td>}
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                          {vendorQuotes[0]?.freight && (
-                            <div className="px-3 py-1.5 border-t border-white/[0.06] text-[10px] text-gray-500">
-                              Freight: {vendorQuotes[0].freight}
+                        <div className="mt-1.5 space-y-2">
+                          {/* Uploaded quote products table */}
+                          {hasUploadedQuotes && (
+                            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] overflow-hidden">
+                              <table className="w-full text-xs">
+                                <thead>
+                                  <tr className="border-b border-white/[0.06] text-gray-600">
+                                    <th className="text-left py-1.5 pl-3 pr-2 font-medium">Product</th>
+                                    <th className="text-right py-1.5 px-2 font-medium">Price</th>
+                                    <th className="text-left py-1.5 px-2 font-medium">Unit</th>
+                                    {vendorQuotes.some(q => q.lead_time) && <th className="text-left py-1.5 px-2 font-medium">Lead Time</th>}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {vendorQuotes.map((q, i) => (
+                                    <tr key={i} className="border-t border-white/[0.03] hover:bg-white/[0.02]">
+                                      <td className="py-1.5 pl-3 pr-2 text-gray-300 max-w-[200px] truncate">{q.product_name || q.description}</td>
+                                      <td className="py-1.5 px-2 text-right text-emerald-400 font-mono">${(q.unit_price || 0).toFixed(2)}</td>
+                                      <td className="py-1.5 px-2 text-gray-500">{q.unit || '—'}</td>
+                                      {vendorQuotes.some(vq => vq.lead_time) && <td className="py-1.5 px-2 text-gray-500">{q.lead_time || '—'}</td>}
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                              {vendorQuotes[0]?.freight && (
+                                <div className="px-3 py-1.5 border-t border-white/[0.06] text-[10px] text-gray-500">
+                                  Freight: {vendorQuotes[0].freight}
+                                </div>
+                              )}
+                              {vendorQuotes[0]?.notes && (
+                                <div className="px-3 py-1.5 border-t border-white/[0.03] text-[10px] text-gray-500 italic">
+                                  {vendorQuotes[0].notes}
+                                </div>
+                              )}
                             </div>
                           )}
-                          {vendorQuotes[0]?.notes && (
-                            <div className="px-3 py-1.5 border-t border-white/[0.03] text-[10px] text-gray-500 italic">
-                              {vendorQuotes[0].notes}
+
+                          {/* If no uploaded quotes but we have pricing, show where prices came from */}
+                          {!hasUploadedQuotes && hasPricing && (
+                            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                              <p className="text-[10px] text-gray-500 mb-1.5">
+                                Prices applied from vendor history{responseFile ? ` and uploaded file (${responseFile})` : ''}:
+                              </p>
+                              <div className="space-y-0.5">
+                                {pricedMats.map((mat, i) => (
+                                  <div key={i} className="flex items-center justify-between text-xs">
+                                    <span className="text-gray-400 truncate mr-2">{mat.item_code || mat.name}</span>
+                                    <span className="text-emerald-400 font-mono flex-shrink-0">${mat.unitPrice.toFixed(2)}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Response file only (no quotes, no pricing) */}
+                          {!hasUploadedQuotes && !hasPricing && responseFile && (
+                            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                              <p className="text-[10px] text-gray-500">
+                                Response file: <span className="text-gray-300">{responseFile}</span>
+                              </p>
+                              <p className="text-[10px] text-amber-400/70 mt-1">No pricing extracted from this response.</p>
                             </div>
                           )}
                         </div>

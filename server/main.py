@@ -701,12 +701,15 @@ def _link_upload_to_requests(job_id: int, products: list[dict]):
     if not requests:
         return []
 
-    # Detect vendors from uploaded products
-    upload_vendors = set()
+    # Detect vendors and file names from uploaded products
+    upload_vendors = {}  # vendor_lower -> {vendor, file_name}
     for p in products:
         v = (p.get("vendor") or "").strip()
         if v:
-            upload_vendors.add(v.lower())
+            upload_vendors[v.lower()] = {
+                "vendor": v,
+                "file_name": p.get("file_name", ""),
+            }
 
     if not upload_vendors:
         return []
@@ -721,13 +724,14 @@ def _link_upload_to_requests(job_id: int, products: list[dict]):
         if req.get("received_at"):
             continue  # already marked received
         req_vendor = _normalize_vendor(req.get("vendor_name") or "")
-        for uv in upload_vendors:
-            uv_norm = _normalize_vendor(uv)
+        for uv_lower, uv_info in upload_vendors.items():
+            uv_norm = _normalize_vendor(uv_lower)
             if req_vendor in uv_norm or uv_norm in req_vendor or req_vendor == uv_norm:
                 matched.append({
                     "request_id": req["id"],
                     "vendor_name": req.get("vendor_name", ""),
                     "sent_at": req.get("sent_at", ""),
+                    "response_file": uv_info.get("file_name", ""),
                 })
                 break
 
@@ -1582,91 +1586,195 @@ async def api_delete_quote_request(request_id: int):
 
 # ── AI: Vendor Detection & Quote Text ────────────────────────────────────────
 
-def _extract_vendor_from_description(description: str, known_vendors: list[str]) -> str | None:
-    """Pass 1: Deterministic vendor extraction from RFMS-style descriptions.
+def _build_vendor_memory() -> dict:
+    """Build vendor knowledge from DB history — no hardcoded lists.
 
-    Most RFMS materials follow the pattern:
-      "F109 - Interface - Breakout - #1238602500 ..."
-      "B102 - Johnsonite - Baseworks Thermoset Rubber ..."
-      "(Scheme A) Daltile - Miramo MR44 Pearl ..."
-      "Schluter - Dilex-AHKA Cove ..."
-
-    Extract the vendor by parsing the description structure.
-    Returns vendor name or None if ambiguous.
+    Returns dict with:
+      - known_names: list of vendor names from vendors table
+      - aliases: dict mapping lowercase variations -> canonical name
+        (learned from vendor_prices where the same vendor_id has different name strings)
+      - product_hints: dict of product_normalized -> vendor_name
+        (what vendor historically supplies which products)
     """
-    import re
+    conn = _get_conn()
+    try:
+        # Known vendor names
+        vendors = conn.execute("SELECT id, name FROM vendors").fetchall()
+        known_names = [v["name"] for v in vendors]
+        vendor_id_map = {v["id"]: v["name"] for v in vendors}
 
-    if not description:
+        # Build alias map: different name strings that map to the same vendor
+        aliases = {}
+        for v in vendors:
+            name = v["name"]
+            aliases[name.lower()] = name
+            # Common variations: "Dal-Tile" -> "Daltile", etc.
+            aliases[name.lower().replace("-", "")] = name
+            aliases[name.lower().replace(" ", "")] = name
+
+        # Learn aliases from vendor_prices (same vendor_id, different vendor_name strings)
+        vp_names = conn.execute("""
+            SELECT DISTINCT vendor_id, vendor_name FROM vendor_prices
+            WHERE vendor_id IS NOT NULL AND vendor_name IS NOT NULL
+        """).fetchall()
+        for vp in vp_names:
+            canonical = vendor_id_map.get(vp["vendor_id"])
+            if canonical:
+                aliases[vp["vendor_name"].lower()] = canonical
+                aliases[vp["vendor_name"].lower().replace("-", "")] = canonical
+
+        # Product hints: which vendor historically supplies which products
+        product_hints = {}
+        ph_rows = conn.execute("""
+            SELECT product_normalized, vendor_name, COUNT(*) as cnt
+            FROM vendor_prices
+            WHERE product_normalized IS NOT NULL AND vendor_name IS NOT NULL
+            GROUP BY product_normalized, vendor_name
+            ORDER BY cnt DESC
+        """).fetchall()
+        for row in ph_rows:
+            pn = row["product_normalized"]
+            if pn and pn not in product_hints:
+                product_hints[pn] = row["vendor_name"]
+
+        return {
+            "known_names": known_names,
+            "aliases": aliases,
+            "product_hints": product_hints,
+        }
+    finally:
+        conn.close()
+
+
+def _fuzzy_match_vendor(text: str, aliases: dict, threshold: int = 2) -> str | None:
+    """Fuzzy-match a text string against known vendor aliases.
+    Handles misspellings, case differences, punctuation, substrings.
+    Returns canonical vendor name or None.
+
+    Uses simple Levenshtein-style matching with max `threshold` edits.
+    No external libraries needed.
+    """
+    if not text or len(text) < 2:
         return None
 
-    desc = description.strip()
+    text_lower = text.lower().strip()
 
-    # Strip leading scheme prefix like "(Scheme A)" or "(Scheme A & B)"
-    desc_clean = re.sub(r'^\(Scheme\s+[^)]+\)\s*', '', desc)
+    # Exact match
+    if text_lower in aliases:
+        return aliases[text_lower]
 
-    # Known vendor names (case-insensitive lookup)
-    vendor_lower_map = {}
-    for v in known_vendors:
-        vendor_lower_map[v.lower()] = v
-    # Add common flooring vendors that might not be in the DB yet
-    _common_vendors = [
-        "Shaw", "Mohawk", "Mohawk Group", "Interface", "Mannington", "Daltile", "Dal-Tile",
-        "Johnsonite", "Armstrong", "Tarkett", "Forbo", "Patcraft", "J+J Flooring",
-        "Karndean", "COREtec", "Schluter", "Ann Sacks", "Metroflor", "Glazzio Surfaces",
-        "Summit International Flooring", "Inax", "Design Direct Source", "Fireclay Tile",
-        "HT HOLDING OF COLORADO", "American Olean",
-    ]
-    for v in _common_vendors:
-        if v.lower() not in vendor_lower_map:
-            vendor_lower_map[v.lower()] = v
+    # Without punctuation/hyphens
+    text_clean = text_lower.replace("-", "").replace(".", "").replace(",", "").replace(" ", "")
+    for alias, canonical in aliases.items():
+        alias_clean = alias.replace("-", "").replace(".", "").replace(",", "").replace(" ", "")
+        if text_clean == alias_clean:
+            return canonical
 
-    # Pattern 1: "ItemCode - VendorName - ProductName - ..."
-    # e.g., "F109 - Interface - Breakout - #1238602500"
-    m = re.match(r'^[A-Z0-9/]+\s*-\s*(.+?)\s*-\s*.+', desc_clean)
-    if m:
-        candidate = m.group(1).strip()
-        # Normalize Dal-Tile -> Daltile
-        if candidate.lower() in ("dal-tile",):
-            candidate = "Daltile"
-        # Check if this is a known vendor
-        if candidate.lower() in vendor_lower_map:
-            return vendor_lower_map[candidate.lower()]
-        # Even if not in our list, if it looks like a proper name (not a product descriptor)
-        # and is reasonably short, trust it
-        if len(candidate) <= 40 and not any(kw in candidate.lower() for kw in [
-            "matte", "glazed", "porcelain", "carpet", "tile", "vinyl", "rubber",
-            "transition", "trim", "edge", "x", '"', "high", "wide",
-        ]):
-            return candidate
+    # Substring match (one contains the other)
+    if len(text_lower) >= 4:
+        for alias, canonical in aliases.items():
+            if len(alias) < 4:
+                continue
+            if alias in text_lower or text_lower in alias:
+                return canonical
 
-    # Pattern 2: Description starts with vendor name directly
-    # e.g., "Schluter - Dilex-AHKA Cove ..."
-    # e.g., "Daltile - Modern Hearth ..."
-    first_part = desc_clean.split(' - ')[0].strip() if ' - ' in desc_clean else None
-    if first_part:
-        if first_part.lower() in vendor_lower_map:
-            return vendor_lower_map[first_part.lower()]
-        # Check "Daltile/Fireclay Tile" style
-        for sub in first_part.split('/'):
-            sub = sub.strip()
-            if sub.lower() in vendor_lower_map:
-                return first_part  # Return the full combined name
+    # Levenshtein distance for typo tolerance (e.g., "Dalitle" ↔ "daltile")
+    def _levenshtein(s1, s2):
+        if len(s1) < len(s2):
+            return _levenshtein(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        prev_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            curr_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                curr_row.append(min(
+                    prev_row[j + 1] + 1,
+                    curr_row[j] + 1,
+                    prev_row[j] + (c1 != c2)
+                ))
+            prev_row = curr_row
+        return prev_row[-1]
 
-    # Pattern 3: Check if any known vendor name appears in the description
-    # Only match if it's a clear word boundary match (not substring of another word)
-    for vl, vn in sorted(vendor_lower_map.items(), key=lambda x: -len(x[0])):
-        if len(vl) < 4:
-            continue  # Skip very short names to avoid false matches
-        pattern = r'(?:^|[\s\-,(/])' + re.escape(vl) + r'(?:[\s\-,)/]|$)'
-        if re.search(pattern, desc.lower()):
-            return vn
+    if len(text_lower) >= 5:
+        best_match = None
+        best_dist = threshold + 1
+        for alias, canonical in aliases.items():
+            if len(alias) < 4 or abs(len(alias) - len(text_lower)) > threshold:
+                continue
+            dist = _levenshtein(text_lower, alias)
+            if dist <= threshold and dist < best_dist:
+                best_dist = dist
+                best_match = canonical
+        if best_match:
+            return best_match
 
     return None
 
 
+def _quick_regex_extract(description: str) -> list[str]:
+    """Light structural regex — extracts vendor candidates from dash-separated descriptions.
+
+    Returns a list of candidates (best first) from the description structure.
+    Zero hardcoded vendor names — just structural parsing.
+
+    Handles:
+      "F109 - Interface - Breakout - ..." → ["Interface"]
+      "(Scheme A) Daltile - Modern Hearth - ..." → ["Daltile"]
+      "Schluter - Dilex-AHKA Cove - ..." → ["Schluter"]
+      "W131/W132/W133 - Daltile/Fireclay Tile - ..." → ["Daltile/Fireclay Tile"]
+    """
+    import re
+    if not description:
+        return []
+
+    desc = description.strip()
+    # Strip scheme prefix
+    desc = re.sub(r'^\(Scheme\s+[^)]+\)\s*', '', desc)
+
+    candidates = []
+
+    # Split on " - " (space-dash-space) to avoid splitting on hyphens inside names
+    # e.g., "Dilex-AHKA" should NOT be split
+    segments = [s.strip() for s in desc.split(' - ') if s.strip()]
+
+    if len(segments) >= 3:
+        # Pattern: "ItemCode - VendorName - ProductName - ..."
+        # First segment is item code, second is likely vendor
+        first = segments[0]
+        second = segments[1]
+        # First segment looks like an item code (short, alphanumeric)
+        if re.match(r'^[A-Za-z0-9/]{1,30}$', first) and len(first) <= 20:
+            candidates.append(second)
+
+    if len(segments) >= 2:
+        # Pattern: "VendorName - ProductName - ..."
+        # First segment could be the vendor directly
+        first = segments[0]
+        # Skip if first is clearly not a vendor: pure dimensions, directions, generic labels
+        if (
+            2 <= len(first) <= 50 and
+            not re.match(r'^[A-Z]\d+$', first) and  # not "F109"
+            not re.match(r'^[\d"\'x\s.]+$', first) and  # not '7" x 48"'
+            not first.lower().startswith(('transition', 'horizontal', 'vertical'))
+        ):
+            if first not in candidates:
+                candidates.append(first)
+
+    return candidates
+
+
 @app.post("/api/jobs/{job_id}/detect-vendors")
 async def api_detect_vendors(job_id: str):
-    """Detect vendors using deterministic extraction first, AI for ambiguous items only."""
+    """Hybrid vendor detection: memory + regex + AI.
+
+    1. MEMORY: Check vendor_prices history and vendors table for known names/aliases
+    2. REGEX: Extract candidate from description structure (no hardcoded names)
+    3. FUZZY MATCH: Match regex candidate against memory (handles typos)
+    4. AI: For unresolved items, ask AI with evidence requirement
+    5. VALIDATE: Cross-check AI results — reject if evidence doesn't appear in description
+    6. RETRY: Focused single-item AI call for any conflicts
+    """
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
@@ -1676,41 +1784,73 @@ async def api_detect_vendors(job_id: str):
     if not materials:
         return {"vendors": {}, "materials": []}
 
-    # Get known vendors for matching
-    known_vendors = list_vendors()
-    vendor_names = [v["name"] for v in known_vendors]
+    import json
 
-    # ── Pass 1: Deterministic extraction from descriptions ──
-    # This handles 80%+ of RFMS materials with zero error rate
-    needs_ai = []  # indices that couldn't be resolved deterministically
+    # ── Build vendor memory from DB history ──
+    memory = _build_vendor_memory()
+    aliases = memory["aliases"]
+    known_names = memory["known_names"]
+    product_hints = memory["product_hints"]
+
     vendor_groups = {}
-    deterministic_count = 0
+    needs_ai = []  # indices still unresolved after regex+memory
+    method_log = {}  # track how each was resolved for debugging
 
     for i, m in enumerate(materials):
         desc = m.get("description", "")
-        extracted = _extract_vendor_from_description(desc, vendor_names)
 
-        if extracted:
-            # Normalize Dal-Tile -> Daltile
-            if extracted.lower() in ("dal-tile",):
-                extracted = "Daltile"
-            materials[i]["vendor"] = extracted
-            vendor_groups.setdefault(extracted, []).append(i)
-            deterministic_count += 1
-        elif not m.get("vendor"):
-            # No vendor in description and no existing vendor — need AI
-            needs_ai.append({
-                "index": i,
-                "item_code": m.get("item_code", ""),
-                "description": desc,
-                "material_type": m.get("material_type", ""),
-            })
-        else:
-            # Has existing vendor, keep it
+        # Step 1: Try regex extraction + fuzzy match against memory
+        candidates = _quick_regex_extract(desc)
+        resolved = False
+        best_candidate = ""
+        for candidate in candidates:
+            matched = _fuzzy_match_vendor(candidate, aliases)
+            if matched:
+                materials[i]["vendor"] = matched
+                vendor_groups.setdefault(matched, []).append(i)
+                method_log[i] = "regex+memory"
+                resolved = True
+                break
+            if not best_candidate:
+                best_candidate = candidate
+        if resolved:
+            continue
+        if best_candidate:
+            # Candidate extracted but not in memory — send to AI for confirmation
+            materials[i]["_regex_candidate"] = best_candidate
+
+        # Step 2: Check product hints from vendor_prices history
+        item_code = (m.get("item_code") or "").strip()
+        normalized = _normalize_product(item_code or desc)
+        if normalized and normalized in product_hints:
+            hint_vendor = product_hints[normalized]
+            canonical = _fuzzy_match_vendor(hint_vendor, aliases) or hint_vendor
+            # Only use product hint if no regex candidate contradicts it
+            if not candidate or candidate.lower() in canonical.lower() or canonical.lower() in candidate.lower():
+                materials[i]["vendor"] = canonical
+                vendor_groups.setdefault(canonical, []).append(i)
+                method_log[i] = "product_history"
+                continue
+
+        # Step 3: If material already has a vendor set, keep it
+        if m.get("vendor"):
             vendor_groups.setdefault(m["vendor"], []).append(i)
+            method_log[i] = "existing"
+            continue
 
-    # ── Pass 2: AI detection for ambiguous materials only ──
-    ai_count = 0
+        # Unresolved — need AI
+        needs_ai.append({
+            "index": i,
+            "item_code": item_code,
+            "description": desc,
+            "material_type": m.get("material_type", ""),
+            "regex_candidate": materials[i].pop("_regex_candidate", ""),
+        })
+
+    # ── AI pass for unresolved materials ──
+    ai_resolved = 0
+    conflicts_resolved = 0
+
     if needs_ai:
         settings = get_settings()
         api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
@@ -1720,19 +1860,26 @@ async def api_detect_vendors(job_id: str):
             import openai
             client = openai.OpenAI(api_key=api_key)
 
-            prompt = f"""You are a commercial flooring industry expert. These materials could not be automatically matched to a vendor from their descriptions. Identify the likely manufacturer/vendor for each.
+            prompt = f"""You are a commercial flooring industry expert. Identify the manufacturer/vendor for each material.
 
-Known vendors in our system: {', '.join(vendor_names) if vendor_names else 'None yet'}
+Known vendors in our system: {', '.join(known_names) if known_names else 'None yet'}
 
-Materials needing vendor identification:
-{chr(10).join(f'{m["index"]}. [{m["item_code"]}] {m["description"]} (type: {m["material_type"]})' for m in needs_ai)}
+Materials needing identification:
+{chr(10).join(
+    f'{m["index"]}. [{m["item_code"]}] {m["description"]} '
+    f'(type: {m["material_type"]}'
+    f'{", regex extracted: " + m["regex_candidate"] if m["regex_candidate"] else ""})'
+    for m in needs_ai
+)}
 
-Common flooring manufacturers: Shaw, Mohawk, Interface, Mannington, Daltile, Johnsonite, Armstrong, Tarkett, Forbo, Patcraft, Schluter, Ann Sacks, Metroflor, Summit International Flooring, Glazzio Surfaces, Inax, Fireclay Tile, etc.
+RULES:
+- The material description is the source of truth. Most follow "ItemCode - VendorName - ProductName - ..."
+- "Daltile" and "Dal-Tile" are the same company — always return "Daltile"
+- Match to known vendor names when possible (handle misspellings)
+- For EACH detection, include "evidence": the exact text snippet from the description that proves it
 
-Use "Daltile" (not "Dal-Tile"). Match to known vendors when possible.
-
-Return ONLY a JSON array: [{{"index": 0, "vendor": "Manufacturer Name"}}]
-If you cannot determine the vendor, set vendor to empty string ""."""
+Return JSON: {{"results": [{{"index": 0, "vendor": "Name", "evidence": "exact text from description"}}]}}
+Set vendor to "" if truly unknown."""
 
             try:
                 response = client.chat.completions.create(
@@ -1740,43 +1887,96 @@ If you cannot determine the vendor, set vendor to empty string ""."""
                     messages=[{"role": "user", "content": prompt}],
                     response_format={"type": "json_object"},
                 )
-                import json
-                raw_content = response.choices[0].message.content
-                result = json.loads(raw_content)
+                result = json.loads(response.choices[0].message.content)
 
+                detections = []
                 if isinstance(result, list):
                     detections = result
                 else:
-                    detections = []
-                    for key in ("vendors", "results", "detections", "materials", "data", "result"):
+                    for key in ("results", "vendors", "detections", "materials", "data"):
                         if key in result and isinstance(result[key], list):
                             detections = result[key]
                             break
-                    if not detections and result and all(k.isdigit() for k in result.keys()):
-                        detections = [v for _, v in sorted(result.items(), key=lambda x: int(x[0]))]
 
+                conflicts = []
                 for det in detections:
                     idx = det.get("index", -1)
                     vendor = (det.get("vendor") or "").strip()
-                    if vendor and 0 <= idx < len(materials):
-                        # Pass 3: Validation — cross-check AI result against description
-                        desc = materials[idx].get("description", "")
-                        desc_vendor = _extract_vendor_from_description(desc, vendor_names)
-                        if desc_vendor and desc_vendor.lower() != vendor.lower():
-                            # Description says one thing, AI says another — trust description
-                            vendor = desc_vendor
-                        materials[idx]["vendor"] = vendor
-                        vendor_groups.setdefault(vendor, []).append(idx)
-                        ai_count += 1
-            except Exception as e:
-                print(f"AI vendor detection failed for {len(needs_ai)} items: {e}")
+                    evidence = (det.get("evidence") or "").strip().lower()
+                    if not vendor or idx < 0 or idx >= len(materials):
+                        continue
 
-    # Save updated vendor fields back to job
+                    desc_lower = (materials[idx].get("description") or "").lower()
+
+                    # Validate evidence
+                    evidence_found = not evidence or evidence in desc_lower
+                    vendor_found = (
+                        vendor.lower() in desc_lower or
+                        vendor.lower().replace("-", "") in desc_lower.replace("-", "")
+                    )
+
+                    if evidence_found or vendor_found:
+                        # Normalize through memory
+                        canonical = _fuzzy_match_vendor(vendor, aliases) or vendor
+                        materials[idx]["vendor"] = canonical
+                        vendor_groups.setdefault(canonical, []).append(idx)
+                        method_log[idx] = "ai"
+                        ai_resolved += 1
+                    else:
+                        # AI's evidence doesn't check out — conflict
+                        conflicts.append({
+                            "index": idx,
+                            "ai_said": vendor,
+                            "description": materials[idx].get("description", ""),
+                        })
+
+                # Retry conflicts with focused single-item calls
+                for conflict in conflicts:
+                    idx = conflict["index"]
+                    desc = conflict["description"]
+                    try:
+                        retry_resp = client.chat.completions.create(
+                            model=model,
+                            messages=[{"role": "user", "content":
+                                f'What manufacturer/vendor makes this product? '
+                                f'Read the description carefully — the vendor name is usually '
+                                f'the second dash-separated segment.\n\n'
+                                f'Description: "{desc}"\n\n'
+                                f'Return JSON: {{"vendor": "Name", "evidence": "exact text"}}'
+                            }],
+                            response_format={"type": "json_object"},
+                        )
+                        retry_result = json.loads(retry_resp.choices[0].message.content)
+                        vendor = (retry_result.get("vendor") or "").strip()
+                        if vendor:
+                            canonical = _fuzzy_match_vendor(vendor, aliases) or vendor
+                            materials[idx]["vendor"] = canonical
+                            vendor_groups.setdefault(canonical, []).append(idx)
+                            method_log[idx] = "ai_retry"
+                            conflicts_resolved += 1
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                print(f"AI vendor detection failed: {e}")
+
+    # Clean up any leftover regex candidates
+    for m in materials:
+        m.pop("_regex_candidate", None)
+
+    # Save updated vendor fields
     save_materials(db_id, materials)
 
-        return {"detections": detections, "vendor_groups": vendor_groups}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI vendor detection failed: {str(e)}")
+    return {
+        "vendor_groups": vendor_groups,
+        "total_detected": sum(1 for m in materials if m.get("vendor")),
+        "resolved_by": {
+            "memory": sum(1 for v in method_log.values() if v in ("regex+memory", "product_history")),
+            "existing": sum(1 for v in method_log.values() if v == "existing"),
+            "ai": ai_resolved,
+            "ai_retry": conflicts_resolved,
+        },
+    }
 
 
 @app.post("/api/jobs/{job_id}/generate-quote-text")
