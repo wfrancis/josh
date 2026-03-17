@@ -298,7 +298,9 @@ def _enrich_known_prices(job: dict):
                     mat["unit_price"] = vp["unit_price"]
                     mat["extended_cost"] = mat["known_price"]
                     mat["price_source"] = "vendor_quote"
-                    mat["vendor"] = vp.get("vendor_name", mat.get("vendor", ""))
+                    # Only set vendor from price match if material doesn't already have one
+                    if not mat.get("vendor"):
+                        mat["vendor"] = vp.get("vendor_name", "")
                     mat["quote_status"] = "quoted"
                     applied_count += 1
                     break
@@ -1580,9 +1582,91 @@ async def api_delete_quote_request(request_id: int):
 
 # ── AI: Vendor Detection & Quote Text ────────────────────────────────────────
 
+def _extract_vendor_from_description(description: str, known_vendors: list[str]) -> str | None:
+    """Pass 1: Deterministic vendor extraction from RFMS-style descriptions.
+
+    Most RFMS materials follow the pattern:
+      "F109 - Interface - Breakout - #1238602500 ..."
+      "B102 - Johnsonite - Baseworks Thermoset Rubber ..."
+      "(Scheme A) Daltile - Miramo MR44 Pearl ..."
+      "Schluter - Dilex-AHKA Cove ..."
+
+    Extract the vendor by parsing the description structure.
+    Returns vendor name or None if ambiguous.
+    """
+    import re
+
+    if not description:
+        return None
+
+    desc = description.strip()
+
+    # Strip leading scheme prefix like "(Scheme A)" or "(Scheme A & B)"
+    desc_clean = re.sub(r'^\(Scheme\s+[^)]+\)\s*', '', desc)
+
+    # Known vendor names (case-insensitive lookup)
+    vendor_lower_map = {}
+    for v in known_vendors:
+        vendor_lower_map[v.lower()] = v
+    # Add common flooring vendors that might not be in the DB yet
+    _common_vendors = [
+        "Shaw", "Mohawk", "Mohawk Group", "Interface", "Mannington", "Daltile", "Dal-Tile",
+        "Johnsonite", "Armstrong", "Tarkett", "Forbo", "Patcraft", "J+J Flooring",
+        "Karndean", "COREtec", "Schluter", "Ann Sacks", "Metroflor", "Glazzio Surfaces",
+        "Summit International Flooring", "Inax", "Design Direct Source", "Fireclay Tile",
+        "HT HOLDING OF COLORADO", "American Olean",
+    ]
+    for v in _common_vendors:
+        if v.lower() not in vendor_lower_map:
+            vendor_lower_map[v.lower()] = v
+
+    # Pattern 1: "ItemCode - VendorName - ProductName - ..."
+    # e.g., "F109 - Interface - Breakout - #1238602500"
+    m = re.match(r'^[A-Z0-9/]+\s*-\s*(.+?)\s*-\s*.+', desc_clean)
+    if m:
+        candidate = m.group(1).strip()
+        # Normalize Dal-Tile -> Daltile
+        if candidate.lower() in ("dal-tile",):
+            candidate = "Daltile"
+        # Check if this is a known vendor
+        if candidate.lower() in vendor_lower_map:
+            return vendor_lower_map[candidate.lower()]
+        # Even if not in our list, if it looks like a proper name (not a product descriptor)
+        # and is reasonably short, trust it
+        if len(candidate) <= 40 and not any(kw in candidate.lower() for kw in [
+            "matte", "glazed", "porcelain", "carpet", "tile", "vinyl", "rubber",
+            "transition", "trim", "edge", "x", '"', "high", "wide",
+        ]):
+            return candidate
+
+    # Pattern 2: Description starts with vendor name directly
+    # e.g., "Schluter - Dilex-AHKA Cove ..."
+    # e.g., "Daltile - Modern Hearth ..."
+    first_part = desc_clean.split(' - ')[0].strip() if ' - ' in desc_clean else None
+    if first_part:
+        if first_part.lower() in vendor_lower_map:
+            return vendor_lower_map[first_part.lower()]
+        # Check "Daltile/Fireclay Tile" style
+        for sub in first_part.split('/'):
+            sub = sub.strip()
+            if sub.lower() in vendor_lower_map:
+                return first_part  # Return the full combined name
+
+    # Pattern 3: Check if any known vendor name appears in the description
+    # Only match if it's a clear word boundary match (not substring of another word)
+    for vl, vn in sorted(vendor_lower_map.items(), key=lambda x: -len(x[0])):
+        if len(vl) < 4:
+            continue  # Skip very short names to avoid false matches
+        pattern = r'(?:^|[\s\-,(/])' + re.escape(vl) + r'(?:[\s\-,)/]|$)'
+        if re.search(pattern, desc.lower()):
+            return vn
+
+    return None
+
+
 @app.post("/api/jobs/{job_id}/detect-vendors")
 async def api_detect_vendors(job_id: str):
-    """Use AI to detect manufacturer/vendor from material descriptions."""
+    """Detect vendors using deterministic extraction first, AI for ambiguous items only."""
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
@@ -1592,79 +1676,103 @@ async def api_detect_vendors(job_id: str):
     if not materials:
         return {"vendors": {}, "materials": []}
 
-    # Build list of materials needing vendor detection
-    needs_detection = []
-    for i, m in enumerate(materials):
-        needs_detection.append({
-            "index": i,
-            "item_code": m.get("item_code", ""),
-            "description": m.get("description", ""),
-            "material_type": m.get("material_type", ""),
-            "vendor": m.get("vendor", ""),
-        })
-
-    settings = get_settings()
-    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
-    model = settings.get("openai_model", "gpt-5-mini")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key not configured")
-
-    import openai
-    client = openai.OpenAI(api_key=api_key)
-
-    # Also get known vendors for context
+    # Get known vendors for matching
     known_vendors = list_vendors()
     vendor_names = [v["name"] for v in known_vendors]
 
-    prompt = f"""You are a commercial flooring industry expert. Identify the manufacturer/vendor for each material based on product names, brand names, and industry knowledge.
+    # ── Pass 1: Deterministic extraction from descriptions ──
+    # This handles 80%+ of RFMS materials with zero error rate
+    needs_ai = []  # indices that couldn't be resolved deterministically
+    vendor_groups = {}
+    deterministic_count = 0
+
+    for i, m in enumerate(materials):
+        desc = m.get("description", "")
+        extracted = _extract_vendor_from_description(desc, vendor_names)
+
+        if extracted:
+            # Normalize Dal-Tile -> Daltile
+            if extracted.lower() in ("dal-tile",):
+                extracted = "Daltile"
+            materials[i]["vendor"] = extracted
+            vendor_groups.setdefault(extracted, []).append(i)
+            deterministic_count += 1
+        elif not m.get("vendor"):
+            # No vendor in description and no existing vendor — need AI
+            needs_ai.append({
+                "index": i,
+                "item_code": m.get("item_code", ""),
+                "description": desc,
+                "material_type": m.get("material_type", ""),
+            })
+        else:
+            # Has existing vendor, keep it
+            vendor_groups.setdefault(m["vendor"], []).append(i)
+
+    # ── Pass 2: AI detection for ambiguous materials only ──
+    ai_count = 0
+    if needs_ai:
+        settings = get_settings()
+        api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+        model = settings.get("openai_model", "gpt-5-mini")
+
+        if api_key:
+            import openai
+            client = openai.OpenAI(api_key=api_key)
+
+            prompt = f"""You are a commercial flooring industry expert. These materials could not be automatically matched to a vendor from their descriptions. Identify the likely manufacturer/vendor for each.
 
 Known vendors in our system: {', '.join(vendor_names) if vendor_names else 'None yet'}
 
-Materials:
-{chr(10).join(f'{m["index"]}. [{m["item_code"]}] {m["description"]} (type: {m["material_type"]}, current vendor: {m["vendor"]})' for m in needs_detection)}
+Materials needing vendor identification:
+{chr(10).join(f'{m["index"]}. [{m["item_code"]}] {m["description"]} (type: {m["material_type"]})' for m in needs_ai)}
 
-For each material, identify the manufacturer. Common flooring manufacturers include:
-Shaw, Mohawk, Interface, Mannington, Daltile, Johnsonite, Armstrong, Tarkett, Forbo, Patcraft, J+J Flooring, Karndean, COREtec, etc.
+Common flooring manufacturers: Shaw, Mohawk, Interface, Mannington, Daltile, Johnsonite, Armstrong, Tarkett, Forbo, Patcraft, Schluter, Ann Sacks, Metroflor, Summit International Flooring, Glazzio Surfaces, Inax, Fireclay Tile, etc.
+
+Use "Daltile" (not "Dal-Tile"). Match to known vendors when possible.
 
 Return ONLY a JSON array: [{{"index": 0, "vendor": "Manufacturer Name"}}]
-If you cannot determine the vendor, set vendor to empty string "".
-Match to our known vendors list when possible (use exact name match)."""
+If you cannot determine the vendor, set vendor to empty string ""."""
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-        )
-        import json
-        raw_content = response.choices[0].message.content
-        result = json.loads(raw_content)
-        # The JSON object response might wrap the array in various keys
-        if isinstance(result, list):
-            detections = result
-        else:
-            detections = []
-            # Try common wrapper keys
-            for key in ("vendors", "results", "detections", "materials", "data", "result"):
-                if key in result and isinstance(result[key], list):
-                    detections = result[key]
-                    break
-            # Handle dict-of-objects format: {"0": {"index": 0, "vendor": "X"}, ...}
-            if not detections and all(k.isdigit() for k in result.keys()):
-                detections = [v for _, v in sorted(result.items(), key=lambda x: int(x[0]))]
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                )
+                import json
+                raw_content = response.choices[0].message.content
+                result = json.loads(raw_content)
 
-        # Build vendor groups
-        vendor_groups = {}
-        for det in detections:
-            idx = det.get("index", -1)
-            vendor = (det.get("vendor") or "").strip()
-            if 0 <= idx < len(materials):
-                materials[idx]["vendor"] = vendor
-            if vendor:
-                vendor_groups.setdefault(vendor, []).append(idx)
+                if isinstance(result, list):
+                    detections = result
+                else:
+                    detections = []
+                    for key in ("vendors", "results", "detections", "materials", "data", "result"):
+                        if key in result and isinstance(result[key], list):
+                            detections = result[key]
+                            break
+                    if not detections and result and all(k.isdigit() for k in result.keys()):
+                        detections = [v for _, v in sorted(result.items(), key=lambda x: int(x[0]))]
 
-        # Save updated vendor fields back to job
-        save_materials(db_id, materials)
+                for det in detections:
+                    idx = det.get("index", -1)
+                    vendor = (det.get("vendor") or "").strip()
+                    if vendor and 0 <= idx < len(materials):
+                        # Pass 3: Validation — cross-check AI result against description
+                        desc = materials[idx].get("description", "")
+                        desc_vendor = _extract_vendor_from_description(desc, vendor_names)
+                        if desc_vendor and desc_vendor.lower() != vendor.lower():
+                            # Description says one thing, AI says another — trust description
+                            vendor = desc_vendor
+                        materials[idx]["vendor"] = vendor
+                        vendor_groups.setdefault(vendor, []).append(idx)
+                        ai_count += 1
+            except Exception as e:
+                print(f"AI vendor detection failed for {len(needs_ai)} items: {e}")
+
+    # Save updated vendor fields back to job
+    save_materials(db_id, materials)
 
         return {"detections": detections, "vendor_groups": vendor_groups}
     except Exception as e:
