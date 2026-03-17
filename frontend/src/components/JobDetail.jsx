@@ -579,7 +579,7 @@ export default function JobDetail() {
                   )}
 
                   {/* Quote Tracker — always visible when requests exist */}
-                  <QuoteTracker job={job} onRefresh={loadJob} />
+                  <QuoteTracker job={job} onRefresh={loadJob} onUploadQuote={() => setQuotePanel('upload')} />
 
                   {/* Action buttons */}
                   {!quotePanel && (

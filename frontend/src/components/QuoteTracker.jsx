@@ -13,7 +13,7 @@ import { api } from '../api'
  *   job: full job object
  *   onRefresh: () => void (reload job data)
  */
-export default function QuoteTracker({ job, onRefresh }) {
+export default function QuoteTracker({ job, onRefresh, onUploadQuote }) {
   const [requests, setRequests] = useState([])
   const [loading, setLoading] = useState(true)
   const [expandedId, setExpandedId] = useState(null)
@@ -344,13 +344,22 @@ export default function QuoteTracker({ job, onRefresh }) {
                     </button>
                   )}
                   {(status === 'waiting' || status === 'overdue') && (
-                    <button
-                      onClick={() => handleMarkReceived(req)}
-                      className="text-[10px] text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded-lg flex items-center gap-1"
-                      title="Mark as received"
-                    >
-                      <Check className="w-3 h-3" /> Received
-                    </button>
+                    <>
+                      <button
+                        onClick={() => onUploadQuote ? onUploadQuote() : handleMarkReceived(req)}
+                        className="text-[10px] text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded-lg flex items-center gap-1"
+                        title="Upload vendor response"
+                      >
+                        <Upload className="w-3 h-3" /> Upload Response
+                      </button>
+                      <button
+                        onClick={() => handleMarkReceived(req)}
+                        className="text-[10px] text-gray-500 hover:text-gray-300 bg-white/[0.04] px-2 py-1 rounded-lg flex items-center gap-1"
+                        title="Mark received without uploading"
+                      >
+                        <Check className="w-3 h-3" />
+                      </button>
+                    </>
                   )}
                   <button
                     onClick={() => handleDelete(req.id)}
