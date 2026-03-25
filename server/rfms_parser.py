@@ -104,7 +104,7 @@ def _is_install(desc: str) -> bool:
 def _extract_unit(desc: str, material_type: str) -> str:
     if material_type in ("rubber_base", "transitions"):
         return "LF"
-    if material_type in ("corridor_broadloom", "unit_carpet_no_pattern", "unit_carpet_pattern"):
+    if material_type in ("corridor_broadloom", "unit_carpet_no_pattern", "unit_carpet_pattern", "cpt_tile"):
         return "SY"
     return "SF"
 
