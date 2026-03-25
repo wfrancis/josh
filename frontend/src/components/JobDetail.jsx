@@ -75,7 +75,7 @@ export default function JobDetail() {
       state: job.state || '',
       zip: job.zip || '',
       salesperson: job.salesperson || '',
-      tax_rate: job.tax_rate ? (job.tax_rate * 100).toFixed(1) : '',
+      tax_rate: job.tax_rate ? (job.tax_rate * 100).toFixed(2) : '',
       unit_count: job.unit_count || '',
       architect: job.architect || '',
       designer: job.designer || '',
@@ -278,9 +278,9 @@ export default function JobDetail() {
                 </label>
                 <label className="block">
                   <span className="text-xs text-gray-500 mb-1 block">Tax Rate (%)</span>
-                  <input type="number" step="0.1" value={editForm.tax_rate} onChange={e => setEditForm(f => ({ ...f, tax_rate: e.target.value }))}
+                  <input type="number" step="0.01" value={editForm.tax_rate} onChange={e => setEditForm(f => ({ ...f, tax_rate: e.target.value }))}
                     className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
-                    placeholder="0.0" />
+                    placeholder="0.00" />
                 </label>
                 <label className="block">
                   <span className="text-xs text-gray-500 mb-1 block">Unit Count</span>
@@ -336,7 +336,7 @@ export default function JobDetail() {
                 )}
                 {job.tax_rate > 0 && (
                   <span className="flex items-center gap-1.5">
-                    <Percent className="w-3.5 h-3.5" /> {(job.tax_rate * 100).toFixed(1)}% tax
+                    <Percent className="w-3.5 h-3.5" /> {(job.tax_rate * 100).toFixed(2)}% tax
                   </span>
                 )}
                 {job.unit_count > 0 && (

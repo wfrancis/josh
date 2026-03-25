@@ -523,7 +523,7 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
                 </div>
               )}
               <div className="flex justify-between text-sm">
-                <span className="text-gray-500">Tax ({((bidData.tax_rate || 0) * 100).toFixed(1)}%)</span>
+                <span className="text-gray-500">Tax ({((bidData.tax_rate || 0) * 100).toFixed(2)}%)</span>
                 <span className="font-semibold text-gray-200 tabular-nums">{formatCurrency(bidData.tax_amount)}</span>
               </div>
               <div className="h-px bg-white/[0.08]" />
