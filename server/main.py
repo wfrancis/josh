@@ -37,6 +37,7 @@ from models import (
 )
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
+from dropbox_scanner import match_folder
 from sundry_calc import calculate_sundries_for_materials
 from labor_calc import calculate_labor_for_materials, load_labor_catalog, load_labor_catalog_from_pdf, get_labor_catalog
 from bid_assembler import assemble_bid
@@ -198,6 +199,7 @@ class SettingsUpdate(BaseModel):
     multi_pass_count: Optional[int] = None
     email_automation_enabled: Optional[str] = None
     email_config: Optional[str] = None
+    bid_folder_path: Optional[str] = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -805,6 +807,33 @@ def api_update_quote(quote_id: int, body: dict = Body(...)):
         _auto_match_quotes(job_id, quotes)
     log_activity(job_id, "quote_updated", f"Quote #{quote_id} updated")
     return {"ok": True}
+
+
+# ── Dropbox Scanner Endpoints ────────────────────────────────────────────────
+
+@app.post("/api/jobs/{job_id}/match-dropbox-folder")
+def api_match_dropbox_folder(job_id: str, body: dict = Body(...)):
+    """Fuzzy-match job project name against a list of folder names from the browser.
+    The browser reads the local Dropbox folder via File System Access API and sends folder names here.
+    """
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    folder_names = body.get("folder_names", [])
+    if not folder_names:
+        return {"folder_found": False, "folder_name": None, "score": 0}
+
+    result = match_folder(
+        job.get("project_name", ""),
+        job.get("gc_name", ""),
+        folder_names,
+    )
+
+    if not result:
+        return {"folder_found": False, "folder_name": None, "score": 0}
+
+    return {"folder_found": True, "folder_name": result["folder_name"], "score": result["score"]}
 
 
 @app.post("/api/jobs/{job_id}/calculate")
@@ -1439,6 +1468,7 @@ def api_get_settings():
         "multi_pass_count": int(settings.get("multi_pass_count", "2")),
         "email_automation_enabled": settings.get("email_automation_enabled", "false"),
         "email_config": settings.get("email_config", ""),
+        "bid_folder_path": settings.get("bid_folder_path", ""),
     }
 
 
@@ -1461,6 +1491,8 @@ def api_update_settings(body: SettingsUpdate):
         updates["email_automation_enabled"] = body.email_automation_enabled
     if body.email_config is not None:
         updates["email_config"] = body.email_config
+    if body.bid_folder_path is not None:
+        updates["bid_folder_path"] = body.bid_folder_path
     if updates:
         save_settings(updates)
         # Apply API key and model to quote parser

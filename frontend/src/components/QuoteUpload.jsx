@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { FileText, Package, AlertTriangle, CheckCircle2, Trash2, Search, Link2, Check, X } from 'lucide-react'
+import { FileText, Package, AlertTriangle, CheckCircle2, Trash2, Search, Link2, Check, X, FolderSearch, Loader2 } from 'lucide-react'
 import FileUpload from './FileUpload'
 import ConfirmDialog from './ConfirmDialog'
 
@@ -14,6 +14,8 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
   const [vendorFilter, setVendorFilter] = useState('')
   const [linkedRequests, setLinkedRequests] = useState([]) // requests matched to this upload
   const [linkingId, setLinkingId] = useState(null)
+  const [scanning, setScanning] = useState(false)
+  const [scanPreview, setScanPreview] = useState(null)
 
   // Populate from existing quotes on load
   useEffect(() => {
@@ -96,6 +98,100 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
     })
   }
 
+  const handleDropboxScan = async () => {
+    // Check browser support
+    if (!window.showDirectoryPicker) {
+      setError('Your browser does not support folder access. Use Chrome or Edge.')
+      return
+    }
+
+    setError(null)
+    setScanning(true)
+    setScanPreview(null)
+
+    try {
+      // Step 1: User picks the bid folder root
+      const bidFolderHandle = await window.showDirectoryPicker({ mode: 'read' })
+
+      // Step 2: List all subdirectories
+      const folderNames = []
+      for await (const entry of bidFolderHandle.values()) {
+        if (entry.kind === 'directory') folderNames.push(entry.name)
+      }
+
+      if (folderNames.length === 0) {
+        setError('No project folders found in selected directory')
+        setScanning(false)
+        return
+      }
+
+      // Step 3: Send folder names to backend for fuzzy matching
+      const matchResult = await api.matchDropboxFolder(jobId, folderNames)
+      if (!matchResult.folder_found) {
+        setError('No matching project folder found. Make sure the job name matches a folder in your bid directory.')
+        setScanning(false)
+        return
+      }
+
+      // Step 4: Open the matched folder and its Correspondence subfolder
+      const projectHandle = await bidFolderHandle.getDirectoryHandle(matchResult.folder_name)
+      let corrHandle
+      try {
+        corrHandle = await projectHandle.getDirectoryHandle('Correspondence')
+      } catch {
+        // No Correspondence subfolder — try project root
+        corrHandle = projectHandle
+      }
+
+      // Step 5: Collect all .eml and .pdf files
+      const files = []
+      for await (const entry of corrHandle.values()) {
+        if (entry.kind === 'file' && /\.(eml|pdf)$/i.test(entry.name)) {
+          const file = await entry.getFile()
+          files.push(file)
+        }
+      }
+
+      if (files.length === 0) {
+        setError(`Found folder "${matchResult.folder_name}" but no .eml or .pdf files in Correspondence`)
+        setScanning(false)
+        return
+      }
+
+      // Show preview before uploading
+      setScanPreview({
+        folder_name: matchResult.folder_name,
+        score: matchResult.score,
+        files: files.map(f => ({ name: f.name, size: f.size })),
+        fileObjects: files,
+      })
+      setScanning(false)
+
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        // User cancelled the folder picker
+      } else {
+        setError(err.message)
+      }
+      setScanning(false)
+    }
+  }
+
+  const handleDropboxImport = async () => {
+    if (!scanPreview?.fileObjects?.length) return
+    setLoading(true)
+    setError(null)
+    try {
+      const result = await api.uploadQuotes(jobId, scanPreview.fileObjects)
+      setProducts(result.products || [])
+      setAutoMatched(result.auto_matched || 0)
+      setLinkedRequests(result.linked_requests || [])
+      setScanPreview(null)
+      onQuotesParsed?.(result.products || [], result.auto_matched || 0)
+    } catch (err) { setError(err.message) }
+    finally { setLoading(false) }
+  }
+
   const validProducts = useMemo(() =>
     products.map((p, idx) => ({ ...p, _idx: idx })).filter(p => !p.error),
     [products])
@@ -120,12 +216,48 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
   return (
     <div className="space-y-4">
       {!hasQuotes && (
-        <FileUpload
-          accept=".pdf,.eml,.msg,.txt" multiple
-          label="Upload Vendor Quotes"
-          description="PDF or text files with vendor pricing"
-          icon={FileText} onUpload={handleUpload} loading={loading}
-        />
+        <div className="space-y-3">
+          <FileUpload
+            accept=".pdf,.eml,.msg,.txt" multiple
+            label="Upload Vendor Quotes"
+            description="PDF or text files with vendor pricing"
+            icon={FileText} onUpload={handleUpload} loading={loading}
+          />
+          <div className="flex items-center gap-3">
+            <div className="flex-1 border-t border-gray-700/50" />
+            <span className="text-xs text-gray-500 uppercase tracking-wider">or</span>
+            <div className="flex-1 border-t border-gray-700/50" />
+          </div>
+          <button
+            onClick={handleDropboxScan}
+            disabled={scanning || loading}
+            className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-500/10 border border-blue-500/20 rounded-xl text-blue-400 hover:bg-blue-500/20 transition-colors disabled:opacity-50"
+          >
+            {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderSearch className="w-4 h-4" />}
+            {scanning ? 'Searching Bid Folder...' : 'Scan Dropbox Bid Folder'}
+          </button>
+          {scanPreview && (
+            <div className="px-4 py-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl">
+              <div className="text-sm text-gray-300">
+                Found: <span className="text-white font-semibold">{scanPreview.folder_name}</span>
+                <span className="text-gray-500 ml-2">({scanPreview.files?.length || 0} quote files)</span>
+              </div>
+              {scanPreview.files?.length > 0 && (
+                <div className="mt-2 text-xs text-gray-500">
+                  {scanPreview.files.map(f => f.name).join(', ')}
+                </div>
+              )}
+              <button
+                onClick={handleDropboxImport}
+                disabled={loading}
+                className="mt-3 px-4 py-2 bg-emerald-600 text-white text-sm rounded-lg hover:bg-emerald-500 transition-colors disabled:opacity-50 flex items-center gap-2"
+              >
+                {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+                {loading ? 'Parsing Quotes...' : `Import ${scanPreview.files?.length || 0} Quote Files`}
+              </button>
+            </div>
+          )}
+        </div>
       )}
 
       {error && (

@@ -20,6 +20,9 @@ export default function SettingsPage() {
   const [model, setModel] = useState('gpt-5-mini')
   const [multiPassCount, setMultiPassCount] = useState(2)
 
+  // Bid folder state
+  const [bidFolderPath, setBidFolderPath] = useState('')
+
   // Email automation state
   const [emailEnabled, setEmailEnabled] = useState(false)
   const [emailSaving, setEmailSaving] = useState(false)
@@ -38,6 +41,8 @@ export default function SettingsPage() {
         setApiKeyMasked(data.openai_api_key_masked)
         setModel(data.openai_model || 'gpt-5-mini')
         setMultiPassCount(data.multi_pass_count || 2)
+        // Bid folder path
+        if (data.bid_folder_path) setBidFolderPath(data.bid_folder_path)
         // Email automation settings
         if (data.email_automation_enabled === 'true') setEmailEnabled(true)
         if (data.email_config) {
@@ -56,6 +61,7 @@ export default function SettingsPage() {
       const payload = {
         openai_model: model,
         multi_pass_count: multiPassCount,
+        bid_folder_path: bidFolderPath,
       }
       // Only send API key if user actively edited it
       if (editingKey && apiKey) {
@@ -231,6 +237,23 @@ export default function SettingsPage() {
                 </div>
               </div>
 
+              {/* Bid Folder Path */}
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-300 flex items-center gap-2">
+                  Dropbox Bid Folder Path
+                </label>
+                <input
+                  type="text"
+                  value={bidFolderPath}
+                  onChange={(e) => setBidFolderPath(e.target.value)}
+                  placeholder="C:\Users\...\001-Bid Folder"
+                  className="input w-full"
+                />
+                <div className="text-xs text-gray-500">
+                  Local path to your Dropbox bid folder. Used by the Dropbox quote scanner.
+                </div>
+              </div>
+
               {/* Save Button */}
               <div className="flex items-center gap-3 pt-2">
                 <button
@@ -243,7 +266,7 @@ export default function SettingsPage() {
                   ) : saveSuccess ? (
                     <><Check className="w-4 h-4" /> Saved</>
                   ) : (
-                    'Save AI Settings'
+                    'Save Settings'
                   )}
                 </button>
                 {saveError && (

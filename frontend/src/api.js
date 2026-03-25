@@ -158,6 +158,9 @@ export const api = {
   updateQuoteRequest: (id, data) => request('/quote-requests/' + id, { method: 'PUT', body: JSON.stringify(data) }),
   deleteQuoteRequest: (id) => request('/quote-requests/' + id, { method: 'DELETE' }),
 
+  // Dropbox Scanner
+  matchDropboxFolder: (jobId, folderNames) => request('/jobs/' + jobId + '/match-dropbox-folder', { method: 'POST', body: JSON.stringify({ folder_names: folderNames }) }),
+
   // AI: Vendor Detection & Quote Text
   detectVendors: (jobId) => request('/jobs/' + jobId + '/detect-vendors', { method: 'POST' }),
   suggestVendors: (jobId, materialIndices) => request('/jobs/' + jobId + '/suggest-vendors', { method: 'POST', body: JSON.stringify({ material_indices: materialIndices }) }),
