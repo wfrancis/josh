@@ -143,14 +143,19 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
         corrHandle = projectHandle
       }
 
-      // Step 5: Collect all .eml and .pdf files
+      // Step 5: Collect all .eml and .pdf files (recursive)
       const files = []
-      for await (const entry of corrHandle.values()) {
-        if (entry.kind === 'file' && /\.(eml|pdf)$/i.test(entry.name)) {
-          const file = await entry.getFile()
-          files.push(file)
+      async function collectFiles(dirHandle) {
+        for await (const entry of dirHandle.values()) {
+          if (entry.kind === 'file' && /\.(eml|pdf)$/i.test(entry.name)) {
+            const file = await entry.getFile()
+            files.push(file)
+          } else if (entry.kind === 'directory') {
+            await collectFiles(entry)
+          }
         }
       }
+      await collectFiles(corrHandle)
 
       if (files.length === 0) {
         setError(`Found folder "${matchResult.folder_name}" but no .eml or .pdf files in Correspondence`)

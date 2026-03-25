@@ -228,7 +228,7 @@ def generate_bid_pdf(
     ]
     if bid_data.get("tax_rate", 0) > 0:
         totals_data.append([
-            f"Tax ({bid_data['tax_rate'] * 100:.1f}%):",
+            f"Tax ({bid_data['tax_rate'] * 100:.2f}%):",
             f"${bid_data['tax_amount']:,.2f}",
         ])
     totals_data.append(["Grand Total:", f"${bid_data['grand_total']:,.2f}"])
