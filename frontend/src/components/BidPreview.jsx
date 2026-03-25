@@ -69,14 +69,41 @@ function BundleCard({ bundle, index, hasFlag }) {
         {expanded ? <ChevronDown className="w-4 h-4 text-gray-500 flex-shrink-0" /> : <ChevronRight className="w-4 h-4 text-gray-600 flex-shrink-0" />}
       </button>
       {expanded && (
-        <div className="px-3 sm:px-4 pb-3 sm:pb-4 border-t border-white/[0.04] pt-3 space-y-2 animate-fade-in">
-          <p className="text-xs text-gray-500 whitespace-pre-line leading-relaxed mb-3">{bundle.description_text}</p>
-          <div className="grid grid-cols-2 gap-2">
-            <CostRow icon={Package} label="Material" value={bundle.material_cost} flag={false} />
-            <CostRow icon={Wrench} label="Sundries" value={bundle.sundry_cost} flag={bundle.sundry_cost === 0} />
-            <CostRow icon={HardHat} label="Labor" value={bundle.labor_cost} flag={bundle.labor_cost === 0} />
-            <CostRow icon={Truck} label="Freight" value={bundle.freight_cost} flag={false} />
-          </div>
+        <div className="px-3 sm:px-4 pb-3 sm:pb-4 border-t border-white/[0.04] pt-3 space-y-3 animate-fade-in">
+          <p className="text-xs text-gray-500 whitespace-pre-line leading-relaxed">{bundle.description_text}</p>
+
+          {/* Material */}
+          <DetailSection icon={Package} label="Material" total={bundle.material_cost}>
+            <DetailLine name={bundle.bundle_name} qty={bundle.order_qty} unit={bundle.unit} rate={bundle.unit_price} cost={bundle.material_cost} />
+          </DetailSection>
+
+          {/* Sundries */}
+          <DetailSection icon={Wrench} label="Sundries" total={bundle.sundry_cost} flag={bundle.sundry_cost === 0}>
+            {bundle.sundry_items?.length > 0 ? bundle.sundry_items.map((s, i) => (
+              <DetailLine key={i} name={s.name} qty={s.qty} unit={s.unit} rate={s.unit_price} cost={s.cost} notes={s.notes} />
+            )) : (
+              <div className="text-[10px] text-gray-600 italic px-1">No sundries configured for this type</div>
+            )}
+          </DetailSection>
+
+          {/* Labor */}
+          <DetailSection icon={HardHat} label="Labor" total={bundle.labor_cost} flag={bundle.labor_cost === 0}>
+            {bundle.labor_items?.length > 0 ? bundle.labor_items.map((l, i) => (
+              <DetailLine key={i} name={l.name} qty={l.qty} unit={l.unit} rate={l.rate} cost={l.cost} />
+            )) : (
+              <div className="text-[10px] text-gray-600 italic px-1">No labor catalog entry matched</div>
+            )}
+          </DetailSection>
+
+          {/* Freight */}
+          <DetailSection icon={Truck} label="Freight" total={bundle.freight_cost}>
+            {bundle.freight_cost > 0 ? (
+              <DetailLine name="Delivery" qty={bundle.order_qty} unit={bundle.unit} rate={bundle.freight_rate || 0} cost={bundle.freight_cost} />
+            ) : (
+              <div className="text-[10px] text-gray-600 italic px-1">No freight for this material type</div>
+            )}
+          </DetailSection>
+
           {(bundle.sundry_cost === 0 || bundle.labor_cost === 0) && (
             <div className="flex items-center gap-1.5 text-[10px] text-amber-500/70 mt-1">
               <AlertTriangle className="w-3 h-3" />
@@ -102,6 +129,40 @@ function CostRow({ icon: Icon, label, value, flag }) {
       <span className={`text-xs font-semibold tabular-nums ${
         flag ? 'text-amber-500/60' : 'text-gray-300'
       }`}>{formatCurrency(value)}</span>
+    </div>
+  )
+}
+
+function DetailSection({ icon: Icon, label, total, flag, children }) {
+  return (
+    <div className={`rounded-xl border ${flag ? 'border-amber-500/[0.1] bg-amber-500/[0.03]' : 'border-white/[0.05] bg-white/[0.02]'}`}>
+      <div className="flex items-center justify-between px-3 py-2 border-b border-white/[0.04]">
+        <div className="flex items-center gap-2">
+          <Icon className={`w-3.5 h-3.5 ${flag ? 'text-amber-500/60' : 'text-gray-500'}`} />
+          <span className={`text-[10px] font-bold uppercase tracking-wider ${flag ? 'text-amber-500/60' : 'text-gray-500'}`}>{label}</span>
+        </div>
+        <span className={`text-xs font-semibold tabular-nums ${flag ? 'text-amber-500/60' : 'text-gray-300'}`}>{formatCurrency(total)}</span>
+      </div>
+      <div className="px-3 py-2 space-y-1">
+        {children}
+      </div>
+    </div>
+  )
+}
+
+function DetailLine({ name, qty, unit, rate, cost, notes }) {
+  const fmtName = (name || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+  return (
+    <div className="flex items-center justify-between text-[11px] py-0.5">
+      <div className="flex-1 min-w-0 text-gray-400 truncate" title={notes || fmtName}>
+        {fmtName}
+        {notes && <span className="text-gray-600 ml-1">({notes})</span>}
+      </div>
+      <div className="flex items-center gap-3 flex-shrink-0 tabular-nums text-gray-500">
+        {qty > 0 && <span>{typeof qty === 'number' && qty % 1 !== 0 ? qty.toFixed(1) : qty} {unit}</span>}
+        {rate > 0 && <span>@ {formatCurrency(rate)}</span>}
+        <span className="text-gray-300 font-medium w-20 text-right">{formatCurrency(cost)}</span>
+      </div>
     </div>
   )
 }

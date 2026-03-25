@@ -125,11 +125,11 @@ def assemble_bid(
         # Material cost
         material_cost = round(order_qty * unit_price, 2)
 
-        # Sundry cost
+        # Sundry cost (keep itemized detail)
         mat_sundries = sundries_by_mat.get(mat_id, [])
         sundry_cost = round(sum(s.get("extended_cost", 0) for s in mat_sundries), 2)
 
-        # Labor cost
+        # Labor cost (keep itemized detail)
         mat_labor = labor_by_mat.get(mat_id, [])
         labor_cost = round(sum(l.get("extended_cost", 0) for l in mat_labor), 2)
 
@@ -156,8 +156,20 @@ def assemble_bid(
             "unit_price": unit_price,
             "material_cost": material_cost,
             "sundry_cost": sundry_cost,
+            "sundry_items": [
+                {"name": s["sundry_name"], "qty": s["qty"], "unit": s.get("unit", ""),
+                 "unit_price": s.get("unit_price", 0), "cost": s.get("extended_cost", 0),
+                 "notes": s.get("notes", "")}
+                for s in mat_sundries
+            ],
             "labor_cost": labor_cost,
+            "labor_items": [
+                {"name": l["labor_description"], "qty": l["qty"], "unit": l.get("unit", ""),
+                 "rate": l.get("rate", 0), "cost": l.get("extended_cost", 0)}
+                for l in mat_labor
+            ],
             "freight_cost": freight_cost,
+            "freight_rate": freight_rate,
             "total_price": total_price,
             "order_qty": round(order_qty, 2),
         })
