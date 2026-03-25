@@ -33,15 +33,23 @@ def set_openai_config(api_key: str = None, model: str = None, num_passes: int = 
         _openai_config["num_passes"] = max(1, min(5, num_passes))
 
 
-SYSTEM_PROMPT = """You are a flooring vendor quote parser. Extract product pricing from the vendor quote text.
+SYSTEM_PROMPT = """You are a flooring vendor quote parser for Standard Interiors, a commercial flooring contractor.
+Extract product pricing from the vendor quote text.
+
+IMPORTANT RULES:
+1. If a single price applies to multiple product lines (e.g. "WG100 and WG200 $27.25"), create a SEPARATE entry for EACH product line with the same price.
+2. Match the original quote request if included in the email thread — use those product names and codes.
+3. The unit for carpet tile (CPT) is always SY (square yards). LVT units are typically SF (square feet).
+4. Extract accessory/adhesive pricing as separate products (TacTiles, adhesives, primers, etc.)
+
 Return a JSON object with a "products" array. Each product should have:
 - vendor: string (company name of the vendor)
-- product_name: string (full product name / style / color)
+- product_name: string (product line name / style — e.g. "WG100", "Breakout", "Dot-O-Mine")
 - unit_price: number (price per unit)
 - unit: string (SF, SY, LF, EA, etc.)
-- freight: number or null (freight cost per unit if mentioned)
+- freight: string or null (freight terms if mentioned, e.g. "FOB La Grange, GA")
 - lead_time: string or null (delivery lead time if mentioned)
-- notes: string or null (any special notes, minimums, conditions)
+- notes: string or null (any special notes, minimums, conditions, backing info)
 
 If you cannot determine a field, set it to null.
 Only return the JSON object, no other text."""

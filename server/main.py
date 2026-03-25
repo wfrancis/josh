@@ -652,7 +652,26 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
     matched_mat_indices = set()
     matched_prod_indices = set()
 
-    # Phase 1: Fast exact item_code matching
+    # Phase 1: Fast matching — item_code AND description-based product identifiers
+    # Extract searchable identifiers from material descriptions.
+    # e.g. "Interface - Woven Gradience - WG100 - 108051 Onyx" → ["wg100", "108051", "woven gradience"]
+    import re as _re
+
+    def _extract_identifiers(description: str) -> list[str]:
+        """Extract product line identifiers from a material description.
+        Splits on ' - ' delimiters and returns meaningful tokens."""
+        parts = [p.strip().lower() for p in description.split(" - ") if p.strip()]
+        identifiers = []
+        for part in parts:
+            # Skip the vendor name (first part) and very short/generic tokens
+            if len(part) < 2:
+                continue
+            identifiers.append(part)
+            # Also extract individual alphanumeric codes (WG100, 108051, etc.)
+            codes = _re.findall(r'[a-z]*\d+[a-z]*\d*', part)
+            identifiers.extend(codes)
+        return identifiers
+
     for mat_idx, mat in enumerate(materials):
         if mat.get("unit_price") and mat["unit_price"] > 0:
             continue  # already priced
@@ -661,18 +680,48 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
         if not item_code and not description:
             continue
 
+        # Build list of identifiers to match against
+        mat_identifiers = _extract_identifiers(description)
+
         for prod_idx, prod in enumerate(products):
-            if prod_idx in matched_prod_indices:
-                continue
             if prod.get("error") or not prod.get("unit_price"):
                 continue
             prod_name = (prod.get("product_name") or "").strip().lower()
             prod_desc = (prod.get("description") or "").strip().lower()
+            prod_text = f"{prod_name} {prod_desc}"
 
             match = False
+
+            # Check 1: item_code in product name/desc (original logic)
             if item_code and len(item_code) >= 3:
                 if item_code in prod_name or item_code in prod_desc:
                     match = True
+
+            # Check 2: product identifiers from description match quote product
+            # e.g. "wg100" from material desc found in "WG100 and WG200" quote product
+            if not match and mat_identifiers:
+                for ident in mat_identifiers:
+                    if len(ident) >= 3 and ident in prod_text:
+                        match = True
+                        break
+
+            # Check 3: quote product name found in material description
+            # e.g. "breakout" from quote found in "Interface - Breakout - ..."
+            if not match and prod_name and len(prod_name) >= 4:
+                # Try the full product name or its key parts
+                prod_parts = [p.strip() for p in prod_name.split(" - ") if len(p.strip()) >= 3]
+                for pp in prod_parts:
+                    if pp in description:
+                        match = True
+                        break
+                # Also try individual significant words from product name
+                if not match:
+                    prod_words = [w for w in _re.findall(r'[a-z]+\d*\S*', prod_name) if len(w) >= 4]
+                    desc_words = set(_re.findall(r'[a-z]+\d*\S*', description))
+                    for pw in prod_words:
+                        if pw in desc_words and pw not in ("tile", "carpet", "floor", "flooring", "interface", "mohawk", "shaw"):
+                            match = True
+                            break
 
             if match:
                 mat["unit_price"] = prod["unit_price"]
@@ -684,7 +733,8 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
                 matched += 1
                 updated = True
                 matched_mat_indices.add(mat_idx)
-                matched_prod_indices.add(prod_idx)
+                # NOTE: Don't add prod_idx to matched_prod_indices here —
+                # one quote product (e.g. "WG100 $27.25") can match multiple materials
                 break
 
     # Phase 2: AI fuzzy matching for remaining unmatched
