@@ -235,6 +235,24 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS price_book_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor TEXT NOT NULL,
+                product_line TEXT NOT NULL,
+                item_no TEXT NOT NULL,
+                material_finish TEXT DEFAULT '',
+                size_mm TEXT DEFAULT '',
+                size_inches TEXT DEFAULT '',
+                list_price REAL NOT NULL,
+                discount_pct REAL DEFAULT 0,
+                net_price REAL NOT NULL,
+                length TEXT DEFAULT '',
+                unit TEXT DEFAULT 'length',
+                category TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_price_book_vendor ON price_book_items(vendor);
+            CREATE INDEX IF NOT EXISTS idx_price_book_product_line ON price_book_items(product_line);
         """)
         conn.commit()
         # Migrations for existing DBs
@@ -1530,5 +1548,91 @@ def delete_quote_request(request_id: int) -> bool:
         cur = conn.execute("DELETE FROM quote_requests WHERE id=?", (request_id,))
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ── Price Book ──────────────────────────────────────────────────────────────
+
+
+def import_price_book(vendor: str, items: list[dict], discount_pct: float, category: str = "") -> int:
+    """Import a vendor price book. Clears existing items for this vendor first.
+    items: list of {product_line, item_no, material_finish, size_mm, size_inches, list_price, net_price, length, unit}
+    Returns number of items imported."""
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM price_book_items WHERE vendor=?", (vendor,))
+        for item in items:
+            conn.execute(
+                """INSERT INTO price_book_items
+                   (vendor, product_line, item_no, material_finish, size_mm, size_inches,
+                    list_price, discount_pct, net_price, length, unit, category)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (vendor, item.get("product_line", ""), item.get("item_no", ""),
+                 item.get("material_finish", ""), item.get("size_mm", ""),
+                 item.get("size_inches", ""), item.get("list_price", 0),
+                 discount_pct, item.get("net_price", 0),
+                 item.get("length", ""), item.get("unit", "length"),
+                 item.get("category", category))
+            )
+        conn.commit()
+        return len(items)
+    finally:
+        conn.close()
+
+
+def search_price_book(query: str, vendor: str = None) -> list[dict]:
+    """Search price book items by product line or item number."""
+    conn = _get_conn()
+    try:
+        q = f"%{query}%"
+        if vendor:
+            rows = conn.execute(
+                "SELECT * FROM price_book_items WHERE vendor=? AND (product_line LIKE ? OR item_no LIKE ?) ORDER BY product_line, list_price",
+                (vendor, q, q)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM price_book_items WHERE product_line LIKE ? OR item_no LIKE ? ORDER BY vendor, product_line, list_price",
+                (q, q)
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def match_price_book(product_line: str, size_mm: str = None, material_finish: str = None, vendor: str = None) -> list[dict]:
+    """Find price book items matching a product line and optional size/material."""
+    conn = _get_conn()
+    try:
+        sql = "SELECT * FROM price_book_items WHERE LOWER(product_line) = LOWER(?)"
+        params = [product_line]
+        if size_mm:
+            sql += " AND size_mm = ?"
+            params.append(size_mm)
+        if material_finish:
+            sql += " AND LOWER(material_finish) LIKE LOWER(?)"
+            params.append(f"%{material_finish}%")
+        if vendor:
+            sql += " AND vendor = ?"
+            params.append(vendor)
+        sql += " ORDER BY list_price"
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_price_book_summary() -> list[dict]:
+    """Get summary of all imported price books."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT vendor, COUNT(*) as item_count, discount_pct,
+                      MIN(net_price) as min_price, MAX(net_price) as max_price,
+                      GROUP_CONCAT(DISTINCT product_line) as product_lines
+               FROM price_book_items GROUP BY vendor"""
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()

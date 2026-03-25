@@ -35,6 +35,7 @@ from models import (
     log_activity, get_activity, add_comment, get_comments,
     create_quote_request, list_quote_requests, update_quote_request, delete_quote_request,
     _normalize_product, _get_conn,
+    import_price_book, search_price_book, match_price_book, get_price_book_summary,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
@@ -190,7 +191,22 @@ def startup():
     init_db()
     _apply_openai_config()
     _seed_company_rates()
+    _auto_import_price_books()
     _start_inbox_monitor()
+
+
+def _auto_import_price_books():
+    """Auto-import price books from JSON files on startup if DB is empty."""
+    summary = get_price_book_summary()
+    if any(s["vendor"] == "Schluter" for s in summary):
+        return  # Already imported
+    json_path = os.path.join(os.path.dirname(__file__), "schluter_prices.json")
+    if os.path.exists(json_path):
+        import json as _json
+        with open(json_path) as f:
+            items = _json.load(f)
+        count = import_price_book("Schluter", items, discount_pct=0.55, category="transitions")
+        print(f"Auto-imported Schluter price book: {count} items (45% of list)")
 
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
@@ -755,6 +771,15 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             matched += 1
             updated = True
 
+    # Phase 3: Price book matching for remaining unpriced materials
+    # Check if any unpriced materials match a vendor price book (e.g. Schluter transitions)
+    still_unpriced = [i for i, m in enumerate(materials) if i not in matched_mat_indices and (not m.get("unit_price") or m["unit_price"] == 0)]
+    if still_unpriced:
+        pb_matched = _price_book_match(materials, still_unpriced)
+        if pb_matched > 0:
+            matched += pb_matched
+            updated = True
+
     if updated:
         save_materials(job_id, materials)
 
@@ -829,6 +854,89 @@ Return empty array [] if no confident matches."""
     except Exception as e:
         print(f"AI quote matching failed (non-fatal): {e}")
         return []
+
+
+def _price_book_match(materials: list[dict], unpriced_indices: list[int]) -> int:
+    """Match unpriced materials against vendor price books (e.g. Schluter).
+    Looks for Schluter product identifiers (SCHIENE, RENO-TK, JOLLY, KERDI, etc.)
+    in the material description and applies the net price (45% of list for Schluter)."""
+    import re as _re
+
+    # Known Schluter product lines to search for in descriptions
+    SCHLUTER_LINES = [
+        "schiene", "reno-t", "reno-tk", "reno-u", "reno-v", "reno-ramp",
+        "jolly", "ditra", "kerdi", "kerdi-band", "kerdi-board", "deco",
+        "dilex", "quadec", "rondec", "trep",
+    ]
+
+    matched = 0
+    for mat_idx in unpriced_indices:
+        mat = materials[mat_idx]
+        description = (mat.get("description") or "").lower()
+        item_code = (mat.get("item_code") or "").lower()
+        mat_type = (mat.get("material_type") or "").lower()
+
+        # Only check price book for transition-type materials or if description mentions Schluter
+        if "schluter" not in description and mat_type not in ("transitions", "waterproofing", "tread_riser"):
+            # Also check if any Schluter product line appears in the description
+            has_schluter = False
+            for line in SCHLUTER_LINES:
+                if line in description:
+                    has_schluter = True
+                    break
+            if not has_schluter:
+                continue
+
+        # Try to find the product line and item number in the description
+        # Descriptions look like: "Schluter SCHIENE A 100 AE" or "RENO-TK ETK 80"
+        best_match = None
+        best_score = 0
+
+        for line in SCHLUTER_LINES:
+            if line in description:
+                # Found a product line — search the price book
+                results = match_price_book(line.upper())
+                if not results:
+                    # Try with hyphenated variants
+                    results = match_price_book(line.upper().replace("-", ""))
+                if not results:
+                    continue
+
+                # Try to narrow down by item number or size from description
+                for pb_item in results:
+                    score = 1  # base score for product line match
+                    pb_item_lower = pb_item["item_no"].lower()
+
+                    # Check if the item number appears in the description
+                    if pb_item_lower and pb_item_lower in description:
+                        score += 5  # strong match
+
+                    # Check size match
+                    if pb_item["size_mm"] and pb_item["size_mm"] in description:
+                        score += 2
+                    if pb_item["size_inches"] and pb_item["size_inches"] in description:
+                        score += 2
+
+                    # Check material/finish match
+                    finish_lower = pb_item["material_finish"].lower()
+                    if finish_lower and any(w in description for w in finish_lower.split() if len(w) > 3):
+                        score += 1
+
+                    if score > best_score:
+                        best_score = score
+                        best_match = pb_item
+
+        if best_match and best_score >= 3:
+            # Apply price book net price (already discounted)
+            mat["unit_price"] = best_match["net_price"]
+            mat["vendor"] = "Schluter"
+            mat["quote_status"] = "price_book"
+            mat["price_source"] = "price_book"
+            order_qty = mat.get("order_qty", 0)
+            mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
+            matched += 1
+
+    return matched
 
 
 def _link_upload_to_requests(job_id: int, products: list[dict]):
@@ -2489,6 +2597,51 @@ def api_add_comment(job_id: str, body: CommentCreate):
     comment = add_comment(job["id"], body.text)
     log_activity(job["id"], "comment_added", "Comment added", {"text": body.text})
     return comment
+
+
+# ── Price Book Endpoints ─────────────────────────────────────────────────────
+
+
+@app.get("/api/price-book")
+def api_price_book_summary():
+    """Get summary of all imported price books."""
+    return get_price_book_summary()
+
+
+@app.post("/api/price-book/import")
+def api_import_price_book(body: dict = Body(...)):
+    """Import a vendor price book from JSON data.
+    Body: {vendor, discount_pct, items: [{product_line, item_no, ...}]}
+    """
+    vendor = body.get("vendor")
+    discount_pct = body.get("discount_pct", 0)
+    items = body.get("items", [])
+    category = body.get("category", "")
+    if not vendor or not items:
+        raise HTTPException(status_code=400, detail="vendor and items required")
+    count = import_price_book(vendor, items, discount_pct, category)
+    return {"imported": count, "vendor": vendor}
+
+
+@app.get("/api/price-book/search")
+def api_search_price_book(q: str = "", vendor: str = None):
+    """Search price book items."""
+    if not q:
+        return []
+    return search_price_book(q, vendor)
+
+
+@app.post("/api/price-book/import-schluter")
+def api_import_schluter():
+    """Import the pre-parsed Schluter price book (schluter_prices.json)."""
+    json_path = os.path.join(os.path.dirname(__file__), "schluter_prices.json")
+    if not os.path.exists(json_path):
+        raise HTTPException(status_code=404, detail="schluter_prices.json not found. Run parse_schluter.py first.")
+    import json as _json
+    with open(json_path) as f:
+        items = _json.load(f)
+    count = import_price_book("Schluter", items, discount_pct=0.55, category="transitions")
+    return {"imported": count, "vendor": "Schluter", "discount": "45% of list (55% off)"}
 
 
 # ── Static Files (React frontend) ────────────────────────────────────────────
