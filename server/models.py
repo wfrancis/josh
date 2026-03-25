@@ -191,6 +191,19 @@ def init_db() -> None:
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS imported_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                file_size INTEGER,
+                source TEXT DEFAULT 'manual',
+                imported_at TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_imported_files_dedup
+                ON imported_files(job_id, file_hash);
+
             CREATE TABLE IF NOT EXISTS job_activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id INTEGER NOT NULL,
@@ -1285,6 +1298,48 @@ def import_vendor_prices_csv(text: str) -> dict:
 
 
 # ── Notifications ────────────────────────────────────────────────────────────
+
+def is_file_imported(job_id: int, file_hash: str) -> bool:
+    """Check if a file with this hash has already been imported for this job."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM imported_files WHERE job_id=? AND file_hash=?",
+            (job_id, file_hash)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def record_imported_file(job_id: int, file_name: str, file_hash: str,
+                         file_size: int = 0, source: str = "manual"):
+    """Record that a file has been imported for a job."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO imported_files (job_id, file_name, file_hash, file_size, source, imported_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, file_name, file_hash, file_size, source, datetime.now().isoformat())
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_imported_files(job_id: int) -> list[dict]:
+    """List all imported files for a job."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT file_name, file_hash, file_size, source, imported_at "
+            "FROM imported_files WHERE job_id=? ORDER BY imported_at DESC",
+            (job_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
 
 def create_notification(job_id: int, ntype: str, message: str) -> int:
     """Create a notification. Returns notification id."""

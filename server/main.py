@@ -31,6 +31,7 @@ from models import (
     create_vendor, delete_vendor,
     get_price_history, import_vendor_prices_csv,
     create_notification, get_notifications, mark_notification_read,
+    is_file_imported, record_imported_file, list_imported_files,
     log_activity, get_activity, add_comment, get_comments,
     create_quote_request, list_quote_requests, update_quote_request, delete_quote_request,
     _normalize_product, _get_conn,
@@ -114,29 +115,57 @@ def _start_inbox_monitor():
     if not all([imap_host, email_addr, email_pass]):
         return
 
-    def on_quote_received(temp_files, sender_email, subject):
-        """Callback when inbox monitor detects a vendor response."""
+    def on_quote_received(*, job_reference=None, temp_files=None, vendor_email=None,
+                          filenames=None, subject=""):
+        """Callback when inbox monitor detects a vendor response.
+        Signature matches InboxMonitor._process_email kwargs."""
+        temp_files = temp_files or []
+        filenames = filenames or []
+        all_products = []
+
         for fpath in temp_files:
             try:
                 products = parse_quote_file(fpath)
-                if not products:
-                    continue
-                # Try to find the job by project name from subject
-                from models import search_all
-                results = search_all(subject[:50])
-                if results.get("jobs"):
-                    job_id = results["jobs"][0]["id"]
-                    save_quotes(job_id, products)
-                    from models import _auto_match_quotes
-                    matched = _auto_match_quotes(job_id)
-                    save_vendor_prices_from_quotes(job_id, products)
-                    vendor_name = products[0].get("vendor", sender_email)
-                    create_notification(
-                        job_id, "quote_received",
-                        f"Quote received from {vendor_name} — {len(products)} products parsed, {matched} auto-matched"
-                    )
+                if products:
+                    all_products.extend(products)
             except Exception as e:
-                print(f"[InboxMonitor] Error processing {fpath}: {e}")
+                print(f"[InboxMonitor] Error parsing {fpath}: {e}")
+
+        if not all_products:
+            print(f"[InboxMonitor] No products extracted from: {subject[:60]}")
+            return
+
+        # Find the matching job — use job_reference first, fall back to subject search
+        job_id = None
+        search_term = job_reference or subject[:80]
+        results = search_all(search_term)
+        if results.get("jobs"):
+            job_id = results["jobs"][0]["id"]
+
+        if not job_id:
+            print(f"[InboxMonitor] No matching job for: {search_term}")
+            return
+
+        # Save quotes and auto-match
+        save_quotes(job_id, all_products)
+        matched = _auto_match_quotes(job_id, all_products)
+        save_vendor_prices_from_quotes(job_id, all_products)
+
+        # Auto-link to open quote requests
+        _link_upload_to_requests(job_id, all_products)
+
+        vendor_name = all_products[0].get("vendor", vendor_email or "Unknown")
+        file_names_str = ", ".join(filenames[:3]) if filenames else "email"
+        create_notification(
+            job_id, "quote_received",
+            f"Quote received from {vendor_name} — {len(all_products)} products parsed, "
+            f"{matched} auto-matched ({file_names_str})"
+        )
+        job = load_job(job_id)
+        log_activity(job_id, "agent_quote_imported",
+                     f"Auto-imported quote from {vendor_name} via email monitor",
+                     {"vendor": vendor_name, "products": len(all_products), "matched": matched})
+        print(f"[InboxMonitor] Imported {len(all_products)} products for job #{job_id} from {vendor_name}")
 
     if _inbox_monitor and _inbox_monitor.is_running:
         _inbox_monitor.stop()
@@ -208,6 +237,62 @@ class SettingsUpdate(BaseModel):
 def api_list_jobs():
     """List all jobs."""
     return list_jobs()
+
+
+@app.get("/api/jobs/match")
+def api_match_job(q: str = ""):
+    """Fuzzy-match an email subject or project reference to a job.
+    Used by the local quote agent to find which job a vendor email belongs to."""
+    if not q or len(q) < 3:
+        return {"job_id": None, "project_name": None, "gc_name": None, "score": 0}
+
+    # Clean the query — strip RE:, FW:, [EXT], etc.
+    import re as _re
+    cleaned = _re.sub(r"^(re|fw|fwd|ext|\[ext\])[\s:]+", "", q, flags=_re.IGNORECASE).strip()
+    cleaned = _re.sub(r"^(quote\s*request|pricing|price\s*list|proposal)\s*[-:–—]\s*", "", cleaned, flags=_re.IGNORECASE).strip()
+
+    # Search using existing search_all
+    results = search_all(cleaned[:80])
+    jobs_found = results.get("jobs", [])
+    if jobs_found:
+        best = jobs_found[0]
+        return {
+            "job_id": best["id"],
+            "project_name": best.get("project_name", ""),
+            "gc_name": best.get("gc_name", ""),
+            "score": 0.8,
+        }
+
+    # Try word-level matching against all jobs
+    all_jobs = list_jobs()
+    cleaned_lower = cleaned.lower()
+    cleaned_words = set(_re.sub(r"[^a-z0-9\s]", "", cleaned_lower).split())
+
+    best_job = None
+    best_score = 0
+    for job in all_jobs:
+        name = (job.get("project_name") or "").lower()
+        gc = (job.get("gc_name") or "").lower()
+        combined_words = set(_re.sub(r"[^a-z0-9\s]", "", f"{gc} {name}").split())
+        if not combined_words or not cleaned_words:
+            continue
+        overlap = cleaned_words & combined_words
+        score = len(overlap) / max(len(cleaned_words), 1)
+        if name in cleaned_lower or cleaned_lower in name:
+            score += 0.3
+        if score > best_score:
+            best_score = score
+            best_job = job
+
+    if best_job and best_score >= 0.3:
+        return {
+            "job_id": best_job["id"],
+            "project_name": best_job.get("project_name", ""),
+            "gc_name": best_job.get("gc_name", ""),
+            "score": round(best_score, 2),
+        }
+
+    return {"job_id": None, "project_name": None, "gc_name": None, "score": 0}
 
 
 @app.post("/api/jobs")
@@ -748,11 +833,20 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
         raise HTTPException(status_code=404, detail="Job not found")
     db_id = job["id"]
 
+    import hashlib as _hashlib
     all_products = []
+    skipped_files = []
     for upload in files:
+        content = await upload.read()
+
+        # Dedup: check file hash before parsing
+        file_hash = _hashlib.sha256(content).hexdigest()
+        if is_file_imported(db_id, file_hash):
+            skipped_files.append(upload.filename)
+            continue
+
         file_path = os.path.join(UPLOAD_DIR, f"quote_{db_id}_{upload.filename}")
         with open(file_path, "wb") as f:
-            content = await upload.read()
             f.write(content)
 
         try:
@@ -760,6 +854,9 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
             for p in products:
                 p["file_name"] = upload.filename
             all_products.extend(products)
+            # Record as imported
+            record_imported_file(db_id, upload.filename, file_hash, len(content),
+                                 source="manual")
         except Exception as e:
             all_products.append({"error": str(e), "file": upload.filename})
 
@@ -779,7 +876,16 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     vendors_found = list(set(p.get("vendor", "Unknown") for p in all_products if p.get("vendor")))
     log_activity(db_id, "quotes_uploaded", f"Uploaded {len(file_names)} quote file(s), {len(all_products)} products, {auto_matched} auto-matched", {"files": file_names, "vendors": vendors_found, "product_count": len(all_products), "auto_matched": auto_matched})
 
-    return {"products": all_products, "auto_matched": auto_matched, "linked_requests": linked_requests}
+    return {"products": all_products, "auto_matched": auto_matched, "linked_requests": linked_requests, "skipped_files": skipped_files}
+
+
+@app.get("/api/jobs/{job_id}/imported-files")
+def api_imported_files(job_id: str):
+    """List all files that have been imported for this job (for dedup)."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return list_imported_files(job["id"])
 
 
 @app.delete("/api/jobs/{job_id}/quotes")
