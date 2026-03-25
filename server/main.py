@@ -213,7 +213,7 @@ def api_create_job(job: JobCreate):
     """Create a new job."""
     job_id = save_job(job.model_dump())
     created = load_job(job_id)
-    log_activity(job_id, "job_created", f"Job '{body.project_name}' created")
+    log_activity(job_id, "job_created", f"Job '{job.project_name}' created")
     return {"id": job_id, "slug": created.get("slug", ""), "message": "Job created"}
 
 
