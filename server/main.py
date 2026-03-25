@@ -882,9 +882,17 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
         installed_qty = merged.get("installed_qty", 0)
         unit_price = merged.get("unit_price", 0)
 
-        # Always recompute order_qty from source values to avoid rounding drift
-        order_qty = installed_qty * (1 + waste_pct)
-        extended_cost = order_qty * unit_price
+        # Recompute order_qty unless user explicitly set it
+        if "order_qty" in m and m["order_qty"] is not None:
+            order_qty = m["order_qty"]
+        else:
+            order_qty = installed_qty * (1 + waste_pct)
+
+        # If user entered a manual total, preserve it exactly
+        if m.get("price_source") == "manual" and "extended_cost" in m and m["extended_cost"] is not None:
+            extended_cost = m["extended_cost"]
+        else:
+            extended_cost = order_qty * unit_price
 
         merged["order_qty"] = round(order_qty, 2)
         merged["extended_cost"] = round(extended_cost, 2)

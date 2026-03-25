@@ -336,10 +336,14 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
         ? (changes.order_qty || 0)
         : installedQty * (1 + wastePct)
       const unitPrice = next.unit_price || 0
+      // If user explicitly set extended_cost (manual price entry), preserve it
+      const extendedCost = ('extended_cost' in changes && changes.price_source === 'manual')
+        ? changes.extended_cost
+        : Math.round(orderQty * unitPrice * 100) / 100
       return {
         ...next,
         order_qty: Math.round(orderQty * 100) / 100,
-        extended_cost: Math.round(orderQty * unitPrice * 100) / 100,
+        extended_cost: extendedCost,
       }
     })
     onUpdate?.(updated)
