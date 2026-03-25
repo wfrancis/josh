@@ -275,6 +275,7 @@ def init_db() -> None:
             ("comment_user", "ALTER TABLE job_comments ADD COLUMN user TEXT DEFAULT 'System'"),
             ("qr_response_file", "ALTER TABLE quote_requests ADD COLUMN response_file TEXT"),
             ("qr_response_notes", "ALTER TABLE quote_requests ADD COLUMN response_notes TEXT"),
+            ("gpm_pct", "ALTER TABLE jobs ADD COLUMN gpm_pct REAL DEFAULT 0"),
         ]:
             try:
                 conn.execute(sql)

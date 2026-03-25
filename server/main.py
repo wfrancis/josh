@@ -482,6 +482,7 @@ def api_update_notes(job_id: str, body: NotesUpdate):
 
 class JobUpdate(BaseModel):
     markup_pct: Optional[float] = None
+    gpm_pct: Optional[float] = None
     project_name: Optional[str] = None
     gc_name: Optional[str] = None
     address: Optional[str] = None
@@ -1296,6 +1297,7 @@ def api_generate_bid(job_id: str):
         "unit_count": job.get("unit_count", 0),
         "salesperson": job.get("salesperson"),
         "markup_pct": job.get("markup_pct", 0),
+        "gpm_pct": job.get("gpm_pct", 0),
     }
 
     # Parse job-specific exclusions (stored as JSON string)
@@ -1319,6 +1321,11 @@ def api_generate_bid(job_id: str):
         "subtotal": bid_data["subtotal"],
         "markup_pct": bid_data["markup_pct"],
         "markup_amount": bid_data["markup_amount"],
+        "gpm_pct": bid_data.get("gpm_pct", 0),
+        "gpm_profit": bid_data.get("gpm_profit", 0),
+        "gpm_labor_adder": bid_data.get("gpm_labor_adder", 0),
+        "gpm_material_adder": bid_data.get("gpm_material_adder", 0),
+        "total_cost": bid_data.get("total_cost", 0),
         "tax_rate": bid_data["tax_rate"],
         "tax_amount": bid_data["tax_amount"],
         "grand_total": bid_data["grand_total"],

@@ -104,6 +104,25 @@ function BundleCard({ bundle, index, hasFlag }) {
             )}
           </DetailSection>
 
+          {/* GPM Profit Distribution */}
+          {(bundle.gpm_labor_adder > 0 || bundle.gpm_material_adder > 0) && (
+            <div className="rounded-xl border border-emerald-500/10 bg-emerald-500/[0.03] px-3 py-2">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-400/60 mb-1">GPM Profit</div>
+              {bundle.gpm_labor_adder > 0 && (
+                <div className="flex justify-between text-[11px]">
+                  <span className="text-gray-500">Added to labor (99%)</span>
+                  <span className="text-emerald-400/70 tabular-nums font-medium">{formatCurrency(bundle.gpm_labor_adder)}</span>
+                </div>
+              )}
+              {bundle.gpm_material_adder > 0 && (
+                <div className="flex justify-between text-[11px]">
+                  <span className="text-gray-500">Added to materials (1%)</span>
+                  <span className="text-emerald-400/70 tabular-nums font-medium">{formatCurrency(bundle.gpm_material_adder)}</span>
+                </div>
+              )}
+            </div>
+          )}
+
           {(bundle.sundry_cost === 0 || bundle.labor_cost === 0) && (
             <div className="flex items-center gap-1.5 text-[10px] text-amber-500/70 mt-1">
               <AlertTriangle className="w-3 h-3" />
@@ -389,6 +408,7 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
   const [bidData, setBidData] = useState(null)
   const [error, setError] = useState(null)
   const [markup, setMarkup] = useState(job.markup_pct ? (job.markup_pct * 100) : 0)
+  const [gpm, setGpm] = useState(job.gpm_pct ? (job.gpm_pct * 100) : 0)
   const [expandedType, setExpandedType] = useState(null)
   const [laborCatalogCount, setLaborCatalogCount] = useState(null)
 
@@ -427,9 +447,9 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
   const handleCalculate = async () => {
     setCalculating(true); setError(null)
     try {
-      // Auto-save materials + markup before generating
+      // Auto-save materials + markup + GPM before generating
       await api.updateMaterials(job.id, job.materials)
-      await api.updateJob(job.id, { markup_pct: markup / 100 })
+      await api.updateJob(job.id, { markup_pct: markup / 100, gpm_pct: gpm / 100 })
       await api.calculate(job.id)
       const result = await api.generateBid(job.id)
       setBidData(result)
@@ -500,22 +520,45 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
               </div>
             </div>
           )}
-          <div className="flex items-center gap-4 mb-4 justify-center">
-            <label className="text-sm text-gray-400 font-medium">Markup</label>
-            <div className="flex items-center gap-1">
-              <input
-                type="number"
-                step="0.5"
-                min="0"
-                max="100"
-                value={markup}
-                onChange={(e) => setMarkup(parseFloat(e.target.value) || 0)}
-                className="w-20 px-3 py-1.5 text-sm bg-white/[0.04] border border-white/[0.06] rounded-lg
-                           text-gray-200 text-right tabular-nums focus:outline-none focus:border-white/[0.12] transition-colors"
-              />
-              <span className="text-sm text-gray-500">%</span>
+          <div className="flex flex-wrap items-center gap-6 mb-4 justify-center">
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-gray-400 font-medium">GPM</label>
+              <div className="flex items-center gap-1">
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0"
+                  max="99"
+                  value={gpm}
+                  onChange={(e) => setGpm(parseFloat(e.target.value) || 0)}
+                  className="w-20 px-3 py-1.5 text-sm bg-white/[0.04] border border-white/[0.06] rounded-lg
+                             text-gray-200 text-right tabular-nums focus:outline-none focus:border-white/[0.12] transition-colors"
+                />
+                <span className="text-sm text-gray-500">%</span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-gray-400 font-medium">Markup</label>
+              <div className="flex items-center gap-1">
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0"
+                  max="100"
+                  value={markup}
+                  onChange={(e) => setMarkup(parseFloat(e.target.value) || 0)}
+                  className="w-20 px-3 py-1.5 text-sm bg-white/[0.04] border border-white/[0.06] rounded-lg
+                             text-gray-200 text-right tabular-nums focus:outline-none focus:border-white/[0.12] transition-colors"
+                />
+                <span className="text-sm text-gray-500">%</span>
+              </div>
             </div>
           </div>
+          {gpm > 0 && (
+            <p className="text-xs text-gray-500 text-center mb-4">
+              GPM distributes profit: 99% to labor, 1% to materials
+            </p>
+          )}
           <button onClick={handleCalculate} disabled={calculating}
                   className="btn-primary text-base px-8 py-3.5 glow-orange">
             {calculating ? (
@@ -573,6 +616,29 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
           <div className="glass-card p-4 sm:p-6 relative overflow-hidden">
             <div className="absolute inset-0 bg-gradient-to-br from-si-orange/[0.04] to-transparent" />
             <div className="relative space-y-3">
+              {bidData.gpm_pct > 0 && (
+                <>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-gray-500">Total Cost</span>
+                    <span className="text-gray-400 tabular-nums">{formatCurrency(bidData.total_cost)}</span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-emerald-400/80">GPM ({((bidData.gpm_pct || 0) * 100).toFixed(1)}%)</span>
+                    <span className="text-emerald-400/80 tabular-nums">{formatCurrency(bidData.gpm_profit)}</span>
+                  </div>
+                  <div className="pl-4 space-y-1">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-gray-600">→ 99% to labor</span>
+                      <span className="text-gray-500 tabular-nums">{formatCurrency(bidData.gpm_labor_adder)}</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-gray-600">→ 1% to materials</span>
+                      <span className="text-gray-500 tabular-nums">{formatCurrency(bidData.gpm_material_adder)}</span>
+                    </div>
+                  </div>
+                  <div className="h-px bg-white/[0.06]" />
+                </>
+              )}
               <div className="flex justify-between text-sm">
                 <span className="text-gray-500">Subtotal</span>
                 <span className="font-semibold text-gray-200 tabular-nums">{formatCurrency(bidData.subtotal)}</span>
