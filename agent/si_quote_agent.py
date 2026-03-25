@@ -1,11 +1,13 @@
 """
-SI Quote Agent — Local background service that monitors email for vendor quotes,
-saves them to the Dropbox Correspondence folder, and uploads to SI Bid Tool.
+SI Quote Agent — Local background service that:
+1. Monitors email for vendor quotes, saves to Dropbox, uploads to SI Bid Tool
+2. Scans Dropbox Correspondence folders for existing quotes when new jobs are created
 
 Usage:
-    python si_quote_agent.py              # Run once (poll inbox, process, exit)
+    python si_quote_agent.py              # Run once (poll inbox + scan jobs, exit)
     python si_quote_agent.py --daemon     # Run continuously (poll every N minutes)
     python si_quote_agent.py --setup      # Interactive first-time config setup
+    python si_quote_agent.py --scan-only  # Only scan Dropbox folders (skip email)
 """
 
 import argparse
@@ -63,7 +65,7 @@ log = logging.getLogger("si-quote-agent")
 
 
 def _init_db():
-    """Create the processed emails tracking table."""
+    """Create the processed emails and scanned jobs tracking tables."""
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("""
         CREATE TABLE IF NOT EXISTS processed_emails (
@@ -74,6 +76,15 @@ def _init_db():
             job_id INTEGER,
             job_name TEXT,
             files_saved TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scanned_jobs (
+            job_id INTEGER PRIMARY KEY,
+            project_name TEXT,
+            folder_path TEXT,
+            files_uploaded INTEGER DEFAULT 0,
+            scanned_at TEXT
         )
     """)
     conn.commit()
@@ -95,6 +106,24 @@ def _mark_processed(uid: str, subject: str, sender: str, job_id: int = None,
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (uid, subject, sender, datetime.now(timezone.utc).isoformat(),
          job_id, job_name, json.dumps(files_saved or [])),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _is_job_scanned(job_id: int) -> bool:
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute("SELECT 1 FROM scanned_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def _mark_job_scanned(job_id: int, project_name: str, folder_path: str, files_uploaded: int):
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute(
+        "INSERT OR REPLACE INTO scanned_jobs (job_id, project_name, folder_path, files_uploaded, scanned_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (job_id, project_name, folder_path, files_uploaded, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -488,6 +517,81 @@ def poll_inbox(config: dict):
             pass
 
 
+# ── Dropbox Folder Scanner (New Job Detection) ──────────────────────────────
+
+
+def scan_new_jobs(config: dict):
+    """Check for new jobs in the SI Bid Tool and scan their Dropbox folders
+    for existing quote files (.eml, .pdf). Uploads any found files to the API."""
+    api_url = config["api_url"]
+    bid_folder = Path(config["bid_folder_path"])
+
+    if not bid_folder.exists():
+        log.warning(f"Bid folder not found: {bid_folder} — skipping folder scan")
+        return
+
+    jobs = _api_list_jobs(api_url)
+    if not jobs:
+        return
+
+    new_jobs = [j for j in jobs if not _is_job_scanned(j["id"])]
+    if not new_jobs:
+        log.debug("No new jobs to scan.")
+        return
+
+    log.info(f"Found {len(new_jobs)} new job(s) to scan for existing quotes")
+
+    for job in new_jobs:
+        job_id = job["id"]
+        project_name = job.get("project_name", "")
+        gc_name = job.get("gc_name", "")
+
+        if not project_name:
+            _mark_job_scanned(job_id, project_name, "", 0)
+            continue
+
+        # Find matching project folder in the bid folder
+        project_folder = _find_project_folder(bid_folder, project_name, gc_name)
+        if not project_folder:
+            log.info(f"Job #{job_id} '{project_name}': no matching bid folder found")
+            _mark_job_scanned(job_id, project_name, "", 0)
+            continue
+
+        log.info(f"Job #{job_id} '{project_name}': matched folder '{project_folder.name}'")
+
+        # Look for Correspondence subfolder first, fall back to project root
+        corr_folder = project_folder / "Correspondence"
+        scan_folder = corr_folder if corr_folder.exists() else project_folder
+
+        # Collect all .eml and .pdf files (recursive)
+        quote_files = []
+        for fpath in scan_folder.rglob("*"):
+            if fpath.is_file() and fpath.suffix.lower() in (".eml", ".pdf"):
+                quote_files.append(fpath)
+
+        if not quote_files:
+            log.info(f"Job #{job_id}: no quote files in '{scan_folder}'")
+            _mark_job_scanned(job_id, project_name, str(project_folder), 0)
+            continue
+
+        log.info(f"Job #{job_id}: found {len(quote_files)} quote file(s) — uploading to bid tool")
+
+        # Upload to SI Bid Tool API
+        result = _api_upload_quotes(api_url, job_id, quote_files)
+        if result:
+            product_count = len(result.get("products", []))
+            auto_matched = result.get("auto_matched", 0)
+            skipped = len(result.get("skipped_files", []))
+            log.info(
+                f"Job #{job_id}: uploaded {product_count} products, "
+                f"{auto_matched} auto-matched, {skipped} skipped (duplicates)"
+            )
+        else:
+            log.warning(f"Job #{job_id}: upload to API failed")
+
+        _mark_job_scanned(job_id, project_name, str(project_folder), len(quote_files))
+
+
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 
@@ -495,6 +599,7 @@ def main():
     parser = argparse.ArgumentParser(description="SI Quote Agent — monitors email for vendor quotes")
     parser.add_argument("--setup", action="store_true", help="Interactive first-time config setup")
     parser.add_argument("--daemon", action="store_true", help="Run continuously (poll every N minutes)")
+    parser.add_argument("--scan-only", action="store_true", help="Only scan Dropbox folders for existing quotes (skip email)")
     args = parser.parse_args()
 
     if args.setup:
@@ -504,7 +609,11 @@ def main():
     _init_db()
     config = load_config()
 
-    if args.daemon:
+    if args.scan_only:
+        log.info("Scan-only mode — checking for new jobs with existing quote files")
+        scan_new_jobs(config)
+        log.info("Done.")
+    elif args.daemon:
         interval = config.get("poll_interval_minutes", 5) * 60
         log.info(f"Starting daemon mode — polling every {config.get('poll_interval_minutes', 5)} minutes")
         log.info(f"Monitoring: {config['email_address']}")
@@ -515,11 +624,16 @@ def main():
             try:
                 poll_inbox(config)
             except Exception as e:
-                log.error(f"Poll cycle error: {e}")
+                log.error(f"Poll cycle error (email): {e}")
+            try:
+                scan_new_jobs(config)
+            except Exception as e:
+                log.error(f"Poll cycle error (folder scan): {e}")
             time.sleep(interval)
     else:
-        # Single poll
+        # Single poll — both email and folder scan
         poll_inbox(config)
+        scan_new_jobs(config)
         log.info("Done.")
 
 
