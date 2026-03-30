@@ -271,6 +271,8 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
   const [stairLaborOptions, setStairLaborOptions] = useState([])
   const [stairCountVal, setStairCountVal] = useState(String(bundle.stair_count || ''))
   const [editingStairCount, setEditingStairCount] = useState(false)
+  const [editingLaborQty, setEditingLaborQty] = useState(null)
+  const [laborQtyVal, setLaborQtyVal] = useState('')
 
   // Sync local state when bundle prop changes
   useEffect(() => {
@@ -402,6 +404,26 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
     setEditingLaborRate(null)
   }
 
+  const saveLaborQty = (laborIdx) => {
+    const newQty = parseFloat(laborQtyVal) || 0
+    if (newQty <= 0) { setEditingLaborQty(null); return }
+    const updatedLabor = (bundle.labor_items || []).map((l, i) => {
+      if (i !== laborIdx) return l
+      const extCost = round2(newQty * l.rate)
+      return { ...l, qty: newQty, extended_cost: extCost }
+    })
+    const newLaborCost = round2(updatedLabor.reduce((s, l) => s + (l.extended_cost || 0), 0))
+    const diff = newLaborCost - (bundle.labor_cost || 0)
+    onUpdate(index, {
+      ...bundle,
+      labor_items: updatedLabor,
+      labor_cost: newLaborCost,
+      total_price: round2((bundle.total_price || 0) + diff),
+      price_override: null,
+    })
+    setEditingLaborQty(null)
+  }
+
   const saveSundryPrice = (sundryIdx) => {
     const newPrice = parseFloat(sundryPriceVal) || 0
     if (newPrice <= 0) { setEditingSundryPrice(null); return }
@@ -425,10 +447,16 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
   // ── Stair Labor ──────────────────────────────────────────────────────────
   const STAIR_KITS = {
     stretched: [
-      { sundry_name: 'Stair Pad', ratio_per_stair: 0.74, unit: 'SY', unit_price: 0 },
+      { sundry_name: 'Stair Pad (6lb 3/8″)', ratio_per_stair: 0.74, unit: 'SY', unit_price: 1.38, roll_size: 30 },
       { sundry_name: 'Stair Tack Strip', ratio_per_stair: 6.0, unit: 'LF', unit_price: 0 },
       { sundry_name: 'Stair Seam Sealer', ratio_per_stair: 5.307, unit: 'LF', unit_price: 0 },
     ],
+  }
+
+  const calcSundryQty = (rule, count) => {
+    const raw = rule.ratio_per_stair * count
+    if (rule.roll_size) return Math.ceil(raw / rule.roll_size) * rule.roll_size
+    return round2(raw)
   }
 
   const fetchStairLaborOptions = async () => {
@@ -451,14 +479,14 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
     }
 
     const kitType = (catalogEntry.description || '').toLowerCase().includes('stretch') ? 'stretched' : null
-    const kitSundries = (STAIR_KITS[kitType] || []).map(s => ({
-      sundry_name: s.sundry_name,
-      qty: round2(s.ratio_per_stair * count),
-      unit: s.unit,
-      unit_price: s.unit_price,
-      extended_cost: round2(s.ratio_per_stair * count * s.unit_price),
-      is_stair_sundry: true,
-    }))
+    const kitSundries = (STAIR_KITS[kitType] || []).map(s => {
+      const qty = calcSundryQty(s, count)
+      return {
+        sundry_name: s.sundry_name, qty, unit: s.unit,
+        unit_price: s.unit_price, extended_cost: round2(qty * s.unit_price),
+        is_stair_sundry: true,
+      }
+    })
 
     const updatedLabor = [...(bundle.labor_items || []), laborItem]
     const updatedSundries = [...(bundle.sundry_items || []), ...kitSundries]
@@ -499,7 +527,7 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
       if (!s.is_stair_sundry) return s
       const rule = kit.find(k => k.sundry_name === s.sundry_name)
       if (!rule) return s
-      const qty = round2(rule.ratio_per_stair * newCount)
+      const qty = calcSundryQty(rule, newCount)
       return { ...s, qty, extended_cost: round2(qty * s.unit_price) }
     })
 
@@ -830,7 +858,28 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
                   {(bundle.labor_items || []).map((l, li) => (
                     <tr key={li} className="group hover:bg-white/[0.02]">
                       <td className="px-3 py-2 text-gray-400">{l.labor_description || '—'}</td>
-                      <td className="px-3 py-2 text-gray-300 tabular-nums text-right">{l.qty != null ? Number(l.qty).toLocaleString(undefined, {maximumFractionDigits: 1}) : '—'}</td>
+                      <td className="px-3 py-2 text-right">
+                        {editingLaborQty === li ? (
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={laborQtyVal}
+                            onChange={(e) => setLaborQtyVal(e.target.value)}
+                            onBlur={() => saveLaborQty(li)}
+                            onKeyDown={(e) => { if (e.key === 'Enter') saveLaborQty(li); if (e.key === 'Escape') setEditingLaborQty(null) }}
+                            className="w-20 bg-white/[0.04] border border-si-accent/50 rounded px-2 py-0.5 text-white text-xs text-right focus:outline-none tabular-nums"
+                            autoFocus
+                          />
+                        ) : (
+                          <span
+                            onClick={() => { setEditingLaborQty(li); setLaborQtyVal(String(l.qty ?? '')) }}
+                            className="cursor-pointer text-gray-300 tabular-nums hover:text-si-accent transition-colors"
+                            title="Click to edit qty"
+                          >
+                            {l.qty != null ? Number(l.qty).toLocaleString(undefined, {maximumFractionDigits: 1}) : '—'}
+                          </span>
+                        )}
+                      </td>
                       <td className="px-3 py-2 text-gray-500 text-right">{l.unit || ''}</td>
                       <td className="px-3 py-2 text-right">
                         {editingLaborRate === li ? (
