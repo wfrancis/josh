@@ -28,62 +28,76 @@ WASTE_FACTORS: dict[str, float] = {
 # Each entry: list of dicts with sundry_name, coverage, unit, unit_price, notes
 SUNDRY_RULES: dict[str, list[dict]] = {
     "unit_carpet_no_pattern": [
-        {"sundry_name": "pad", "coverage": 30, "unit": "SY/roll", "waste": 0.05, "unit_price": 85.00},
+        {"sundry_name": "pad", "coverage": 30, "unit": "SY/roll", "waste": 0.05, "unit_price": 41.40,
+         "notes": "$1.38/SY x 30 SY/roll"},
         {"sundry_name": "pad_cement", "coverage": 100, "unit": "SY/each", "unit_price": 28.00},
         {"sundry_name": "tack_strip", "coverage": 400, "unit": "LF/carton", "unit_price": 22.00,
-         "notes": "estimate 1 LF per SY for perimeter"},
-        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll", "unit_price": 18.00},
+         "qty_source": "tack_strip_lf", "notes": "RFMS measured LF / 400 LF per carton"},
+        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll", "unit_price": 9.09,
+         "qty_source": "seam_tape_lf", "notes": "RFMS measured LF / 60 LF per roll"},
     ],
     "unit_carpet_pattern": [
-        {"sundry_name": "pad", "coverage": 30, "unit": "SY/roll", "waste": 0.05, "unit_price": 85.00},
+        {"sundry_name": "pad", "coverage": 30, "unit": "SY/roll", "waste": 0.05, "unit_price": 41.40,
+         "notes": "$1.38/SY x 30 SY/roll"},
         {"sundry_name": "pad_cement", "coverage": 100, "unit": "SY/each", "unit_price": 28.00},
         {"sundry_name": "tack_strip", "coverage": 400, "unit": "LF/carton", "unit_price": 22.00,
-         "notes": "estimate 1 LF per SY for perimeter"},
-        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll", "unit_price": 18.00},
+         "qty_source": "tack_strip_lf", "notes": "RFMS measured LF / 400 LF per carton"},
+        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll", "unit_price": 9.09,
+         "qty_source": "seam_tape_lf", "notes": "RFMS measured LF / 60 LF per roll"},
     ],
     "unit_lvt": [
-        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00,
-         "notes": "4-gal pail"},
-        {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 73.00,
+         "notes": "Taylor Dynamics 4-gal pail"},
+        {"sundry_name": "primer", "coverage": 350, "unit": "SF/bucket", "unit_price": 17.00,
+         "notes": "Taylor 2025 1"},
     ],
     "cpt_tile": [
-        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00,
-         "notes": "4-gal pail"},
-        {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 73.00,
+         "notes": "Taylor Dynamics 4-gal pail"},
+        {"sundry_name": "primer", "coverage": 350, "unit": "SF/bucket", "unit_price": 17.00,
+         "notes": "Taylor 2025 1"},
     ],
     "corridor_broadloom": [
         {"sundry_name": "adhesive", "coverage": 80, "unit": "SY/pail", "unit_price": 95.00,
          "notes": "direct glue adhesive"},
         {"sundry_name": "primer", "coverage": 100, "unit": "SY/pail", "unit_price": 65.00},
-        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll", "unit_price": 18.00},
+        {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll", "unit_price": 9.09},
     ],
     "floor_tile": [
-        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 18.00},
-        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag", "unit_price": 22.00},
+        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 15.95,
+         "white_price": 17.95, "notes": "grey $15.95, white $17.95 for mosaic/backsplash"},
+        {"sundry_name": "lft_thinset", "coverage": 30, "unit": "SF/bag", "unit_price": 16.85,
+         "min_tile_size": 15, "notes": "only for tiles >15x15"},
         {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag", "unit_price": 32.00,
          "notes": "approximate"},
     ],
     "wall_tile": [
-        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 18.00},
-        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag", "unit_price": 22.00},
+        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 15.95,
+         "white_price": 17.95, "notes": "grey $15.95, white $17.95 for mosaic/backsplash"},
+        {"sundry_name": "lft_thinset", "coverage": 30, "unit": "SF/bag", "unit_price": 16.85,
+         "min_tile_size": 15, "notes": "only for tiles >15x15"},
         {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag", "unit_price": 32.00,
          "notes": "approximate"},
     ],
     "backsplash": [
-        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 18.00},
-        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag", "unit_price": 22.00},
+        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 17.95,
+         "notes": "backsplash always uses white thinset"},
+        {"sundry_name": "lft_thinset", "coverage": 30, "unit": "SF/bag", "unit_price": 16.85,
+         "min_tile_size": 15, "notes": "only for tiles >15x15"},
         {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag", "unit_price": 32.00,
          "notes": "approximate"},
-        {"sundry_name": "caulking", "coverage": 4, "unit": "units/tube", "unit_price": 8.50,
-         "notes": "1 tube per 4 units"},
+        {"sundry_name": "caulking", "coverage": 2, "unit": "units/tube", "unit_price": 13.85,
+         "qty_basis": "unit_count", "notes": "1 tube per 2 unit backsplashes"},
     ],
     "tub_shower_surround": [
-        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 18.00},
-        {"sundry_name": "lft_thinset", "coverage": 33, "unit": "SF/bag", "unit_price": 22.00},
+        {"sundry_name": "thinset", "coverage": 40, "unit": "SF/bag", "unit_price": 15.95,
+         "white_price": 17.95, "notes": "grey $15.95, white $17.95 for mosaic"},
+        {"sundry_name": "lft_thinset", "coverage": 30, "unit": "SF/bag", "unit_price": 16.85,
+         "min_tile_size": 15, "notes": "only for tiles >15x15"},
         {"sundry_name": "grout", "coverage": 100, "unit": "SF/bag", "unit_price": 32.00,
          "notes": "approximate"},
-        {"sundry_name": "caulking", "coverage": 2, "unit": "units/tube", "unit_price": 8.50,
-         "notes": "1 tube per 2 units for tubs, 1 per 3 for surrounds"},
+        {"sundry_name": "caulking", "coverage": 2, "unit": "units/tube", "unit_price": 13.85,
+         "qty_basis": "tub_shower_total", "notes": "1 tube per 2 tubs/showers"},
     ],
     "rubber_base": [
         {"sundry_name": "adhesive", "coverage": 60, "unit": "LF/tube", "unit_price": 12.00},
@@ -95,11 +109,10 @@ SUNDRY_RULES: dict[str, list[dict]] = {
     "rubber_sheet": [
         {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00},
         {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
-        {"sundry_name": "seam_weld", "coverage": 500, "unit": "LF/roll", "unit_price": 45.00},
+        {"sundry_name": "weld_rod", "coverage": 500, "unit": "LF/roll", "unit_price": 45.00,
+         "qty_source": "weld_rod_lf"},
     ],
-    "transitions": [
-        {"sundry_name": "adhesive", "coverage": 100, "unit": "LF/tube", "unit_price": 12.00},
-    ],
+    "transitions": [],
     "vct": [
         {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 85.00},
         {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
@@ -128,11 +141,14 @@ FREIGHT_RATES: dict[str, float] = {
 }
 
 # ─── Labor Quantity Rules ─────────────────────────────────────────────────────
+# Labor is paid on NET installed area for everything EXCEPT unit stretch-in
+# broadloom (unit_carpet_*), where installers are paid by the roll/total material.
 LABOR_QTY_RULES: dict[str, str] = {
-    "broadloom": "with_waste",
-    "rubber_base": "no_waste",
+    "unit_carpet_no_pattern": "with_waste",
+    "unit_carpet_pattern": "with_waste",
+    "corridor_broadloom": "no_waste",
     "transitions": "from_measure",
-    "default": "with_waste",
+    "default": "no_waste",
 }
 
 # ─── Bid Description Templates ───────────────────────────────────────────────
@@ -204,6 +220,27 @@ BID_TEMPLATES: dict[str, str] = {
         "Installation is figured as Direct Glue over Primed Substrate\n"
         "Installed QTY {installed_qty} {unit}"
     ),
+}
+
+# ─── Derived Bundle Rules ────────────────────────────────────────────────────
+# Virtual bundles auto-generated from existing material quantities.
+DERIVED_BUNDLE_RULES: dict[str, dict] = {
+    "waterproofing": {
+        "source_type": "tub_shower_surround",
+        "material_name": "Custom RedGard Fluid Applied Membrane",
+        "coverage_sf": 275,
+        "pail_cost": 156.00,
+        "mesh_per_100_units": 300.00,
+        "labor_rate_sf": 0.55,
+    },
+    "crack_isolation": {
+        "source_type": "floor_tile",
+        "area_type": "common",
+        "material_name": "Custom RedGard Crack Isolation Membrane",
+        "coverage_sf": 500,
+        "pail_cost": 156.00,
+        "labor_rate_sf": 0.28,
+    },
 }
 
 # ─── Exclusions Template ─────────────────────────────────────────────────────

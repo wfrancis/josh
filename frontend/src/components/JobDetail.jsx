@@ -11,6 +11,7 @@ import StepIndicator from './StepIndicator'
 
 import MaterialsTable from './MaterialsTable'
 import BidPreview from './BidPreview'
+import ProposalEditor from './ProposalEditor'
 import QuoteUpload from './QuoteUpload'
 import VendorQuoteFlow from './VendorQuoteFlow'
 import QuoteTracker from './QuoteTracker'
@@ -76,9 +77,12 @@ export default function JobDetail() {
       zip: job.zip || '',
       salesperson: job.salesperson || '',
       tax_rate: job.tax_rate ? (job.tax_rate * 100).toFixed(2) : '',
+      gpm_pct: job.gpm_pct ? (job.gpm_pct * 100).toFixed(2) : '',
       unit_count: job.unit_count || '',
+      tub_shower_count: job.tub_shower_count || '',
       architect: job.architect || '',
       designer: job.designer || '',
+      textura_fee: job.textura_fee || 0,
     })
     setEditing(true)
   }
@@ -100,9 +104,12 @@ export default function JobDetail() {
         zip: editForm.zip || null,
         salesperson: editForm.salesperson || null,
         tax_rate: editForm.tax_rate ? parseFloat(editForm.tax_rate) / 100 : 0,
+        gpm_pct: editForm.gpm_pct ? parseFloat(editForm.gpm_pct) / 100 : 0,
         unit_count: editForm.unit_count ? parseInt(editForm.unit_count) : 0,
+        tub_shower_count: editForm.tub_shower_count ? parseInt(editForm.tub_shower_count) : 0,
         architect: editForm.architect || null,
         designer: editForm.designer || null,
+        textura_fee: editForm.textura_fee ? 1 : 0,
       }
       await api.updateJob(jobId, updates)
       const updated = await api.getJob(jobId)
@@ -177,7 +184,28 @@ export default function JobDetail() {
     setIsDirty(true)
   }
 
+  // Auto-save: debounce 1.5s after any material edit
+  const autoSaveRef = useRef(null)
+  useEffect(() => {
+    if (!isDirty || !job?.materials?.length) return
+    clearTimeout(autoSaveRef.current)
+    autoSaveRef.current = setTimeout(async () => {
+      try {
+        setSaving(true)
+        const result = await api.updateMaterials(jobId, job.materials)
+        setJob(j => ({ ...j, materials: result.materials }))
+        setIsDirty(false)
+      } catch (err) {
+        console.error('Auto-save failed:', err)
+      } finally {
+        setSaving(false)
+      }
+    }, 1500)
+    return () => clearTimeout(autoSaveRef.current)
+  }, [isDirty, job?.materials])
+
   const handleSavePricing = async () => {
+    clearTimeout(autoSaveRef.current)
     setSaving(true)
     setError(null)
     try {
@@ -280,11 +308,28 @@ export default function JobDetail() {
                   <span className="text-xs text-gray-500 mb-1 block">Tax Rate (%)</span>
                   <input type="number" step="0.01" value={editForm.tax_rate} onChange={e => setEditForm(f => ({ ...f, tax_rate: e.target.value }))}
                     className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
-                    placeholder="0.00" />
+                    placeholder="9.15" />
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-500 mb-1 block">GPM (%)</span>
+                  <input type="number" step="0.01" value={editForm.gpm_pct} onChange={e => setEditForm(f => ({ ...f, gpm_pct: e.target.value }))}
+                    className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                    placeholder="23" />
+                </label>
+                <label className="flex items-center gap-3 py-2">
+                  <input type="checkbox" checked={!!editForm.textura_fee} onChange={e => setEditForm(f => ({ ...f, textura_fee: e.target.checked ? 1 : 0 }))}
+                    className="w-4 h-4 rounded border-white/10 bg-white/[0.04] text-si-accent focus:ring-si-accent/50" />
+                  <span className="text-xs text-gray-500">Textura Fee (0.22%)</span>
                 </label>
                 <label className="block">
                   <span className="text-xs text-gray-500 mb-1 block">Unit Count</span>
                   <input type="number" value={editForm.unit_count} onChange={e => setEditForm(f => ({ ...f, unit_count: e.target.value }))}
+                    className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                    placeholder="0" />
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-500 mb-1 block">Tubs/Showers per Unit</span>
+                  <input type="number" value={editForm.tub_shower_count} onChange={e => setEditForm(f => ({ ...f, tub_shower_count: e.target.value }))}
                     className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
                     placeholder="0" />
                 </label>
@@ -339,9 +384,19 @@ export default function JobDetail() {
                     <Percent className="w-3.5 h-3.5" /> {(job.tax_rate * 100).toFixed(2)}% tax
                   </span>
                 )}
+                {job.gpm_pct > 0 && (
+                  <span className="flex items-center gap-1.5">
+                    <Percent className="w-3.5 h-3.5" /> {(job.gpm_pct * 100).toFixed(0)}% GPM
+                  </span>
+                )}
                 {job.unit_count > 0 && (
                   <span className="flex items-center gap-1.5">
                     <Hash className="w-3.5 h-3.5" /> {job.unit_count} units
+                  </span>
+                )}
+                {job.tub_shower_count > 0 && (
+                  <span className="flex items-center gap-1.5">
+                    <Hash className="w-3.5 h-3.5" /> {job.tub_shower_count} tubs/showers per unit
                   </span>
                 )}
                 {aiSettings && (
@@ -702,16 +757,7 @@ export default function JobDetail() {
 
         {step === 'bid' && (
           <div className="glass-card p-4 sm:p-8">
-            <h2 className="text-lg font-bold text-white mb-1">Generate Bid</h2>
-            <p className="text-sm text-gray-500 mb-6">
-              Calculate sundries, labor, and freight, then generate the bid PDF.
-            </p>
-            <BidPreview job={job} api={api} onGoBack={() => setStep('takeoff')}
-              onBidCleared={async () => {
-                const updated = await api.getJob(jobId)
-                setJob(updated)
-              }}
-            />
+            <ProposalEditor job={job} api={api} onGoBack={() => setStep('takeoff')} />
           </div>
         )}
       </div>

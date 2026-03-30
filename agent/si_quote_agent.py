@@ -319,29 +319,39 @@ def _api_match_job(api_url: str, subject: str) -> dict | None:
 
 
 def _api_upload_quotes(api_url: str, job_id: int, files: list[Path]) -> dict | None:
-    """Upload quote files to the SI Bid Tool API."""
-    try:
-        multipart = []
-        for fpath in files:
-            multipart.append(("files", (fpath.name, open(fpath, "rb"), "application/octet-stream")))
+    """Upload quote files to the SI Bid Tool API, one at a time to avoid timeouts."""
+    all_products = []
+    total_matched = 0
+    total_skipped = []
 
-        resp = requests.post(
-            f"{api_url}/api/jobs/{job_id}/upload-quotes",
-            files=multipart,
-            timeout=120,
-        )
+    for fpath in files:
+        try:
+            log.info(f"  Uploading: {fpath.name}")
+            with open(fpath, "rb") as fh:
+                resp = requests.post(
+                    f"{api_url}/api/jobs/{job_id}/upload-quotes",
+                    files=[("files", (fpath.name, fh, "application/octet-stream"))],
+                    timeout=180,
+                )
+            if resp.status_code == 200:
+                data = resp.json()
+                products = data.get("products", [])
+                matched = data.get("auto_matched", 0)
+                skipped = data.get("skipped_files", [])
+                all_products.extend(products)
+                total_matched += matched
+                total_skipped.extend(skipped)
+                log.info(f"  {fpath.name}: {len(products)} products, {matched} matched")
+            else:
+                log.error(f"  {fpath.name}: upload failed ({resp.status_code}): {resp.text[:200]}")
+        except Exception as e:
+            log.error(f"  {fpath.name}: upload error: {e}")
 
-        # Close file handles
-        for _, (_, fh, _) in multipart:
-            fh.close()
-
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            log.error(f"Upload failed ({resp.status_code}): {resp.text[:200]}")
-    except Exception as e:
-        log.error(f"Upload error: {e}")
-    return None
+    return {
+        "products": all_products,
+        "auto_matched": total_matched,
+        "skipped_files": total_skipped,
+    }
 
 
 def _api_list_jobs(api_url: str) -> list[dict]:

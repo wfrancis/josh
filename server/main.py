@@ -43,9 +43,11 @@ from dropbox_scanner import match_folder
 from sundry_calc import calculate_sundries_for_materials
 from labor_calc import calculate_labor_for_materials, load_labor_catalog, load_labor_catalog_from_pdf, get_labor_catalog
 from bid_assembler import assemble_bid
-from pdf_generator import generate_bid_pdf
+from pdf_generator import generate_bid_pdf, generate_proposal_pdf
+from proposal_bundler import generate_proposal_data
 from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE
 from email_agent import compose_quote_request, send_email, generate_quote_request_text
+from ai_client import chat_complete, get_provider_info
 from inbox_monitor import InboxMonitor
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
@@ -219,11 +221,14 @@ class JobCreate(BaseModel):
     state: Optional[str] = None
     zip: Optional[str] = None
     tax_rate: float = 0.0
+    gpm_pct: float = 0.0
     unit_count: int = 0
+    tub_shower_count: int = 0
     salesperson: Optional[str] = None
     notes: Optional[str] = None
     architect: Optional[str] = None
     designer: Optional[str] = None
+    textura_fee: int = 0
 
 
 class MaterialUpdate(BaseModel):
@@ -240,6 +245,7 @@ class BulkDeleteRequest(BaseModel):
 
 class SettingsUpdate(BaseModel):
     openai_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
     openai_model: Optional[str] = None
     multi_pass_count: Optional[int] = None
     email_automation_enabled: Optional[str] = None
@@ -491,10 +497,12 @@ class JobUpdate(BaseModel):
     zip: Optional[str] = None
     tax_rate: Optional[float] = None
     unit_count: Optional[int] = None
+    tub_shower_count: Optional[int] = None
     salesperson: Optional[str] = None
     notes: Optional[str] = None
     architect: Optional[str] = None
     designer: Optional[str] = None
+    textura_fee: Optional[int] = None
 
 @app.put("/api/jobs/{job_id}")
 def api_update_job(job_id: str, body: JobUpdate):
@@ -559,6 +567,11 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         if not rfms_job_info and any(file_job_info.values()):
             rfms_job_info = file_job_info
 
+        # Detect area_type from filename: "common area(s)" or "amenity" → common, else unit
+        fname_lower = (file.filename or "").lower()
+        area_type = "common" if ("common area" in fname_lower or "amenity" in fname_lower or "common_area" in fname_lower) else "unit"
+        for mat in result.get("materials", []):
+            mat["area_type"] = area_type
         all_materials_raw.extend(result.get("materials", []))
 
     # Update job info from RFMS if available
@@ -594,6 +607,13 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
                 "material_type": m.get("material_type", "unknown"),
                 "installed_qty": m.get("qty", 0),
                 "unit": m.get("unit"),
+                "area_type": m.get("area_type", "unit"),
+                "tack_strip_lf": m.get("tack_strip_lf", 0),
+                "seam_tape_lf": m.get("seam_tape_lf", 0),
+                "pad_sy": m.get("pad_sy", 0),
+                "is_mosaic": m.get("is_mosaic", False),
+                "is_penny_hex": m.get("is_penny_hex", False),
+                "crack_isolation_sf": m.get("crack_isolation_sf", 0),
             })
 
     # Load waste factors from DB (falls back to config defaults)
@@ -639,6 +659,13 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             "extended_cost": round(unit_price * round(order_qty, 2), 2),
             "ai_confidence": m.get("ai_confidence"),
             "quote_status": quote_status,
+            "area_type": m.get("area_type", "unit"),
+            "tack_strip_lf": m.get("tack_strip_lf", 0),
+            "seam_tape_lf": m.get("seam_tape_lf", 0),
+            "pad_sy": m.get("pad_sy", 0),
+            "is_mosaic": m.get("is_mosaic", False),
+            "is_penny_hex": m.get("is_penny_hex", False),
+            "crack_isolation_sf": m.get("crack_isolation_sf", 0),
         })
 
     material_ids = save_materials(db_id, materials)
@@ -651,6 +678,36 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
     log_activity(db_id, "rfms_uploaded", f"Uploaded {len(file_names)} RFMS file(s), {len(materials)} materials parsed", {"files": file_names, "material_count": len(materials)})
 
     return {"job_info": rfms_job_info, "materials": materials}
+
+
+def _apply_fob_freight(mat: dict, prod: dict):
+    """When vendor freight is FOB (we pay shipping), apply internal freight rates
+    based on material type. CPT/carpet tile uses cpt_tile rate, LVT uses lvt rate."""
+    freight_val = prod.get("freight") or ""
+    if not isinstance(freight_val, str) or "fob" not in freight_val.lower():
+        return  # Not FOB — freight is either included or a dollar amount
+
+    mat_type = (mat.get("material_type") or "").lower()
+    unit = (mat.get("unit") or "").upper()
+    description = (mat.get("description") or "").lower()
+
+    # Determine freight rate from internal config based on material type
+    rate = None
+    if mat_type in ("carpet_tile", "cpt", "cpt_tile") or "carpet tile" in description or "cpt" in (mat.get("item_code") or "").lower():
+        rate = FREIGHT_RATES.get("cpt_tile", 1.25)  # per SY
+    elif mat_type in ("lvt", "unit_lvt") or "lvt" in description or "lvt" in (mat.get("item_code") or "").lower() or "vinyl plank" in description:
+        # Determine LVT thickness from description
+        if "5mm" in description or "4.5mm" in description or "5.0mm" in description:
+            rate = FREIGHT_RATES.get("lvt_5mm", 0.25)  # per SF
+        else:
+            rate = FREIGHT_RATES.get("lvt_2mm", 0.11)  # per SF
+    elif mat_type in ("broadloom",) or "broadloom" in description:
+        rate = FREIGHT_RATES.get("broadloom", 0.65)  # per SY
+
+    if rate is not None:
+        mat["freight_per_unit"] = rate
+        mat["freight_source"] = "internal_rate"
+        print(f"[freight] FOB detected for {mat.get('item_code', '?')} — applied internal rate ${rate}/{unit}")
 
 
 def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
@@ -668,6 +725,7 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
     updated = False
     matched_mat_indices = set()
     matched_prod_indices = set()
+    conn = _get_conn()
 
     # Phase 1: Fast matching — item_code AND description-based product identifiers
     # Extract searchable identifiers from material descriptions.
@@ -689,6 +747,27 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             identifiers.extend(codes)
         return identifiers
 
+    # Generic words that should NOT count as meaningful matches on their own
+    GENERIC_WORDS = {
+        "tile", "carpet", "floor", "flooring", "interface", "mohawk", "shaw",
+        "matte", "glossy", "polished", "honed", "satin", "brushed",  # finishes
+        "black", "white", "grey", "gray", "brown", "beige", "cream", "ivory",  # colors
+        "wall", "base", "trim", "edge", "cove", "corner",  # generic parts
+        "custom", "standard", "premium", "commercial", "residential",
+        "rubber", "vinyl", "porcelain", "ceramic", "glass", "stone", "marble",
+        "daltile", "johnsonite", "schluter", "mannington",  # vendor names
+        "rectangular", "square", "round", "linear", "straight",
+        "size", "type", "style", "color", "finish", "series",
+    }
+
+    # Also collect ALL quote products across the DB for this job (not just current upload)
+    # so we can score against the full universe of quotes
+    all_quotes = conn.execute(
+        "SELECT id, product_name, vendor, unit_price, unit, file_name FROM job_quotes WHERE job_id=?",
+        (job_id,)
+    ).fetchall() if conn else []
+    all_quote_products = [dict(q) for q in all_quotes] if all_quotes else products
+
     for mat_idx, mat in enumerate(materials):
         if mat.get("unit_price") and mat["unit_price"] > 0:
             continue  # already priced
@@ -700,59 +779,99 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
         # Build list of identifiers to match against
         mat_identifiers = _extract_identifiers(description)
 
-        for prod_idx, prod in enumerate(products):
-            if prod.get("error") or not prod.get("unit_price"):
+        # Score ALL products and pick the best match instead of first-match-wins
+        best_score = 0
+        best_prod = None
+        best_prod_idx = None
+
+        # Use all_quote_products for scoring (includes previous uploads)
+        scoring_products = all_quote_products if all_quote_products else products
+
+        for prod_idx, prod in enumerate(scoring_products):
+            if prod.get("error"):
+                continue
+            unit_price = prod.get("unit_price", 0)
+            if not unit_price:
                 continue
             prod_name = (prod.get("product_name") or "").strip().lower()
             prod_desc = (prod.get("description") or "").strip().lower()
             prod_text = f"{prod_name} {prod_desc}"
 
-            match = False
+            score = 0
 
-            # Check 1: item_code in product name/desc (original logic)
+            # Check 1: item_code in product name/desc (strong signal: +10)
             if item_code and len(item_code) >= 3:
                 if item_code in prod_name or item_code in prod_desc:
-                    match = True
+                    score += 10
 
             # Check 2: product identifiers from description match quote product
-            # e.g. "wg100" from material desc found in "WG100 and WG200" quote product
-            if not match and mat_identifiers:
+            if mat_identifiers:
                 for ident in mat_identifiers:
                     if len(ident) >= 3 and ident in prod_text:
-                        match = True
-                        break
+                        # Weight by specificity: codes with digits worth more
+                        if _re.search(r'\d', ident):
+                            score += 5  # alphanumeric codes like "d617", "wg100"
+                        elif ident not in GENERIC_WORDS and len(ident) >= 4:
+                            score += 2  # meaningful product names
+                        elif ident not in GENERIC_WORDS:
+                            score += 1
 
             # Check 3: quote product name found in material description
-            # e.g. "breakout" from quote found in "Interface - Breakout - ..."
-            if not match and prod_name and len(prod_name) >= 4:
-                # Try the full product name or its key parts
+            if prod_name and len(prod_name) >= 4:
                 prod_parts = [p.strip() for p in prod_name.split(" - ") if len(p.strip()) >= 3]
                 for pp in prod_parts:
                     if pp in description:
-                        match = True
-                        break
-                # Also try individual significant words from product name
-                if not match:
-                    prod_words = [w for w in _re.findall(r'[a-z]+\d*\S*', prod_name) if len(w) >= 4]
-                    desc_words = set(_re.findall(r'[a-z]+\d*\S*', description))
-                    for pw in prod_words:
-                        if pw in desc_words and pw not in ("tile", "carpet", "floor", "flooring", "interface", "mohawk", "shaw"):
-                            match = True
-                            break
+                        score += 3
 
-            if match:
-                mat["unit_price"] = prod["unit_price"]
-                mat["vendor"] = prod.get("vendor", "")
-                mat["quote_status"] = "quoted"
-                mat["price_source"] = "vendor_quote"
-                order_qty = mat.get("order_qty", 0)
-                mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
-                matched += 1
-                updated = True
-                matched_mat_indices.add(mat_idx)
-                # NOTE: Don't add prod_idx to matched_prod_indices here —
-                # one quote product (e.g. "WG100 $27.25") can match multiple materials
-                break
+                # Individual significant words from product name
+                prod_words = [w for w in _re.findall(r'[a-z]+\d*\S*', prod_name) if len(w) >= 4]
+                desc_words = set(_re.findall(r'[a-z]+\d*\S*', description))
+                for pw in prod_words:
+                    if pw in desc_words and pw not in GENERIC_WORDS:
+                        score += 2
+
+            # Check 4: Word-level overlap scoring (handles comma-separated quote formats)
+            # Tokenize both sides into individual words and count meaningful overlaps
+            desc_tokens = set(_re.findall(r'[a-z]+', description))
+            prod_tokens = set(_re.findall(r'[a-z]+', prod_text))
+            meaningful_overlap = (desc_tokens & prod_tokens) - GENERIC_WORDS - {"and", "the", "for", "with"}
+            # Only count words with 4+ chars to avoid noise
+            meaningful_overlap = {w for w in meaningful_overlap if len(w) >= 4}
+            score += len(meaningful_overlap)  # +1 per meaningful shared word
+
+            # Check 5: Dimension/size match (e.g. "1x1", "12x24", "4x12")
+            # Normalize dimensions to (w,h) tuples to handle "12" x 24"" vs "12x24"
+            desc_dims = set(_re.findall(r'(\d+)\s*["\']?\s*x\s*["\']?\s*(\d+)', description))
+            prod_dims = set(_re.findall(r'(\d+)\s*["\']?\s*x\s*["\']?\s*(\d+)', prod_text))
+            if desc_dims and prod_dims and desc_dims & prod_dims:
+                score += 3  # matching dimensions is strong signal
+
+            # Check 6: Vendor name match (bonus if vendor matches)
+            mat_vendor = (mat.get("vendor") or "").strip().lower()
+            prod_vendor = (prod.get("vendor") or "").strip().lower()
+            # Also check if material description contains vendor name
+            if prod_vendor and len(prod_vendor) >= 3:
+                if prod_vendor in description or (mat_vendor and prod_vendor in mat_vendor):
+                    score += 1  # small bonus for vendor match
+
+            if score > best_score:
+                best_score = score
+                best_prod = prod
+                best_prod_idx = prod_idx
+
+        # Require a minimum score of 3 to accept a match (prevents single generic word matches)
+        if best_score >= 3 and best_prod:
+            mat["unit_price"] = best_prod["unit_price"]
+            mat["vendor"] = best_prod.get("vendor", "")
+            mat["quote_status"] = "quoted"
+            mat["price_source"] = "vendor_quote"
+            # If freight is FOB, apply internal freight rates by material type
+            _apply_fob_freight(mat, best_prod)
+            order_qty = mat.get("order_qty", 0)
+            mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
+            matched += 1
+            updated = True
+            matched_mat_indices.add(mat_idx)
 
     # Phase 2: AI fuzzy matching for remaining unmatched
     unmatched_mats = [(i, m) for i, m in enumerate(materials) if i not in matched_mat_indices and (not m.get("unit_price") or m["unit_price"] == 0)]
@@ -767,18 +886,36 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             mat["vendor"] = prod.get("vendor", "")
             mat["quote_status"] = "quoted"
             mat["price_source"] = "vendor_quote"
+            _apply_fob_freight(mat, prod)
             order_qty = mat.get("order_qty", 0)
             mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
             matched += 1
             updated = True
 
-    # Phase 3: Price book matching for remaining unpriced materials
-    # Check if any unpriced materials match a vendor price book (e.g. Schluter transitions)
+    # Phase 3: Apply transition default rules (Carpet→LVT = Silver Pin, etc.)
     still_unpriced = [i for i, m in enumerate(materials) if i not in matched_mat_indices and (not m.get("unit_price") or m["unit_price"] == 0)]
     if still_unpriced:
-        pb_matched = _price_book_match(materials, still_unpriced)
+        td_matched = _apply_transition_defaults(materials, still_unpriced)
+        if td_matched > 0:
+            matched += td_matched
+            updated = True
+
+    # Phase 4: Price book matching for remaining unpriced materials
+    # Check if any unpriced materials match a vendor price book (e.g. Schluter transitions)
+    still_unpriced2 = [i for i, m in enumerate(materials) if i not in matched_mat_indices and (not m.get("unit_price") or m["unit_price"] == 0)]
+    if still_unpriced2:
+        pb_matched = _price_book_match(materials, still_unpriced2)
         if pb_matched > 0:
             matched += pb_matched
+            updated = True
+
+    # Phase 5: Apply labor rates to all Schluter transitions (even those matched by vendor quotes)
+    for mat in materials:
+        if (mat.get("vendor") or "").lower() == "schluter" and not mat.get("labor_rate_lf"):
+            desc = (mat.get("description") or "").lower()
+            is_premium = any(line in desc for line in SCHLUTER_PREMIUM_LABOR_LINES)
+            mat["labor_rate_lf"] = SCHLUTER_LABOR_RATE_PREMIUM if is_premium else SCHLUTER_LABOR_RATE_DEFAULT
+            mat["labor_catalog"] = "Schluter Schiene"
             updated = True
 
     if updated:
@@ -795,12 +932,13 @@ def _ai_match_quotes(unmatched_mats: list, unmatched_prods: list) -> list:
     settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
-    if not api_key:
+
+    provider = get_provider_info(api_key)
+    if not provider["available"]:
         return []
 
     try:
-        import openai, json
-        client = openai.OpenAI(api_key=api_key)
+        import json
 
         mat_lines = []
         for i, (idx, m) in enumerate(unmatched_mats):
@@ -821,15 +959,17 @@ Vendor quoted products:
 Match products to materials based on: brand name, product line, color, style number, dimensions.
 Only match if you are 80%+ confident they are the same product.
 
-Return ONLY a JSON array: [{{"material": "M0", "product": "P0", "confidence": 0.95}}]
-Return empty array [] if no confident matches."""
+Return ONLY a JSON object with a "matches" key: {{"matches": [{{"material": "M0", "product": "P0", "confidence": 0.95}}]}}
+Return {{"matches": []}} if no confident matches."""
 
-        response = client.chat.completions.create(
+        raw = chat_complete(
+            system="You are a commercial flooring product matching assistant. Return JSON only.",
+            user=prompt,
+            api_key=api_key,
             model=model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
+            json_mode=True,
         )
-        result = json.loads(response.choices[0].message.content)
+        result = json.loads(raw)
 
         # Parse result
         matches_raw = result if isinstance(result, list) else result.get("matches", result.get("results", result.get("data", [])))
@@ -857,48 +997,207 @@ Return empty array [] if no confident matches."""
         return []
 
 
+# ─── Transition Default Rules ───────────────────────────────────────────────
+# These rules define the default product, price, and labor rate for each
+# transition type. Applied BEFORE AI/price-book matching so they take priority.
+TRANSITION_DEFAULTS = [
+    {
+        "match": "carpet to lvt",  # substring match on description
+        "product": "Silver Pin Metal",
+        "vendor": "Silver Pin Metal",
+        "price_per_piece": 7.94,
+        "stick_length_lf": 12.0,
+        "labor_rate_lf": 0,  # no install labor for pin metal
+        "labor_catalog": "",
+        "price_source": "default_rule",
+    },
+    {
+        "match": "vertical exposed edge",
+        "product": "Schluter Jolly J 100 AE",
+        "vendor": "Schluter",
+        "price_per_piece": 9.78,  # Jolly J 100 AE net
+        "stick_length_lf": 8.0 + 2.0 / 12.0,  # 8'-2"
+        "labor_rate_lf": 0.50,
+        "labor_catalog": "Schluter Schiene",
+        "price_source": "price_book",
+    },
+    {
+        "match": "tile to lvt",
+        "product": "Schluter Reno-U AEU 100",
+        "vendor": "Schluter",
+        "price_per_piece": 12.15,  # Reno-U AEU 100 net
+        "stick_length_lf": 8.0 + 2.0 / 12.0,
+        "labor_rate_lf": 0.50,
+        "labor_catalog": "Schluter Schiene",
+        "price_source": "price_book",
+    },
+    {
+        "match": "tile to carpet",  # tile to CPT
+        "match_alt": "tile to cpt",
+        "product": "Schluter Reno-TK AETK 100",
+        "vendor": "Schluter",
+        "price_per_piece": 12.80,  # Reno-TK AETK 100 net
+        "stick_length_lf": 8.0 + 2.0 / 12.0,
+        "labor_rate_lf": 0.50,
+        "labor_catalog": "Schluter Schiene",
+        "price_source": "price_book",
+    },
+]
+
+# Catch-all default for any transition not matched by specific rules above.
+# Generic transitions (Carpet to Tile, Carpet to VCT, @Courtyard, etc.)
+# default to Schluter Reno-TK AE 100.
+TRANSITION_CATCHALL = {
+    "product": "Schluter Reno-TK AETK 100",
+    "vendor": "Schluter",
+    "price_per_piece": 12.80,  # Reno-TK AETK 100 net
+    "stick_length_lf": 8.0 + 2.0 / 12.0,
+    "labor_rate_lf": 0.50,
+    "labor_catalog": "Schluter Schiene",
+    "price_source": "price_book",
+}
+
+# Schluter labor rate exceptions: Dilex, Rondec, Quadec = $1.07/LF (all others = $0.50/LF)
+SCHLUTER_LABOR_RATE_DEFAULT = 0.50
+SCHLUTER_LABOR_RATE_PREMIUM = 1.07
+SCHLUTER_PREMIUM_LABOR_LINES = {"dilex", "rondec", "quadec"}
+
+
+def _apply_transition_defaults(materials: list[dict], unpriced_indices: list[int]) -> int:
+    """Apply default transition product/pricing rules BEFORE AI matching.
+    Returns number of materials matched."""
+    import math
+    matched = 0
+
+    for mat_idx in unpriced_indices:
+        mat = materials[mat_idx]
+        mat_type = (mat.get("material_type") or "").lower()
+        if mat_type != "transitions":
+            continue
+
+        description = (mat.get("description") or "").lower()
+        order_qty_lf = mat.get("order_qty", 0)
+        fixture_count = mat.get("fixture_count", 0) or 0
+
+        # Check each rule
+        for rule in TRANSITION_DEFAULTS:
+            match_str = rule["match"]
+            match_alt = rule.get("match_alt", "")
+            if match_str in description or (match_alt and match_alt in description):
+                price_per_piece = rule["price_per_piece"]
+                stick_lf = rule["stick_length_lf"]
+
+                # Calculate pieces
+                if rule["vendor"] == "Schluter":
+                    pieces = _calc_schluter_pieces(order_qty_lf, fixture_count, stick_lf)
+                else:
+                    pieces = math.ceil(order_qty_lf / stick_lf) if order_qty_lf > 0 else 0
+
+                mat["unit_price"] = price_per_piece
+                mat["vendor"] = rule["vendor"]
+                mat["price_source"] = rule["price_source"]
+                mat["quote_status"] = "price_book"
+                mat["extended_cost"] = round(pieces * price_per_piece, 2)
+
+                # Set labor rate
+                labor_rate = rule["labor_rate_lf"]
+                mat["labor_rate_lf"] = labor_rate
+                mat["labor_catalog"] = rule.get("labor_catalog", "")
+
+                matched += 1
+                break  # first matching rule wins
+        else:
+            # No specific rule matched — skip named Schluter products (they'll match via price book)
+            # For generic transitions, apply catch-all default (Reno-TK AE 100)
+            if "schluter" not in description:
+                rule = TRANSITION_CATCHALL
+                stick_lf = rule["stick_length_lf"]
+                pieces = _calc_schluter_pieces(order_qty_lf, fixture_count, stick_lf)
+                mat["unit_price"] = rule["price_per_piece"]
+                mat["vendor"] = rule["vendor"]
+                mat["price_source"] = rule["price_source"]
+                mat["quote_status"] = "price_book"
+                mat["extended_cost"] = round(pieces * rule["price_per_piece"], 2)
+                mat["labor_rate_lf"] = rule["labor_rate_lf"]
+                mat["labor_catalog"] = rule["labor_catalog"]
+                matched += 1
+
+        # If no rule matched but it's a named Schluter product, apply labor rates
+        if (mat.get("vendor") or "").lower() == "schluter" and not mat.get("labor_rate_lf"):
+            is_premium = any(line in description for line in SCHLUTER_PREMIUM_LABOR_LINES)
+            mat["labor_rate_lf"] = SCHLUTER_LABOR_RATE_PREMIUM if is_premium else SCHLUTER_LABOR_RATE_DEFAULT
+            mat["labor_catalog"] = "Schluter Schiene"
+
+    return matched
+
+
+def _calc_schluter_pieces(order_qty_lf: float, fixture_count: int, piece_lf: float) -> int:
+    """Calculate number of Schluter pieces needed.
+    If fixture_count is set, each fixture needs full pieces per side (no splicing across fixtures).
+    E.g. 200 showers at 7'-6" each side: each side = 1 piece, 2 sides = 2 pieces/fixture = 400 total.
+    Without fixture_count, just divides total LF by piece length."""
+    import math
+    if order_qty_lf <= 0:
+        return 0
+    if fixture_count and fixture_count > 0:
+        # Fixture-based: each fixture needs full pieces, can't reuse leftover across fixtures
+        # Assume 2 sides per fixture (tub/shower has left + right)
+        sides = 2
+        lf_per_side = order_qty_lf / (fixture_count * sides)
+        pieces_per_side = math.ceil(lf_per_side / piece_lf)
+        return fixture_count * sides * pieces_per_side
+    else:
+        return math.ceil(order_qty_lf / piece_lf)
+
+
 def _price_book_match(materials: list[dict], unpriced_indices: list[int]) -> int:
     """Match unpriced materials against vendor price books (e.g. Schluter).
-    Looks for Schluter product identifiers (SCHIENE, RENO-TK, JOLLY, KERDI, etc.)
-    in the material description and applies the net price (45% of list for Schluter)."""
+    Only matches when description explicitly contains a Schluter product line name
+    as a whole word AND has additional identifying info (item number, size, etc.)."""
     import re as _re
 
-    # Known Schluter product lines to search for in descriptions
+    # Known Schluter product lines — only match as whole words to avoid false positives
+    # e.g. "deco" must not match "decorative", "trep" must not match "trepidation"
     SCHLUTER_LINES = [
         "schiene", "reno-t", "reno-tk", "reno-u", "reno-v", "reno-ramp",
-        "jolly", "ditra", "kerdi", "kerdi-band", "kerdi-board", "deco",
-        "dilex", "quadec", "rondec", "trep",
+        "jolly", "ditra", "kerdi", "kerdi-band", "kerdi-board",
+        "dilex-ahka", "dilex-ahk", "dilex", "quadec", "rondec", "trep-e", "trep-b", "trep-s",
+        "trep-fl", "trep-ek", "trep-se", "trep-tap",
     ]
+    # Compile whole-word patterns (avoid substring matches like "deco" in "decorative")
+    SCHLUTER_PATTERNS = {
+        line: _re.compile(r'\b' + _re.escape(line) + r'\b', _re.IGNORECASE)
+        for line in SCHLUTER_LINES
+    }
 
     matched = 0
+    ai_candidates = []
     for mat_idx in unpriced_indices:
         mat = materials[mat_idx]
         description = (mat.get("description") or "").lower()
         item_code = (mat.get("item_code") or "").lower()
         mat_type = (mat.get("material_type") or "").lower()
 
-        # Only check price book for transition-type materials or if description mentions Schluter
-        if "schluter" not in description and mat_type not in ("transitions", "waterproofing", "tread_riser"):
-            # Also check if any Schluter product line appears in the description
-            has_schluter = False
-            for line in SCHLUTER_LINES:
-                if line in description:
-                    has_schluter = True
-                    break
-            if not has_schluter:
-                continue
+        # STRICT GATE: Only match if material is a known Schluter-applicable type
+        # OR the description explicitly says "schluter"
+        is_schluter_type = mat_type in ("transitions", "waterproofing", "tread_riser")
+        has_schluter_name = "schluter" in description
+
+        if not is_schluter_type and not has_schluter_name:
+            # For unknown types (no AI classification), require "schluter" in description
+            # Do NOT fall through to product line name matching — too many false positives
+            continue
 
         # Try to find the product line and item number in the description
         # Descriptions look like: "Schluter SCHIENE A 100 AE" or "RENO-TK ETK 80"
         best_match = None
         best_score = 0
 
-        for line in SCHLUTER_LINES:
-            if line in description:
-                # Found a product line — search the price book
+        for line, pattern in SCHLUTER_PATTERNS.items():
+            if pattern.search(description):
+                # Found a product line as a whole word — search the price book
                 results = match_price_book(line.upper())
                 if not results:
-                    # Try with hyphenated variants
                     results = match_price_book(line.upper().replace("-", ""))
                 if not results:
                     continue
@@ -929,15 +1228,156 @@ def _price_book_match(materials: list[dict], unpriced_indices: list[int]) -> int
 
         if best_match and best_score >= 3:
             # Apply price book net price (already discounted)
-            mat["unit_price"] = best_match["net_price"]
+            # Schluter transitions are sold per PIECE (each piece = 8'-2" = 8.1667 LF)
+            import math
+            SCHLUTER_PIECE_LF = 8.0 + 2.0 / 12.0  # 8'-2" = 8.1667 LF
+            price_per_piece = best_match["net_price"]
+            order_qty_lf = mat.get("order_qty", 0)
+            fixture_count = mat.get("fixture_count", 0) or 0
+            pieces_needed = _calc_schluter_pieces(order_qty_lf, fixture_count, SCHLUTER_PIECE_LF)
+            mat["unit_price"] = price_per_piece
             mat["vendor"] = "Schluter"
             mat["quote_status"] = "price_book"
             mat["price_source"] = "price_book"
-            order_qty = mat.get("order_qty", 0)
-            mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
+            mat["extended_cost"] = round(pieces_needed * price_per_piece, 2)
+            # Apply labor rate
+            is_premium = any(line in description for line in SCHLUTER_PREMIUM_LABOR_LINES)
+            mat["labor_rate_lf"] = SCHLUTER_LABOR_RATE_PREMIUM if is_premium else SCHLUTER_LABOR_RATE_DEFAULT
+            mat["labor_catalog"] = "Schluter Schiene"
             matched += 1
+        elif (is_schluter_type or has_schluter_name) and (not best_match or best_score < 3):
+            # No rule-based match or low-confidence match — queue for AI matching
+            ai_candidates.append(mat_idx)
+
+    # Phase 2: AI matching for remaining Schluter materials
+    if ai_candidates:
+        ai_matched = _ai_price_book_match(materials, ai_candidates)
+        matched += ai_matched
 
     return matched
+
+
+def _ai_price_book_match(materials: list[dict], candidate_indices: list[int]) -> int:
+    """Use AI to match Schluter materials to the price book when rule-based matching fails."""
+    import json as _json
+
+    settings = get_settings()
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+    model = settings.get("openai_model", "gpt-5-mini")
+    provider = get_provider_info(api_key)
+    if not provider["available"]:
+        return 0
+
+    # Group candidates by detected product line to minimize AI calls
+    # Gather all price book entries for relevant product lines
+    all_pb_items = search_price_book("", vendor="Schluter")
+    if not all_pb_items:
+        return 0
+
+    # Build material list for AI
+    mat_lines = []
+    for i, idx in enumerate(candidate_indices):
+        mat = materials[idx]
+        desc = mat.get("description", "")
+        unit = mat.get("unit", "")
+        mat_lines.append(f"M{i}: {desc} (unit: {unit})")
+
+    # Build price book summary grouped by product line
+    pb_by_line = {}
+    for pb in all_pb_items:
+        line = pb["product_line"]
+        if line not in pb_by_line:
+            pb_by_line[line] = []
+        pb_by_line[line].append(pb)
+
+    pb_lines = []
+    for line, items in sorted(pb_by_line.items()):
+        # Show a sample of items per line to keep prompt reasonable
+        samples = items[:8]
+        for s in samples:
+            pb_lines.append(
+                f"  {line} | {s['item_no']} | {s['material_finish']} | "
+                f"size: {s.get('size_inches', '')} | ${s['net_price']}/{s.get('unit', 'length')}"
+            )
+        if len(items) > 8:
+            pb_lines.append(f"  ... and {len(items) - 8} more {line} items")
+
+    prompt = f"""Match these Schluter transition materials to the correct product from our Schluter price book.
+
+Materials to match:
+{chr(10).join(mat_lines)}
+
+Schluter Price Book:
+{chr(10).join(pb_lines)}
+
+Rules:
+- Match based on product line (Reno-TK, Reno-Ramp, Dilex, Schiene, etc.), material/finish, and size
+- DEFAULT: Unless the description explicitly specifies a different finish or size, always default to AE (satin anodized aluminum) finish and 100 (10mm / 3/8") size. This is standard estimating practice.
+- Only use a different finish (ATGB, ATG, AK, etc.) if the description explicitly calls it out in the finish schedule
+- If size is not specified, use 100 (10mm)
+- If the exact product line is not in the price book, check if a similar or parent product line exists (e.g. DILEX-AHKA may relate to DECO or JOLLY). If nothing similar exists, return no match for that material
+- Only match if you are confident the product line and material type are correct
+
+Return JSON: {{"matches": [{{"material": "M0", "item_no": "AETK 80", "product_line": "RENO-TK", "net_price": 9.80, "confidence": 0.9, "reason": "Reno-TK anodized aluminum 5/16 inch"}}]}}
+Return {{"matches": []}} for any materials you cannot confidently match."""
+
+    try:
+        # Sanitize prompt to avoid encoding issues on Windows
+        prompt = prompt.encode("ascii", errors="replace").decode("ascii")
+
+        raw = chat_complete(
+            system="You are a Schluter product matching expert for commercial flooring. Return JSON only.",
+            user=prompt,
+            api_key=api_key,
+            model=model,
+            json_mode=True,
+        )
+        result = _json.loads(raw)
+        matches_raw = result if isinstance(result, list) else result.get("matches", [])
+        if not isinstance(matches_raw, list):
+            matches_raw = []
+
+        matched = 0
+        for m in matches_raw:
+            conf = m.get("confidence", 0)
+            if conf < 0.7:
+                continue
+            mat_ref = m.get("material", "")
+            try:
+                local_idx = int(mat_ref.replace("M", ""))
+                mat_idx = candidate_indices[local_idx]
+            except (ValueError, IndexError):
+                continue
+
+            net_price = m.get("net_price", 0)
+            if not net_price or net_price <= 0:
+                continue
+
+            mat = materials[mat_idx]
+            # Schluter transitions are sold per PIECE (each piece = 8'-2" = 8.1667 LF)
+            import math
+            SCHLUTER_PIECE_LF = 8.0 + 2.0 / 12.0  # 8'-2" = 8.1667 LF
+            price_per_piece = net_price
+            order_qty_lf = mat.get("order_qty", 0)
+            fixture_count = mat.get("fixture_count", 0) or 0
+            pieces_needed = _calc_schluter_pieces(order_qty_lf, fixture_count, SCHLUTER_PIECE_LF)
+            mat["unit_price"] = price_per_piece
+            mat["vendor"] = "Schluter"
+            mat["quote_status"] = "price_book"
+            mat["price_source"] = "price_book"
+            mat["extended_cost"] = round(pieces_needed * price_per_piece, 2)
+            # Apply labor rate
+            desc_lower = (mat.get("description") or "").lower()
+            is_premium = any(line in desc_lower for line in SCHLUTER_PREMIUM_LABOR_LINES)
+            mat["labor_rate_lf"] = SCHLUTER_LABOR_RATE_PREMIUM if is_premium else SCHLUTER_LABOR_RATE_DEFAULT
+            mat["labor_catalog"] = "Schluter Schiene"
+            matched += 1
+            print(f"[price_book] AI matched: {mat.get('description', '')[:60]} -> {m.get('product_line')} {m.get('item_no')} ${net_price}/pc x {pieces_needed}pc")
+
+        return matched
+    except Exception as e:
+        print(f"[price_book] AI matching error: {e}")
+        return 0
 
 
 def _link_upload_to_requests(job_id: int, products: list[dict]):
@@ -993,6 +1433,10 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     db_id = job["id"]
 
     import hashlib as _hashlib
+
+    # Ensure AI config is loaded (key may have been added since server start)
+    _apply_openai_config()
+
     all_products = []
     skipped_files = []
     for upload in files:
@@ -1013,9 +1457,10 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
             for p in products:
                 p["file_name"] = upload.filename
             all_products.extend(products)
-            # Record as imported
-            record_imported_file(db_id, upload.filename, file_hash, len(content),
-                                 source="manual")
+            # Only record as imported if we actually extracted products
+            if products:
+                record_imported_file(db_id, upload.filename, file_hash, len(content),
+                                     source="manual")
         except Exception as e:
             all_products.append({"error": str(e), "file": upload.filename})
 
@@ -1110,6 +1555,16 @@ def api_calculate(job_id: str):
 
     materials = job.get("materials", [])
 
+    # Stamp job-level counts for sundry calculations
+    unit_count = job.get("unit_count", 0) or 0
+    tub_shower_count = job.get("tub_shower_count", 0) or 0
+    for mat in materials:
+        mtype = mat.get("material_type", "")
+        if mtype == "backsplash":
+            mat["unit_count"] = unit_count
+        if mtype == "tub_shower_surround":
+            mat["tub_shower_total"] = tub_shower_count
+
     # Calculate sundries
     sundries = calculate_sundries_for_materials(materials)
     save_sundries(job["id"], sundries)
@@ -1156,6 +1611,21 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
         # If user entered a manual total, preserve it exactly
         if m.get("price_source") == "manual" and "extended_cost" in m and m["extended_cost"] is not None:
             extended_cost = m["extended_cost"]
+        elif merged.get("price_source") in ("price_book", "default_rule") and (merged.get("material_type") or "").lower() == "transitions":
+            # Transitions: recalculate piece-based pricing
+            import math
+            vendor = (merged.get("vendor") or "").lower()
+            # Determine stick length based on vendor/product
+            if "silver pin" in vendor:
+                stick_lf = 12.0  # Silver Pin Metal = 12' sticks
+            else:
+                stick_lf = 8.0 + 2.0 / 12.0  # Schluter = 8'-2"
+            fixture_count = merged.get("fixture_count", 0) or 0
+            if vendor == "schluter":
+                pieces = _calc_schluter_pieces(order_qty, fixture_count, stick_lf)
+            else:
+                pieces = math.ceil(order_qty / stick_lf) if order_qty > 0 else 0
+            extended_cost = pieces * unit_price
         else:
             extended_cost = order_qty * unit_price
 
@@ -1188,10 +1658,10 @@ def api_estimate_price(job_id: str, material_idx: int):
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
 
-    if not api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key not configured")
+    provider = get_provider_info(api_key)
+    if not provider["available"]:
+        raise HTTPException(status_code=400, detail="No AI API key configured (set OpenAI or ANTHROPIC_API_KEY)")
 
-    import openai
     import json as _json
 
     # Check price history and price list for existing data to inform the estimate
@@ -1221,8 +1691,6 @@ def api_estimate_price(job_id: str, material_idx: int):
 
     history_context = "\n".join(context_lines) if context_lines else "No historical pricing data available."
 
-    client = openai.OpenAI(api_key=api_key)
-
     prompt = f"""Estimate the unit price for this flooring/interior material.
 Return JSON: {{"estimated_price": <number>, "confidence": <0-1>, "reasoning": "<brief>"}}
 
@@ -1239,15 +1707,14 @@ If historical data is available, weight it heavily in your estimate. Otherwise, 
 The price should be per {m.get('unit', 'unit')}. Be conservative — estimate on the higher side."""
 
     try:
-        response = client.chat.completions.create(
+        raw = chat_complete(
+            system="You are a commercial flooring estimator. Return only valid JSON.",
+            user=prompt,
+            api_key=api_key,
             model=model,
-            messages=[
-                {"role": "system", "content": "You are a commercial flooring estimator. Return only valid JSON."},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
+            json_mode=True,
         )
-        result = _json.loads(response.choices[0].message.content)
+        result = _json.loads(raw)
         estimated_price = float(result.get("estimated_price", 0))
         confidence = float(result.get("confidence", 0.5))
         reasoning = result.get("reasoning", "")
@@ -1323,8 +1790,6 @@ def api_generate_bid(job_id: str):
         "markup_amount": bid_data["markup_amount"],
         "gpm_pct": bid_data.get("gpm_pct", 0),
         "gpm_profit": bid_data.get("gpm_profit", 0),
-        "gpm_labor_adder": bid_data.get("gpm_labor_adder", 0),
-        "gpm_material_adder": bid_data.get("gpm_material_adder", 0),
         "total_cost": bid_data.get("total_cost", 0),
         "tax_rate": bid_data["tax_rate"],
         "tax_amount": bid_data["tax_amount"],
@@ -1372,6 +1837,123 @@ def api_download_bid_pdf(job_id: str):
         pdf_path,
         media_type="application/pdf",
         filename=f"bid_{job_id}.pdf",
+    )
+
+
+# ── Proposal Endpoints ─────────────────────────────────────────────────────
+
+@app.post("/api/jobs/{job_id}/proposal/rewrite-descriptions")
+async def api_rewrite_descriptions(job_id: str, request: Request):
+    """Use AI to rewrite bundle descriptions in professional proposal style."""
+    from description_agent import rewrite_bundle_descriptions
+
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    body = await request.json()
+    bundles = body.get("bundles", [])
+    if not bundles:
+        raise HTTPException(status_code=400, detail="No bundles provided")
+
+    descriptions = rewrite_bundle_descriptions(bundles, job)
+    return {"descriptions": descriptions}
+
+
+@app.post("/api/jobs/{job_id}/proposal/generate")
+def api_generate_proposal(job_id: str):
+    """Auto-bundle materials into proposal line items."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Always recalculate sundries and labor to reflect latest rules/flags
+    materials = job.get("materials", [])
+    unit_count = job.get("unit_count", 0) or 0
+    tub_shower_count = job.get("tub_shower_count", 0) or 0
+
+    # Stamp job-level counts onto materials so sundry_calc can use them
+    for mat in materials:
+        mtype = mat.get("material_type", "")
+        if mtype == "backsplash":
+            mat["unit_count"] = unit_count
+        if mtype == "tub_shower_surround":
+            mat["tub_shower_total"] = tub_shower_count  # total tubs/showers on job
+
+    if materials:
+        sundries = calculate_sundries_for_materials(materials)
+        save_sundries(job["id"], sundries)
+        labor_items = calculate_labor_for_materials(materials)
+        save_labor(job["id"], labor_items)
+        # Reload job with freshly calculated sundries/labor
+        job = load_job(job_id)
+
+    proposal = generate_proposal_data(job["id"], job)
+    return proposal
+
+
+@app.post("/api/jobs/{job_id}/proposal/pdf")
+async def api_generate_proposal_pdf(job_id: str, request: Request):
+    """Generate proposal PDF from edited bundle data."""
+    import json as _json
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    body = await request.json()
+    # Build proposal data from the edited bundles sent by frontend
+    job_info = {
+        "id": job["id"],
+        "project_name": job["project_name"],
+        "gc_name": job.get("gc_name"),
+        "address": job.get("address"),
+        "city": job.get("city"),
+        "state": job.get("state"),
+        "zip": job.get("zip"),
+        "tax_rate": job.get("tax_rate", 0),
+        "unit_count": job.get("unit_count", 0),
+        "salesperson": job.get("salesperson"),
+    }
+
+    proposal_data = {
+        "job_info": job_info,
+        "bundles": body.get("bundles", []),
+        "subtotal": body.get("subtotal", 0),
+        "tax_rate": body.get("tax_rate", 0),
+        "tax_amount": body.get("tax_amount", 0),
+        "grand_total": body.get("grand_total", 0),
+        "notes": body.get("notes", []),
+        "terms": body.get("terms", []),
+        "exclusions": body.get("exclusions", []),
+    }
+
+    pdf_path = os.path.join(PDF_DIR, f"proposal_{job['id']}.pdf")
+    generate_proposal_pdf(proposal_data, pdf_path)
+
+    # Save proposal data to job
+    job["proposal_data"] = _json.dumps(proposal_data)
+    save_job(job)
+
+    log_activity(job["id"], "proposal_generated",
+                 f"Proposal generated: {len(proposal_data['bundles'])} bundles, total ${proposal_data['grand_total']:,.2f}",
+                 {"bundle_count": len(proposal_data["bundles"]), "grand_total": proposal_data["grand_total"]})
+
+    return {"status": "ok", "pdf_url": f"/api/jobs/{job_id}/proposal.pdf"}
+
+
+@app.get("/api/jobs/{job_id}/proposal.pdf")
+def api_download_proposal_pdf(job_id: str):
+    """Download the generated proposal PDF."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    pdf_path = os.path.join(PDF_DIR, f"proposal_{job['id']}.pdf")
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="PDF not found. Generate proposal first.")
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=f"{job['project_name']} Proposal.pdf",
     )
 
 
@@ -1685,7 +2267,6 @@ async def api_upload_price_list(file: UploadFile = File(...)):
 def _parse_price_list_pdf(file_path: str, api_key: str = None, model: str = "gpt-5-mini") -> list[dict]:
     """Parse a price list PDF using AI."""
     import pdfplumber
-    from openai import OpenAI
 
     text_parts = []
     with pdfplumber.open(file_path) as pdf:
@@ -1697,16 +2278,9 @@ def _parse_price_list_pdf(file_path: str, api_key: str = None, model: str = "gpt
     if not text.strip():
         return []
 
-    client_kwargs = {}
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    client = OpenAI(**client_kwargs)
-
     import json as _json
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": """You are parsing a material price list for a flooring/interiors company.
+
+    system_msg = """You are parsing a material price list for a flooring/interiors company.
 Extract every product/material entry into a JSON array.
 
 For each entry, extract:
@@ -1717,12 +2291,16 @@ For each entry, extract:
 - vendor: the vendor/manufacturer if shown
 - notes: any additional notes
 
-Return JSON: {"entries": [{"product_name": "...", "material_type": "...", "unit": "...", "unit_price": 0.00, "vendor": "...", "notes": "..."}, ...]}"""},
-            {"role": "user", "content": text},
-        ],
-        response_format={"type": "json_object"},
+Return JSON: {"entries": [{"product_name": "...", "material_type": "...", "unit": "...", "unit_price": 0.00, "vendor": "...", "notes": "..."}, ...]}"""
+
+    raw = chat_complete(
+        system=system_msg,
+        user=text,
+        api_key=api_key,
+        model=model,
+        json_mode=True,
     )
-    parsed = _json.loads(response.choices[0].message.content)
+    parsed = _json.loads(raw)
     return parsed.get("entries", [])
 
 
@@ -1732,7 +2310,7 @@ Return JSON: {"entries": [{"product_name": "...", "material_type": "...", "unit"
 def api_get_settings():
     """Get app settings (API key is masked)."""
     settings = get_settings()
-    # Mask the API key for display
+    # Mask API keys for display
     raw_key = settings.get("openai_api_key", "")
     if raw_key and len(raw_key) > 8:
         masked = raw_key[:4] + "•" * (len(raw_key) - 8) + raw_key[-4:]
@@ -1740,14 +2318,28 @@ def api_get_settings():
         masked = "•" * len(raw_key)
     else:
         masked = ""
+
+    anthropic_key = settings.get("anthropic_api_key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+    if anthropic_key and len(anthropic_key) > 8:
+        anthropic_masked = anthropic_key[:4] + "•" * (len(anthropic_key) - 8) + anthropic_key[-4:]
+    elif anthropic_key:
+        anthropic_masked = "•" * len(anthropic_key)
+    else:
+        anthropic_masked = ""
+
+    provider = get_provider_info(raw_key)
     return {
         "openai_api_key_set": bool(raw_key),
         "openai_api_key_masked": masked,
+        "anthropic_api_key_set": bool(anthropic_key),
+        "anthropic_api_key_masked": anthropic_masked,
         "openai_model": settings.get("openai_model", "gpt-5-mini"),
         "multi_pass_count": int(settings.get("multi_pass_count", "2")),
         "email_automation_enabled": settings.get("email_automation_enabled", "false"),
         "email_config": settings.get("email_config", ""),
         "bid_folder_path": settings.get("bid_folder_path", ""),
+        "ai_provider": provider["provider"],
+        "ai_available": provider["available"],
     }
 
 
@@ -1757,6 +2349,8 @@ def api_update_settings(body: SettingsUpdate):
     updates = {}
     if body.openai_api_key is not None:
         updates["openai_api_key"] = body.openai_api_key
+    if body.anthropic_api_key is not None:
+        updates["anthropic_api_key"] = body.anthropic_api_key
     if body.openai_model is not None:
         if body.openai_model not in ("gpt-5-mini", "gpt-5.4"):
             raise HTTPException(status_code=400, detail="Invalid model. Choose gpt-5-mini or gpt-5.4")
@@ -1784,13 +2378,22 @@ def api_update_settings(body: SettingsUpdate):
 
 
 def _apply_openai_config(settings: dict = None):
-    """Apply stored OpenAI settings to the quote parser."""
+    """Apply stored AI settings to the quote parser and ai_client."""
     if settings is None:
         settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
     passes = int(settings.get("multi_pass_count", "2"))
-    print(f"[openai_config] api_key={'set' if api_key else 'MISSING'}, model={model}, passes={passes}")
+
+    # If Anthropic key is stored in settings, set it in the environment
+    # so ai_client.py can detect it as a fallback
+    anthropic_key = settings.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+    if anthropic_key and not os.environ.get("ANTHROPIC_API_KEY"):
+        os.environ["ANTHROPIC_API_KEY"] = anthropic_key
+
+    provider = get_provider_info(api_key)
+    print(f"[ai_config] provider={provider['provider']}, openai_key={'set' if api_key else 'MISSING'}, "
+          f"anthropic_key={'set' if anthropic_key else 'MISSING'}, model={model}, passes={passes}")
     set_openai_config(api_key=api_key, model=model, num_passes=passes)
 
 
@@ -2152,10 +2755,8 @@ async def api_detect_vendors(job_id: str):
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
 
-    if api_key:
-        import openai
-        client = openai.OpenAI(api_key=api_key)
-
+    provider = get_provider_info(api_key)
+    if provider["available"]:
         # Send ALL materials to AI — fast-pass results shown as "pre-assigned"
         # AI's job: confirm correct ones, correct wrong ones, fill in unknowns
         mat_lines = []
@@ -2205,12 +2806,14 @@ async def api_detect_vendors(job_id: str):
         )
 
         try:
-            resp = client.chat.completions.create(
+            raw = chat_complete(
+                system="You are a commercial flooring industry expert.",
+                user=prompt,
+                api_key=api_key,
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
+                json_mode=True,
             )
-            result = json.loads(resp.choices[0].message.content)
+            result = json.loads(raw)
 
             detections = result if isinstance(result, list) else next(
                 (result[k] for k in ("results", "vendors", "detections", "materials", "data")
@@ -2344,11 +2947,10 @@ async def api_generate_quote_text(job_id: str, request: Request):
     settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key not configured")
 
-    import openai
-    client = openai.OpenAI(api_key=api_key)
+    provider = get_provider_info(api_key)
+    if not provider["available"]:
+        raise HTTPException(status_code=400, detail="No AI API key configured (set OpenAI or ANTHROPIC_API_KEY)")
 
     mat_lines = []
     for i, m in enumerate(selected, 1):
@@ -2406,11 +3008,12 @@ Write a clean, professional email body. Requirements:
 - Start with a brief intro about the project"""
 
     try:
-        response = client.chat.completions.create(
+        text = chat_complete(
+            system="You are a professional flooring estimator composing vendor emails.",
+            user=prompt,
+            api_key=api_key,
             model=model,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.choices[0].message.content.strip()
+        ).strip()
         return {"text": text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI quote text generation failed: {str(e)}")
@@ -2469,11 +3072,10 @@ async def api_suggest_vendors(job_id: str, request: Request):
     settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key not configured")
 
-    import openai
-    client = openai.OpenAI(api_key=api_key)
+    provider = get_provider_info(api_key)
+    if not provider["available"]:
+        raise HTTPException(status_code=400, detail="No AI API key configured (set OpenAI or ANTHROPIC_API_KEY)")
 
     prompt = f"""You are a commercial flooring industry expert. Given these unassigned materials and our vendor history, suggest which vendor to contact for each material.
 
@@ -2492,13 +3094,14 @@ Return ONLY a JSON array: [{{"material_index": 0, "suggested_vendor": "Vendor Na
 If you cannot suggest a vendor, omit that material from the array."""
 
     try:
-        response = client.chat.completions.create(
+        raw = chat_complete(
+            system="You are a commercial flooring industry expert.",
+            user=prompt,
+            api_key=api_key,
             model=model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
+            json_mode=True,
         )
-        import json
-        result = json.loads(response.choices[0].message.content)
+        result = json.loads(raw)
         if isinstance(result, list):
             suggestions = result
         else:
@@ -2526,11 +3129,10 @@ async def api_suggest_vendor_contacts(request: Request):
     settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key not configured")
 
-    import openai
-    client = openai.OpenAI(api_key=api_key)
+    provider = get_provider_info(api_key)
+    if not provider["available"]:
+        raise HTTPException(status_code=400, detail="No AI API key configured (set OpenAI or ANTHROPIC_API_KEY)")
 
     prompt = f"""You are a commercial flooring industry expert. For each flooring manufacturer/vendor listed below,
 provide helpful contact information and suggestions for finding a sales rep.
@@ -2549,13 +3151,14 @@ Return ONLY a JSON array:
 [{{"vendor": "Name", "website": "url", "find_rep_url": "url or instruction", "general_email": "email or empty", "products": "what they sell", "notes": "helpful tip"}}]"""
 
     try:
-        response = client.chat.completions.create(
+        raw = chat_complete(
+            system="You are a commercial flooring industry expert.",
+            user=prompt,
+            api_key=api_key,
             model=model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
+            json_mode=True,
         )
-        import json
-        result = json.loads(response.choices[0].message.content)
+        result = json.loads(raw)
         suggestions = result if isinstance(result, list) else result.get("suggestions", result.get("vendors", []))
         return {"suggestions": suggestions}
     except Exception as e:

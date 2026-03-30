@@ -19,7 +19,7 @@ from collections import defaultdict
 PDF_PATH = os.path.join(os.path.expanduser("~"), "Desktop", "schluter-price-list-usa.pdf")
 OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "schluter_prices.json")
 
-DISCOUNT_MULTIPLIER = 0.45  # Net price = list_price * 0.45
+DISCOUNT_MULTIPLIER = 0.55  # Net price = list_price * 0.55 (45% off list)
 
 
 def parse_profile_pages(pdf):

@@ -48,7 +48,7 @@ function CreateJobModal({ open, onClose, onCreated }) {
   const [form, setForm] = useState({
     project_name: '', gc_name: '', architect: '', designer: '',
     address: '', city: '', state: '', zip: '',
-    tax_rate: 0, unit_count: 0, salesperson: '',
+    tax_rate: 0, gpm_pct: 0, unit_count: 0, tub_shower_count: 0, salesperson: '',
   })
   const [saving, setSaving] = useState(false)
 
@@ -61,7 +61,9 @@ function CreateJobModal({ open, onClose, onCreated }) {
       const result = await api.createJob({
         ...form,
         tax_rate: parseFloat(form.tax_rate) / 100 || 0,
+        gpm_pct: parseFloat(form.gpm_pct) / 100 || 0,
         unit_count: parseInt(form.unit_count) || 0,
+        tub_shower_count: parseInt(form.tub_shower_count) || 0,
       })
       onCreated(result.slug || result.id)
     } catch (err) {
@@ -126,16 +128,26 @@ function CreateJobModal({ open, onClose, onCreated }) {
                 <input className="input" value={form.zip} onChange={set('zip')} />
               </div>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
               <div>
                 <label className="label">Tax Rate (%)</label>
                 <input className="input" type="number" step="0.01" min="0" max="20"
-                       value={form.tax_rate} onChange={set('tax_rate')} placeholder="0.00" />
+                       value={form.tax_rate} onChange={set('tax_rate')} placeholder="9.15" />
+              </div>
+              <div>
+                <label className="label">GPM (%)</label>
+                <input className="input" type="number" step="0.01" min="0" max="100"
+                       value={form.gpm_pct} onChange={set('gpm_pct')} placeholder="23" />
               </div>
               <div>
                 <label className="label">Unit Count</label>
                 <input className="input" type="number" min="0"
                        value={form.unit_count} onChange={set('unit_count')} placeholder="0" />
+              </div>
+              <div>
+                <label className="label">Total Tubs/Showers</label>
+                <input className="input" type="number" min="0"
+                       value={form.tub_shower_count} onChange={set('tub_shower_count')} placeholder="0" />
               </div>
             </div>
             <div className="flex gap-3 pt-3">

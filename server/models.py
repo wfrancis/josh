@@ -62,6 +62,9 @@ def init_db() -> None:
                 vendor TEXT,
                 unit_price REAL DEFAULT 0,
                 extended_cost REAL DEFAULT 0,
+                fixture_count INTEGER DEFAULT 0,
+                labor_rate_lf REAL DEFAULT 0,
+                labor_catalog TEXT,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
 
@@ -276,6 +279,20 @@ def init_db() -> None:
             ("qr_response_file", "ALTER TABLE quote_requests ADD COLUMN response_file TEXT"),
             ("qr_response_notes", "ALTER TABLE quote_requests ADD COLUMN response_notes TEXT"),
             ("gpm_pct", "ALTER TABLE jobs ADD COLUMN gpm_pct REAL DEFAULT 0"),
+            ("freight_per_unit", "ALTER TABLE job_materials ADD COLUMN freight_per_unit REAL"),
+            ("freight_source", "ALTER TABLE job_materials ADD COLUMN freight_source TEXT"),
+            ("proposal_data", "ALTER TABLE jobs ADD COLUMN proposal_data TEXT"),
+            ("tack_strip_lf", "ALTER TABLE job_materials ADD COLUMN tack_strip_lf REAL DEFAULT 0"),
+            ("seam_tape_lf", "ALTER TABLE job_materials ADD COLUMN seam_tape_lf REAL DEFAULT 0"),
+            ("pad_sy", "ALTER TABLE job_materials ADD COLUMN pad_sy REAL DEFAULT 0"),
+            ("area_type", "ALTER TABLE job_materials ADD COLUMN area_type TEXT DEFAULT 'unit'"),
+            ("tub_shower_count", "ALTER TABLE jobs ADD COLUMN tub_shower_count INTEGER DEFAULT 0"),
+            ("is_mosaic", "ALTER TABLE job_materials ADD COLUMN is_mosaic BOOLEAN DEFAULT 0"),
+            ("is_penny_hex", "ALTER TABLE job_materials ADD COLUMN is_penny_hex BOOLEAN DEFAULT 0"),
+            ("crack_isolation_sf", "ALTER TABLE job_materials ADD COLUMN crack_isolation_sf REAL DEFAULT 0"),
+            ("sundry_freight", "ALTER TABLE job_sundries ADD COLUMN freight_cost REAL DEFAULT 0"),
+            ("weld_rod_lf", "ALTER TABLE job_materials ADD COLUMN weld_rod_lf REAL DEFAULT 0"),
+            ("textura_fee", "ALTER TABLE jobs ADD COLUMN textura_fee INTEGER DEFAULT 0"),
         ]:
             try:
                 conn.execute(sql)
@@ -332,43 +349,53 @@ def save_job(job_data: dict) -> int:
     try:
         job_id = job_data.get("id")
         slug = _slugify(job_data["project_name"])
-        # Ensure bid_data is stored as JSON string, not dict
+        # Ensure bid_data and proposal_data are stored as JSON string, not dict
         bid_data_val = job_data.get("bid_data")
         if isinstance(bid_data_val, dict):
             bid_data_val = _json.dumps(bid_data_val)
+        proposal_data_val = job_data.get("proposal_data")
+        if isinstance(proposal_data_val, dict):
+            proposal_data_val = _json.dumps(proposal_data_val)
         if job_id:
             slug = _make_unique_slug(conn, slug, exclude_id=job_id)
             conn.execute("""
                 UPDATE jobs SET
                     project_name=?, gc_name=?, address=?, city=?, state=?, zip=?,
-                    tax_rate=?, unit_count=?, salesperson=?, notes=?, slug=?, exclusions=?,
-                    markup_pct=?, bid_data=?, architect=?, designer=?
+                    tax_rate=?, gpm_pct=?, unit_count=?, tub_shower_count=?,
+                    salesperson=?, notes=?, slug=?, exclusions=?,
+                    markup_pct=?, bid_data=?, architect=?, designer=?, proposal_data=?,
+                    textura_fee=?
                 WHERE id=?
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
                 job_data.get("state"), job_data.get("zip"),
-                job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
+                job_data.get("tax_rate", 0), job_data.get("gpm_pct", 0),
+                job_data.get("unit_count", 0), job_data.get("tub_shower_count", 0),
                 job_data.get("salesperson"), job_data.get("notes"), slug,
                 job_data.get("exclusions"), job_data.get("markup_pct", 0),
                 bid_data_val, job_data.get("architect"), job_data.get("designer"),
-                job_id
+                proposal_data_val, job_data.get("textura_fee", 0), job_id
             ))
         else:
             slug = _make_unique_slug(conn, slug)
             cur = conn.execute("""
                 INSERT INTO jobs (project_name, gc_name, address, city, state, zip,
-                                  tax_rate, unit_count, salesperson, notes, slug, exclusions,
-                                  markup_pct, bid_data, architect, designer, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  tax_rate, gpm_pct, unit_count, tub_shower_count,
+                                  salesperson, notes, slug, exclusions,
+                                  markup_pct, bid_data, architect, designer, proposal_data,
+                                  textura_fee, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_data["project_name"], job_data.get("gc_name"),
                 job_data.get("address"), job_data.get("city"),
                 job_data.get("state"), job_data.get("zip"),
-                job_data.get("tax_rate", 0), job_data.get("unit_count", 0),
+                job_data.get("tax_rate", 0), job_data.get("gpm_pct", 0),
+                job_data.get("unit_count", 0), job_data.get("tub_shower_count", 0),
                 job_data.get("salesperson"), job_data.get("notes"), slug,
                 job_data.get("exclusions"), job_data.get("markup_pct", 0),
                 bid_data_val, job_data.get("architect"), job_data.get("designer"),
+                proposal_data_val, job_data.get("textura_fee", 0),
                 datetime.now().isoformat()
             ))
             job_id = cur.lastrowid
@@ -390,14 +417,24 @@ def save_materials(job_id: int, materials: list[dict]) -> list[int]:
                 INSERT INTO job_materials
                     (job_id, item_code, description, material_type, installed_qty,
                      unit, waste_pct, order_qty, vendor, unit_price, extended_cost, ai_confidence,
-                     quote_status, price_source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     quote_status, price_source, freight_per_unit, freight_source,
+                     fixture_count, labor_rate_lf, labor_catalog,
+                     tack_strip_lf, seam_tape_lf, pad_sy, area_type,
+                     is_mosaic, is_penny_hex, crack_isolation_sf, weld_rod_lf)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_id, m.get("item_code"), m.get("description"),
                 m.get("material_type"), m.get("installed_qty", 0),
                 m.get("unit"), m.get("waste_pct", 0), m.get("order_qty", 0),
                 m.get("vendor"), m.get("unit_price", 0), m.get("extended_cost", 0),
-                m.get("ai_confidence"), m.get("quote_status"), m.get("price_source")
+                m.get("ai_confidence"), m.get("quote_status"), m.get("price_source"),
+                m.get("freight_per_unit"), m.get("freight_source"), m.get("fixture_count", 0),
+                m.get("labor_rate_lf", 0), m.get("labor_catalog"),
+                m.get("tack_strip_lf", 0), m.get("seam_tape_lf", 0), m.get("pad_sy", 0),
+                m.get("area_type", "unit"),
+                1 if m.get("is_mosaic") else 0, 1 if m.get("is_penny_hex") else 0,
+                m.get("crack_isolation_sf", 0),
+                m.get("weld_rod_lf", 0),
             ))
             ids.append(cur.lastrowid)
         conn.commit()
@@ -414,12 +451,13 @@ def save_sundries(job_id: int, sundries: list[dict]) -> None:
         for s in sundries:
             conn.execute("""
                 INSERT INTO job_sundries
-                    (job_id, material_id, sundry_name, qty, unit, unit_price, extended_cost)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (job_id, material_id, sundry_name, qty, unit, unit_price, extended_cost, freight_cost)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_id, s.get("material_id"), s.get("sundry_name"),
                 s.get("qty", 0), s.get("unit"),
-                s.get("unit_price", 0), s.get("extended_cost", 0)
+                s.get("unit_price", 0), s.get("extended_cost", 0),
+                s.get("freight_cost", 0),
             ))
         conn.commit()
     finally:
@@ -467,10 +505,9 @@ def save_bundles(job_id: int, bundles: list[dict]) -> None:
 
 
 def save_quotes(job_id: int, quotes: list[dict]) -> list[int]:
-    """Save parsed quote products for a job. Returns list of quote ids."""
+    """Append parsed quote products for a job. Returns list of new quote ids."""
     conn = _get_conn()
     try:
-        conn.execute("DELETE FROM job_quotes WHERE job_id=?", (job_id,))
         ids = []
         for q in quotes:
             if q.get("error"):
@@ -953,7 +990,9 @@ def save_vendor_prices_from_quotes(job_id: int, products: list[dict]) -> int:
 
             product_normalized = _normalize_product(product_name)
             freight = p.get("freight")
-            total = unit_price + (freight or 0)
+            # freight can be a string ("FOB La Grange, GA") or a number
+            freight_num = freight if isinstance(freight, (int, float)) else 0
+            total = unit_price + freight_num
 
             conn.execute("""
                 INSERT INTO vendor_prices

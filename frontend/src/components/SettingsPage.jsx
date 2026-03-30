@@ -17,6 +17,12 @@ export default function SettingsPage() {
   const [apiKeyMasked, setApiKeyMasked] = useState('')
   const [showApiKey, setShowApiKey] = useState(false)
   const [editingKey, setEditingKey] = useState(false)
+  const [anthropicKey, setAnthropicKey] = useState('')
+  const [anthropicKeySet, setAnthropicKeySet] = useState(false)
+  const [anthropicKeyMasked, setAnthropicKeyMasked] = useState('')
+  const [showAnthropicKey, setShowAnthropicKey] = useState(false)
+  const [editingAnthropicKey, setEditingAnthropicKey] = useState(false)
+  const [aiProvider, setAiProvider] = useState('none')
   const [model, setModel] = useState('gpt-5-mini')
   const [multiPassCount, setMultiPassCount] = useState(2)
 
@@ -39,6 +45,9 @@ export default function SettingsPage() {
       .then(data => {
         setApiKeySet(data.openai_api_key_set)
         setApiKeyMasked(data.openai_api_key_masked)
+        setAnthropicKeySet(data.anthropic_api_key_set)
+        setAnthropicKeyMasked(data.anthropic_api_key_masked || '')
+        setAiProvider(data.ai_provider || 'none')
         setModel(data.openai_model || 'gpt-5-mini')
         setMultiPassCount(data.multi_pass_count || 2)
         // Bid folder path
@@ -63,15 +72,23 @@ export default function SettingsPage() {
         multi_pass_count: multiPassCount,
         bid_folder_path: bidFolderPath,
       }
-      // Only send API key if user actively edited it
+      // Only send API keys if user actively edited them
       if (editingKey && apiKey) {
         payload.openai_api_key = apiKey
+      }
+      if (editingAnthropicKey && anthropicKey) {
+        payload.anthropic_api_key = anthropicKey
       }
       const result = await api.updateSettings(payload)
       setApiKeySet(result.openai_api_key_set)
       setApiKeyMasked(result.openai_api_key_masked)
+      setAnthropicKeySet(result.anthropic_api_key_set)
+      setAnthropicKeyMasked(result.anthropic_api_key_masked || '')
+      setAiProvider(result.ai_provider || 'none')
       setEditingKey(false)
       setApiKey('')
+      setEditingAnthropicKey(false)
+      setAnthropicKey('')
       setSaveSuccess(true)
       setTimeout(() => setSaveSuccess(false), 3000)
     } catch (err) {
@@ -157,6 +174,72 @@ export default function SettingsPage() {
                 <p className="text-xs text-gray-600 mt-2">
                   Your API key is stored securely on the server and never exposed to the browser.
                 </p>
+              </div>
+
+              {/* Anthropic API Key */}
+              <div>
+                <label className="label flex items-center gap-2">
+                  <Key className="w-3.5 h-3.5" />
+                  Anthropic API Key
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-purple-500/15 text-purple-400 uppercase tracking-wider">
+                    Alternative
+                  </span>
+                </label>
+                {anthropicKeySet && !editingAnthropicKey ? (
+                  <div className="flex items-center gap-3">
+                    <div className="input flex-1 flex items-center gap-2 text-gray-400 font-mono text-sm">
+                      {showAnthropicKey ? anthropicKeyMasked : '••••••••••••••••••••'}
+                      <button onClick={() => setShowAnthropicKey(!showAnthropicKey)} className="ml-auto text-gray-500 hover:text-gray-300">
+                        {showAnthropicKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => setEditingAnthropicKey(true)}
+                      className="btn-ghost text-sm px-4 py-2.5"
+                    >
+                      Change
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="password"
+                      className="input flex-1 font-mono text-sm"
+                      value={anthropicKey}
+                      onChange={(e) => setAnthropicKey(e.target.value)}
+                      placeholder="sk-ant-..."
+                      autoComplete="off"
+                    />
+                    {editingAnthropicKey && (
+                      <button
+                        onClick={() => { setEditingAnthropicKey(false); setAnthropicKey('') }}
+                        className="btn-ghost text-sm px-4 py-2.5"
+                      >
+                        Cancel
+                      </button>
+                    )}
+                  </div>
+                )}
+                <p className="text-xs text-gray-600 mt-2">
+                  Used as a fallback when no OpenAI key is set. Get one from{' '}
+                  <a href="https://console.anthropic.com" target="_blank" rel="noopener" className="text-purple-400 hover:underline">console.anthropic.com</a>
+                </p>
+              </div>
+
+              {/* Active AI Provider Status */}
+              <div className={`p-3 rounded-lg border ${
+                aiProvider !== 'none'
+                  ? 'border-emerald-500/20 bg-emerald-500/[0.04]'
+                  : 'border-amber-500/20 bg-amber-500/[0.04]'
+              }`}>
+                <div className="flex items-center gap-2">
+                  <div className={`w-2 h-2 rounded-full ${aiProvider !== 'none' ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                  <span className="text-xs font-medium text-gray-300">
+                    {aiProvider === 'openai' && 'Active: OpenAI'}
+                    {aiProvider === 'anthropic' && 'Active: Anthropic Claude'}
+                    {aiProvider === 'none' && 'No AI provider configured — quote parsing and material classification disabled'}
+                  </span>
+                </div>
               </div>
 
               {/* Model Selection */}

@@ -105,6 +105,51 @@ function EditableCell({ value, onSave, type = 'text', className = '' }) {
   )
 }
 
+function FixtureCountCell({ value, onSave }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const inputRef = useRef(null)
+
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus()
+      inputRef.current.select()
+    }
+  }, [editing])
+
+  const commit = () => {
+    setEditing(false)
+    const parsed = parseInt(draft) || 0
+    if (parsed !== (value || 0)) onSave(parsed)
+  }
+
+  if (!editing) {
+    return (
+      <span
+        className="cursor-pointer hover:bg-white/[0.04] rounded px-1 -mx-1 text-gray-400"
+        onClick={() => { setDraft(value > 0 ? String(value) : ''); setEditing(true) }}
+      >
+        {value > 0 ? value : <span className="text-gray-700">—</span>}
+      </span>
+    )
+  }
+
+  return (
+    <input
+      ref={inputRef}
+      type="number"
+      min="0"
+      step="1"
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') setEditing(false) }}
+      className="editable-cell w-14 text-right"
+      placeholder="—"
+    />
+  )
+}
+
 function TypeDropdown({ currentType, confidence, onSelect, editable }) {
   const [open, setOpen] = useState(false)
   const dropdownRef = useRef(null)
@@ -157,12 +202,13 @@ function TypeDropdown({ currentType, confidence, onSelect, editable }) {
   )
 }
 
-function PriceActionMenu({ material, onRequestQuote, onSetTotal, onAiEstimate, onClearPrice, estimating, hasPrice, extendedCost, priceSource }) {
+function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimate, onClearPrice, estimating, hasPrice, extendedCost, priceSource }) {
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editValue, setEditValue] = useState('')
   const menuRef = useRef(null)
   const inputRef = useRef(null)
+  const unit = material.unit || ''
 
   useEffect(() => {
     if (!open) return
@@ -180,13 +226,17 @@ function PriceActionMenu({ material, onRequestQuote, onSetTotal, onAiEstimate, o
     }
   }, [editing])
 
-  const handleSubmitTotal = () => {
+  const submittedRef = useRef(false)
+  const handleSubmitUnitPrice = () => {
+    if (submittedRef.current) return
+    submittedRef.current = true
     const val = parseFloat(editValue)
     if (val > 0) {
-      onSetTotal(val)
+      onSetUnitPrice(val)
     }
     setEditing(false)
     setEditValue('')
+    setTimeout(() => { submittedRef.current = false }, 0)
   }
 
   if (editing) {
@@ -199,13 +249,14 @@ function PriceActionMenu({ material, onRequestQuote, onSetTotal, onAiEstimate, o
           value={editValue}
           onChange={e => setEditValue(e.target.value)}
           onKeyDown={e => {
-            if (e.key === 'Enter') handleSubmitTotal()
+            if (e.key === 'Enter') handleSubmitUnitPrice()
             if (e.key === 'Escape') { setEditing(false); setEditValue('') }
           }}
-          onBlur={handleSubmitTotal}
-          placeholder={extendedCost ? String(Math.round(extendedCost)) : '0'}
-          className="editable-cell w-28 text-right text-gray-100"
+          onBlur={handleSubmitUnitPrice}
+          placeholder={material.unit_price > 0 ? String(round2(material.unit_price)) : '0.00'}
+          className="editable-cell w-20 text-right text-gray-100"
         />
+        {unit && <span className="text-gray-500 text-[11px]">/{unit}</span>}
       </div>
     )
   }
@@ -227,22 +278,46 @@ function PriceActionMenu({ material, onRequestQuote, onSetTotal, onAiEstimate, o
           }`}
         >
           {formatCurrency(extendedCost)}
-          {priceSource && priceSource !== 'none' && (
-            <span className={`block text-[10px] font-normal ${
-              priceSource === 'ai_estimate' ? 'text-violet-400/60' :
-              priceSource === 'vendor_quote' ? 'text-sky-400/60' :
-              priceSource === 'manual' ? 'text-emerald-400/60' :
-              'text-gray-500'
-            }`}>
-              {priceSource === 'ai_estimate' ? 'AI est.' :
-               priceSource === 'vendor_quote' ? 'Vendor' :
-               priceSource === 'manual' ? 'Manual' : ''}
-            </span>
-          )}
+          <span className={`block text-[10px] font-normal ${
+            priceSource === 'ai_estimate' ? 'text-violet-400/60' :
+            priceSource === 'vendor_quote' ? 'text-sky-400/60' :
+            priceSource === 'manual' ? 'text-emerald-400/60' :
+            'text-gray-500'
+          }`}>
+            {material.unit_price > 0 ? (() => {
+              const isTransitionPiece = (priceSource === 'price_book' || priceSource === 'default_rule') &&
+                (material.material_type || '').toLowerCase() === 'transitions'
+              if (isTransitionPiece) {
+                const vendor = (material.vendor || '').toLowerCase()
+                const pieceLF = vendor.includes('silver pin') ? 12 : (8 + 2/12) // Silver Pin=12', Schluter=8'2"
+                const orderQty = material.order_qty || material.installed_qty || 0
+                const fc = material.fixture_count || 0
+                let pieces = 0
+                if (fc > 0 && vendor.includes('schluter')) {
+                  const sides = 2
+                  const lfPerSide = orderQty / (fc * sides)
+                  const pcsPerSide = Math.ceil(lfPerSide / pieceLF)
+                  pieces = fc * sides * pcsPerSide
+                } else {
+                  pieces = orderQty > 0 ? Math.ceil(orderQty / pieceLF) : 0
+                }
+                const laborRate = material.labor_rate_lf > 0 ? ` · Labor $${material.labor_rate_lf}/LF` : ''
+                return `$${round2(material.unit_price)}/EA · ${pieces}pc${laborRate}`
+              }
+              return `$${round2(material.unit_price)}/${unit || 'ea'}`
+            })() : ''}
+            {priceSource && priceSource !== 'none' ? ` · ${
+              priceSource === 'ai_estimate' ? 'AI est.' :
+              priceSource === 'vendor_quote' ? 'Vendor' :
+              priceSource === 'price_book' ? 'Price Book' :
+              priceSource === 'default_rule' ? 'Default' :
+              priceSource === 'manual' ? 'Manual' : ''
+            }` : ''}
+          </span>
         </button>
       ) : (
         <button
-          onClick={() => setOpen(!open)}
+          onClick={() => { setEditValue(''); setEditing(true) }}
           className="text-xs font-medium px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 transition-colors"
         >
           Need Price
@@ -251,11 +326,11 @@ function PriceActionMenu({ material, onRequestQuote, onSetTotal, onAiEstimate, o
       {open && !estimating && (
         <div className="absolute right-0 top-full mt-1 z-50 w-52 bg-gray-900 border border-white/[0.1] rounded-xl shadow-2xl py-1">
           <button
-            onClick={() => { setOpen(false); setEditValue(extendedCost ? String(Math.round(extendedCost * 100) / 100) : ''); setEditing(true) }}
+            onClick={() => { setOpen(false); setEditValue(material.unit_price > 0 ? String(round2(material.unit_price)) : ''); setEditing(true) }}
             className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2 text-gray-300"
           >
             <DollarSign className="w-3.5 h-3.5 text-emerald-400" />
-            Enter Price
+            Enter Unit Price
           </button>
           <button
             onClick={() => { onRequestQuote(material); setOpen(false) }}
@@ -337,9 +412,28 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
         : installedQty * (1 + wastePct)
       const unitPrice = next.unit_price || 0
       // If user explicitly set extended_cost (manual price entry), preserve it
-      const extendedCost = ('extended_cost' in changes && changes.price_source === 'manual')
-        ? changes.extended_cost
-        : Math.round(orderQty * unitPrice * 100) / 100
+      let extendedCost
+      if ('extended_cost' in changes && changes.price_source === 'manual') {
+        extendedCost = changes.extended_cost
+      } else if ((next.price_source === 'price_book' || next.price_source === 'default_rule') &&
+                 (next.material_type || '').toLowerCase() === 'transitions') {
+        // Transition piece-based pricing
+        const vendor = (next.vendor || '').toLowerCase()
+        const pieceLF = vendor.includes('silver pin') ? 12 : (8 + 2/12)
+        const fc = next.fixture_count || 0
+        let pieces = 0
+        if (fc > 0 && vendor.includes('schluter')) {
+          const sides = 2
+          const lfPerSide = orderQty / (fc * sides)
+          const pcsPerSide = Math.ceil(lfPerSide / pieceLF)
+          pieces = fc * sides * pcsPerSide
+        } else {
+          pieces = orderQty > 0 ? Math.ceil(orderQty / pieceLF) : 0
+        }
+        extendedCost = Math.round(pieces * unitPrice * 100) / 100
+      } else {
+        extendedCost = Math.round(orderQty * unitPrice * 100) / 100
+      }
       return {
         ...next,
         order_qty: Math.round(orderQty * 100) / 100,
@@ -426,6 +520,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
         case 'install_qty': return m.installed_qty || 0
         case 'waste': return m.waste_pct || 0
         case 'order_qty': return m.order_qty || 0
+        case 'fixture_count': return m.fixture_count || 0
         case 'unit_price': return m.unit_price || 0
         case 'extended': return m.extended_cost || 0
         default: return 0
@@ -545,6 +640,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
               { label: 'Install Qty', key: 'install_qty', align: 'right', hide: 'hidden md:table-cell', tooltip: 'Quantity needed for installation' },
               { label: 'Waste', key: 'waste', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Waste factor percentage added to install quantity' },
               { label: 'Order Qty', key: 'order_qty', align: 'right', hide: 'hidden md:table-cell', tooltip: 'Quantity to order (install qty + waste)' },
+              { label: 'Fixtures', key: 'fixture_count', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Number of tubs/showers — used for piece count on Schluter transitions' },
               ...(onRequestQuote ? [{ label: 'Internal Price', key: 'known_price', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Price from your warehouse inventory or past vendor quotes' }] : []),
               { label: 'Total', key: 'extended', align: 'right', hide: '', tooltip: 'Your bid price for this line item' },
               ...(showDeleteCol ? [{ label: '', key: null, align: 'center', hide: '' }] : []),
@@ -665,6 +761,20 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     formatNumber(m.order_qty)
                   )}
                 </td>
+                <td className="hidden lg:table-cell py-3 px-2 sm:px-3 text-right tabular-nums text-gray-400">
+                  {(m.material_type === 'transitions' || (m.vendor || '').toLowerCase().includes('schluter')) ? (
+                    editable ? (
+                      <FixtureCountCell
+                        value={m.fixture_count || 0}
+                        onSave={(val) => updateMaterial(m._origIdx, { fixture_count: val })}
+                      />
+                    ) : (
+                      m.fixture_count > 0 ? m.fixture_count : <span className="text-gray-700">—</span>
+                    )
+                  ) : (
+                    <span className="text-gray-700">—</span>
+                  )}
+                </td>
                 {onRequestQuote && (
                   <td className="hidden lg:table-cell py-3 px-2 sm:px-3 text-right tabular-nums text-xs">
                     {m.known_price ? (
@@ -687,10 +797,10 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                       extendedCost={m.extended_cost}
                       priceSource={m.price_source}
                       estimating={estimatingIdx === m._origIdx}
-                      onSetTotal={(total) => {
+                      onSetUnitPrice={(unitPrice) => {
                         const orderQty = m.order_qty || m.installed_qty || 1
-                        const unitPrice = orderQty > 0 ? round2(total / orderQty) : total
-                        updateMaterial(m._origIdx, { unit_price: unitPrice, extended_cost: round2(total), price_source: 'manual' })
+                        const extCost = round2(unitPrice * orderQty)
+                        updateMaterial(m._origIdx, { unit_price: unitPrice, extended_cost: extCost, price_source: 'manual' })
                       }}
                       onRequestQuote={() => onRequestQuote(m)}
                       onAiEstimate={async () => {
@@ -716,7 +826,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   <td className="py-3 px-1 text-center">
                     <button
                       onClick={() => deleteMaterial(m._origIdx)}
-                      className="p-1.5 rounded-lg text-gray-700 opacity-100 sm:opacity-0 sm:group-hover:opacity-100
+                      className="p-1.5 rounded-lg text-gray-500
                                  hover:text-red-400 hover:bg-red-500/10 transition-all"
                       title="Remove material"
                     >

@@ -27,7 +27,9 @@ def _get_freight_rate(material_type: str, freight_rates: dict = None) -> float:
     freight_map = {
         "cpt_tile": "cpt_tile",
         "corridor_broadloom": "broadloom",
-        "unit_lvt": "lvt_5mm",
+        "unit_carpet_no_pattern": "broadloom",
+        "unit_carpet_pattern": "broadloom",
+        "unit_lvt": "lvt_2mm",
     }
     key = freight_map.get(material_type)
     if key:
@@ -133,8 +135,8 @@ def assemble_bid(
         mat_labor = labor_by_mat.get(mat_id, [])
         labor_cost = round(sum(l.get("extended_cost", 0) for l in mat_labor), 2)
 
-        # Freight
-        freight_rate = _get_freight_rate(material_type, db_freight_rates)
+        # Freight — use per-material override (from FOB detection) or fall back to config
+        freight_rate = mat.get("freight_per_unit") or _get_freight_rate(material_type, db_freight_rates)
         freight_cost = round(order_qty * freight_rate, 2)
 
         # Total for this bundle
@@ -175,54 +177,45 @@ def assemble_bid(
         })
 
     # ── GPM (Gross Profit Margin) Distribution ──────────────────────────────
-    # GPM works differently from markup:
-    #   Revenue = Cost / (1 - GPM)
-    #   Profit  = Revenue - Cost
-    # Then profit is distributed: 99% to labor lines, 1% to materials
-    gpm_pct = job_info.get("gpm_pct", 0) or 0  # e.g. 0.20 for 20% GPM
+    # Revenue = Cost / (1 - GPM), profit distributed proportionally across bundles
+    gpm_pct = job_info.get("gpm_pct", 0) or 0  # e.g. 0.23 for 23% GPM
 
     total_cost = round(sum(b["total_price"] for b in bundles), 2)
-    total_labor_cost = round(sum(b["labor_cost"] for b in bundles), 2)
-    total_material_cost = round(sum(b["material_cost"] for b in bundles), 2)
 
     gpm_profit = 0
-    gpm_labor_adder = 0
-    gpm_material_adder = 0
 
     if gpm_pct > 0 and gpm_pct < 1 and total_cost > 0:
         revenue = total_cost / (1 - gpm_pct)
         gpm_profit = round(revenue - total_cost, 2)
+        # Split: 99% loaded onto labor, 1% onto material
         gpm_labor_adder = round(gpm_profit * 0.99, 2)
-        gpm_material_adder = round(gpm_profit * 0.01, 2)
-        # Fix rounding so adders sum to exactly gpm_profit
         gpm_material_adder = round(gpm_profit - gpm_labor_adder, 2)
 
-        # Distribute profit across bundles proportionally
+        # Distribute proportionally across bundles by bundle cost share
         for b in bundles:
-            # Labor profit: proportional to this bundle's labor cost vs total labor
-            if total_labor_cost > 0 and b["labor_cost"] > 0:
-                labor_share = b["labor_cost"] / total_labor_cost
-                b["gpm_labor_adder"] = round(gpm_labor_adder * labor_share, 2)
+            bundle_cost = b["material_cost"] + b["sundry_cost"] + b["labor_cost"] + b["freight_cost"]
+            if total_cost > 0 and bundle_cost > 0:
+                share = bundle_cost / total_cost
+                b["gpm_labor_adder"] = round(gpm_labor_adder * share, 2)
+                b["gpm_material_adder"] = round(gpm_material_adder * share, 2)
             else:
                 b["gpm_labor_adder"] = 0
-
-            # Material profit: proportional to this bundle's material cost vs total material
-            if total_material_cost > 0 and b["material_cost"] > 0:
-                mat_share = b["material_cost"] / total_material_cost
-                b["gpm_material_adder"] = round(gpm_material_adder * mat_share, 2)
-            else:
                 b["gpm_material_adder"] = 0
 
-            # Update bundle total to include GPM adders
-            b["total_price"] = round(
-                b["material_cost"] + b["sundry_cost"] + b["labor_cost"] + b["freight_cost"]
-                + b["gpm_labor_adder"] + b["gpm_material_adder"], 2
-            )
+            b["gpm_adder"] = b["gpm_labor_adder"] + b["gpm_material_adder"]
+            b["total_price"] = round(bundle_cost + b["gpm_adder"], 2)
 
     subtotal = round(sum(b["total_price"] for b in bundles), 2)
     markup_amount = round(subtotal * markup_pct, 2) if markup_pct else 0
     subtotal_with_markup = round(subtotal + markup_amount, 2)
-    tax_amount = round(subtotal_with_markup * tax_rate, 2)
+    # Tax applies only to materials (material + sundry + freight + GPM material adder), not labor
+    taxable = round(sum(
+        b["material_cost"] + b["sundry_cost"] + b["freight_cost"] + b.get("gpm_material_adder", 0)
+        for b in bundles
+    ), 2)
+    if markup_pct:
+        taxable = round(taxable * (1 + markup_pct), 2)
+    tax_amount = round(taxable * tax_rate, 2)
     grand_total = round(subtotal_with_markup + tax_amount, 2)
 
     return {
@@ -233,8 +226,6 @@ def assemble_bid(
         "markup_amount": markup_amount,
         "gpm_pct": gpm_pct,
         "gpm_profit": gpm_profit,
-        "gpm_labor_adder": gpm_labor_adder,
-        "gpm_material_adder": gpm_material_adder,
         "total_cost": total_cost,
         "tax_rate": tax_rate,
         "tax_amount": tax_amount,

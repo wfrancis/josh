@@ -5,12 +5,13 @@ determine quantities based on LABOR_QTY_RULES, and compute costs.
 
 import json
 import os
+import re
 from typing import Optional
 
 import openpyxl
 import pdfplumber
-from openai import OpenAI
 
+from ai_client import chat_complete, get_provider_info
 from config import LABOR_QTY_RULES, WASTE_FACTORS
 from models import save_labor_catalog_entries, get_labor_catalog_entries
 
@@ -34,25 +35,154 @@ Important:
 - If a field is missing, use empty string for text or 0 for numbers
 """
 
-# Map material types to labor catalog type keywords
-MATERIAL_TO_LABOR_MAP: dict[str, list[str]] = {
-    "unit_carpet_no_pattern": ["carpet", "stretch"],
-    "unit_carpet_pattern": ["carpet", "stretch", "pattern"],
-    "unit_lvt": ["lvt", "vinyl plank", "luxury vinyl"],
-    "cpt_tile": ["carpet tile"],
-    "corridor_broadloom": ["broadloom", "direct glue carpet"],
-    "floor_tile": ["floor tile", "ceramic", "porcelain"],
-    "wall_tile": ["wall tile"],
-    "backsplash": ["backsplash", "wall tile"],
-    "tub_shower_surround": ["tub", "shower", "surround", "wall tile"],
-    "rubber_base": ["rubber base", "base"],
-    "vct": ["vct", "vinyl composition"],
-    "rubber_tile": ["rubber tile"],
-    "rubber_sheet": ["rubber sheet"],
-    "wood": ["wood", "hardwood"],
-    "tread_riser": ["tread", "riser", "stair"],
-    "transitions": ["transition", "reducer", "t-molding"],
-    "waterproofing": ["waterproof", "membrane"],
+# ── Labor matching rules ─────────────────────────────────────────────────────
+# Each material type maps to a base labor entry search + optional add-ons.
+# "base" is a list of description substrings that ALL must match (AND logic).
+# "size_tiers" defines qty thresholds to pick the right size tier.
+# "addons" is a list of description substrings for X ADD entries to include.
+LABOR_RULES: dict[str, dict] = {
+    "unit_carpet_no_pattern": {
+        "labor_type": "Project Carpet",
+        "base": ["broadloom", "stretch", "over pad"],
+        "size_tiers": [
+            (2000, "more than 2000"),
+            (0, "2000sy or less"),
+        ],
+        "size_field": "installed_qty",  # SY
+        "addons": [],
+    },
+    "unit_carpet_pattern": {
+        "labor_type": "Project Carpet",
+        "base": ["broadloom", "stretch", "over pad"],
+        "size_tiers": [
+            (2000, "more than 2000"),
+            (0, "2000sy or less"),
+        ],
+        "size_field": "installed_qty",
+        "addons": ["x add for pattern"],
+    },
+    "cpt_tile": {
+        "labor_type": "Project Carpet",
+        "base": ["carpet tile"],
+        "size_tiers": [],
+        "addons": [],
+    },
+    "corridor_broadloom": {
+        "labor_type": "Project Carpet",
+        "base": ["broadloom", "direct glue"],
+        "size_tiers": [],
+        "addons": [],
+    },
+    "unit_lvt": {
+        "labor_type": "Project Resilient Tile",
+        "base": ["plank or lvt", "glue down"],
+        "size_tiers": [
+            (1000, "more than 1000"),
+            (0, "1000sf or less"),
+        ],
+        "size_field": "installed_qty",
+        "addons": [],
+    },
+    "floor_tile": {
+        "labor_type": "Project Tile",
+        "base": ["porcelain set monolithic"],
+        "size_tiers": [
+            (2500, "more than 2500"),
+            (1000, "between 1000"),
+            (0, "1000sf or less"),
+        ],
+        "size_field": "installed_qty",
+        "addons": [],
+    },
+    "wall_tile": {
+        "labor_type": "Project Tile",
+        "base": ["porcelain set monolithic"],
+        "size_tiers": [
+            (2500, "more than 2500"),
+            (1000, "between 1000"),
+            (0, "1000sf or less"),
+        ],
+        "size_field": "installed_qty",
+        "addons": [],
+    },
+    "backsplash": {
+        "labor_type": "Project Tile",
+        "base": ["porcelain set monolithic"],
+        "size_tiers": [
+            (2500, "more than 2500"),
+            (1000, "between 1000"),
+            (0, "1000sf or less"),
+        ],
+        "size_field": "installed_qty",
+        "addons": ["x add for backsplash"],
+    },
+    "tub_shower_surround": {
+        "labor_type": "Project Tile",
+        "base": ["porcelain set monolithic"],
+        "size_tiers": [
+            (2500, "more than 2500"),
+            (1000, "between 1000"),
+            (0, "1000sf or less"),
+        ],
+        "size_field": "installed_qty",
+        "addons": [],
+    },
+    "rubber_base": {
+        "labor_type": "Project Wall Base",
+        "base": ["4 inch cove base"],
+        "size_tiers": [],
+        "addons": [],
+    },
+    "rubber_tile": {
+        "labor_type": "Project Resilient Tile",
+        "base": ["rubber", "tile"],
+        "size_tiers": [],
+        "addons": [],
+    },
+    "rubber_sheet": {
+        "labor_type": "Project Resilient Rolled Sheet",
+        "base": ["commercial sheet vinyl", "over 1/4"],
+        "size_tiers": [
+            (1000, "more than 1000"),
+            (0, "1000sy or less"),
+        ],
+        "size_field": "installed_qty_sy",
+        "addons": ["weld commercial vinyl"],
+    },
+    "vct": {
+        "labor_type": "Project Resilient Tile",
+        "base": ["vct", "glue down"],
+        "size_tiers": [
+            (1000, "more than 1000"),
+            (0, "1000sf or less"),
+        ],
+        "size_field": "installed_qty",
+        "addons": [],
+    },
+    "wood": {
+        "labor_type": "Project Hardwood",
+        "base": ["prefinished hardwood", "glue down"],
+        "size_tiers": [],
+        "addons": [],
+    },
+    "tread_riser": {
+        "labor_type": "Project Resilient Tile",
+        "base": ["stair", "tread and riser"],
+        "size_tiers": [],
+        "addons": [],
+    },
+    "waterproofing": {
+        "labor_type": "Project Tile Add Ons",
+        "base": ["waterproofing kerdi"],
+        "size_tiers": [],
+        "addons": [],
+    },
+    "transitions": {
+        "labor_type": "Project Tile Add Ons",
+        "base": ["schluter schiene"],
+        "size_tiers": [],
+        "addons": [],
+    },
 }
 
 
@@ -106,21 +236,14 @@ def load_labor_catalog_from_pdf(file_path: str, api_key: str = None, model: str 
     if not text.strip():
         raise ValueError("Could not extract text from labor catalog PDF")
 
-    # Call OpenAI to parse the labor entries
-    client_kwargs = {}
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    client = OpenAI(**client_kwargs)
-
-    response = client.chat.completions.create(
+    # Call AI to parse the labor entries
+    content = chat_complete(
+        system=LABOR_CATALOG_PROMPT,
+        user=text,
+        api_key=api_key,
         model=model,
-        messages=[
-            {"role": "system", "content": LABOR_CATALOG_PROMPT},
-            {"role": "user", "content": text},
-        ],
-        response_format={"type": "json_object"},
+        json_mode=True,
     )
-    content = response.choices[0].message.content
     parsed = json.loads(content)
     entries = parsed.get("entries", [])
 
@@ -151,32 +274,128 @@ def _safe_float(val) -> float:
         return 0.0
 
 
-def _find_labor_entry(material_type: str, catalog: list[dict] = None) -> Optional[dict]:
-    """Find the best matching labor catalog entry for a material type."""
-    keywords = MATERIAL_TO_LABOR_MAP.get(material_type, [])
-    if not keywords:
+_TILE_TYPES = {"floor_tile", "wall_tile", "backsplash", "tub_shower_surround"}
+
+_TILE_DIM_RE = re.compile(r'(\d+(?:\.\d+)?)\s*["\u201d]?\s*x\s*(\d+(?:\.\d+)?)\s*["\u201d]?', re.IGNORECASE)
+
+
+def _parse_tile_dims(description: str):
+    """Parse tile dimensions from a material description like '12" x 24"'.
+    Returns (min_edge, max_edge) or None."""
+    m = _TILE_DIM_RE.search(description)
+    if not m:
         return None
+    a, b = float(m.group(1)), float(m.group(2))
+    return (min(a, b), max(a, b))
+
+
+def _tile_dim_tier(w: float, h: float) -> str:
+    """Map tile dimensions to the catalog dimension keyword for filtering."""
+    max_edge = max(w, h)
+    min_edge = min(w, h)
+    if max_edge > 36:
+        return "greater than 36in"
+    elif max_edge > 24:
+        return "greater than 24in"
+    elif min_edge >= 24 and max_edge >= 24:
+        return "24x24"
+    elif max_edge <= 13:
+        return "0-13x0-13"
+    else:
+        return "12x24"
+
+
+def _find_labor_entries(
+    material_type: str,
+    installed_qty: float,
+    catalog: list[dict] = None,
+    rule_override: dict = None,
+    material: dict = None,
+) -> list[dict]:
+    """Find all matching labor catalog entries for a material type.
+
+    Returns a list of catalog entries: the base rate entry + any X ADD entries.
+    Uses LABOR_RULES for precise matching with size tier selection.
+    rule_override: optional dict to override specific rule fields (e.g. base keywords for mosaic).
+    material: optional full material dict for tile dimension matching.
+    """
+    rule = LABOR_RULES.get(material_type)
+    if not rule:
+        return []
+    if rule_override:
+        rule = {**rule, **rule_override}
 
     if catalog is None:
         catalog = get_labor_catalog_entries()
 
-    for entry in catalog:
-        entry_text = f"{entry['labor_type']} {entry['description']}".lower()
-        for kw in keywords:
-            if kw.lower() in entry_text:
-                return entry
+    # Filter catalog to matching labor_type
+    type_prefix = rule["labor_type"].lower()
+    type_entries = [e for e in catalog if e["labor_type"].lower().startswith(type_prefix)]
 
-    return None
+    results = []
+
+    # Find base entry: ALL substrings in "base" must match the description
+    base_keywords = [kw.lower() for kw in rule["base"]]
+    candidates = []
+    for entry in type_entries:
+        desc = entry["description"].lower()
+        if all(kw in desc for kw in base_keywords):
+            candidates.append(entry)
+
+    # For tile types, filter candidates by tile dimensions from material description
+    if material_type in _TILE_TYPES and material and candidates:
+        dims = _parse_tile_dims(material.get("description", ""))
+        if dims:
+            tier_kw = _tile_dim_tier(dims[0], dims[1]).lower()
+            dim_filtered = [c for c in candidates if tier_kw in c["description"].lower()]
+            if dim_filtered:
+                candidates = dim_filtered
+
+    # Apply size tier selection if defined
+    size_tiers = rule.get("size_tiers", [])
+    if size_tiers and candidates:
+        # Convert qty to SY if the rule's thresholds are in SY
+        size_qty = installed_qty
+        if rule.get("size_field") == "installed_qty_sy":
+            size_qty = installed_qty / 9
+
+        best = None
+        for threshold, tier_kw in size_tiers:
+            if size_qty > threshold:
+                # Find candidate matching this tier keyword
+                for c in candidates:
+                    if tier_kw.lower() in c["description"].lower():
+                        best = c
+                        break
+                if best:
+                    break
+        if best:
+            results.append(best)
+        elif candidates:
+            results.append(candidates[0])
+    elif candidates:
+        results.append(candidates[0])
+
+    # Find addon entries (X ADD lines)
+    for addon_kw in rule.get("addons", []):
+        addon_kw_lower = addon_kw.lower()
+        for entry in type_entries:
+            if addon_kw_lower in entry["description"].lower():
+                results.append(entry)
+                break
+
+    return results
 
 
 def _get_labor_qty_rule(material_type: str) -> str:
-    """Get the labor quantity rule for a material type."""
-    # Check specific rules first
-    for key, rule in LABOR_QTY_RULES.items():
+    """Get the labor quantity rule for a material type.
+    Matches longest key first so 'corridor_broadloom' beats 'broadloom'.
+    """
+    for key in sorted(LABOR_QTY_RULES.keys(), key=len, reverse=True):
         if key == "default":
             continue
         if key in material_type:
-            return rule
+            return LABOR_QTY_RULES[key]
     return LABOR_QTY_RULES["default"]
 
 
@@ -185,34 +404,28 @@ def calculate_labor(
     installed_qty: float,
     waste_pct: Optional[float] = None,
     measure_qty: Optional[float] = None,
-) -> Optional[dict]:
+    material: dict = None,
+) -> list[dict]:
     """
-    Calculate labor for a material line item.
-
-    Args:
-        material_type: e.g. "unit_carpet_no_pattern"
-        installed_qty: base installed quantity
-        waste_pct: waste percentage (if None, looked up from WASTE_FACTORS)
-        measure_qty: quantity from measure file (for "from_measure" rule)
-
-    Returns:
-        {
-            "labor_description": str,
-            "qty": float,
-            "unit": str,
-            "rate": float,
-            "extended_cost": float,
-        }
-        or None if no matching labor entry found.
+    Calculate labor for a single material line item.
+    Returns a list of labor line items (base + add-ons), or empty list.
+    material: optional full material dict for mosaic detection.
     """
-    entry = _find_labor_entry(material_type)
-    if not entry:
-        return None
+    # Build rule override for mosaic tiles
+    rule_override = None
+    if material and material.get("is_mosaic"):
+        if material.get("is_penny_hex"):
+            rule_override = {"base": ["penny round or hex mosaic"]}
+        else:
+            rule_override = {"base": ["mosaic sheet backed porcelain"]}
+
+    entries = _find_labor_entries(material_type, installed_qty, rule_override=rule_override, material=material)
+    if not entries:
+        return []
 
     if waste_pct is None:
         waste_pct = WASTE_FACTORS.get(material_type, 0)
 
-    # Determine labor qty based on rule
     rule = _get_labor_qty_rule(material_type)
     if rule == "with_waste":
         labor_qty = installed_qty * (1 + waste_pct)
@@ -223,33 +436,54 @@ def calculate_labor(
     else:
         labor_qty = installed_qty * (1 + waste_pct)
 
-    rate = entry["cost"]
-    extended_cost = labor_qty * rate
-
-    return {
-        "labor_description": f"{entry['labor_type']} - {entry['description']}",
-        "qty": round(labor_qty, 2),
-        "unit": entry["unit"],
-        "rate": rate,
-        "extended_cost": round(extended_cost, 2),
-    }
+    results = []
+    for entry in entries:
+        rate = entry["cost"]
+        extended_cost = labor_qty * rate
+        results.append({
+            "labor_description": f"{entry['labor_type']} - {entry['description']}",
+            "qty": round(labor_qty, 2),
+            "unit": entry["unit"],
+            "rate": rate,
+            "extended_cost": round(extended_cost, 2),
+        })
+    return results
 
 
 def calculate_labor_for_materials(materials: list[dict]) -> list[dict]:
     """
     Calculate labor for a list of material line items.
     Loads labor catalog from DB once for efficiency.
+    Each material can produce multiple labor line items (base + add-ons).
     """
     catalog = get_labor_catalog_entries()
     results = []
     for mat in materials:
         material_type = mat.get("material_type", "")
-        installed_qty = mat.get("installed_qty", 0)
+        installed_qty = _safe_float(mat.get("installed_qty", 0))
         waste_pct = mat.get("waste_pct")
         material_id = mat.get("id") or mat.get("item_code")
 
-        entry = _find_labor_entry(material_type, catalog)
-        if not entry:
+        # Skip labor for non-Schluter transitions (pin metal, etc.)
+        # Schluter products: named "Schluter", Jolly, Exposed Edge Trim, metal trim to tile
+        if material_type == "transitions":
+            desc = mat.get("description", "").lower()
+            is_schluter = ("schluter" in desc or "jolly" in desc
+                           or "exposed edge trim" in desc
+                           or "metal trim" in desc)
+            if not is_schluter:
+                continue
+
+        # Build rule override for mosaic tiles
+        rule_override = None
+        if mat.get("is_mosaic"):
+            if mat.get("is_penny_hex"):
+                rule_override = {"base": ["penny round or hex mosaic"]}
+            else:
+                rule_override = {"base": ["mosaic sheet backed porcelain"]}
+
+        entries = _find_labor_entries(material_type, installed_qty, catalog, rule_override=rule_override, material=mat)
+        if not entries:
             continue
 
         if waste_pct is None:
@@ -263,17 +497,35 @@ def calculate_labor_for_materials(materials: list[dict]) -> list[dict]:
         else:
             labor_qty = installed_qty * (1 + waste_pct)
 
-        rate = entry["cost"]
-        extended_cost = labor_qty * rate
+        for entry in entries:
+            rate = entry["cost"]
+            entry_desc = entry.get("description", "").lower()
+            entry_unit = (entry.get("unit") or "").upper()
 
-        results.append({
-            "labor_description": f"{entry['labor_type']} - {entry['description']}",
-            "qty": round(labor_qty, 2),
-            "unit": entry["unit"],
-            "rate": rate,
-            "extended_cost": round(extended_cost, 2),
-            "material_id": material_id,
-        })
+            # Weld addon: use weld_rod_lf from material instead of installed qty
+            if "weld" in entry_desc and entry_desc.startswith("x add"):
+                weld_lf = _safe_float(mat.get("weld_rod_lf", 0))
+                qty = weld_lf if weld_lf > 0 else labor_qty
+            # Convert units if needed (catalog SY vs material SF)
+            elif entry_unit == "SY" and material_type not in ("unit_carpet_no_pattern", "unit_carpet_pattern", "corridor_broadloom", "cpt_tile"):
+                # Material is in SF, convert qty to SY
+                qty = labor_qty / 9
+            elif entry_unit in ("SF", "") and material_type in ("unit_carpet_no_pattern", "unit_carpet_pattern", "corridor_broadloom"):
+                # Material is in SY, convert qty to SF
+                qty = labor_qty * 9
+            else:
+                qty = labor_qty
+
+            extended_cost = qty * rate
+
+            results.append({
+                "labor_description": f"{entry['labor_type']} - {entry['description']}",
+                "qty": round(qty, 2),
+                "unit": entry_unit or entry.get("unit", ""),
+                "rate": rate,
+                "extended_cost": round(extended_cost, 2),
+                "material_id": material_id,
+            })
 
     return results
 

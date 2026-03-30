@@ -7,8 +7,9 @@ import json
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from openai import OpenAI
 from typing import Optional
+
+from ai_client import chat_complete
 
 
 def compose_quote_request(
@@ -81,24 +82,15 @@ def compose_quote_request(
     if sender_name:
         user_prompt += f"\nSender Name: {sender_name}"
 
-    # Build OpenAI client using same pattern as quote_parser.py
-    client_kwargs = {}
     api_key = openai_config.get("api_key")
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    client = OpenAI(**client_kwargs)
-
     model = openai_config.get("model", "gpt-5-mini")
 
-    response = client.chat.completions.create(
+    body = chat_complete(
+        system=system_prompt,
+        user=user_prompt,
+        api_key=api_key,
         model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-
-    body = response.choices[0].message.content.strip()
+    ).strip()
 
     # Append signature if provided
     if sender_signature:

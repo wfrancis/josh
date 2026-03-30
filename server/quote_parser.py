@@ -13,7 +13,8 @@ from typing import Optional
 import statistics
 
 import pdfplumber
-from openai import OpenAI
+
+from ai_client import chat_complete, get_provider_info
 
 # ── Configurable OpenAI settings ──────────────────────────────────────────────
 _openai_config = {
@@ -124,17 +125,15 @@ def _extract_eml(eml_path: str) -> dict:
     }
 
 
-def _call_openai_single(quote_text: str, client: OpenAI, model: str) -> list[dict]:
-    """Single pass: send text to OpenAI and parse the structured response."""
-    response = client.chat.completions.create(
+def _call_ai_single(quote_text: str, api_key: str, model: str) -> list[dict]:
+    """Single pass: send text to AI and parse the structured response."""
+    content = chat_complete(
+        system=SYSTEM_PROMPT,
+        user=quote_text,
+        api_key=api_key,
         model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": quote_text},
-        ],
-        response_format={"type": "json_object"},
+        json_mode=True,
     )
-    content = response.choices[0].message.content
     parsed = json.loads(content)
     return parsed.get("products", [])
 
@@ -171,10 +170,14 @@ def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
         if prices:
             base["unit_price"] = round(statistics.median(prices), 2)
 
-        # Take median freight if available
-        freights = [v.get("freight", 0) for v in variants if v.get("freight")]
+        # Take median freight if numeric, otherwise keep first string value
+        freights = [v.get("freight") for v in variants if v.get("freight")]
         if freights:
-            base["freight"] = round(statistics.median(freights), 2)
+            numeric_freights = [f for f in freights if isinstance(f, (int, float))]
+            if numeric_freights:
+                base["freight"] = round(statistics.median(numeric_freights), 2)
+            else:
+                base["freight"] = freights[0]  # Keep string like "FOB La Grange, GA"
 
         merged.append(base)
 
@@ -182,28 +185,29 @@ def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
 
 
 def _call_openai(quote_text: str) -> list[dict]:
-    """Multi-pass OpenAI call: runs N passes and merges results for accuracy."""
+    """Multi-pass AI call: runs N passes and merges results for accuracy."""
     api_key = _openai_config["api_key"]
     model = _openai_config["model"]
     num_passes = _openai_config["num_passes"]
 
-    client_kwargs = {}
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    client = OpenAI(**client_kwargs)  # falls back to OPENAI_API_KEY env var
+    # Check if any AI provider is available
+    provider = get_provider_info(api_key)
+    if not provider["available"]:
+        print("[quote_parser] No AI API key available — cannot parse quotes")
+        return []
 
     if num_passes <= 1:
-        return _call_openai_single(quote_text, client, model)
+        return _call_ai_single(quote_text, api_key, model)
 
     # Run multiple passes
     all_results = []
     for i in range(num_passes):
         try:
-            result = _call_openai_single(quote_text, client, model)
+            result = _call_ai_single(quote_text, api_key, model)
             all_results.append(result)
         except Exception:
             if i == 0:
-                raise  # If first pass fails, propagate error
+                raise
             # If later passes fail, just skip
 
     if not all_results:
@@ -236,8 +240,9 @@ def parse_quote_eml(eml_path: str) -> list[dict]:
         try:
             products = _call_openai(context)
             all_products.extend(products)
-        except Exception:
-            pass  # Body might not contain pricing
+        except Exception as e:
+            print(f"[quote_parser] Error parsing email body: {e}")
+            import traceback; traceback.print_exc()
 
     # Process PDF attachments
     for att in eml_data["attachments"]:
