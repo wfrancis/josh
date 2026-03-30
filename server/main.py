@@ -45,7 +45,7 @@ from labor_calc import calculate_labor_for_materials, load_labor_catalog, load_l
 from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf, generate_proposal_pdf
 from proposal_bundler import generate_proposal_data
-from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE
+from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE, STAIR_SUNDRY_KITS
 from email_agent import compose_quote_request, send_email, generate_quote_request_text
 from ai_client import chat_complete, get_provider_info
 from inbox_monitor import InboxMonitor
@@ -1887,6 +1887,7 @@ def api_get_proposal_bundles(job_id: str):
 
 
 @app.put("/api/jobs/{job_id}/proposal/bundles")
+@app.post("/api/jobs/{job_id}/proposal/bundles/save")
 async def api_save_proposal_bundles(job_id: str, request: Request):
     """Auto-save proposal editor state (bundles, notes, terms, GPM, etc.)."""
     import json as _json
@@ -2125,6 +2126,14 @@ def api_get_labor_catalog():
     return {"entries": catalog, "count": len(catalog)}
 
 
+@app.get("/api/labor-catalog/stairs")
+def api_get_stair_labor():
+    """Get stair-related labor catalog entries."""
+    catalog = get_labor_catalog()
+    stair_entries = [e for e in catalog if 'stair' in (e.get('description') or '').lower()]
+    return {"entries": stair_entries}
+
+
 @app.put("/api/labor-catalog/{entry_id}")
 def api_update_labor_catalog_entry(entry_id: int, body: dict):
     """Update a single labor catalog entry."""
@@ -2146,6 +2155,12 @@ def api_clear_labor_catalog():
     """Clear all labor catalog entries."""
     clear_labor_catalog()
     return {"message": "Labor catalog cleared"}
+
+
+@app.get("/api/stair-sundry-kits")
+def api_get_stair_sundry_kits():
+    """Get stair sundry kit definitions (ratios per stair)."""
+    return {"kits": STAIR_SUNDRY_KITS}
 
 
 @app.get("/api/search")

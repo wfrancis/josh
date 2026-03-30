@@ -93,6 +93,8 @@ export const api = {
   updateLaborCatalogEntry: (id, data) => request('/labor-catalog/' + id, { method: 'PUT', body: JSON.stringify(data) }),
   deleteLaborCatalogEntry: (id) => request('/labor-catalog/' + id, { method: 'DELETE' }),
   clearLaborCatalog: () => request('/labor-catalog', { method: 'DELETE' }),
+  getStairLabor: () => request('/labor-catalog/stairs'),
+  getStairSundryKits: () => request('/stair-sundry-kits'),
 
   // Quotes
   clearQuotes: (jobId) => request('/jobs/' + jobId + '/quotes', { method: 'DELETE' }),

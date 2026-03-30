@@ -131,6 +131,16 @@ SUNDRY_RULES: dict[str, list[dict]] = {
     ],
 }
 
+# ─── Stair Sundry Kits ──────────────────────────────────────────────────────
+# Per-stair ratios based on commercial stair (4' × 1' × 8" tall)
+STAIR_SUNDRY_KITS: dict[str, list[dict]] = {
+    "stretched": [
+        {"sundry_name": "Stair Pad", "ratio_per_stair": 0.74, "unit": "SY", "unit_price": 0},
+        {"sundry_name": "Stair Tack Strip", "ratio_per_stair": 6.0, "unit": "LF", "unit_price": 0},
+        {"sundry_name": "Stair Seam Sealer", "ratio_per_stair": 5.307, "unit": "LF", "unit_price": 0},
+    ],
+}
+
 # ─── Freight Rates ────────────────────────────────────────────────────────────
 FREIGHT_RATES: dict[str, float] = {
     "cpt_tile": 1.25,          # per SY

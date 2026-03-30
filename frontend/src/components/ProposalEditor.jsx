@@ -267,6 +267,10 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
   const [gpmLaborVal, setGpmLaborVal] = useState(String(bundle.gpm_labor_adder || 0))
   const [editingGpmMaterial, setEditingGpmMaterial] = useState(false)
   const [gpmMaterialVal, setGpmMaterialVal] = useState(String(bundle.gpm_material_adder || 0))
+  const [showStairLabor, setShowStairLabor] = useState(false)
+  const [stairLaborOptions, setStairLaborOptions] = useState([])
+  const [stairCountVal, setStairCountVal] = useState(String(bundle.stair_count || ''))
+  const [editingStairCount, setEditingStairCount] = useState(false)
 
   // Sync local state when bundle prop changes
   useEffect(() => {
@@ -274,6 +278,7 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
     setDescVal(bundle.description_text || '')
     setPriceVal(String(bundle.price_override ?? bundle.total_price ?? 0))
     setFreightVal(String(bundle.freight_override ?? bundle.freight_cost ?? 0))
+    setStairCountVal(String(bundle.stair_count || ''))
   }, [bundle])
 
   const saveName = () => {
@@ -417,6 +422,104 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
     setEditingSundryPrice(null)
   }
 
+  // ── Stair Labor ──────────────────────────────────────────────────────────
+  const STAIR_KITS = {
+    stretched: [
+      { sundry_name: 'Stair Pad', ratio_per_stair: 0.74, unit: 'SY', unit_price: 0 },
+      { sundry_name: 'Stair Tack Strip', ratio_per_stair: 6.0, unit: 'LF', unit_price: 0 },
+      { sundry_name: 'Stair Seam Sealer', ratio_per_stair: 5.307, unit: 'LF', unit_price: 0 },
+    ],
+  }
+
+  const fetchStairLaborOptions = async () => {
+    if (stairLaborOptions.length > 0) { setShowStairLabor(true); return }
+    try {
+      const res = await fetch('/api/labor-catalog/stairs').then(r => r.ok ? r.json() : null)
+      if (res?.entries) { setStairLaborOptions(res.entries); setShowStairLabor(true) }
+    } catch (e) { console.error('Failed to fetch stair labor:', e) }
+  }
+
+  const addStairLabor = (catalogEntry) => {
+    const count = parseInt(stairCountVal) || bundle.stair_count || 0
+    if (count <= 0) { setEditingStairCount(true); setShowStairLabor(false); return }
+
+    const laborItem = {
+      labor_description: `${catalogEntry.description}`,
+      qty: count, unit: 'EA', rate: catalogEntry.cost,
+      extended_cost: round2(count * catalogEntry.cost),
+      is_stair_labor: true,
+    }
+
+    const kitType = (catalogEntry.description || '').toLowerCase().includes('stretch') ? 'stretched' : null
+    const kitSundries = (STAIR_KITS[kitType] || []).map(s => ({
+      sundry_name: s.sundry_name,
+      qty: round2(s.ratio_per_stair * count),
+      unit: s.unit,
+      unit_price: s.unit_price,
+      extended_cost: round2(s.ratio_per_stair * count * s.unit_price),
+      is_stair_sundry: true,
+    }))
+
+    const updatedLabor = [...(bundle.labor_items || []), laborItem]
+    const updatedSundries = [...(bundle.sundry_items || []), ...kitSundries]
+    const newLaborCost = round2(updatedLabor.reduce((s, l) => s + (l.extended_cost || 0), 0))
+    const newSundryCost = round2(updatedSundries.reduce((s, item) => s + (item.extended_cost || 0), 0))
+    const laborDiff = newLaborCost - (bundle.labor_cost || 0)
+    const sundryDiff = newSundryCost - (bundle.sundry_cost || 0)
+
+    onUpdate(index, {
+      ...bundle,
+      labor_items: updatedLabor,
+      sundry_items: updatedSundries,
+      labor_cost: newLaborCost,
+      sundry_cost: newSundryCost,
+      total_price: round2((bundle.total_price || 0) + laborDiff + sundryDiff),
+      stair_count: count,
+      stair_labor_type: kitType,
+      price_override: null,
+    })
+    setShowStairLabor(false)
+  }
+
+  const saveStairCount = () => {
+    const newCount = parseInt(stairCountVal) || 0
+    setEditingStairCount(false)
+    if (newCount === (bundle.stair_count || 0)) return
+
+    // Update stair labor quantities
+    const updatedLabor = (bundle.labor_items || []).map(l => {
+      if (!l.is_stair_labor) return l
+      return { ...l, qty: newCount, extended_cost: round2(newCount * l.rate) }
+    })
+
+    // Update stair sundry quantities
+    const kitType = bundle.stair_labor_type || 'stretched'
+    const kit = STAIR_KITS[kitType] || []
+    const updatedSundries = (bundle.sundry_items || []).map(s => {
+      if (!s.is_stair_sundry) return s
+      const rule = kit.find(k => k.sundry_name === s.sundry_name)
+      if (!rule) return s
+      const qty = round2(rule.ratio_per_stair * newCount)
+      return { ...s, qty, extended_cost: round2(qty * s.unit_price) }
+    })
+
+    const newLaborCost = round2(updatedLabor.reduce((s, l) => s + (l.extended_cost || 0), 0))
+    const newSundryCost = round2(updatedSundries.reduce((s, item) => s + (item.extended_cost || 0), 0))
+    const laborDiff = newLaborCost - (bundle.labor_cost || 0)
+    const sundryDiff = newSundryCost - (bundle.sundry_cost || 0)
+
+    onUpdate(index, {
+      ...bundle,
+      labor_items: updatedLabor,
+      sundry_items: updatedSundries,
+      labor_cost: newLaborCost,
+      sundry_cost: newSundryCost,
+      total_price: round2((bundle.total_price || 0) + laborDiff + sundryDiff),
+      stair_count: newCount,
+      price_override: null,
+    })
+  }
+
   const materialCount = bundle.materials?.length || 0
   const freightAdj = bundle.freight_override != null ? (bundle.freight_override - (bundle.freight_cost || 0)) : 0
   const displayPrice = bundle.price_override ?? ((bundle.total_price ?? 0) + freightAdj)
@@ -536,6 +639,31 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
             />
           </div>
 
+          {/* Stair Count */}
+          <div className="flex items-center gap-3">
+            <label className="text-[10px] font-bold uppercase tracking-wider text-gray-500">Stair Count</label>
+            {editingStairCount ? (
+              <input
+                type="number"
+                value={stairCountVal}
+                onChange={(e) => setStairCountVal(e.target.value)}
+                onBlur={saveStairCount}
+                onKeyDown={(e) => { if (e.key === 'Enter') saveStairCount(); if (e.key === 'Escape') { setStairCountVal(String(bundle.stair_count || '')); setEditingStairCount(false) } }}
+                className="w-24 bg-white/[0.04] border border-si-accent/50 rounded px-2 py-1 text-white text-xs text-right focus:outline-none tabular-nums"
+                autoFocus
+                placeholder="0"
+              />
+            ) : (
+              <span
+                onClick={() => setEditingStairCount(true)}
+                className="cursor-pointer text-gray-300 tabular-nums text-xs hover:text-si-accent transition-colors px-2 py-1 rounded hover:bg-white/[0.04]"
+                title="Click to edit stair count"
+              >
+                {bundle.stair_count || '—'}
+              </span>
+            )}
+          </div>
+
           {/* Materials table */}
           {materialCount > 0 && (
             <div>
@@ -649,12 +777,42 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
               <label className="text-[10px] font-bold uppercase tracking-wider text-gray-500">
                 Labor ({bundle.labor_items?.length || 0})
               </label>
-              <button
-                onClick={() => { setAddingLabor(true); setNewLabor({ labor_description: '', qty: '', unit: 'SY', rate: '' }) }}
-                className="flex items-center gap-1 text-[10px] text-si-accent hover:text-si-accent/80 transition-colors"
-              >
-                <Plus className="w-3 h-3" /> Add Labor
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => { setAddingLabor(true); setNewLabor({ labor_description: '', qty: '', unit: 'SY', rate: '' }) }}
+                  className="flex items-center gap-1 text-[10px] text-si-accent hover:text-si-accent/80 transition-colors"
+                >
+                  <Plus className="w-3 h-3" /> Add Labor
+                </button>
+                <div className="relative">
+                  <button
+                    onClick={fetchStairLaborOptions}
+                    className="flex items-center gap-1 text-[10px] text-amber-400 hover:text-amber-300 transition-colors"
+                  >
+                    <Plus className="w-3 h-3" /> Add Stair Labor
+                  </button>
+                  {showStairLabor && stairLaborOptions.length > 0 && (
+                    <div className="absolute right-0 top-full mt-1 z-50 bg-gray-900 border border-white/[0.1] rounded-lg shadow-xl py-1 min-w-[280px] max-h-60 overflow-y-auto">
+                      {stairLaborOptions.map((opt, oi) => (
+                        <button
+                          key={oi}
+                          onClick={() => addStairLabor(opt)}
+                          className="w-full text-left px-3 py-2 text-xs text-gray-300 hover:bg-white/[0.06] hover:text-white transition-colors flex justify-between items-center gap-2"
+                        >
+                          <span className="truncate">{opt.description}</span>
+                          <span className="text-gray-500 tabular-nums flex-shrink-0">{formatCurrency(opt.cost)}/{opt.unit}</span>
+                        </button>
+                      ))}
+                      <button
+                        onClick={() => setShowStairLabor(false)}
+                        className="w-full text-left px-3 py-1.5 text-[10px] text-gray-600 hover:text-gray-400 border-t border-white/[0.06]"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
             <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] overflow-x-auto">
               <table className="w-full text-xs">
@@ -1099,6 +1257,34 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     }, 1500)
     return () => { if (autoSaveRef.current) clearTimeout(autoSaveRef.current) }
   }, [isDirty, bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, job?.id])
+
+  // Ref to hold latest state for flush-on-unmount (avoids stale closures)
+  const stateRef = useRef({ bundles: [], notes: [], terms: [], exclusions: [], taxRate: 0, gpmPct: 0, texturaEnabled: false, subtotal: 0, taxAmount: 0, grandTotal: 0, gpmTotal: 0, gpmLabor: 0, gpmMaterial: 0, texturaAmount: 0, isDirty: false })
+  useEffect(() => {
+    stateRef.current = { bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, isDirty }
+  })
+
+  // Flush pending save immediately on unmount or beforeunload
+  useEffect(() => {
+    const flushSave = () => {
+      const s = stateRef.current
+      if (!s.isDirty || !job?.id || s.bundles.length === 0) return
+      // Use sendBeacon for reliability during unload
+      const payload = JSON.stringify({
+        bundles: s.bundles, notes: s.notes, terms: s.terms, exclusions: s.exclusions,
+        tax_rate: s.taxRate, gpm_pct: s.gpmPct / 100, textura_fee: s.texturaEnabled ? 1 : 0,
+        subtotal: s.subtotal, tax_amount: s.taxAmount, grand_total: s.grandTotal,
+        gpm_profit: s.gpmTotal, gpm_labor: s.gpmLabor, gpm_material: s.gpmMaterial,
+        textura_amount: s.texturaAmount,
+      })
+      navigator.sendBeacon(`/api/jobs/${job.id}/proposal/bundles/save`, new Blob([payload], { type: 'application/json' }))
+    }
+    window.addEventListener('beforeunload', flushSave)
+    return () => {
+      window.removeEventListener('beforeunload', flushSave)
+      flushSave() // Also flush on component unmount (tab switch)
+    }
+  }, [job?.id])
 
   // Helper: set bundles + mark dirty
   const setBundlesAndDirty = useCallback((updater) => {
