@@ -1269,43 +1269,47 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     return () => { cancelled = true }
   }, [job?.id])
 
-  // Auto-save debounce (1.5s after any edit)
+  // Save proposal data to backend
+  const doSave = useCallback(async () => {
+    if (!job?.id || bundles.length === 0) return
+    setSaving(true)
+    try {
+      await fetch(`/api/jobs/${job.id}/proposal/bundles`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          bundles,
+          notes,
+          terms,
+          exclusions,
+          tax_rate: taxRate,
+          gpm_pct: gpmPct / 100,
+          textura_fee: texturaEnabled ? 1 : 0,
+          subtotal,
+          tax_amount: taxAmount,
+          grand_total: grandTotal,
+          gpm_profit: gpmTotal,
+          gpm_labor: gpmLabor,
+          gpm_material: gpmMaterial,
+          textura_amount: texturaAmount,
+        }),
+      })
+      setIsDirty(false)
+      setLastSaved(new Date())
+    } catch (e) {
+      console.error('Auto-save failed:', e)
+    } finally {
+      setSaving(false)
+    }
+  }, [bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, job?.id])
+
+  // Auto-save: immediate on every dirty change, debounced 500ms to batch rapid edits
   useEffect(() => {
     if (!isDirty || !job?.id || bundles.length === 0) return
     if (autoSaveRef.current) clearTimeout(autoSaveRef.current)
-    autoSaveRef.current = setTimeout(async () => {
-      setSaving(true)
-      try {
-        await fetch(`/api/jobs/${job.id}/proposal/bundles`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            bundles,
-            notes,
-            terms,
-            exclusions,
-            tax_rate: taxRate,
-            gpm_pct: gpmPct / 100,
-            textura_fee: texturaEnabled ? 1 : 0,
-            subtotal,
-            tax_amount: taxAmount,
-            grand_total: grandTotal,
-            gpm_profit: gpmTotal,
-            gpm_labor: gpmLabor,
-            gpm_material: gpmMaterial,
-            textura_amount: texturaAmount,
-          }),
-        })
-        setIsDirty(false)
-        setLastSaved(new Date())
-      } catch (e) {
-        console.error('Auto-save failed:', e)
-      } finally {
-        setSaving(false)
-      }
-    }, 1500)
+    autoSaveRef.current = setTimeout(() => { doSave() }, 500)
     return () => { if (autoSaveRef.current) clearTimeout(autoSaveRef.current) }
-  }, [isDirty, bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, job?.id])
+  }, [isDirty, bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, job?.id, doSave])
 
   // Ref to hold latest state for flush-on-unmount (avoids stale closures)
   const stateRef = useRef({ bundles: [], notes: [], terms: [], exclusions: [], taxRate: 0, gpmPct: 0, texturaEnabled: false, subtotal: 0, taxAmount: 0, grandTotal: 0, gpmTotal: 0, gpmLabor: 0, gpmMaterial: 0, texturaAmount: 0, isDirty: false })
