@@ -616,6 +616,20 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
                 "crack_isolation_sf": m.get("crack_isolation_sf", 0),
             })
 
+    # Deduplicate by item_code — if the same item_code appears with different
+    # area_types (e.g. from uploading unit + common area files), keep only the first
+    seen_codes = {}
+    deduped = []
+    for m in merged_raw:
+        code = m.get("item_code")
+        if code and code in seen_codes:
+            # Skip duplicate — same item_code already present
+            continue
+        if code:
+            seen_codes[code] = True
+        deduped.append(m)
+    merged_raw = deduped
+
     # Load waste factors from DB (falls back to config defaults)
     import json as _json
     _waste_data = get_company_rate("waste_factors")

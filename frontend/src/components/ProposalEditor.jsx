@@ -262,6 +262,10 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
   const [laborRateVal, setLaborRateVal] = useState('')
   const [editingSundryPrice, setEditingSundryPrice] = useState(null)
   const [sundryPriceVal, setSundryPriceVal] = useState('')
+  const [editingGpmLabor, setEditingGpmLabor] = useState(false)
+  const [gpmLaborVal, setGpmLaborVal] = useState(String(bundle.gpm_labor_adder || 0))
+  const [editingGpmMaterial, setEditingGpmMaterial] = useState(false)
+  const [gpmMaterialVal, setGpmMaterialVal] = useState(String(bundle.gpm_material_adder || 0))
 
   // Sync local state when bundle prop changes
   useEffect(() => {
@@ -294,6 +298,46 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
     setFreightVal(String(num))
     setEditingFreight(false)
     onUpdate(index, { ...bundle, freight_override: num })
+  }
+
+  const saveGpmLabor = () => {
+    const num = parseCurrencyInput(gpmLaborVal)
+    setGpmLaborVal(String(num))
+    setEditingGpmLabor(false)
+    const oldAdder = (bundle.gpm_labor_adder || 0) + (bundle.gpm_material_adder || 0)
+    const newAdder = num + (bundle.gpm_material_adder || 0)
+    const diff = newAdder - oldAdder
+    onUpdate(index, {
+      ...bundle,
+      gpm_labor_adder: num,
+      gpm_adder: round2(newAdder),
+      total_price: round2((bundle.total_price || 0) + diff),
+      price_override: undefined,
+    })
+  }
+
+  const saveGpmMaterial = () => {
+    const num = parseCurrencyInput(gpmMaterialVal)
+    setGpmMaterialVal(String(num))
+    setEditingGpmMaterial(false)
+    const oldAdder = (bundle.gpm_labor_adder || 0) + (bundle.gpm_material_adder || 0)
+    const newAdder = (bundle.gpm_labor_adder || 0) + num
+    const diff = newAdder - oldAdder
+    // Recalculate tax since GPM material adder affects taxable base
+    const taxRate = bundle.tax_amount && bundle.taxable ? bundle.tax_amount / bundle.taxable : 0
+    const oldTaxable = bundle.taxable || 0
+    const newTaxable = round2(oldTaxable - (bundle.gpm_material_adder || 0) + num)
+    const newTax = round2(newTaxable * taxRate)
+    const taxDiff = newTax - (bundle.tax_amount || 0)
+    onUpdate(index, {
+      ...bundle,
+      gpm_material_adder: num,
+      gpm_adder: round2(newAdder),
+      taxable: newTaxable,
+      tax_amount: newTax,
+      total_price: round2((bundle.total_price || 0) + diff + taxDiff),
+      price_override: undefined,
+    })
   }
 
   const deleteLabor = (laborIdx) => {
@@ -783,16 +827,50 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
                   )}
                 </div>
               ) : null}
-              {bundle.gpm_labor_adder > 0 && (
-                <div className="flex justify-between text-gray-400">
-                  <span>GPM Labor (99%)</span><span className="tabular-nums text-emerald-400">{formatCurrency(bundle.gpm_labor_adder)}</span>
-                </div>
-              )}
-              {bundle.gpm_material_adder > 0 && (
-                <div className="flex justify-between text-gray-400">
-                  <span>GPM Material (1%)</span><span className="tabular-nums text-emerald-400">{formatCurrency(bundle.gpm_material_adder)}</span>
-                </div>
-              )}
+              <div className="flex justify-between text-gray-400">
+                <span>GPM Labor</span>
+                {editingGpmLabor ? (
+                  <input
+                    autoFocus
+                    type="text"
+                    value={gpmLaborVal}
+                    onChange={(e) => setGpmLaborVal(e.target.value)}
+                    onBlur={saveGpmLabor}
+                    onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); if (e.key === 'Escape') { setGpmLaborVal(String(bundle.gpm_labor_adder || 0)); setEditingGpmLabor(false) } }}
+                    className="bg-white/[0.06] border border-white/[0.12] rounded px-2 py-0.5 text-emerald-400 text-xs tabular-nums focus:outline-none focus:border-emerald-400/50 w-28 text-right"
+                  />
+                ) : (
+                  <span
+                    className="tabular-nums text-emerald-400 cursor-pointer hover:text-emerald-300 transition-colors"
+                    onClick={() => { setGpmLaborVal(String(bundle.gpm_labor_adder || 0)); setEditingGpmLabor(true) }}
+                    title="Click to edit GPM labor"
+                  >
+                    {formatCurrency(bundle.gpm_labor_adder || 0)}
+                  </span>
+                )}
+              </div>
+              <div className="flex justify-between text-gray-400">
+                <span>GPM Material</span>
+                {editingGpmMaterial ? (
+                  <input
+                    autoFocus
+                    type="text"
+                    value={gpmMaterialVal}
+                    onChange={(e) => setGpmMaterialVal(e.target.value)}
+                    onBlur={saveGpmMaterial}
+                    onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); if (e.key === 'Escape') { setGpmMaterialVal(String(bundle.gpm_material_adder || 0)); setEditingGpmMaterial(false) } }}
+                    className="bg-white/[0.06] border border-white/[0.12] rounded px-2 py-0.5 text-emerald-400 text-xs tabular-nums focus:outline-none focus:border-emerald-400/50 w-28 text-right"
+                  />
+                ) : (
+                  <span
+                    className="tabular-nums text-emerald-400 cursor-pointer hover:text-emerald-300 transition-colors"
+                    onClick={() => { setGpmMaterialVal(String(bundle.gpm_material_adder || 0)); setEditingGpmMaterial(true) }}
+                    title="Click to edit GPM material"
+                  >
+                    {formatCurrency(bundle.gpm_material_adder || 0)}
+                  </span>
+                )}
+              </div>
               {bundle.tax_amount > 0 && (
                 <div className="flex justify-between text-gray-400">
                   <span>Tax</span><span className="tabular-nums text-gray-300">{formatCurrency(bundle.tax_amount)}</span>
@@ -868,36 +946,56 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   const [rewriting, setRewriting] = useState(false)
   const [texturaEnabled, setTexturaEnabled] = useState(!!job?.textura_fee)
   const [texturaAmount, setTexturaAmount] = useState(0)
+  const [gpmPct, setGpmPct] = useState(job?.gpm_pct ? (job.gpm_pct * 100) : 0)
+  const [gpmLabor, setGpmLabor] = useState(0)
+  const [gpmMaterial, setGpmMaterial] = useState(0)
+  const [gpmTotal, setGpmTotal] = useState(0)
 
-  // Recalculate totals when bundles change
-  // Tax is now per-bundle (included in total_price), so we sum per-bundle tax_amount
-  const recalcTotals = useCallback((currentBundles, rate, textura) => {
-    // total_price on each bundle now includes tax
-    const preTotalCalc = currentBundles.reduce((sum, b) => {
-      const freightAdj = b.freight_override != null ? (b.freight_override - (b.freight_cost || 0)) : 0
-      const price = b.price_override ?? ((b.total_price ?? 0) + freightAdj)
-      return sum + price
+  // Recalculate totals when bundles, GPM, tax, or textura change
+  const recalcTotals = useCallback((currentBundles, rate, textura, gpm) => {
+    const gpmDecimal = (gpm || 0) / 100
+
+    // Sum raw base costs across all bundles
+    const totalBaseCost = currentBundles.reduce((sum, b) => {
+      return sum + (b.material_cost || 0) + (b.sundry_cost || 0) + (b.labor_cost || 0)
+        + (b.freight_override ?? b.freight_cost ?? 0)
     }, 0)
-    // Sum per-bundle tax amounts for display
-    const tax = currentBundles.reduce((sum, b) => {
-      if (b.price_override != null && b.total_price > 0) {
-        const ratio = b.price_override / b.total_price
-        return sum + (b.tax_amount || 0) * ratio
-      }
-      return sum + (b.tax_amount || 0)
-    }, 0)
-    const sub = preTotalCalc - tax
-    setSubtotal(sub)
+
+    // Calculate GPM profit on total cost
+    let profit = 0, profitLabor = 0, profitMaterial = 0
+    if (gpmDecimal > 0 && gpmDecimal < 1 && totalBaseCost > 0) {
+      const revenue = totalBaseCost / (1 - gpmDecimal)
+      profit = Math.round((revenue - totalBaseCost) * 100) / 100
+      profitLabor = Math.round(profit * 0.9793 * 100) / 100
+      profitMaterial = Math.round((profit - profitLabor) * 100) / 100
+    }
+    setGpmTotal(profit)
+    setGpmLabor(profitLabor)
+    setGpmMaterial(profitMaterial)
+
+    // Sell price = base cost + GPM profit
+    const sellPrice = totalBaseCost + profit
+
+    // Tax on materials only: material + sundry + freight + GPM material adder
+    const taxableBase = currentBundles.reduce((sum, b) => {
+      return sum + (b.material_cost || 0) + (b.sundry_cost || 0)
+        + (b.freight_override ?? b.freight_cost ?? 0)
+    }, 0) + profitMaterial
+    const tax = Math.round(taxableBase * rate * 100) / 100
+
+    const preTotalCalc = sellPrice + tax
+    setSubtotal(sellPrice)
     setTaxAmount(tax)
-    // Textura fee: 0.22% of total (subtotal + tax)
-    const txtAmt = textura ? Math.round(preTotalCalc * 0.0022 * 100) / 100 : 0
+
+    // Textura fee: 0.22% of total, capped at $5,000
+    const txtAmt = textura ? Math.min(Math.round(preTotalCalc * 0.0022 * 100) / 100, 5000) : 0
     setTexturaAmount(txtAmt)
     setGrandTotal(preTotalCalc + txtAmt)
   }, [])
 
   useEffect(() => {
-    recalcTotals(bundles, taxRate, texturaEnabled)
-  }, [bundles, taxRate, texturaEnabled, recalcTotals])
+    recalcTotals(bundles, taxRate, texturaEnabled, gpmPct)
+  }, [bundles, taxRate, texturaEnabled, gpmPct, recalcTotals])
 
   // Generate proposal bundles from API
   const generateBundles = useCallback(async () => {
@@ -1091,6 +1189,10 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         subtotal,
         tax_rate: taxRate,
         tax_amount: taxAmount,
+        gpm_pct: gpmPct / 100,
+        gpm_profit: gpmTotal,
+        gpm_labor: gpmLabor,
+        gpm_material: gpmMaterial,
         textura_fee: texturaEnabled ? 1 : 0,
         textura_amount: texturaAmount,
         grand_total: grandTotal,
@@ -1110,7 +1212,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     } finally {
       setGenerating(false)
     }
-  }, [job, bundles, notes, terms, exclusions, subtotal, taxRate, taxAmount, texturaEnabled, texturaAmount, grandTotal])
+  }, [job, bundles, notes, terms, exclusions, subtotal, taxRate, taxAmount, gpmPct, gpmTotal, gpmLabor, gpmMaterial, texturaEnabled, texturaAmount, grandTotal])
 
   // Download PDF
   const downloadPdf = useCallback(() => {
@@ -1294,22 +1396,36 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
                   <span className="text-white font-semibold">Total Cost</span>
                   <span className="text-white font-semibold tabular-nums">{formatCurrency(totalCost)}</span>
                 </div>
-                {totalGpm > 0 && (
-                  <>
-                    <div className="flex justify-between border-t border-white/[0.06] pt-2 mt-1">
-                      <span className="text-emerald-400 font-semibold">GPM Profit ({job.gpm_pct ? (job.gpm_pct * 100).toFixed(0) : 0}%)</span>
-                      <span className="text-emerald-400 font-semibold tabular-nums">{formatCurrency(totalGpm)}</span>
+                <div className="border-t border-white/[0.06] pt-2 mt-1">
+                  <div className="flex justify-between">
+                    <div className="flex items-center gap-2 text-emerald-400 font-semibold">
+                      <span>GPM Profit</span>
+                      <input
+                        type="text"
+                        value={gpmPct ? Number(gpmPct).toFixed(2) : '0.00'}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value)
+                          setGpmPct(isNaN(val) ? 0 : val)
+                        }}
+                        className="bg-white/[0.04] border border-white/[0.08] rounded-lg px-2 py-1 text-emerald-400 text-xs tabular-nums w-20 text-center focus:outline-none focus:border-emerald-400/50"
+                      />
+                      <span className="text-emerald-600 text-xs">%</span>
                     </div>
-                    <div className="flex justify-between text-xs pl-3">
-                      <span className="text-gray-500">Labor (99%)</span>
-                      <span className="text-gray-400 tabular-nums">{formatCurrency(totalGpmLabor)}</span>
-                    </div>
-                    <div className="flex justify-between text-xs pl-3">
-                      <span className="text-gray-500">Material (1%)</span>
-                      <span className="text-gray-400 tabular-nums">{formatCurrency(totalGpmMaterial)}</span>
-                    </div>
-                  </>
-                )}
+                    <span className="text-emerald-400 font-semibold tabular-nums">{formatCurrency(gpmTotal)}</span>
+                  </div>
+                  {gpmTotal > 0 && (
+                    <>
+                      <div className="flex justify-between text-xs pl-3 mt-2">
+                        <span className="text-gray-500">Labor (97.93%)</span>
+                        <span className="text-gray-400 tabular-nums">{formatCurrency(gpmLabor)}</span>
+                      </div>
+                      <div className="flex justify-between text-xs pl-3">
+                        <span className="text-gray-500">Material (2.07%)</span>
+                        <span className="text-gray-400 tabular-nums">{formatCurrency(gpmMaterial)}</span>
+                      </div>
+                    </>
+                  )}
+                </div>
               </div>
             </div>
 

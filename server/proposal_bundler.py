@@ -935,34 +935,33 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
             bundles.insert(insert_idx, db)
 
     # ── Apply GPM (Gross Profit Margin) ──────────────────────────────────
-    # GPM is calculated on material costs only (material + sundry + freight).
-    # Labor is pass-through — not included in the GPM base.
-    # The resulting profit is redistributed: 99% on labor line, 1% on material line.
+    # GPM is calculated on the TOTAL project cost (material + sundry + freight + labor).
+    # Revenue = TotalCost / (1 - GPM%), profit distributed proportionally across bundles.
+    # The resulting profit is split: 97.93% loaded onto labor, 2.07% onto material.
     gpm_pct = _safe_float(job.get("gpm_pct", 0))
-    total_material_base = round(sum(
-        b["material_cost"] + b["sundry_cost"] + b["freight_cost"]
+    total_cost = round(sum(
+        b["material_cost"] + b["sundry_cost"] + b["freight_cost"] + b["labor_cost"]
         for b in bundles
     ), 2)
 
-    if gpm_pct > 0 and gpm_pct < 1 and total_material_base > 0:
-        revenue = total_material_base / (1 - gpm_pct)
-        gpm_profit = round(revenue - total_material_base, 2)
-        # Split: 99% loaded onto labor, 1% onto material
-        gpm_labor_adder = round(gpm_profit * 0.99, 2)
+    if gpm_pct > 0 and gpm_pct < 1 and total_cost > 0:
+        revenue = total_cost / (1 - gpm_pct)
+        gpm_profit = round(revenue - total_cost, 2)
+        # Split: 97.93% loaded onto labor, 2.07% onto material
+        gpm_labor_adder = round(gpm_profit * 0.9793, 2)
         gpm_material_adder = round(gpm_profit - gpm_labor_adder, 2)
 
-        # Distribute proportionally across bundles by material base share
+        # Distribute proportionally across bundles by total cost share
         for b in bundles:
-            bundle_mat_base = b["material_cost"] + b["sundry_cost"] + b["freight_cost"]
-            if total_material_base > 0 and bundle_mat_base > 0:
-                share = bundle_mat_base / total_material_base
+            bundle_cost = b["material_cost"] + b["sundry_cost"] + b["freight_cost"] + b["labor_cost"]
+            if total_cost > 0 and bundle_cost > 0:
+                share = bundle_cost / total_cost
                 b["gpm_labor_adder"] = round(gpm_labor_adder * share, 2)
                 b["gpm_material_adder"] = round(gpm_material_adder * share, 2)
             else:
                 b["gpm_labor_adder"] = 0
                 b["gpm_material_adder"] = 0
 
-            bundle_cost = bundle_mat_base + b["labor_cost"]
             b["gpm_adder"] = b["gpm_labor_adder"] + b["gpm_material_adder"]
             b["total_price"] = round(bundle_cost + b["gpm_adder"], 2)
 
@@ -979,9 +978,9 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
     tax_amount = round(sum(b["tax_amount"] for b in bundles), 2)
     grand_total = subtotal  # tax is already included in each bundle's total_price
 
-    # ── Textura fee (0.22% of total project dollars) ──────────────────────
+    # ── Textura fee (0.22% of total project dollars, capped at $5,000) ───
     textura_fee = int(job.get("textura_fee", 0))
-    textura_amount = round(grand_total * 0.0022, 2) if textura_fee else 0
+    textura_amount = min(round(grand_total * 0.0022, 2), 5000.00) if textura_fee else 0
     if textura_fee:
         grand_total = round(grand_total + textura_amount, 2)
 

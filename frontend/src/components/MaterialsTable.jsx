@@ -826,7 +826,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   <td className="py-3 px-1 text-center">
                     <button
                       onClick={() => deleteMaterial(m._origIdx)}
-                      className="p-1.5 rounded-lg text-gray-500
+                      className="p-1.5 rounded-lg text-red-400/70
                                  hover:text-red-400 hover:bg-red-500/10 transition-all"
                       title="Remove material"
                     >

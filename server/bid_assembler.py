@@ -187,8 +187,8 @@ def assemble_bid(
     if gpm_pct > 0 and gpm_pct < 1 and total_cost > 0:
         revenue = total_cost / (1 - gpm_pct)
         gpm_profit = round(revenue - total_cost, 2)
-        # Split: 99% loaded onto labor, 1% onto material
-        gpm_labor_adder = round(gpm_profit * 0.99, 2)
+        # Split: 97.93% loaded onto labor, 2.07% onto material
+        gpm_labor_adder = round(gpm_profit * 0.9793, 2)
         gpm_material_adder = round(gpm_profit - gpm_labor_adder, 2)
 
         # Distribute proportionally across bundles by bundle cost share
