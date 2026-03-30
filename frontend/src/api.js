@@ -61,6 +61,11 @@ export const api = {
   updateMaterials: (jobId, materials) =>
     request(`/jobs/${jobId}/materials`, { method: 'PUT', body: JSON.stringify({ materials }) }),
 
+  // Proposal Bundles (auto-save)
+  loadProposalBundles: (jobId) => request(`/jobs/${jobId}/proposal/bundles`),
+  saveProposalBundles: (jobId, data) =>
+    request(`/jobs/${jobId}/proposal/bundles`, { method: 'PUT', body: JSON.stringify(data) }),
+
   // Calculate
   calculate: (jobId) => request(`/jobs/${jobId}/calculate`, { method: 'POST' }),
 

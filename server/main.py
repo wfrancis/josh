@@ -1874,6 +1874,47 @@ async def api_rewrite_descriptions(job_id: str, request: Request):
     return {"descriptions": descriptions}
 
 
+@app.get("/api/jobs/{job_id}/proposal/bundles")
+def api_get_proposal_bundles(job_id: str):
+    """Load saved proposal editor state (bundles, notes, terms, etc.)."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    pd = job.get("proposal_data")
+    if pd and isinstance(pd, dict) and pd.get("bundles"):
+        return pd
+    return {"bundles": [], "notes": [], "terms": [], "exclusions": []}
+
+
+@app.put("/api/jobs/{job_id}/proposal/bundles")
+async def api_save_proposal_bundles(job_id: str, request: Request):
+    """Auto-save proposal editor state (bundles, notes, terms, GPM, etc.)."""
+    import json as _json
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    body = await request.json()
+    proposal_data = {
+        "bundles": body.get("bundles", []),
+        "notes": body.get("notes", []),
+        "terms": body.get("terms", []),
+        "exclusions": body.get("exclusions", []),
+        "tax_rate": body.get("tax_rate", 0),
+        "gpm_pct": body.get("gpm_pct", 0),
+        "textura_fee": body.get("textura_fee", 0),
+        "subtotal": body.get("subtotal", 0),
+        "tax_amount": body.get("tax_amount", 0),
+        "grand_total": body.get("grand_total", 0),
+        "gpm_profit": body.get("gpm_profit", 0),
+        "gpm_labor": body.get("gpm_labor", 0),
+        "gpm_material": body.get("gpm_material", 0),
+        "textura_amount": body.get("textura_amount", 0),
+    }
+    job["proposal_data"] = proposal_data
+    save_job(job)
+    return {"status": "ok"}
+
+
 @app.post("/api/jobs/{job_id}/proposal/generate")
 def api_generate_proposal(job_id: str):
     """Auto-bundle materials into proposal line items."""

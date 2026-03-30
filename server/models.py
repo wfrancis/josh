@@ -607,6 +607,14 @@ def load_job(job_ref) -> Optional[dict]:
             except (ValueError, TypeError):
                 job["bid_data"] = None
 
+        # Parse proposal_data JSON if present
+        raw_proposal = job.get("proposal_data")
+        if raw_proposal:
+            try:
+                job["proposal_data"] = _json.loads(raw_proposal)
+            except (ValueError, TypeError):
+                job["proposal_data"] = None
+
         job["materials"] = [
             dict(r) for r in
             conn.execute("SELECT * FROM job_materials WHERE job_id=? ORDER BY id", (jid,)).fetchall()

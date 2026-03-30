@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import {
   FileDown, Loader2, ChevronDown, ChevronRight, ChevronUp,
   GripVertical, Pencil, Trash2, Plus, Save, RotateCcw, Eye, Check, X,
@@ -951,6 +952,12 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   const [gpmMaterial, setGpmMaterial] = useState(0)
   const [gpmTotal, setGpmTotal] = useState(0)
 
+  // Auto-save state
+  const [isDirty, setIsDirty] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [lastSaved, setLastSaved] = useState(null)
+  const autoSaveRef = useRef(null)
+
   // Recalculate totals when bundles, GPM, tax, or textura change
   const recalcTotals = useCallback((currentBundles, rate, textura, gpm) => {
     const gpmDecimal = (gpm || 0) / 100
@@ -1016,6 +1023,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
       setExclusions(data.exclusions || [])
       setTaxRate(data.tax_rate || job.tax_rate || 0)
       setHasGenerated(true)
+      setIsDirty(true)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -1023,30 +1031,98 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     }
   }, [job])
 
-  // Auto-generate on mount
+  // Load saved bundles on mount, or auto-generate if none saved
   useEffect(() => {
-    if (job?.id && !hasGenerated) {
-      generateBundles()
-    }
+    if (!job?.id || hasGenerated) return
+    let cancelled = false
+    ;(async () => {
+      setLoading(true)
+      try {
+        const saved = await fetch(`/api/jobs/${job.id}/proposal/bundles`).then(r => r.ok ? r.json() : null)
+        if (cancelled) return
+        if (saved && saved.bundles && saved.bundles.length > 0) {
+          setBundles(saved.bundles)
+          setNotes(saved.notes || [])
+          setTerms(saved.terms || [])
+          setExclusions(saved.exclusions || [])
+          setTaxRate(saved.tax_rate ?? job.tax_rate ?? 0)
+          if (saved.gpm_pct != null) setGpmPct(saved.gpm_pct * 100)
+          if (saved.textura_fee != null) setTexturaEnabled(!!saved.textura_fee)
+          setHasGenerated(true)
+          setLoading(false)
+          return
+        }
+      } catch (e) {
+        console.warn('Could not load saved proposal, generating fresh:', e)
+      }
+      if (!cancelled) {
+        generateBundles()
+      }
+    })()
+    return () => { cancelled = true }
   }, [job?.id])
+
+  // Auto-save debounce (1.5s after any edit)
+  useEffect(() => {
+    if (!isDirty || !job?.id || bundles.length === 0) return
+    if (autoSaveRef.current) clearTimeout(autoSaveRef.current)
+    autoSaveRef.current = setTimeout(async () => {
+      setSaving(true)
+      try {
+        await fetch(`/api/jobs/${job.id}/proposal/bundles`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bundles,
+            notes,
+            terms,
+            exclusions,
+            tax_rate: taxRate,
+            gpm_pct: gpmPct / 100,
+            textura_fee: texturaEnabled ? 1 : 0,
+            subtotal,
+            tax_amount: taxAmount,
+            grand_total: grandTotal,
+            gpm_profit: gpmTotal,
+            gpm_labor: gpmLabor,
+            gpm_material: gpmMaterial,
+            textura_amount: texturaAmount,
+          }),
+        })
+        setIsDirty(false)
+        setLastSaved(new Date())
+      } catch (e) {
+        console.error('Auto-save failed:', e)
+      } finally {
+        setSaving(false)
+      }
+    }, 1500)
+    return () => { if (autoSaveRef.current) clearTimeout(autoSaveRef.current) }
+  }, [isDirty, bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, job?.id])
+
+  // Helper: set bundles + mark dirty
+  const setBundlesAndDirty = useCallback((updater) => {
+    setBundles(updater)
+    setIsDirty(true)
+  }, [])
 
   // Update a bundle at index
   const updateBundle = useCallback((idx, updated) => {
-    setBundles(prev => {
+    setBundlesAndDirty(prev => {
       const next = [...prev]
       next[idx] = updated
       return next
     })
-  }, [])
+  }, [setBundlesAndDirty])
 
   // Delete a bundle
   const deleteBundle = useCallback((idx) => {
-    setBundles(prev => prev.filter((_, i) => i !== idx))
-  }, [])
+    setBundlesAndDirty(prev => prev.filter((_, i) => i !== idx))
+  }, [setBundlesAndDirty])
 
   // Move a bundle up/down
   const moveBundle = useCallback((idx, direction) => {
-    setBundles(prev => {
+    setBundlesAndDirty(prev => {
       const next = [...prev]
       const targetIdx = idx + direction
       if (targetIdx < 0 || targetIdx >= next.length) return prev
@@ -1055,7 +1131,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
       next[targetIdx] = temp
       return next
     })
-  }, [])
+  }, [setBundlesAndDirty])
 
   // Add a new blank bundle
   const addBundle = useCallback(() => {
@@ -1066,8 +1142,8 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
       price_override: 0,
       materials: [],
     }
-    setBundles(prev => [...prev, newBundle])
-  }, [bundles.length])
+    setBundlesAndDirty(prev => [...prev, newBundle])
+  }, [bundles.length, setBundlesAndDirty])
 
   // Rewrite descriptions using AI agent
   const rewriteDescriptions = useCallback(async () => {
@@ -1087,7 +1163,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
       const data = await res.json()
       const descriptions = data.descriptions || []
       if (descriptions.length > 0) {
-        setBundles(prev => {
+        setBundlesAndDirty(prev => {
           const next = [...prev]
           for (const d of descriptions) {
             const idx = d.index
@@ -1163,7 +1239,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     // Remove selected bundles and insert combined at first selected position
     const remaining = bundles.filter((_, i) => !indices.has(i))
     remaining.splice(sorted[0], 0, combined)
-    setBundles(remaining)
+    setBundlesAndDirty(() => remaining)
 
     // Reset combine state
     setSelectMode(false)
@@ -1229,8 +1305,10 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
             <FileText className="w-5 h-5 text-si-accent" />
             Proposal Editor
           </h2>
-          <p className="text-sm text-gray-500 mt-0.5">
+          <p className="text-sm text-gray-500 mt-0.5 flex items-center gap-2">
             Edit bundles, pricing, and generate the proposal PDF
+            {saving && <span className="text-xs text-si-accent/70 flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" /> Saving...</span>}
+            {!saving && lastSaved && <span className="text-xs text-emerald-500/60">✓ Saved</span>}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -1346,9 +1424,9 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
       {/* Notes, Terms, Exclusions */}
       {!loading && hasGenerated && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <EditableList title="Notes" items={notes} onChange={setNotes} />
-          <EditableList title="Terms & Conditions" items={terms} onChange={setTerms} />
-          <EditableList title="Exclusions" items={exclusions} onChange={setExclusions} />
+          <EditableList title="Notes" items={notes} onChange={v => { setNotes(v); setIsDirty(true) }} />
+          <EditableList title="Terms & Conditions" items={terms} onChange={v => { setTerms(v); setIsDirty(true) }} />
+          <EditableList title="Exclusions" items={exclusions} onChange={v => { setExclusions(v); setIsDirty(true) }} />
         </div>
       )}
 
@@ -1406,6 +1484,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
                         onChange={(e) => {
                           const val = parseFloat(e.target.value)
                           setGpmPct(isNaN(val) ? 0 : val)
+                          setIsDirty(true)
                         }}
                         className="bg-white/[0.04] border border-white/[0.08] rounded-lg px-2 py-1 text-emerald-400 text-xs tabular-nums w-20 text-center focus:outline-none focus:border-emerald-400/50"
                       />
@@ -1459,7 +1538,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
                     <input
                       type="checkbox"
                       checked={texturaEnabled}
-                      onChange={(e) => setTexturaEnabled(e.target.checked)}
+                      onChange={(e) => { setTexturaEnabled(e.target.checked); setIsDirty(true) }}
                       className="w-3.5 h-3.5 rounded border-white/10 bg-white/[0.04] text-si-accent focus:ring-si-accent/50"
                     />
                     <span>Textura (0.22%)</span>
@@ -1517,14 +1596,15 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         </div>
         )})()}
 
-      {/* Combine Bundles Dialog — rendered at top level to avoid CSS transform issues */}
-      {showCombineDialog && (
+      {/* Combine Bundles Dialog — portaled to document.body to escape CSS transform containing block */}
+      {showCombineDialog && createPortal(
         <CombineBundlesDialog
           bundles={bundles}
           selectedIndices={selectedIndices}
           onCombine={combineBundles}
           onCancel={() => setShowCombineDialog(false)}
-        />
+        />,
+        document.body
       )}
     </div>
   )
