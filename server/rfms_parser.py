@@ -104,18 +104,38 @@ def _extract_install_code(desc: str) -> str:
     """Extract item code from an install line description.
 
     Examples:
-        "Install CPT-2 Broadloom"      -> "CPT-2"
-        "Install T-3 Floor Tile"       -> "T-3"
-        "Install F102 - Carpet Tile"   -> "F102"
-        "Install BR-1 Wall Tile"       -> "BR-1"
-        "Install LVP-1 Vinyl Plank"    -> "LVP-1"
+        "Install CPT-2 Broadloom"                          -> "CPT-2"
+        "Install T-3 Floor Tile"                            -> "T-3"
+        "Install F102 - Carpet Tile"                        -> "F102"
+        "Install BR-1 Wall Tile"                            -> "BR-1"
+        "Install LVP-1 Vinyl Plank"                         -> "LVP-1"
+        "Install - (Scheme A) Metroflor - Performer..."     -> "Metroflor"
+        "Install - 7\" x 48\" - Luxury Vinyl Plank..."      -> "7\" x 48\""
     """
     # Strip "Install " prefix
     clean = re.sub(r'^install\s+', '', desc.strip(), flags=re.IGNORECASE)
+    # Strip leading dashes/whitespace
+    clean = re.sub(r'^[\s\-]+', '', clean)
+    # Extract scheme prefix if present (e.g. "(Scheme A)") to include in key
+    scheme_m = re.match(r'\(Scheme\s+([A-Z](?:\s*&\s*[A-Z])?)\)\s*', clean, re.IGNORECASE)
+    scheme_prefix = ""
+    if scheme_m:
+        scheme_prefix = f"(SCHEME {scheme_m.group(1).upper()}) "
+        clean_no_scheme = clean[scheme_m.end():]
+    else:
+        clean_no_scheme = clean
     # Match item codes like CPT-2, T-3, F102, BR-1, LVP-1, W131, SCH-1, RB-1
-    # Allow leading dashes/whitespace (e.g. "Install - F113 - Rubber Sheet")
-    m = re.match(r'[\s\-]*([A-Z]{1,4}-?\d{1,4}(?:/[A-Z]{1,4}-?\d{1,4})*)', clean, re.IGNORECASE)
-    return m.group(1).upper() if m else ""
+    m = re.match(r'([A-Z]{1,4}-?\d{1,4}(?:/[A-Z]{1,4}-?\d{1,4})*)', clean_no_scheme, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    # Fallback: take the first part before " - " (e.g. "Metroflor")
+    # Prefix with scheme to distinguish Scheme A vs Scheme B for same manufacturer
+    parts = clean_no_scheme.split(' - ')
+    if parts and parts[0].strip():
+        label = parts[0].strip()[:30]
+        if re.search(r'[A-Za-z]', label):
+            return (scheme_prefix + label).upper()
+    return ""
 
 
 def _extract_unit(desc: str, material_type: str) -> str:
@@ -127,15 +147,25 @@ def _extract_unit(desc: str, material_type: str) -> str:
 
 
 def _extract_item_label(desc: str) -> str:
-    # Strip scheme prefix
-    clean = re.sub(r'^\(Scheme\s+[A-Z](?:\s*&\s*[A-Z])?\)\s*', '', desc)
+    # Check for scheme prefix
+    scheme_m = re.match(r'^\(Scheme\s+([A-Z](?:\s*&\s*[A-Z])?)\)\s*', desc, re.IGNORECASE)
+    scheme_prefix = ""
+    if scheme_m:
+        scheme_prefix = f"(Scheme {scheme_m.group(1).upper()}) "
+        clean = desc[scheme_m.end():]
+    else:
+        clean = desc
     # Match codes like F102, W131/W132/W133, B102
     m = re.match(r'^([A-Z]\d{2,4}(?:/[A-Z]\d{2,4})*)\b', clean)
     if m:
-        return m.group(1)
+        return m.group(1)  # F-codes don't need scheme prefix (they're unique)
     parts = clean.split(' - ')
     if parts:
-        return parts[0].strip()[:30]
+        label = parts[0].strip()[:30]
+        # Non-F-code labels need scheme prefix to distinguish (e.g. "Metroflor" Scheme A vs B)
+        if scheme_prefix and label:
+            return scheme_prefix + label
+        return label
     return desc[:30]
 
 
