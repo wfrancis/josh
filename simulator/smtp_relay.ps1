@@ -71,7 +71,8 @@ function Handle-SmtpSession {
                     $filename = "${timestamp}_${safeName}.eml"
                     $filepath = Join-Path $folder $filename
 
-                    Set-Content -Path $filepath -Value $data -Encoding UTF8
+                    # Use .NET to write without BOM — Python email parser chokes on BOM
+                    [System.IO.File]::WriteAllText($filepath, $data, (New-Object System.Text.UTF8Encoding $false))
                     Write-Log "Saved: $filename -> $(Split-Path $folder -Leaf) (To: $toAddr)"
 
                     # Reset for next message

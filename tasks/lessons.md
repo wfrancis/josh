@@ -37,6 +37,30 @@
 - Profit is redistributed: 99% on labor line, 1% on material/sundry line
 - Revenue = material_base / (1 - gpm_pct)
 
+## Vendor Quote Simulation Bugs Found & Fixed
+- **PowerShell UTF-8 BOM**: `Set-Content -Encoding UTF8` adds a BOM (EF BB BF) that corrupts Python's email parser. Always use `[System.IO.File]::WriteAllText($path, $data, (New-Object System.Text.UTF8Encoding $false))` for BOM-free UTF-8.
+- **JS string vs number ID mismatch**: Inline `onclick="fn('${id}')"` passes a string, but `array.find(r => r.id === id)` compares to a number from JSON. Always `Number(id)` at the top of every function that receives an ID from HTML onclick.
+- **Vendor Simulator status API**: UI expected `data.pending` but API returns `data.counts.pending`. Always check the actual API response shape before writing UI code.
+- **Test mode "Send to Simulator" button**: Must show in test mode even when vendor has no email. Use `(contact?.contact_email || testMode)` as the condition, with a fallback email like `vendorname@simulator.local`.
+- **Adhesive freight**: Vendor-supplied adhesives need `freight_per_unit: 5.00` in sundry rules. Taylor Dynamics stocked adhesive has no freight.
+- **Textura on PDF**: `textura_fee` and `textura_amount` must be passed through the `proposal_data` dict to the PDF generator — they were being sent from frontend but dropped at the API layer.
+
+## Stair Sundry Ratios (Commercial)
+- Pad: 0.74 SY/stair (6lb 3/8", $1.38/SY, 30 SY rolls — round up to full rolls)
+- Tack strip: 6.0 LF/stair (amenity situation)
+- Seam sealer: 5.307 LF/stair
+
+## Tax Calculation
+- Tax must be computed as derived state from current cost components, NOT stored from generation time
+- Formula: taxable = material_cost + sundry_cost + freight + gpm_material_adder
+- Tax = taxable × taxRate
+- Recalculate in updateBundle() on every edit, and sum per-bundle in recalcTotals()
+
+## TDZ (Temporal Dead Zone) in React Minified Builds
+- `const` + `useCallback` declarations are NOT hoisted in minified builds
+- If function A references variable B, B must be declared BEFORE A in source order
+- Symptom: `ReferenceError: Cannot access 'X' before initialization` only in production builds
+
 ## Server / Frontend
 - Python changes require server restart (no auto-reload)
 - Frontend JSX changes require `npx vite build` in frontend/ dir (serves from dist/)

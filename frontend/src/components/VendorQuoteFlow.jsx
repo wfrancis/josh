@@ -197,7 +197,7 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
       const subject = `Request for Pricing — ${job.project_name || 'Project'}`
       await api.sendQuoteEmail(job.id, {
         vendor_name: vendorName,
-        vendor_email: contact.contact_email || '',
+        vendor_email: contact.contact_email || (testMode ? `${vendorName.toLowerCase().replace(/\s+/g, '')}@simulator.local` : ''),
         vendor_id: vendorObj?.id || null,
         subject,
         body: generatedText[vendorName] || '',
@@ -484,8 +484,8 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
                             )}
                           </button>
 
-                          {/* Send Email button — routes based on test mode */}
-                          {contact?.contact_email && (
+                          {/* Send Email / Send to Simulator button */}
+                          {(contact?.contact_email || testMode) && (
                             <button
                               onClick={() => {
                                 if (!isSent) handleSendEmail(vendorName, vendorMats)
@@ -510,8 +510,8 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
                             </button>
                           )}
 
-                          {/* Fallback mailto link when no SMTP available + manual mark sent */}
-                          {!contact?.contact_email && (
+                          {/* Fallback: manual mark sent when no email and not in test mode */}
+                          {!contact?.contact_email && !testMode && (
                             <button
                               onClick={() => handleMarkSent(vendorName, vendorMats)}
                               disabled={isMarkingSent || isSent}

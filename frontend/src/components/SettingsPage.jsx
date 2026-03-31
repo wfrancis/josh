@@ -29,6 +29,10 @@ export default function SettingsPage() {
   // Bid folder state
   const [bidFolderPath, setBidFolderPath] = useState('')
 
+  // Vendor quote test mode
+  const [testMode, setTestMode] = useState(false)
+  const [testModeToggling, setTestModeToggling] = useState(false)
+
   // Email automation state
   const [emailEnabled, setEmailEnabled] = useState(false)
   const [emailSaving, setEmailSaving] = useState(false)
@@ -53,6 +57,7 @@ export default function SettingsPage() {
         // Bid folder path
         if (data.bid_folder_path) setBidFolderPath(data.bid_folder_path)
         // Email automation settings
+        if (data.vendor_quote_test_mode === 'true') setTestMode(true)
         if (data.email_automation_enabled === 'true') setEmailEnabled(true)
         if (data.email_config) {
           try { setEmailConfig(prev => ({ ...prev, ...JSON.parse(data.email_config) })) } catch {}
@@ -359,6 +364,50 @@ export default function SettingsPage() {
                   </span>
                 )}
               </div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Vendor Quote Test Mode ──────────────────── */}
+        <div className={`glass-card p-8 border-2 ${testMode ? 'border-amber-500/50' : 'border-transparent'}`}>
+          <div className="flex items-start gap-4">
+            <div className={`w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 ${testMode ? 'bg-amber-500/20' : 'bg-gray-500/10'}`}>
+              <span className="text-xl">{testMode ? '\u26A0\uFE0F' : '\uD83E\uDDEA'}</span>
+            </div>
+            <div className="flex-1">
+              <h2 className="text-lg font-bold text-white">Vendor Quote Test Mode</h2>
+              <p className="text-sm text-gray-500 mt-1">
+                {testMode
+                  ? 'All outgoing vendor emails route to the local Vendor Simulator. Run start_simulator.bat first.'
+                  : 'When enabled, vendor quote emails go to the Simulator instead of real vendors.'}
+              </p>
+            </div>
+            <button
+              disabled={testModeToggling}
+              onClick={async () => {
+                setTestModeToggling(true)
+                try {
+                  const newVal = testMode ? 'false' : 'true'
+                  await api.updateSettings({ vendor_quote_test_mode: newVal })
+                  setTestMode(!testMode)
+                } catch (err) { console.error(err) }
+                finally { setTestModeToggling(false) }
+              }}
+              className={`relative w-14 h-7 rounded-full transition-colors duration-200 flex-shrink-0 ${
+                testMode ? 'bg-amber-500' : 'bg-white/[0.08]'
+              }`}
+            >
+              <div className={`absolute top-0.5 left-0.5 w-6 h-6 rounded-full bg-white shadow transition-transform duration-200 ${
+                testMode ? 'translate-x-7' : ''
+              }`} />
+            </button>
+          </div>
+          {testMode && (
+            <div className="mt-4 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20">
+              <p className="text-xs text-amber-300 font-medium">
+                Simulator must be running on localhost:8100.
+                Open <a href="http://localhost:8100" target="_blank" rel="noopener noreferrer" className="underline hover:text-amber-200">localhost:8100</a> to see vendor responses.
+              </p>
             </div>
           )}
         </div>
