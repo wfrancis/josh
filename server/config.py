@@ -59,7 +59,7 @@ SUNDRY_RULES: dict[str, list[dict]] = {
     ],
     "corridor_broadloom": [
         {"sundry_name": "adhesive", "coverage": 80, "unit": "SY/pail", "unit_price": 95.00,
-         "notes": "direct glue adhesive"},
+         "freight_per_unit": 5.00, "notes": "direct glue adhesive"},
         {"sundry_name": "primer", "coverage": 100, "unit": "SY/pail", "unit_price": 65.00},
         {"sundry_name": "seam_tape", "coverage": 60, "unit": "LF/roll", "unit_price": 9.09},
     ],
@@ -103,22 +103,26 @@ SUNDRY_RULES: dict[str, list[dict]] = {
         {"sundry_name": "adhesive", "coverage": 60, "unit": "LF/tube", "unit_price": 12.00},
     ],
     "rubber_tile": [
-        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00},
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00,
+         "freight_per_unit": 5.00},
         {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
     ],
     "rubber_sheet": [
-        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00},
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00,
+         "freight_per_unit": 5.00},
         {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
         {"sundry_name": "weld_rod", "coverage": 500, "unit": "LF/roll", "unit_price": 45.00,
          "qty_source": "weld_rod_lf"},
     ],
     "transitions": [],
     "vct": [
-        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 85.00},
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 85.00,
+         "freight_per_unit": 5.00},
         {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
     ],
     "wood": [
-        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 110.00},
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 110.00,
+         "freight_per_unit": 5.00},
         {"sundry_name": "moisture_barrier", "coverage": 500, "unit": "SF/roll", "unit_price": 75.00},
     ],
     "waterproofing": [

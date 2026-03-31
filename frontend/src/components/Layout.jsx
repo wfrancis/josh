@@ -203,12 +203,51 @@ function NotificationBell() {
   )
 }
 
+function TestModeBanner() {
+  const [testMode, setTestMode] = useState(false)
+  const [toggling, setToggling] = useState(false)
+
+  useEffect(() => {
+    api.simStatus().then(s => setTestMode(!!s.test_mode)).catch(() => {})
+  }, [])
+
+  const handleToggle = async () => {
+    setToggling(true)
+    try {
+      await api.updateSettings({ vendor_quote_test_mode: testMode ? 'false' : 'true' })
+      setTestMode(!testMode)
+    } catch (err) {
+      console.error('Failed to toggle test mode:', err)
+    } finally {
+      setToggling(false)
+    }
+  }
+
+  if (!testMode) return null
+
+  return (
+    <div className="bg-amber-500 text-black px-4 py-2 flex items-center justify-center gap-3 text-sm font-bold tracking-wide z-[100] relative">
+      <span className="text-lg">&#9888;</span>
+      <span>TEST MODE — Vendor emails route to Simulator, not real vendors.</span>
+      <button
+        onClick={handleToggle}
+        disabled={toggling}
+        className="ml-2 px-3 py-1 rounded-lg bg-black/20 hover:bg-black/30 text-black font-semibold text-xs transition-colors disabled:opacity-50"
+      >
+        {toggling ? 'Switching...' : 'Switch to Live \u2192'}
+      </button>
+    </div>
+  )
+}
+
 export default function Layout({ children }) {
   const location = useLocation()
   const [mobileOpen, setMobileOpen] = useState(false)
 
   return (
-    <div className="min-h-screen flex">
+    <div className="min-h-screen flex flex-col">
+      <TestModeBanner />
+      <div className="flex flex-1 min-h-0">
       {/* ── Desktop Sidebar ──────────────────────────── */}
       <aside className="hidden md:flex w-[260px] flex-shrink-0 bg-[#080C19] border-r border-white/[0.04] flex-col relative">
         <SidebarContent location={location} onNavigate={() => {}} />
@@ -255,6 +294,7 @@ export default function Layout({ children }) {
           {children}
         </div>
       </main>
+      </div>
     </div>
   )
 }

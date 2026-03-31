@@ -29,6 +29,13 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
   const [existingRequests, setExistingRequests] = useState([])
   const [vendorSuggestions, setVendorSuggestions] = useState({}) // materialOrigIdx -> {suggested_vendor, reason}
   const [suggestingVendors, setSuggestingVendors] = useState(false)
+  const [testMode, setTestMode] = useState(false)
+  const [sendingEmail, setSendingEmail] = useState(null) // vendor name being sent
+
+  // Check if test mode is active
+  useEffect(() => {
+    api.simStatus().then(s => setTestMode(!!s.test_mode)).catch(() => {})
+  }, [])
 
   // Load known vendors + existing quote requests on mount
   useEffect(() => {
@@ -177,6 +184,33 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
       setError(err.message)
     } finally {
       setMarkingSent(null)
+    }
+  }
+
+  const handleSendEmail = async (vendorName, vendorMaterials) => {
+    setSendingEmail(vendorName)
+    setError(null)
+    try {
+      const vendorObj = vendors.find(v => v.name === vendorName)
+      const contact = vendorObj || {}
+      const materialIds = vendorMaterials.map(m => ({ id: m.id, item_code: m.item_code || '' })).filter(m => m.id)
+      const subject = `Request for Pricing — ${job.project_name || 'Project'}`
+      await api.sendQuoteEmail(job.id, {
+        vendor_name: vendorName,
+        vendor_email: contact.contact_email || '',
+        vendor_id: vendorObj?.id || null,
+        subject,
+        body: generatedText[vendorName] || '',
+        material_ids: materialIds,
+        sent_at: new Date().toISOString(),
+      })
+      setSentVendors(prev => new Set([...prev, vendorName]))
+      if (onQuoteRequestCreated) onQuoteRequestCreated()
+    } catch (err) {
+      console.error('Failed to send quote email:', err)
+      setError(err.message)
+    } finally {
+      setSendingEmail(null)
     }
   }
 
@@ -450,36 +484,49 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
                             )}
                           </button>
 
-                          {/* Open in Email — mailto link */}
+                          {/* Send Email button — routes based on test mode */}
                           {contact?.contact_email && (
-                            <a
-                              href={`mailto:${contact.contact_email}?subject=${encodeURIComponent(`Request for Pricing — ${job.project_name || 'Project'}`)}&body=${encodeURIComponent(generatedText[vendorName] || '')}`}
+                            <button
                               onClick={() => {
-                                // Auto-mark sent when they click email
-                                if (!isSent) handleMarkSent(vendorName, vendorMats)
+                                if (!isSent) handleSendEmail(vendorName, vendorMats)
                               }}
-                              className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-medium bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 transition-colors"
+                              disabled={sendingEmail === vendorName || isSent}
+                              className={`flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-medium transition-colors disabled:opacity-50 ${
+                                isSent
+                                  ? 'bg-emerald-500/20 text-emerald-300'
+                                  : testMode
+                                    ? 'bg-amber-500/20 text-amber-300 hover:bg-amber-500/30'
+                                    : 'bg-blue-500/20 text-blue-300 hover:bg-blue-500/30'
+                              }`}
                             >
-                              <ExternalLink className="w-4 h-4" />
-                              Email
-                            </a>
+                              {sendingEmail === vendorName ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : isSent ? (
+                                <Check className="w-4 h-4" />
+                              ) : (
+                                <Send className="w-4 h-4" />
+                              )}
+                              {isSent ? 'Sent' : testMode ? 'Send to Simulator' : 'Send Email'}
+                            </button>
                           )}
 
-                          {/* Mark Sent button */}
-                          <button
-                            onClick={() => handleMarkSent(vendorName, vendorMats)}
-                            disabled={isMarkingSent || isSent}
-                            className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-medium bg-white/[0.06] text-gray-300 hover:bg-white/[0.1] hover:text-white transition-colors disabled:opacity-50"
-                          >
-                            {isMarkingSent ? (
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                            ) : isSent ? (
-                              <Check className="w-4 h-4 text-emerald-400" />
-                            ) : (
-                              <Send className="w-4 h-4" />
-                            )}
-                            {isSent ? 'Sent' : 'Mark Sent'}
-                          </button>
+                          {/* Fallback mailto link when no SMTP available + manual mark sent */}
+                          {!contact?.contact_email && (
+                            <button
+                              onClick={() => handleMarkSent(vendorName, vendorMats)}
+                              disabled={isMarkingSent || isSent}
+                              className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-medium bg-white/[0.06] text-gray-300 hover:bg-white/[0.1] hover:text-white transition-colors disabled:opacity-50"
+                            >
+                              {isMarkingSent ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : isSent ? (
+                                <Check className="w-4 h-4 text-emerald-400" />
+                              ) : (
+                                <Send className="w-4 h-4" />
+                              )}
+                              {isSent ? 'Sent' : 'Mark Sent'}
+                            </button>
+                          )}
                         </div>
                       </div>
                     )}

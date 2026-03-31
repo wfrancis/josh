@@ -777,6 +777,14 @@ def generate_proposal_pdf(
             Paragraph(f"${tax_amount:,.2f}", styles["total_value"]),
         ])
 
+    textura_fee = proposal_data.get("textura_fee", 0)
+    textura_amount = proposal_data.get("textura_amount", 0)
+    if textura_fee and textura_amount:
+        totals_rows.append([
+            Paragraph("<b>Textura Fee (0.22%):</b>", styles["total_label"]),
+            Paragraph(f"${textura_amount:,.2f}", styles["total_value"]),
+        ])
+
     totals_rows.append([
         Paragraph("<b>Grand Total:</b>", styles["total_label"]),
         Paragraph(f"<b>${grand_total:,.2f}</b>", styles["total_value"]),

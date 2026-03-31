@@ -98,6 +98,80 @@ os.makedirs(PDF_DIR, exist_ok=True)
 
 
 _inbox_monitor: InboxMonitor | None = None
+_sim_watcher = None  # SimFolderWatcher instance (lazy import to avoid circular)
+
+
+def _start_sim_watcher():
+    """Start the SimFolderWatcher if vendor quote test mode is enabled."""
+    global _sim_watcher
+    settings = get_settings()
+    test_mode = str(settings.get("vendor_quote_test_mode", "false")).lower() == "true"
+
+    # Stop existing watcher if running
+    if _sim_watcher and _sim_watcher.is_running:
+        _sim_watcher.stop()
+        _sim_watcher = None
+
+    if not test_mode:
+        return
+
+    from sim_email import SimFolderWatcher
+
+    def on_sim_quote_received(*, job_reference=None, temp_files=None, vendor_email=None,
+                              filenames=None, subject=""):
+        """Callback for sim watcher — same pipeline as InboxMonitor."""
+        temp_files = temp_files or []
+        filenames = filenames or []
+        all_products = []
+
+        for fpath in temp_files:
+            try:
+                products = parse_quote_file(fpath)
+                if products:
+                    all_products.extend(products)
+            except Exception as e:
+                print(f"[SimWatcher] Error parsing {fpath}: {e}")
+
+        if not all_products:
+            print(f"[SimWatcher] No products extracted from: {subject[:60]}")
+            return
+
+        # Try X-SI-Job-Id header first (numeric), then fuzzy search
+        job_id = None
+        if job_reference and job_reference.isdigit():
+            job = load_job(int(job_reference))
+            if job:
+                job_id = job["id"]
+
+        if not job_id:
+            search_term = job_reference or subject[:80]
+            results = search_all(search_term)
+            if results.get("jobs"):
+                job_id = results["jobs"][0]["id"]
+
+        if not job_id:
+            print(f"[SimWatcher] No matching job for: {job_reference or subject}")
+            return
+
+        save_quotes(job_id, all_products)
+        matched = _auto_match_quotes(job_id, all_products)
+        save_vendor_prices_from_quotes(job_id, all_products)
+        _link_upload_to_requests(job_id, all_products)
+
+        vendor_name = all_products[0].get("vendor", vendor_email or "Unknown")
+        file_names_str = ", ".join(filenames[:3]) if filenames else "email"
+        create_notification(
+            job_id, "quote_received",
+            f"[SIM] Quote received from {vendor_name} — {len(all_products)} products parsed, "
+            f"{matched} auto-matched ({file_names_str})"
+        )
+        log_activity(job_id, "agent_quote_imported",
+                     f"[SIM] Auto-imported quote from {vendor_name} via test mode",
+                     {"vendor": vendor_name, "products": len(all_products), "matched": matched, "sim": True})
+        print(f"[SimWatcher] Imported {len(all_products)} products for job #{job_id} from {vendor_name}")
+
+    _sim_watcher = SimFolderWatcher(on_quote_received=on_sim_quote_received)
+    _sim_watcher.start()
 
 
 def _start_inbox_monitor():
@@ -105,6 +179,11 @@ def _start_inbox_monitor():
     global _inbox_monitor
     import json as _json
     settings = get_settings()
+    # Don't start real inbox monitor when in test mode
+    if str(settings.get("vendor_quote_test_mode", "false")).lower() == "true":
+        if _inbox_monitor and _inbox_monitor.is_running:
+            _inbox_monitor.stop()
+        return
     if settings.get("email_automation_enabled") != "true":
         return
     try:
@@ -195,6 +274,7 @@ def startup():
     _seed_company_rates()
     _auto_import_price_books()
     _start_inbox_monitor()
+    _start_sim_watcher()
 
 
 def _auto_import_price_books():
@@ -251,6 +331,7 @@ class SettingsUpdate(BaseModel):
     email_automation_enabled: Optional[str] = None
     email_config: Optional[str] = None
     bid_folder_path: Optional[str] = None
+    vendor_quote_test_mode: Optional[str] = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -1978,6 +2059,8 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
         "tax_rate": body.get("tax_rate", 0),
         "tax_amount": body.get("tax_amount", 0),
         "grand_total": body.get("grand_total", 0),
+        "textura_fee": body.get("textura_fee", 0),
+        "textura_amount": body.get("textura_amount", 0),
         "notes": body.get("notes", []),
         "terms": body.get("terms", []),
         "exclusions": body.get("exclusions", []),
@@ -2410,6 +2493,7 @@ def api_get_settings():
         "bid_folder_path": settings.get("bid_folder_path", ""),
         "ai_provider": provider["provider"],
         "ai_available": provider["available"],
+        "vendor_quote_test_mode": settings.get("vendor_quote_test_mode", "false"),
     }
 
 
@@ -2436,6 +2520,8 @@ def api_update_settings(body: SettingsUpdate):
         updates["email_config"] = body.email_config
     if body.bid_folder_path is not None:
         updates["bid_folder_path"] = body.bid_folder_path
+    if body.vendor_quote_test_mode is not None:
+        updates["vendor_quote_test_mode"] = body.vendor_quote_test_mode
     if updates:
         save_settings(updates)
         # Apply API key and model to quote parser
@@ -2444,6 +2530,10 @@ def api_update_settings(body: SettingsUpdate):
         # Restart inbox monitor if email settings changed
         if body.email_automation_enabled is not None or body.email_config is not None:
             _start_inbox_monitor()
+        # Restart sim watcher if test mode changed
+        if body.vendor_quote_test_mode is not None:
+            _start_sim_watcher()
+            _start_inbox_monitor()  # Re-evaluate: stop real monitor if test mode on
     return {"message": "Settings updated", **api_get_settings()}
 
 
@@ -3322,6 +3412,81 @@ def api_import_schluter():
         items = _json.load(f)
     count = import_price_book("Schluter", items, discount_pct=0.55, category="transitions")
     return {"imported": count, "vendor": "Schluter", "discount": "45% of list (55% off)"}
+
+
+# ── Vendor Quote Test Mode / Simulation ──────────────────────────────────────
+
+@app.get("/api/sim/status")
+def api_sim_status():
+    """Check if vendor quote test mode is active."""
+    settings = get_settings()
+    test_mode = str(settings.get("vendor_quote_test_mode", "false")).lower() == "true"
+    watcher_active = _sim_watcher is not None and _sim_watcher.is_running if _sim_watcher else False
+    return {
+        "test_mode": test_mode,
+        "watcher_active": watcher_active,
+    }
+
+
+@app.post("/api/jobs/{job_id}/send-quote-email")
+async def api_send_quote_email(job_id: str, request: Request):
+    """Send a vendor quote request email via SMTP.
+
+    In test mode: routes to localhost:2525 (PowerShell relay → Vendor Simulator)
+    In production: routes to real SMTP server → real vendor
+    """
+    db_id = _resolve_job_id(job_id)
+    if not db_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    body = await request.json()
+    vendor_name = body.get("vendor_name", "").strip()
+    vendor_email = body.get("vendor_email", "").strip()
+    subject = body.get("subject", "").strip()
+    email_body = body.get("body", "").strip()
+    material_ids = body.get("material_ids", [])
+    vendor_id = body.get("vendor_id")
+
+    if not vendor_name or not vendor_email:
+        raise HTTPException(status_code=400, detail="vendor_name and vendor_email are required")
+    if not subject:
+        job = load_job(db_id)
+        subject = f"Request for Pricing — {job.get('project_name', 'Project')}"
+
+    # Get SMTP config based on test mode
+    settings = get_settings()
+    from sim_email import get_smtp_config, sim_send_quote
+    smtp_config = get_smtp_config(settings)
+
+    try:
+        sim_send_quote(
+            job_id=db_id,
+            vendor_name=vendor_name,
+            vendor_email=vendor_email,
+            subject=subject,
+            body=email_body,
+            smtp_config=smtp_config,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
+
+    # Create quote_request record (same as existing Mark Sent flow)
+    qr = create_quote_request(
+        job_id=db_id,
+        vendor_name=vendor_name,
+        material_ids=material_ids,
+        request_text=email_body,
+        vendor_id=vendor_id,
+        status="sent",
+        sent_at=body.get("sent_at") or __import__("datetime").datetime.utcnow().isoformat(),
+    )
+
+    test_mode = str(settings.get("vendor_quote_test_mode", "false")).lower() == "true"
+    log_activity(db_id, "quote_email_sent",
+                 f"{'[SIM] ' if test_mode else ''}Quote email sent to {vendor_name} ({vendor_email})",
+                 {"vendor": vendor_name, "vendor_email": vendor_email, "test_mode": test_mode})
+
+    return {"status": "sent", "quote_request": qr, "test_mode": test_mode}
 
 
 # ── Static Files (React frontend) ────────────────────────────────────────────
