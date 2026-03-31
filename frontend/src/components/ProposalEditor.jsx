@@ -249,7 +249,7 @@ function CombineBundlesDialog({ bundles, selectedIndices, onCombine, onCancel })
 }
 
 /* ─── Bundle Card ─────────────────────────────────────────────────────── */
-function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMode, selected, onToggleSelect }) {
+function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate, selectMode, selected, onToggleSelect }) {
   const [expanded, setExpanded] = useState(false)
   const [editingName, setEditingName] = useState(false)
   const [nameVal, setNameVal] = useState(bundle.bundle_name)
@@ -273,6 +273,8 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
   const [editingStairCount, setEditingStairCount] = useState(false)
   const [editingLaborQty, setEditingLaborQty] = useState(null)
   const [laborQtyVal, setLaborQtyVal] = useState('')
+  const [editingFreightUnit, setEditingFreightUnit] = useState(null)
+  const [freightUnitVal, setFreightUnitVal] = useState('')
 
   // Sync local state when bundle prop changes
   useEffect(() => {
@@ -444,6 +446,25 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
     setEditingSundryPrice(null)
   }
 
+  const saveFreightUnit = (matIdx) => {
+    const newFreight = parseFloat(freightUnitVal) || 0
+    setEditingFreightUnit(null)
+    const updatedMaterials = (bundle.materials || []).map((m, i) => {
+      if (i !== matIdx) return m
+      const freightCost = round2(newFreight * (m.order_qty || m.installed_qty || 0))
+      return { ...m, freight_per_unit: newFreight, freight_cost: freightCost }
+    })
+    const newFreightCost = round2(updatedMaterials.reduce((s, m) => s + (m.freight_cost || 0), 0))
+    const diff = newFreightCost - (bundle.freight_cost || 0)
+    onUpdate(index, {
+      ...bundle,
+      materials: updatedMaterials,
+      freight_cost: newFreightCost,
+      total_price: round2((bundle.total_price || 0) + diff),
+      price_override: null,
+    })
+  }
+
   // ── Stair Labor ──────────────────────────────────────────────────────────
   const STAIR_KITS = {
     stretched: [
@@ -550,7 +571,13 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
 
   const materialCount = bundle.materials?.length || 0
   const freightAdj = bundle.freight_override != null ? (bundle.freight_override - (bundle.freight_cost || 0)) : 0
-  const displayPrice = bundle.price_override ?? ((bundle.total_price ?? 0) + freightAdj)
+  // Compute tax from current cost components (never use stale bundle.tax_amount)
+  const freight = (bundle.freight_override ?? bundle.freight_cost ?? 0)
+  const bundleTaxable = round2((bundle.material_cost || 0) + (bundle.sundry_cost || 0) + freight + (bundle.gpm_material_adder || 0))
+  const bundleTax = round2(bundleTaxable * (taxRate || 0))
+  const bundlePreTax = round2((bundle.material_cost || 0) + (bundle.sundry_cost || 0) + (bundle.labor_cost || 0) + freight + (bundle.gpm_labor_adder || 0) + (bundle.gpm_material_adder || 0))
+  const bundleTotal = round2(bundlePreTax + bundleTax)
+  const displayPrice = bundle.price_override ?? bundleTotal
   const descPreview = (bundle.description_text || '').split('\n').slice(0, 2).join('\n')
   const hasMoreDesc = (bundle.description_text || '').split('\n').length > 2
 
@@ -707,6 +734,7 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
                       <th className="text-right px-3 py-2 font-medium">Order Qty</th>
                       <th className="text-right px-3 py-2 font-medium">Unit</th>
                       <th className="text-right px-3 py-2 font-medium">Unit Price</th>
+                      <th className="text-right px-3 py-2 font-medium">Freight/Unit</th>
                       <th className="text-right px-3 py-2 font-medium">Ext Cost</th>
                     </tr>
                   </thead>
@@ -722,6 +750,28 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
                         <td className="px-3 py-2 text-gray-300 tabular-nums text-right whitespace-nowrap">
                           {mat.unit_price != null ? formatCurrency(mat.unit_price) : '—'}
                         </td>
+                        <td className="px-3 py-2 text-right whitespace-nowrap">
+                          {editingFreightUnit === mi ? (
+                            <input
+                              type="number"
+                              step="0.0001"
+                              value={freightUnitVal}
+                              onChange={(e) => setFreightUnitVal(e.target.value)}
+                              onBlur={() => saveFreightUnit(mi)}
+                              onKeyDown={(e) => { if (e.key === 'Enter') saveFreightUnit(mi); if (e.key === 'Escape') setEditingFreightUnit(null) }}
+                              className="w-20 bg-white/[0.04] border border-si-accent/50 rounded px-2 py-0.5 text-white text-xs text-right focus:outline-none tabular-nums"
+                              autoFocus
+                            />
+                          ) : (
+                            <span
+                              onClick={() => { setEditingFreightUnit(mi); setFreightUnitVal(String(mat.freight_per_unit ?? '')) }}
+                              className="cursor-pointer text-gray-400 tabular-nums hover:text-si-accent transition-colors"
+                              title="Click to edit freight per unit"
+                            >
+                              {mat.freight_per_unit != null ? `$${Number(mat.freight_per_unit).toFixed(4)}` : '—'}
+                            </span>
+                          )}
+                        </td>
                         <td className="px-3 py-2 text-white tabular-nums text-right font-medium whitespace-nowrap">
                           {mat.extended_cost != null ? formatCurrency(mat.extended_cost) : '—'}
                         </td>
@@ -730,7 +780,7 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
                   </tbody>
                   <tfoot>
                     <tr className="border-t border-white/[0.08]">
-                      <td colSpan={5} className="px-3 py-2 text-gray-500 text-right font-medium">Material Total</td>
+                      <td colSpan={6} className="px-3 py-2 text-gray-500 text-right font-medium">Material Total</td>
                       <td className="px-3 py-2 text-white tabular-nums text-right font-bold">{formatCurrency(bundle.material_cost)}</td>
                     </tr>
                   </tfoot>
@@ -1079,17 +1129,13 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, selectMo
                   </span>
                 )}
               </div>
-              {bundle.tax_amount > 0 && (
+              {bundleTax > 0 && (
                 <div className="flex justify-between text-gray-400">
-                  <span>Tax</span><span className="tabular-nums text-gray-300">{formatCurrency(bundle.tax_amount)}</span>
+                  <span>Tax</span><span className="tabular-nums text-gray-300">{formatCurrency(bundleTax)}</span>
                 </div>
               )}
               <div className="flex justify-between text-white font-bold pt-1.5 border-t border-white/[0.06]">
-                <span>Bundle Total</span><span className="tabular-nums">{formatCurrency(
-                  bundle.freight_override != null
-                    ? bundle.total_price + (bundle.freight_override - (bundle.freight_cost || 0))
-                    : bundle.total_price
-                )}</span>
+                <span>Bundle Total</span><span className="tabular-nums">{formatCurrency(bundleTotal)}</span>
               </div>
             </div>
           </div>
@@ -1187,16 +1233,14 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     setGpmLabor(profitLabor)
     setGpmMaterial(profitMaterial)
 
-    // Sell price = base cost + GPM profit
+    // Tax per bundle: (material + sundry + freight + gpm_material_adder) × rate
+    const tax = currentBundles.reduce((sum, b) => {
+      const freight = b.freight_override ?? b.freight_cost ?? 0
+      const taxable = (b.material_cost || 0) + (b.sundry_cost || 0) + freight + (b.gpm_material_adder || 0)
+      return sum + Math.round(taxable * rate * 100) / 100
+    }, 0)
+
     const sellPrice = totalBaseCost + profit
-
-    // Tax on materials only: material + sundry + freight + GPM material adder
-    const taxableBase = currentBundles.reduce((sum, b) => {
-      return sum + (b.material_cost || 0) + (b.sundry_cost || 0)
-        + (b.freight_override ?? b.freight_cost ?? 0)
-    }, 0) + profitMaterial
-    const tax = Math.round(taxableBase * rate * 100) / 100
-
     const preTotalCalc = sellPrice + tax
     setSubtotal(sellPrice)
     setTaxAmount(tax)
@@ -1414,10 +1458,20 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   const updateBundle = useCallback((idx, updated) => {
     setBundlesAndDirty(prev => {
       const next = [...prev]
-      next[idx] = updated
+      // Recalculate tax and total from cost components
+      const b = { ...updated }
+      const freight = b.freight_override ?? b.freight_cost ?? 0
+      const taxable = round2((b.material_cost || 0) + (b.sundry_cost || 0) + freight + (b.gpm_material_adder || 0))
+      b.taxable = taxable
+      b.tax_amount = round2(taxable * taxRate)
+      const preTax = round2((b.material_cost || 0) + (b.sundry_cost || 0) + (b.labor_cost || 0) + freight + (b.gpm_labor_adder || 0) + (b.gpm_material_adder || 0))
+      if (b.price_override == null) {
+        b.total_price = round2(preTax + b.tax_amount)
+      }
+      next[idx] = b
       return next
     })
-  }, [setBundlesAndDirty])
+  }, [setBundlesAndDirty, taxRate])
 
   // Delete a bundle
   const deleteBundle = useCallback((idx) => {
@@ -1711,6 +1765,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
               onUpdate={updateBundle}
               onDelete={deleteBundle}
               onMove={moveBundle}
+              taxRate={taxRate}
               selectMode={selectMode}
               selected={selectedIndices.has(i)}
               onToggleSelect={toggleSelect}
