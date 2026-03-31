@@ -1211,6 +1211,12 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     recalcTotals(bundles, taxRate, texturaEnabled, gpmPct)
   }, [bundles, taxRate, texturaEnabled, gpmPct, recalcTotals])
 
+  // Helper: set bundles + mark dirty (must be before generateBundles/doSave)
+  const setBundlesAndDirty = useCallback((updater) => {
+    setBundles(updater)
+    setIsDirty(true)
+  }, [])
+
   // Generate proposal bundles from API
   const generateBundles = useCallback(async () => {
     if (!job?.id) return
@@ -1403,12 +1409,6 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
       flushSave() // Also flush on component unmount (tab switch)
     }
   }, [job?.id])
-
-  // Helper: set bundles + mark dirty
-  const setBundlesAndDirty = useCallback((updater) => {
-    setBundles(updater)
-    setIsDirty(true)
-  }, [])
 
   // Update a bundle at index
   const updateBundle = useCallback((idx, updated) => {
