@@ -1224,19 +1224,84 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         throw new Error(err.detail || 'Failed to generate proposal')
       }
       const data = await res.json()
-      setBundles(data.bundles || [])
-      setNotes(data.notes || [])
-      setTerms(data.terms || [])
-      setExclusions(data.exclusions || [])
+      const freshBundles = data.bundles || []
+
+      // Merge manual edits from previous bundles into fresh bundles
+      setBundlesAndDirty(prevBundles => {
+        if (!prevBundles || prevBundles.length === 0) return freshBundles
+
+        // Index previous bundles by name for fast lookup
+        const prevByName = {}
+        prevBundles.forEach(b => { prevByName[b.bundle_name] = b })
+
+        const merged = freshBundles.map(fresh => {
+          const prev = prevByName[fresh.bundle_name]
+          if (!prev) return fresh
+
+          // Preserve manual edits from previous bundle
+          const edits = {}
+          if (prev.price_override != null) edits.price_override = prev.price_override
+          if (prev.freight_override != null) edits.freight_override = prev.freight_override
+          if (prev.description_text && prev.description_text !== fresh.description_text) edits.description_text = prev.description_text
+          if (prev.stair_count) { edits.stair_count = prev.stair_count; edits.stair_labor_type = prev.stair_labor_type }
+          if (prev.gpm_labor_adder) edits.gpm_labor_adder = prev.gpm_labor_adder
+          if (prev.gpm_material_adder) edits.gpm_material_adder = prev.gpm_material_adder
+
+          // Preserve manually added labor lines (stair labor, custom labor)
+          const manualLabor = (prev.labor_items || []).filter(l => l.is_stair_labor || !fresh.labor_items?.some(fl => fl.labor_description === l.labor_description))
+          if (manualLabor.length > 0) {
+            edits.labor_items = [...(fresh.labor_items || []), ...manualLabor]
+            edits.labor_cost = round2(edits.labor_items.reduce((s, l) => s + (l.extended_cost || 0), 0))
+          }
+
+          // Preserve stair sundries and edited sundry prices
+          const stairSundries = (prev.sundry_items || []).filter(s => s.is_stair_sundry)
+          const editedPrices = {}
+          ;(prev.sundry_items || []).forEach(s => {
+            if (!s.is_stair_sundry && s.unit_price != null) editedPrices[s.sundry_name] = s.unit_price
+          })
+          let sundries = (fresh.sundry_items || []).map(s => {
+            if (editedPrices[s.sundry_name] != null && editedPrices[s.sundry_name] !== s.unit_price) {
+              const price = editedPrices[s.sundry_name]
+              return { ...s, unit_price: price, extended_cost: round2(s.qty * price) }
+            }
+            return s
+          })
+          if (stairSundries.length > 0) sundries = [...sundries, ...stairSundries]
+          if (stairSundries.length > 0 || Object.keys(editedPrices).length > 0) {
+            edits.sundry_items = sundries
+            edits.sundry_cost = round2(sundries.reduce((s, item) => s + (item.extended_cost || 0), 0))
+          }
+
+          // Recalculate total if we changed labor or sundries
+          const result = { ...fresh, ...edits }
+          if (edits.labor_cost != null || edits.sundry_cost != null) {
+            result.total_price = round2(
+              (result.material_cost || 0) + (result.labor_cost || 0) +
+              (result.sundry_cost || 0) + (result.freight_cost || 0) +
+              (result.gpm_labor_adder || 0) + (result.gpm_material_adder || 0)
+            )
+          }
+          return result
+        })
+
+        // Re-add combined bundles that don't exist in fresh (they were manually created)
+        const freshNames = new Set(freshBundles.map(b => b.bundle_name))
+        const combinedBundles = prevBundles.filter(b => !freshNames.has(b.bundle_name))
+        return [...merged, ...combinedBundles]
+      })
+
+      setNotes(prev => prev.length > 0 ? prev : data.notes || [])
+      setTerms(prev => prev.length > 0 ? prev : data.terms || [])
+      setExclusions(prev => prev.length > 0 ? prev : data.exclusions || [])
       setTaxRate(data.tax_rate || job.tax_rate || 0)
       setHasGenerated(true)
-      setIsDirty(true)
     } catch (err) {
       setError(err.message)
     } finally {
       setLoading(false)
     }
-  }, [job])
+  }, [job, setBundlesAndDirty])
 
   // Load saved bundles on mount, or auto-generate if none saved
   useEffect(() => {
@@ -1554,7 +1619,10 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           {!selectMode ? (
             <>
               <button
-                onClick={generateBundles}
+                onClick={() => {
+                  if (bundles.length > 0 && !window.confirm('Regenerate bundles from materials? Your manual edits (prices, stair labor, combines) will be preserved.')) return
+                  generateBundles()
+                }}
                 disabled={loading}
                 className="flex items-center gap-2 bg-white/[0.04] border border-white/[0.08] hover:bg-white/[0.08] text-gray-300 font-medium rounded-xl px-4 py-2 text-sm transition-colors disabled:opacity-50"
               >
