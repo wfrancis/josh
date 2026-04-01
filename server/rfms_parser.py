@@ -109,8 +109,9 @@ def _extract_install_code(desc: str) -> str:
         "Install F102 - Carpet Tile"                        -> "F102"
         "Install BR-1 Wall Tile"                            -> "BR-1"
         "Install LVP-1 Vinyl Plank"                         -> "LVP-1"
-        "Install - (Scheme A) Metroflor - Performer..."     -> "Metroflor"
-        "Install - 7\" x 48\" - Luxury Vinyl Plank..."      -> "7\" x 48\""
+        "Install - (Scheme A) Metroflor - Performer..."     -> "(SCHEME A) METROFLOR"
+        "Install (Standard) - CPT-200 - Broadloom"          -> "(STANDARD) CPT-200"
+        "Install (Premium) -  T-203 - Wall Tile..."          -> "(PREMIUM) T-203"
     """
     # Strip "Install " prefix
     clean = re.sub(r'^install\s+', '', desc.strip(), flags=re.IGNORECASE)
@@ -124,17 +125,30 @@ def _extract_install_code(desc: str) -> str:
         clean_no_scheme = clean[scheme_m.end():]
     else:
         clean_no_scheme = clean
-    # Match item codes like CPT-2, T-3, F102, BR-1, LVP-1, W131, SCH-1, RB-1
-    m = re.match(r'([A-Z]{1,4}-?\d{1,4}(?:/[A-Z]{1,4}-?\d{1,4})*)', clean_no_scheme, re.IGNORECASE)
+    # Extract option prefixes if present (e.g. "(Standard)", "(Premium)")
+    # These work like scheme prefixes — may be stacked: "(Alternate) (Standard)"
+    _OPTION_RE = re.compile(r'^\((Standard|Premium|Alternate|Budget|Base|Upgrade)\)\s*[-–—]?\s*', re.IGNORECASE)
+    option_parts = []
+    while True:
+        option_m = _OPTION_RE.match(clean_no_scheme)
+        if not option_m:
+            break
+        option_parts.append(option_m.group(1).upper())
+        clean_no_scheme = clean_no_scheme[option_m.end():]
+    option_prefix = " ".join(f"({p})" for p in option_parts) + " " if option_parts else ""
+    prefix = scheme_prefix or option_prefix
+    # Match item codes like CPT-2, T-3, F102, BR-1, LVP-1, W131, SCH-1, RB-1, T-200.1
+    m = re.match(r'([A-Z]{1,4}-?\d{1,4}(?:\.\d+)?(?:/[A-Z]{1,4}-?\d{1,4})*)', clean_no_scheme, re.IGNORECASE)
     if m:
-        return m.group(1).upper()
+        code = m.group(1).upper()
+        return (prefix + code) if prefix else code
     # Fallback: take the first part before " - " (e.g. "Metroflor")
-    # Prefix with scheme to distinguish Scheme A vs Scheme B for same manufacturer
+    # Prefix with scheme/option to distinguish variants
     parts = clean_no_scheme.split(' - ')
     if parts and parts[0].strip():
         label = parts[0].strip()[:30]
         if re.search(r'[A-Za-z]', label):
-            return (scheme_prefix + label).upper()
+            return (prefix + label).upper() if prefix else label.upper()
     return ""
 
 
@@ -147,7 +161,7 @@ def _extract_unit(desc: str, material_type: str) -> str:
 
 
 def _extract_item_label(desc: str) -> str:
-    # Check for scheme prefix
+    # Check for scheme prefix (e.g. "(Scheme A)")
     scheme_m = re.match(r'^\(Scheme\s+([A-Z](?:\s*&\s*[A-Z])?)\)\s*', desc, re.IGNORECASE)
     scheme_prefix = ""
     if scheme_m:
@@ -155,16 +169,29 @@ def _extract_item_label(desc: str) -> str:
         clean = desc[scheme_m.end():]
     else:
         clean = desc
-    # Match codes like F102, W131/W132/W133, B102
-    m = re.match(r'^([A-Z]\d{2,4}(?:/[A-Z]\d{2,4})*)\b', clean)
+    # Check for option prefixes (e.g. "(Standard)", "(Premium)", "(Alternate)")
+    # These work like scheme prefixes — they designate separate product choices
+    # May be stacked: "(Alternate) (Standard) - T-200.1 -..."
+    _OPTION_RE = re.compile(r'^\((Standard|Premium|Alternate|Budget|Base|Upgrade)\)\s*[-–—]?\s*', re.IGNORECASE)
+    option_parts = []
+    while True:
+        option_m = _OPTION_RE.match(clean)
+        if not option_m:
+            break
+        option_parts.append(option_m.group(1).title())
+        clean = clean[option_m.end():]
+    option_prefix = " ".join(f"({p})" for p in option_parts) + " " if option_parts else ""
+    prefix = scheme_prefix or option_prefix
+    # Match codes like F102, W131/W132/W133, B102, CPT-200, T-202, T-200.1
+    m = re.match(r'^([A-Z]{1,4}-?\d{1,4}(?:\.\d+)?(?:/[A-Z]{1,4}-?\d{1,4})*)\b', clean, re.IGNORECASE)
     if m:
-        return m.group(1)  # F-codes don't need scheme prefix (they're unique)
+        code = m.group(1)
+        return (prefix + code).strip() if prefix else code
     parts = clean.split(' - ')
     if parts:
         label = parts[0].strip()[:30]
-        # Non-F-code labels need scheme prefix to distinguish (e.g. "Metroflor" Scheme A vs B)
-        if scheme_prefix and label:
-            return scheme_prefix + label
+        if prefix and label:
+            return prefix + label
         return label
     return desc[:30]
 

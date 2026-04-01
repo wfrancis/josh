@@ -37,6 +37,14 @@
 - Profit is redistributed: 99% on labor line, 1% on material/sundry line
 - Revenue = material_base / (1 - gpm_pct)
 
+## RFMS Parser: (Standard)/(Premium) Option Prefix Bug
+- RFMS descriptions can start with `(Standard)`, `(Premium)`, `(Alternate)` etc. — these are option designations like `(Scheme A/B)`
+- The parser must strip these prefixes to reach the real item code (CPT-200, T-202, etc.)
+- If not stripped: ALL `(Standard)` materials share one item_code → install qtys summed across ALL materials → 42x inflated quantities → dedup drops most materials
+- Fix: treat option prefixes identically to scheme prefixes in both `_extract_item_label()` and `_extract_install_code()`
+- Prefixes can stack: `(Alternate) (Standard) - T-200.1` → must loop to strip all
+- The option prefix stays in the item_code for uniqueness: `"(Standard) CPT-200"` vs `"(Premium) CPT-201"`
+
 ## Vendor Quote Simulation Bugs Found & Fixed
 - **PowerShell UTF-8 BOM**: `Set-Content -Encoding UTF8` adds a BOM (EF BB BF) that corrupts Python's email parser. Always use `[System.IO.File]::WriteAllText($path, $data, (New-Object System.Text.UTF8Encoding $false))` for BOM-free UTF-8.
 - **JS string vs number ID mismatch**: Inline `onclick="fn('${id}')"` passes a string, but `array.find(r => r.id === id)` compares to a number from JSON. Always `Number(id)` at the top of every function that receives an ID from HTML onclick.
