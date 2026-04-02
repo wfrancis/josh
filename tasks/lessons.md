@@ -37,6 +37,21 @@
 - Profit is redistributed: 99% on labor line, 1% on material/sundry line
 - Revenue = material_base / (1 - gpm_pct)
 
+## Schluter Product Pricing Rules
+- Schluter products are priced from `price_book_items` table (imported via Schluter catalog)
+- ALL Schluter products come in 8' sticks (8' 2-1/2" = 8.208 LF) — ALWAYS round up to full sticks
+- Default finish is AE (satin anodized aluminum) unless spec says otherwise
+- Auto-pricer matches by product_line (SCHIENE, RENO-TK, JOLLY, etc.) + item_no from description
+- Schluter Jolly for tub/shower surrounds: qty = tub_shower_count × 2 sticks
+- Price per stick from price_book_items, NOT per LF — extended_cost = sticks × stick_price
+
+## Silver Pin Metal Transitions
+- Silver pin metal is $7.94 per 12' stick (not per LF)
+- Only used at unit stretch-in CPT to LVT transitions
+- NEVER used for common area/amenity CPT transitions
+- Common area CPT transitions use different trim (vendor quoted, e.g. Schluter)
+- Stored in config.py SUNDRY_RULES under "transitions"
+
 ## RFMS Parser: (Standard)/(Premium) Option Prefix Bug
 - RFMS descriptions can start with `(Standard)`, `(Premium)`, `(Alternate)` etc. — these are option designations like `(Scheme A/B)`
 - The parser must strip these prefixes to reach the real item code (CPT-200, T-202, etc.)

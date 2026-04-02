@@ -463,7 +463,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
   }
 
   const showDeleteCol = editable
-  const colCount = 6 + (showDeleteCol ? 1 : 0)
+  const colCount = 6
 
 
 
@@ -537,7 +537,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
   const isFiltered = searchQuery || typeFilter || unpricedOnly
 
   return (
-    <div className="overflow-x-auto">
+    <div>
       {materials.length > 5 && (
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3 mb-4">
           <div className="relative flex-1 min-w-0">
@@ -643,12 +643,12 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
               { label: 'Fixtures', key: 'fixture_count', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Number of tubs/showers — used for piece count on Schluter transitions' },
               ...(onRequestQuote ? [{ label: 'Internal Price', key: 'known_price', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Price from your warehouse inventory or past vendor quotes' }] : []),
               { label: 'Total', key: 'extended', align: 'right', hide: '', tooltip: 'Your bid price for this line item' },
-              ...(showDeleteCol ? [{ label: '', key: null, align: 'center', hide: '' }] : []),
+              // Delete button is now inline in Total cell, no separate column needed
             ].map((col, i) => (
               <th key={col.label || `col-${i}`}
                 onClick={col.key ? () => toggleSort(col.key) : undefined}
                 className={`py-3 px-2 sm:px-3 font-bold text-gray-500 text-[10px] uppercase tracking-[0.12em]
-                  text-${col.align} ${col.label === '' ? 'w-10' : ''} ${col.hide}
+                  text-${col.align} ${col.label === '' ? 'w-0 p-0' : ''} ${col.hide}
                   ${col.key ? 'cursor-pointer hover:text-gray-300 select-none transition-colors' : ''}`}
               >
                 <span className="inline-flex items-center gap-1">
@@ -790,6 +790,8 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   </td>
                 )}
                 <td className="py-3 px-2 sm:px-3 text-right tabular-nums font-medium">
+                  <div className="flex items-start justify-end gap-1">
+                  <div className="flex-1 text-right">
                   {onRequestQuote ? (
                     <PriceActionMenu
                       material={m}
@@ -821,19 +823,18 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   ) : (
                     <span className="text-gray-600">—</span>
                   )}
-                </td>
-                {showDeleteCol && (
-                  <td className="py-3 px-1 text-center">
+                  </div>
+                  {showDeleteCol && (
                     <button
-                      onClick={() => deleteMaterial(m._origIdx)}
-                      className="p-1.5 rounded-lg text-red-400/70
-                                 hover:text-red-400 hover:bg-red-500/10 transition-all"
+                      onClick={(e) => { e.stopPropagation(); deleteMaterial(m._origIdx) }}
+                      className="p-0.5 -mr-1 rounded text-red-400/30 hover:text-red-400 hover:bg-red-500/10 transition-all flex-shrink-0"
                       title="Remove material"
                     >
-                      <Trash2 className="w-3.5 h-3.5" />
+                      <Trash2 className="w-3 h-3" />
                     </button>
-                  </td>
-                )}
+                  )}
+                  </div>
+                </td>
               </tr>
             )
           })}

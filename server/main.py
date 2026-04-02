@@ -61,6 +61,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _match_price_book(material: dict) -> dict | None:
+    """Match a material to a price_book_items entry (e.g. Schluter catalog).
+
+    Looks for Schluter product references in the description like:
+      "Schluter - Schiene #AE-100" -> product_line=SCHIENE, item_no=AE 100
+      "Schluter - Reno-TK"         -> product_line=RENO-TK, default AE finish
+      "Schluter - Jolly"           -> product_line=JOLLY, default AE finish
+    Returns dict with unit_price (per LF), vendor, price_source.
+    """
+    desc = (material.get("description") or "")
+    if "schluter" not in desc.lower():
+        return None
+
+    import re
+    from models import _get_conn
+    conn = _get_conn()
+    try:
+        # Extract product line and optional item number
+        # "Schluter - Schiene #AE-100" -> line="Schiene", item="AE-100"
+        # "Schluter - Reno-TK - Transition" -> line="Reno-TK", item=None
+        m = re.search(r'schluter\s*[-–—]\s*([\w][\w-]*?)(?:\s*#([\w-]+)|\s)', desc, re.IGNORECASE)
+        if not m:
+            return None
+
+        product_line = m.group(1).upper()  # SCHIENE, RENO-TK, JOLLY, FINEC, etc.
+        raw_item = (m.group(2) or "").upper()  # AE-100, empty, etc.
+
+        row = None
+        if raw_item:
+            # Normalize: "AE-100" -> "AE 100" (DB uses space separator)
+            item_normalized = re.sub(r'[-]', ' ', raw_item).strip()
+            row = conn.execute(
+                "SELECT net_price, length FROM price_book_items WHERE UPPER(product_line)=? AND UPPER(REPLACE(TRIM(item_no), '-', ' '))=?",
+                (product_line, item_normalized)
+            ).fetchone()
+
+        if not row:
+            # Fallback: match product_line with anodized aluminum finish (default for SI)
+            row = conn.execute(
+                "SELECT net_price, length FROM price_book_items WHERE UPPER(product_line)=? AND material_finish LIKE '%anodized%' ORDER BY net_price ASC LIMIT 1",
+                (product_line,)
+            ).fetchone()
+
+        if not row:
+            return None
+
+        net_price = row[0]  # price per stick
+        length_str = row[1] or ""
+        # Parse stick length: "2.5 m - 8' 2-1/2" length" -> ~8.2 LF
+        stick_lf = 8.208  # default Schluter stick length (2.5m)
+        lf_match = re.search(r"(\d+)'\s*(\d+)?", length_str)
+        if lf_match:
+            feet = int(lf_match.group(1))
+            inches = int(lf_match.group(2)) if lf_match.group(2) else 0
+            stick_lf = feet + inches / 12.0
+
+        price_per_lf = round(net_price / stick_lf, 4)
+        return {
+            "unit_price": price_per_lf,
+            "stick_price": net_price,
+            "stick_lf": stick_lf,
+            "vendor": "Schluter",
+            "price_source": "price_book",
+        }
+    finally:
+        conn.close()
+
+
 def _match_price_list(material: dict, price_list: list[dict]) -> dict | None:
     """Match a material to a price list entry by item_code, description, or material_type."""
     item_code = (material.get("item_code") or "").strip().lower()
@@ -727,14 +795,32 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         installed_qty = m.get("installed_qty", m.get("qty", 0))
         order_qty = installed_qty * (1 + waste_pct)
 
-        # Auto-price from internal price list
+        # Auto-price from internal price list and price books
         unit_price = m.get("unit_price", 0)
         vendor = m.get("vendor", "")
+        price_source = m.get("price_source")
         if not unit_price and _price_list:
             matched = _match_price_list(m, _price_list)
             if matched:
                 unit_price = matched["unit_price"]
                 vendor = matched.get("vendor", "")
+                price_source = "price_list"
+        # Check price_book_items (e.g. Schluter catalog)
+        # Schluter products come in 8' sticks — round up to full sticks
+        unit_override = None
+        if not unit_price:
+            pb_match = _match_price_book(m)
+            if pb_match:
+                import math
+                stick_price = pb_match.get("stick_price", 0)
+                stick_lf = pb_match.get("stick_lf", 8.208)
+                sticks_needed = math.ceil(order_qty / stick_lf) if order_qty > 0 else 0
+                vendor = pb_match.get("vendor", "")
+                price_source = pb_match.get("price_source", "price_book")
+                # Price by full sticks rounded up
+                order_qty = sticks_needed
+                unit_price = stick_price
+                unit_override = "EA"
 
         # Set quote_status for unpriced materials
         quote_status = m.get("quote_status")
@@ -746,7 +832,7 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             "description": m.get("description"),
             "material_type": material_type,
             "installed_qty": round(installed_qty, 2),
-            "unit": m.get("unit"),
+            "unit": unit_override or m.get("unit"),
             "waste_pct": waste_pct,
             "order_qty": round(order_qty, 2),
             "vendor": vendor,
@@ -754,6 +840,7 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             "extended_cost": round(unit_price * round(order_qty, 2), 2),
             "ai_confidence": m.get("ai_confidence"),
             "quote_status": quote_status,
+            "price_source": price_source,
             "area_type": m.get("area_type", "unit"),
             "tack_strip_lf": m.get("tack_strip_lf", 0),
             "seam_tape_lf": m.get("seam_tape_lf", 0),
@@ -1650,15 +1737,20 @@ def api_calculate(job_id: str):
 
     materials = job.get("materials", [])
 
-    # Stamp job-level counts for sundry calculations
+    # Stamp job-level counts for sundry calculations and Schluter fixture counts
     unit_count = job.get("unit_count", 0) or 0
     tub_shower_count = job.get("tub_shower_count", 0) or 0
     for mat in materials:
         mtype = mat.get("material_type", "")
+        desc = (mat.get("description") or "").lower()
         if mtype == "backsplash":
             mat["unit_count"] = unit_count
         if mtype == "tub_shower_surround":
             mat["tub_shower_total"] = tub_shower_count
+        # Schluter transitions at tub/shower surrounds get fixture_count from tub_shower_count
+        # This enables _calc_schluter_pieces to compute pieces per fixture (2 sides each)
+        if "schluter" in desc and ("tub" in desc or "shower" in desc or "surround" in desc or "rr" in desc or "wash" in desc):
+            mat["fixture_count"] = tub_shower_count
 
     # Calculate sundries
     sundries = calculate_sundries_for_materials(materials)

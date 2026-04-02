@@ -705,7 +705,7 @@ export default function JobDetail() {
                     </button>
                   </div>
                 </div>
-                <div className="overflow-x-auto">
+                <div>
                   <MaterialsTable
                     materials={job.materials}
                     editable

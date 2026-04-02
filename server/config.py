@@ -98,6 +98,9 @@ SUNDRY_RULES: dict[str, list[dict]] = {
          "notes": "approximate"},
         {"sundry_name": "caulking", "coverage": 2, "unit": "units/tube", "unit_price": 13.85,
          "qty_basis": "tub_shower_total", "notes": "1 tube per 2 tubs/showers"},
+        {"sundry_name": "schluter_jolly", "coverage": 0.5, "unit": "EA/stick", "unit_price": 4.89,
+         "qty_basis": "tub_shower_total",
+         "notes": "Schluter Jolly AE exposed edge trim, 8' stick. 2 sticks per tub/shower (1 per side). Qty = tub_shower_count * 2"},
     ],
     "rubber_base": [
         {"sundry_name": "adhesive", "coverage": 60, "unit": "LF/tube", "unit_price": 12.00},
@@ -114,7 +117,10 @@ SUNDRY_RULES: dict[str, list[dict]] = {
         {"sundry_name": "weld_rod", "coverage": 500, "unit": "LF/roll", "unit_price": 45.00,
          "qty_source": "weld_rod_lf"},
     ],
-    "transitions": [],
+    "transitions": [
+        {"sundry_name": "silver_pin_metal", "coverage": 12, "unit": "LF/stick", "unit_price": 7.94,
+         "notes": "Silver pin metal transition strip, 12' stick. UNIT stretch-in CPT to LVT only, NOT common area CPT."},
+    ],
     "vct": [
         {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 85.00,
          "freight_per_unit": 5.00},
