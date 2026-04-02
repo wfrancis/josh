@@ -98,9 +98,9 @@ SUNDRY_RULES: dict[str, list[dict]] = {
          "notes": "approximate"},
         {"sundry_name": "caulking", "coverage": 2, "unit": "units/tube", "unit_price": 13.85,
          "qty_basis": "tub_shower_total", "notes": "1 tube per 2 tubs/showers"},
-        {"sundry_name": "schluter_jolly", "coverage": 0.5, "unit": "EA/stick", "unit_price": 4.89,
+        {"sundry_name": "schluter_jolly", "coverage": 0.5, "unit": "EA/stick", "unit_price": 9.78,
          "qty_basis": "tub_shower_total",
-         "notes": "Schluter Jolly AE exposed edge trim, 8' stick. 2 sticks per tub/shower (1 per side). Qty = tub_shower_count * 2"},
+         "notes": "Schluter Jolly J 100 AE, 8' stick, $9.78/stick. 2 sticks per tub/shower (1 per side). Qty = tub_shower_count * 2"},
     ],
     "rubber_base": [
         {"sundry_name": "adhesive", "coverage": 60, "unit": "LF/tube", "unit_price": 12.00},
