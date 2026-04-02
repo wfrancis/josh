@@ -914,6 +914,31 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
     # e.g. "Interface - Woven Gradience - WG100 - 108051 Onyx" → ["wg100", "108051", "woven gradience"]
     import re as _re
 
+    def _extract_vendor_from_desc(description: str) -> str:
+        """Extract vendor name from RFMS description.
+        RFMS format: '(Standard) - T-200 - Arizona Tile - Flash - Ivory...'
+        The vendor name is typically the part after the item code, before the product line.
+        Only returns a vendor if the description has the standard ' - ' delimited format
+        with at least 3 parts (code - vendor - product)."""
+        parts = [p.strip() for p in description.split(" - ") if p.strip()]
+        if len(parts) < 3:
+            return ""  # Not enough parts for code - vendor - product format
+        # Skip option prefixes and item codes to find the vendor name
+        for part in parts:
+            clean = part.strip()
+            # Skip option prefixes like (Standard), (Premium), (Alternate)
+            if _re.match(r'^\(', clean):
+                continue
+            # Skip item codes like CPT-200, T-202, F103, LVT-200, B-101, TS-100
+            if _re.match(r'^[A-Z]{1,4}-?\d{1,4}', clean):
+                continue
+            # Skip numeric-only parts
+            if _re.match(r'^\d+', clean):
+                continue
+            # This should be the vendor name
+            return clean.lower()
+        return ""
+
     def _extract_identifiers(description: str) -> list[str]:
         """Extract product line identifiers from a material description.
         Splits on ' - ' delimiters and returns meaningful tokens."""
@@ -961,6 +986,10 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
         # Build list of identifiers to match against
         mat_identifiers = _extract_identifiers(description)
 
+        # Extract vendor name from RFMS description for hard filtering
+        # e.g. "(Standard) - T-200 - Arizona Tile - Flash" → "arizona tile"
+        rfms_vendor = _extract_vendor_from_desc(mat.get("description") or "")
+
         # Score ALL products and pick the best match instead of first-match-wins
         best_score = 0
         best_prod = None
@@ -977,7 +1006,22 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
                 continue
             prod_name = (prod.get("product_name") or "").strip().lower()
             prod_desc = (prod.get("description") or "").strip().lower()
+            prod_vendor = (prod.get("vendor") or "").strip().lower()
             prod_text = f"{prod_name} {prod_desc}"
+
+            # HARD FILTER: If RFMS description names a vendor, only match quotes
+            # from that vendor. "T-200 - Arizona Tile - Flash" must match Arizona Tile
+            # quotes, never Metropolitan Floors or anyone else.
+            if rfms_vendor and len(rfms_vendor) >= 3:
+                vendor_match = False
+                if rfms_vendor in prod_vendor or prod_vendor in rfms_vendor:
+                    vendor_match = True
+                # Also check product name/file for vendor name
+                prod_file = (prod.get("file_name") or "").lower()
+                if rfms_vendor in prod_file:
+                    vendor_match = True
+                if not vendor_match:
+                    continue  # SKIP — wrong vendor, don't even score
 
             score = 0
 
@@ -1012,29 +1056,18 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
                     if pw in desc_words and pw not in GENERIC_WORDS:
                         score += 2
 
-            # Check 4: Word-level overlap scoring (handles comma-separated quote formats)
-            # Tokenize both sides into individual words and count meaningful overlaps
+            # Check 4: Word-level overlap scoring
             desc_tokens = set(_re.findall(r'[a-z]+', description))
             prod_tokens = set(_re.findall(r'[a-z]+', prod_text))
             meaningful_overlap = (desc_tokens & prod_tokens) - GENERIC_WORDS - {"and", "the", "for", "with"}
-            # Only count words with 4+ chars to avoid noise
             meaningful_overlap = {w for w in meaningful_overlap if len(w) >= 4}
-            score += len(meaningful_overlap)  # +1 per meaningful shared word
+            score += len(meaningful_overlap)
 
             # Check 5: Dimension/size match (e.g. "1x1", "12x24", "4x12")
-            # Normalize dimensions to (w,h) tuples to handle "12" x 24"" vs "12x24"
             desc_dims = set(_re.findall(r'(\d+)\s*["\']?\s*x\s*["\']?\s*(\d+)', description))
             prod_dims = set(_re.findall(r'(\d+)\s*["\']?\s*x\s*["\']?\s*(\d+)', prod_text))
             if desc_dims and prod_dims and desc_dims & prod_dims:
-                score += 3  # matching dimensions is strong signal
-
-            # Check 6: Vendor name match (bonus if vendor matches)
-            mat_vendor = (mat.get("vendor") or "").strip().lower()
-            prod_vendor = (prod.get("vendor") or "").strip().lower()
-            # Also check if material description contains vendor name
-            if prod_vendor and len(prod_vendor) >= 3:
-                if prod_vendor in description or (mat_vendor and prod_vendor in mat_vendor):
-                    score += 1  # small bonus for vendor match
+                score += 3
 
             if score > best_score:
                 best_score = score

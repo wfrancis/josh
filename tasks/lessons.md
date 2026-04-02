@@ -37,6 +37,14 @@
 - Profit is redistributed: 99% on labor line, 1% on material/sundry line
 - Revenue = material_base / (1 - gpm_pct)
 
+## Vendor Quote Matching: No Fuzzy Matching
+- The RFMS description contains the vendor name: "T-200 - Arizona Tile - Flash - Ivory"
+- The auto-matcher MUST extract the vendor name from the RFMS description
+- Vendor name is a HARD FILTER — only match quotes from the vendor named in the RFMS
+- If RFMS says "Arizona Tile", NEVER match to Metropolitan Floors or anyone else
+- Vendor extraction: split on " - ", skip option prefixes and item codes, take the first real name
+- Materials without a clear vendor in the description (transitions, generic items) skip the filter
+
 ## Waterproofing (RedGard) Pricing
 - Custom RedGard 5 Gal Pail: $156.00, coverage 275 SF/pail (2 coats)
 - Mesh fabric: $42.00/roll, 300 SF/roll
