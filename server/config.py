@@ -132,8 +132,10 @@ SUNDRY_RULES: dict[str, list[dict]] = {
         {"sundry_name": "moisture_barrier", "coverage": 500, "unit": "SF/roll", "unit_price": 75.00},
     ],
     "waterproofing": [
-        {"sundry_name": "membrane", "coverage": 100, "unit": "SF/gal", "unit_price": 55.00},
-        {"sundry_name": "mesh_fabric", "coverage": 300, "unit": "SF/roll", "unit_price": 42.00},
+        {"sundry_name": "redgard_pail", "coverage": 275, "unit": "SF/pail", "unit_price": 156.00,
+         "notes": "Custom RedGard 5 Gal Pail, 275 SF/pail coverage at 2 coats"},
+        {"sundry_name": "mesh_fabric", "coverage": 300, "unit": "SF/roll", "unit_price": 42.00,
+         "notes": "Mesh tape for corners and seams"},
     ],
     "tread_riser": [
         {"sundry_name": "adhesive", "coverage": 50, "unit": "LF/tube", "unit_price": 12.00},

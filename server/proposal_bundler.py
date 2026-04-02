@@ -738,13 +738,18 @@ def _generate_derived_bundles(job: dict, materials: list[dict]) -> list[dict]:
     unit_count = _safe_float(job.get("unit_count", 0))
 
     # ── Unit Waterproofing ────────────────────────────────────────────────
+    # Skip derived waterproofing if RFMS already has a waterproofing material line
+    # (e.g. "Liquid-Latex Rubber...Redgard" parsed as material_type=waterproofing)
+    has_rfms_waterproofing = any(
+        m.get("material_type") == "waterproofing" for m in materials
+    )
     wp_rule = DERIVED_BUNDLE_RULES.get("waterproofing", {})
     surround_sf = sum(
         _safe_float(m.get("installed_qty"))
         for m in materials
         if m.get("material_type") == wp_rule.get("source_type")
     )
-    if surround_sf > 0:
+    if surround_sf > 0 and not has_rfms_waterproofing:
         pails = math.ceil(surround_sf / wp_rule["coverage_sf"])
         material_cost = round(pails * wp_rule["pail_cost"], 2)
         mesh_cost = round(math.ceil(unit_count / 100) * wp_rule["mesh_per_100_units"], 2) if unit_count > 0 else 0

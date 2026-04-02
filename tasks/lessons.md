@@ -37,6 +37,15 @@
 - Profit is redistributed: 99% on labor line, 1% on material/sundry line
 - Revenue = material_base / (1 - gpm_pct)
 
+## Waterproofing (RedGard) Pricing
+- Custom RedGard 5 Gal Pail: $156.00, coverage 275 SF/pail (2 coats)
+- Mesh fabric: $42.00/roll, 300 SF/roll
+- Labor: $0.55/SF
+- RFMS may include waterproofing as a material line ("Liquid-Latex Rubber...Redgard")
+- When RFMS has it: bundler uses that material directly, applies sundry rules for pails + mesh
+- When RFMS doesn't have it: bundler derives from tub_shower_surround SF
+- NEVER double-count: skip derived bundle if RFMS waterproofing material exists
+
 ## Schluter Product Pricing Rules
 - Schluter products are priced from `price_book_items` table (imported via Schluter catalog)
 - ALL Schluter products come in 8' sticks (8' 2-1/2" = 8.208 LF) — ALWAYS round up to full sticks
