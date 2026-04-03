@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from 'react'
+import React, { useState, useRef, useEffect, useMemo } from 'react'
 import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store, Mail, DollarSign, Sparkles, XCircle, Info, Clock, Check } from 'lucide-react'
 
 function round2(val) { return Math.round((val || 0) * 100) / 100 }
@@ -511,25 +511,61 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
   })
 
   // Apply sorting
-  const displayMaterials = useMemo(() => {
-    if (!sortCol) return filteredMaterials
-    const sorted = [...filteredMaterials]
-    const getVal = (m) => {
-      switch (sortCol) {
-        case 'type': return TYPE_LABELS[m.material_type] || m.material_type || ''
-        case 'install_qty': return m.installed_qty || 0
-        case 'waste': return m.waste_pct || 0
-        case 'order_qty': return m.order_qty || 0
-        case 'fixture_count': return m.fixture_count || 0
-        case 'unit_price': return m.unit_price || 0
-        case 'extended': return m.extended_cost || 0
-        default: return 0
-      }
+  // Extract option prefix from item_code: "(Standard) CPT-200" → "Standard"
+  const getOptionPrefix = (m) => {
+    const match = (m.item_code || '').match(/^\((\w+)\)/)
+    if (match) {
+      const label = match[1].toLowerCase()
+      if (['standard', 'premium', 'alternate', 'budget', 'base', 'upgrade'].includes(label))
+        return match[1]
     }
+    return ''
+  }
+
+  // Get section key for grouping: "unit:Standard", "unit:Premium", "unit:", "common:"
+  const getSectionKey = (m) => {
+    const area = (m.area_type || 'unit').toLowerCase()
+    const option = getOptionPrefix(m)
+    return `${area}:${option}`
+  }
+
+  const displayMaterials = useMemo(() => {
+    const sorted = [...filteredMaterials]
+
+    // Default sort: area_type (unit first), then option prefix (Standard, Premium, none), then user sort
+    const areaOrder = { unit: 0, common: 1 }
+    const optionOrder = { Standard: 0, Premium: 1, Alternate: 2, '': 3 }
+
     sorted.sort((a, b) => {
-      const va = getVal(a), vb = getVal(b)
-      if (typeof va === 'string') return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va)
-      return sortDir === 'asc' ? va - vb : vb - va
+      // Primary: area_type
+      const aArea = areaOrder[(a.area_type || 'unit').toLowerCase()] ?? 1
+      const bArea = areaOrder[(b.area_type || 'unit').toLowerCase()] ?? 1
+      if (aArea !== bArea) return aArea - bArea
+
+      // Secondary: option prefix
+      const aOpt = optionOrder[getOptionPrefix(a)] ?? 3
+      const bOpt = optionOrder[getOptionPrefix(b)] ?? 3
+      if (aOpt !== bOpt) return aOpt - bOpt
+
+      // Tertiary: user-selected sort column
+      if (sortCol) {
+        const getVal = (m) => {
+          switch (sortCol) {
+            case 'type': return TYPE_LABELS[m.material_type] || m.material_type || ''
+            case 'install_qty': return m.installed_qty || 0
+            case 'waste': return m.waste_pct || 0
+            case 'order_qty': return m.order_qty || 0
+            case 'fixture_count': return m.fixture_count || 0
+            case 'unit_price': return m.unit_price || 0
+            case 'extended': return m.extended_cost || 0
+            default: return 0
+          }
+        }
+        const va = getVal(a), vb = getVal(b)
+        if (typeof va === 'string') return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va)
+        return sortDir === 'asc' ? va - vb : vb - va
+      }
+      return 0
     })
     return sorted
   }, [filteredMaterials, sortCol, sortDir])
@@ -668,13 +704,38 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
           </tr>
         </thead>
         <tbody className="divide-y divide-white/[0.03]">
-          {displayMaterials.map((m) => {
+          {(() => {
+            let lastSection = null
+            const _SECTION_LABELS = {
+              'unit:Standard': 'Unit (Standard)',
+              'unit:Premium': 'Unit (Premium)',
+              'unit:Alternate': 'Unit (Alternate)',
+              'unit:': 'Unit',
+              'common:Standard': 'Common Area (Standard)',
+              'common:Premium': 'Common Area (Premium)',
+              'common:': 'Common Area',
+            }
+            return displayMaterials.map((m) => {
+              const section = getSectionKey(m)
+              const sectionLabel = _SECTION_LABELS[section] || section
+              let sectionHeader = null
+              if (section !== lastSection) {
+                lastSection = section
+                sectionHeader = (
+                  <tr key={`section-${section}`} className="bg-white/[0.02]">
+                    <td colSpan={colCount + 1} className="py-2 px-3 text-xs font-bold text-gray-400 uppercase tracking-[0.15em] border-b border-white/[0.08]">
+                      {sectionLabel}
+                    </td>
+                  </tr>
+                )
+              }
             const hasPrice = m.unit_price > 0
             const lowConf = m.ai_confidence != null && m.ai_confidence < 0.7
             const veryLowConf = m.ai_confidence != null && m.ai_confidence < 0.5
             const rowBg = !hasPrice ? 'bg-amber-500/[0.04] border-l-2 border-l-amber-500/40' : veryLowConf ? 'bg-red-500/[0.06]' : lowConf ? 'bg-amber-500/[0.06]' : ''
-            return (
-              <tr key={m.id || m._origIdx} data-material-id={m.id} className={`group hover:bg-white/[0.02] transition-all ${rowBg}`}>
+            return (<React.Fragment key={m.id || m._origIdx}>
+              {sectionHeader}
+              <tr data-material-id={m.id} className={`group hover:bg-white/[0.02] transition-all ${rowBg}`}>
                 <td className="py-3 px-2 sm:px-3 max-w-0 sm:max-w-none">
                   {editable ? (
                     <EditableCell
@@ -836,8 +897,9 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   </div>
                 </td>
               </tr>
-            )
-          })}
+            </React.Fragment>)
+          })
+          })()}
         </tbody>
         <tfoot>
           <tr className="border-t border-white/[0.08]">

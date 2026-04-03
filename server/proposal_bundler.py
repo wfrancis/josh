@@ -260,6 +260,24 @@ def _get_scheme_label(mat: dict) -> Optional[str]:
     return sorted(letters)[0]
 
 
+def _get_option_label(mat: dict) -> Optional[str]:
+    """Extract option prefix (Standard, Premium, Alternate) from item_code.
+    e.g. '(Standard) CPT-200' → 'Standard', '(Premium) T-203' → 'Premium'"""
+    item_code = (mat.get("item_code") or "").strip()
+    m = re.match(r'^\((\w+)\)', item_code)
+    if m:
+        label = m.group(1).title()
+        if label.lower() in ("standard", "premium", "alternate", "budget", "base", "upgrade"):
+            return label
+    return None
+
+
+def _strip_option_prefix(item_code: str) -> str:
+    """Strip option prefix from item_code for regex matching.
+    '(Standard) CPT-200' → 'CPT-200', '(Premium) F102' → 'F102'"""
+    return re.sub(r'^\([^)]+\)\s*', '', item_code.strip())
+
+
 def _description_contains_location(mat: dict) -> Optional[str]:
     """Check if a material description references a special location.
     Returns the location keyword found, or None."""
@@ -451,13 +469,15 @@ def _classify_material(mat: dict) -> tuple[str, str]:
     material_type = (mat.get("material_type") or "").strip().lower()
     desc = (mat.get("description") or "").lower()
     area_type = (mat.get("area_type") or "unit").lower()
+    option_label = _get_option_label(mat)  # "Standard", "Premium", etc. or None
+    bare_code = _strip_option_prefix(item_code)  # strip "(Standard) " for regex matching
 
     # ── Rule 1: F-### codes → individual bundles
-    if _F_CODE_RE.match(item_code):
-        group_key, tmpl = f"f_code:{item_code.upper()}", "floor_tile"
+    if _F_CODE_RE.match(bare_code):
+        group_key, tmpl = f"f_code:{bare_code.upper()}", "floor_tile"
     # ── Rule 2: W-### codes → individual bundles
-    elif _W_CODE_RE.match(item_code):
-        group_key, tmpl = f"w_code:{item_code.upper()}", "wall_tile"
+    elif _W_CODE_RE.match(bare_code):
+        group_key, tmpl = f"w_code:{bare_code.upper()}", "wall_tile"
     # ── Rule 3: Transitions
     elif material_type == "transitions":
         location = _description_contains_location(mat)
@@ -524,6 +544,10 @@ def _classify_material(mat: dict) -> tuple[str, str]:
         fallback_key = item_code or desc[:40] or str(id(mat))
         group_key, tmpl = f"individual:{fallback_key}", ""
 
+    # Append option label (Standard/Premium) to separate variants into different bundles
+    if option_label and not group_key.startswith(("f_code:", "w_code:", "individual:")):
+        group_key = f"{group_key}:{option_label}"
+
     # Prefix with "common:" for common area materials to keep them separate
     if area_type == "common":
         group_key = f"common:{group_key}"
@@ -587,8 +611,12 @@ def _bundle_display_name(group_key: str, materials: list[dict]) -> str:
             return f"Unit Backsplash {scheme_label}".strip()
         return f"Unit Backsplash (Scheme {scheme})"
 
-    # Static display names
-    base_key = group_key.split(":")[0] if ":" in group_key else group_key
+    # Static display names — check for option suffix (Standard/Premium/etc.)
+    _OPTION_LABELS = {"standard", "premium", "alternate", "budget", "base", "upgrade"}
+    parts = group_key.split(":")
+    base_key = parts[0]
+    option_suffix = parts[-1] if len(parts) > 1 and parts[-1].lower() in _OPTION_LABELS else None
+
     if base_key in _GROUP_DISPLAY_NAMES:
         display = _GROUP_DISPLAY_NAMES[base_key]
         # Append scheme labels for unit-level bundles if detectable
@@ -596,6 +624,9 @@ def _bundle_display_name(group_key: str, materials: list[dict]) -> str:
             scheme_label = _extract_schemes(materials)
             if scheme_label:
                 display = f"{display} {scheme_label}"
+        # Append option label (Standard/Premium)
+        if option_suffix:
+            display = f"{display} ({option_suffix})"
         return display
 
     # Individual / floor_tile / wall_tile with code
