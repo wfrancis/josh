@@ -122,7 +122,12 @@ def assemble_bid(
         mat_id = mat.get("id") or mat.get("item_code")
 
         # Calculate order qty with waste
-        order_qty = installed_qty * (1 + waste_pct)
+        # If unit is EA, the order_qty is already pre-calculated (rolls, pails, sticks)
+        # — don't recalculate from installed_qty
+        if unit == "EA" and mat.get("order_qty"):
+            order_qty = mat["order_qty"]
+        else:
+            order_qty = installed_qty * (1 + waste_pct)
 
         # Material cost
         material_cost = round(order_qty * unit_price, 2)
