@@ -44,6 +44,13 @@
 - If RFMS says "Arizona Tile", NEVER match to Metropolitan Floors or anyone else
 - Vendor extraction: split on " - ", skip option prefixes and item codes, take the first real name
 - Materials without a clear vendor in the description (transitions, generic items) skip the filter
+- Vendor aliases for parent/subsidiary: Daltile=Marazzi (Daltile owns Marazzi), Interface=Flor, Mohawk=Daltile/Marazzi
+
+## Pliteq Genie Mat RST-05
+- $93.02 per ROLL, NOT per SF
+- Each roll covers 120 SF
+- Round up to full rolls: ceil(SF / 120) × $93.02
+- NEVER price this per SF — the $93.02 is the roll price
 
 ## Waterproofing (RedGard) Pricing
 - Custom RedGard 5 Gal Pail: $156.00, coverage 275 SF/pail (2 coats)
@@ -58,6 +65,7 @@
 - Schluter products are priced from `price_book_items` table (imported via Schluter catalog)
 - ALL Schluter products come in 8' sticks (8' 2-1/2" = 8.208 LF) — ALWAYS round up to full sticks
 - Default finish is AE (satin anodized aluminum) unless spec says otherwise
+- Default SIZE is always 100 for all Schluter profiles
 - Auto-pricer matches by product_line (SCHIENE, RENO-TK, JOLLY, etc.) + item_no from description
 - Schluter Jolly for tub/shower surrounds: qty = tub_shower_count × 2 sticks
 - Price per stick from price_book_items, NOT per LF — extended_cost = sticks × stick_price

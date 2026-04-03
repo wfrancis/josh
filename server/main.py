@@ -1012,10 +1012,24 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             # HARD FILTER: If RFMS description names a vendor, only match quotes
             # from that vendor. "T-200 - Arizona Tile - Flash" must match Arizona Tile
             # quotes, never Metropolitan Floors or anyone else.
+            # Vendor aliases: parent companies own subsidiaries (Daltile=Marazzi, etc.)
+            _VENDOR_ALIASES = {
+                "marazzi": ["daltile"], "daltile": ["marazzi"],
+                "flor": ["interface"], "interface": ["flor"],
+                "mohawk": ["daltile", "marazzi"], "daltile": ["marazzi", "mohawk"],
+            }
             if rfms_vendor and len(rfms_vendor) >= 3:
                 vendor_match = False
+                # Direct match
                 if rfms_vendor in prod_vendor or prod_vendor in rfms_vendor:
                     vendor_match = True
+                # Check aliases (e.g. Marazzi material can match Daltile quote)
+                if not vendor_match:
+                    aliases = _VENDOR_ALIASES.get(rfms_vendor, [])
+                    for alias in aliases:
+                        if alias in prod_vendor or prod_vendor in alias:
+                            vendor_match = True
+                            break
                 # Also check product name/file for vendor name
                 prod_file = (prod.get("file_name") or "").lower()
                 if rfms_vendor in prod_file:

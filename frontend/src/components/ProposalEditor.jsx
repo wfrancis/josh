@@ -1221,7 +1221,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         + (b.freight_override ?? b.freight_cost ?? 0)
     }, 0)
 
-    // Calculate GPM profit on total cost
+    // Calculate GPM profit on total cost and distribute to bundles
     let profit = 0, profitLabor = 0, profitMaterial = 0
     if (gpmDecimal > 0 && gpmDecimal < 1 && totalBaseCost > 0) {
       const revenue = totalBaseCost / (1 - gpmDecimal)
@@ -1232,6 +1232,23 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     setGpmTotal(profit)
     setGpmLabor(profitLabor)
     setGpmMaterial(profitMaterial)
+
+    // Distribute GPM profit proportionally across bundles by cost share
+    if (profit > 0 && totalBaseCost > 0) {
+      for (const b of currentBundles) {
+        const bCost = (b.material_cost || 0) + (b.sundry_cost || 0) + (b.labor_cost || 0) + (b.freight_override ?? b.freight_cost ?? 0)
+        const share = bCost / totalBaseCost
+        b.gpm_labor_adder = round2(profitLabor * share)
+        b.gpm_material_adder = round2(profitMaterial * share)
+        b.gpm_adder = round2(b.gpm_labor_adder + b.gpm_material_adder)
+      }
+    } else {
+      for (const b of currentBundles) {
+        b.gpm_labor_adder = 0
+        b.gpm_material_adder = 0
+        b.gpm_adder = 0
+      }
+    }
 
     // Tax per bundle: (material + sundry + freight + gpm_material_adder) × rate
     const tax = currentBundles.reduce((sum, b) => {
@@ -1368,7 +1385,9 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           setTerms(saved.terms || [])
           setExclusions(saved.exclusions || [])
           setTaxRate(saved.tax_rate ?? job.tax_rate ?? 0)
-          if (saved.gpm_pct != null) setGpmPct(saved.gpm_pct * 100)
+          // Use saved gpm_pct if non-zero, otherwise fall back to job's gpm_pct
+          const savedGpm = saved.gpm_pct != null ? saved.gpm_pct : (job?.gpm_pct || 0)
+          setGpmPct((savedGpm || job?.gpm_pct || 0) * 100)
           if (saved.textura_fee != null) setTexturaEnabled(!!saved.textura_fee)
           setHasGenerated(true)
           setLoading(false)
