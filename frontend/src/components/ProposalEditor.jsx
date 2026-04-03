@@ -1301,8 +1301,37 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         const prevByName = {}
         prevBundles.forEach(b => { prevByName[b.bundle_name] = b })
 
+        // Fuzzy name match: strip option/scheme suffixes
+        const stripSuffix = (name) => (name || '').replace(/\s*\((?:Standard|Premium|Alternate|Budget|Scheme\s+\w+(?:\s*&\s*\w+)?)\)\s*/gi, '').trim()
+        const prevByBaseName = {}
+        prevBundles.forEach(b => {
+          const base = stripSuffix(b.bundle_name)
+          if (base && !prevByBaseName[base]) prevByBaseName[base] = b
+        })
+
+        // Material overlap match: index previous bundles by material item_codes
+        const prevByMatCode = {}
+        prevBundles.forEach(b => {
+          (b.materials || []).forEach(m => {
+            const code = m.item_code || m.id
+            if (code && !prevByMatCode[code]) prevByMatCode[code] = b
+          })
+        })
+
+        // Multi-strategy match: exact name → fuzzy name → material overlap
+        const findPrev = (fresh) => {
+          if (prevByName[fresh.bundle_name]) return prevByName[fresh.bundle_name]
+          const baseName = stripSuffix(fresh.bundle_name)
+          if (baseName && prevByBaseName[baseName]) return prevByBaseName[baseName]
+          const freshCodes = (fresh.materials || []).map(m => m.item_code || m.id).filter(Boolean)
+          for (const code of freshCodes) {
+            if (prevByMatCode[code]) return prevByMatCode[code]
+          }
+          return null
+        }
+
         const merged = freshBundles.map(fresh => {
-          const prev = prevByName[fresh.bundle_name]
+          const prev = findPrev(fresh)
           if (!prev) return fresh
 
           // Preserve manual edits from previous bundle
