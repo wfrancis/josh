@@ -1336,12 +1336,14 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
 
           // Preserve manual edits from previous bundle
           const edits = {}
+          // Preserve user's custom bundle name if they renamed it
+          if (prev.bundle_name !== fresh.bundle_name) edits.bundle_name = prev.bundle_name
           if (prev.price_override != null) edits.price_override = prev.price_override
           if (prev.freight_override != null) edits.freight_override = prev.freight_override
           if (prev.description_text && prev.description_text !== fresh.description_text) edits.description_text = prev.description_text
           if (prev.stair_count) { edits.stair_count = prev.stair_count; edits.stair_labor_type = prev.stair_labor_type }
-          if (prev.gpm_labor_adder) edits.gpm_labor_adder = prev.gpm_labor_adder
-          if (prev.gpm_material_adder) edits.gpm_material_adder = prev.gpm_material_adder
+          if (prev.gpm_labor_adder != null) edits.gpm_labor_adder = prev.gpm_labor_adder
+          if (prev.gpm_material_adder != null) edits.gpm_material_adder = prev.gpm_material_adder
 
           // Preserve manually added labor lines (stair labor, custom labor)
           const manualLabor = (prev.labor_items || []).filter(l => l.is_stair_labor || !fresh.labor_items?.some(fl => fl.labor_description === l.labor_description))
