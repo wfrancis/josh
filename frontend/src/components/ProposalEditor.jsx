@@ -469,8 +469,8 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
   const STAIR_KITS = {
     stretched: [
       { sundry_name: 'Stair Pad (6lb 3/8″)', ratio_per_stair: 0.74, unit: 'SY', unit_price: 1.38, roll_size: 30 },
-      { sundry_name: 'Stair Tack Strip', ratio_per_stair: 6.0, unit: 'LF', unit_price: 0 },
-      { sundry_name: 'Stair Seam Sealer', ratio_per_stair: 5.307, unit: 'LF', unit_price: 0 },
+      { sundry_name: 'Stair Tack Strip', ratio_per_stair: 6.0, unit: 'LF', unit_price: 0.055 },
+      { sundry_name: 'Stair Seam Sealer', ratio_per_stair: 5.307, unit: 'LF', unit_price: 0.1515 },
     ],
   }
 

@@ -148,8 +148,10 @@ SUNDRY_RULES: dict[str, list[dict]] = {
 STAIR_SUNDRY_KITS: dict[str, list[dict]] = {
     "stretched": [
         {"sundry_name": "Stair Pad (6lb 3/8\")", "ratio_per_stair": 0.74, "unit": "SY", "unit_price": 1.38, "roll_size": 30},
-        {"sundry_name": "Stair Tack Strip", "ratio_per_stair": 6.0, "unit": "LF", "unit_price": 0},
-        {"sundry_name": "Stair Seam Sealer", "ratio_per_stair": 5.307, "unit": "LF", "unit_price": 0},
+        {"sundry_name": "Stair Tack Strip", "ratio_per_stair": 6.0, "unit": "LF", "unit_price": 0.055,
+         "notes": "$22/carton ÷ 400 LF/carton = $0.055/LF"},
+        {"sundry_name": "Stair Seam Sealer", "ratio_per_stair": 5.307, "unit": "LF", "unit_price": 0.1515,
+         "notes": "$9.09/roll ÷ 60 LF/roll = $0.1515/LF"},
     ],
 }
 
