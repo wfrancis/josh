@@ -930,7 +930,23 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                           </span>
                         )}
                       </td>
-                      <td className="px-3 py-2 text-gray-500 text-right">{l.unit || ''}</td>
+                      <td className="px-3 py-2 text-right">
+                        <select
+                          value={l.unit || 'SY'}
+                          onChange={(e) => {
+                            const updated = [...(bundle.labor_items || [])]
+                            updated[li] = { ...updated[li], unit: e.target.value }
+                            const laborCost = round2(updated.reduce((s, item) => s + (item.extended_cost || 0), 0))
+                            onUpdate(index, { ...bundle, labor_items: updated, labor_cost: laborCost })
+                          }}
+                          className="bg-transparent border-none text-gray-500 text-xs text-right cursor-pointer hover:text-white focus:outline-none appearance-none"
+                        >
+                          <option value="SY">SY</option>
+                          <option value="SF">SF</option>
+                          <option value="LF">LF</option>
+                          <option value="EA">EA</option>
+                        </select>
+                      </td>
                       <td className="px-3 py-2 text-right">
                         {editingLaborRate === li ? (
                           <input
