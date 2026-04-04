@@ -1399,10 +1399,36 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           return result
         })
 
-        // Re-add combined bundles that don't exist in fresh (they were manually created)
-        const freshNames = new Set(freshBundles.map(b => b.bundle_name))
-        const combinedBundles = prevBundles.filter(b => !freshNames.has(b.bundle_name))
-        return [...merged, ...combinedBundles]
+        // Re-add custom/combined bundles that weren't matched to any fresh bundle.
+        // Insert them at their original position relative to matched bundles, not at the end.
+        const matchedPrevNames = new Set()
+        merged.forEach(b => {
+          // Track which prev bundles were matched (by checking if edits were applied)
+          const prev = findPrev(b)
+          if (prev) matchedPrevNames.add(prev.bundle_name)
+        })
+        const unmatchedPrev = prevBundles.filter(b => !matchedPrevNames.has(b.bundle_name))
+
+        // For each unmatched prev bundle, find its original neighbors and insert nearby
+        let result = [...merged]
+        for (const ub of unmatchedPrev) {
+          const origIdx = prevBundles.indexOf(ub)
+          // Find the closest matched bundle that was before this one in the original order
+          let insertAfter = -1
+          for (let i = origIdx - 1; i >= 0; i--) {
+            const neighbor = prevBundles[i]
+            const neighborInResult = result.findIndex(r => {
+              const prev = findPrev(r)
+              return prev && prev.bundle_name === neighbor.bundle_name
+            })
+            if (neighborInResult >= 0) {
+              insertAfter = neighborInResult
+              break
+            }
+          }
+          result.splice(insertAfter + 1, 0, ub)
+        }
+        return result
       })
 
       setNotes(prev => prev.length > 0 ? prev : data.notes || [])
