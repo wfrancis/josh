@@ -110,6 +110,12 @@ SUNDRY_RULES: dict[str, list[dict]] = {
          "freight_per_unit": 5.00},
         {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
     ],
+    "sound_mat": [
+        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 73.00,
+         "notes": "Taylor Dynamics 4-gal pail (stocked, no freight)"},
+        {"sundry_name": "primer", "coverage": 350, "unit": "SF/bucket", "unit_price": 17.00,
+         "notes": "Taylor 2025 1"},
+    ],
     "rubber_sheet": [
         {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00,
          "freight_per_unit": 5.00},

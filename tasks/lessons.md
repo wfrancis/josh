@@ -46,6 +46,15 @@
 - Materials without a clear vendor in the description (transitions, generic items) skip the filter
 - Vendor aliases for parent/subsidiary: Daltile=Marazzi (Daltile owns Marazzi), Interface=Flor, Mohawk=Daltile/Marazzi
 
+## Sound Mat (Pliteq Genie Mat) Rules
+- Material type: `sound_mat` (NOT rubber_sheet)
+- Price: $93.02 per ROLL (120 SF/roll), round up to full rolls
+- Adhesive: Taylor Dynamics stocked $73/pail at 700 SF/pail (NO freight — stocked)
+- Primer: Taylor $17/bucket at 350 SF/bucket
+- NO weld rod (sound mat doesn't get welded)
+- Labor: Rubber sheet over 3mm at $0.50/SF
+- NOT the same as rubber_sheet which uses $95/pail vendor adhesive + $65 primer + weld rod
+
 ## Pliteq Genie Mat RST-05
 - $93.02 per ROLL, NOT per SF
 - Each roll covers 120 SF
