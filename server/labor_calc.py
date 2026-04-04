@@ -139,6 +139,13 @@ LABOR_RULES: dict[str, dict] = {
         "size_tiers": [],
         "addons": [],
     },
+    "sound_mat": {
+        "labor_type": "Project Resilient Rolled Sheet",
+        "base": ["install sound mat", "less than 3mm"],
+        "size_tiers": [],
+        "size_field": "installed_qty",
+        "addons": [],
+    },
     "rubber_sheet": {
         "labor_type": "Project Resilient Rolled Sheet",
         "base": ["commercial sheet vinyl", "over 1/4"],
