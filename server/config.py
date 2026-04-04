@@ -19,6 +19,7 @@ WASTE_FACTORS: dict[str, float] = {
     "rubber_base": 0.05,
     "vct": 0.12,
     "rubber_tile": 0.12,
+    "sound_mat": 0.05,
     "rubber_sheet": 0.20,
     "wood": 0.15,
     "tread_riser": 0.04,
