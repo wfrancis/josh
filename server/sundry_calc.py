@@ -89,9 +89,27 @@ def calculate_sundries(
             if not _is_large_format_tile(desc):
                 continue
 
-        # Caulking and similar: use unit_count or tub_shower_total instead of installed_qty
+        # Grout: use tile-dimension-based formula from Custom Building Products Prism calculator
+        # Coverage = 2.73 × (W × L) / ((W + L) × J × T) SF per 17 lb bag
+        # where W,L = tile dims in inches, J = joint width, T = tile thickness
         qty_basis = rule.get("qty_basis")
-        if qty_basis == "unit_count":
+        if qty_basis == "grout_formula":
+            desc = material.get("description", "")
+            dims = re.findall(r'(\d+(?:\.\d+)?)\s*["\u201d]?\s*x\s*(\d+(?:\.\d+)?)\s*["\u201d]?', desc.lower())
+            if dims:
+                tw, tl = float(dims[0][0]), float(dims[0][1])
+                # Default joint width 1/8", default thickness 3/8" (common commercial)
+                joint = rule.get("joint_width", 0.125)
+                thickness = 0.25 if max(tw, tl) <= 6 else 0.375
+                if (tw + tl) > 0 and joint > 0 and thickness > 0:
+                    coverage_per_bag = 2.73 * (tw * tl) / ((tw + tl) * joint * thickness)
+                    qty_needed = math.ceil(installed_qty / coverage_per_bag) if coverage_per_bag > 0 else 0
+                else:
+                    qty_needed = math.ceil(installed_qty / coverage) if coverage else 0
+            else:
+                # No dimensions found, fall back to flat coverage
+                qty_needed = math.ceil(installed_qty / coverage) if coverage else 0
+        elif qty_basis == "unit_count":
             basis_qty = _safe_float(material.get("unit_count"))
             qty_needed = math.ceil(basis_qty / coverage) if basis_qty > 0 else 0
         elif qty_basis == "tub_shower_total":
