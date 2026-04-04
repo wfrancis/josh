@@ -707,30 +707,34 @@ def auto_bundle_materials(
     }
 
     def _sort_key(group_key: str) -> tuple:
-        base = group_key.split(":")[0] if ":" in group_key else group_key
+        # Top-level: ALL unit bundles before ALL common area bundles
+        area_priority = 1000 if group_key.startswith("common:") else 0
+        base = group_key.replace("common:", "").split(":")[0] if ":" in group_key else group_key
         priority = _ORDER_PRIORITY.get(base)
         if priority is not None:
-            return (priority, group_key)
-        if group_key.startswith("backsplash:"):
-            return (30, group_key)
+            return (area_priority + priority, group_key)
+        if group_key.startswith("backsplash:") or base == "backsplash":
+            return (area_priority + 30, group_key)
         if base == "tub_shower":
-            return (40, group_key)
-        if group_key.startswith("waterproofing:"):
-            return (50, group_key)
-        if group_key.startswith("transitions:"):
-            loc = group_key.split(":", 1)[1]
-            return (60 if loc == "unit" else 61, group_key)
+            return (area_priority + 40, group_key)
+        if base == "waterproofing" or group_key.startswith("waterproofing:"):
+            return (area_priority + 50, group_key)
+        if base == "sound_mat":
+            return (area_priority + 55, group_key)
+        if group_key.startswith("transitions:") or base == "transitions":
+            loc = group_key.split(":", 1)[1] if ":" in group_key else "unit"
+            return (area_priority + (60 if loc == "unit" else 61), group_key)
         if group_key.startswith("f_code:"):
-            return (70, group_key)
+            return (area_priority + 70, group_key)
         if group_key.startswith("w_code:"):
-            return (80, group_key)
+            return (area_priority + 80, group_key)
         if base in ("rubber_base", "boh_rubber_base"):
-            return (90, group_key)
+            return (area_priority + 90, group_key)
         if base in ("boh_lvt", "boh_cpt", "boh_cpt_tile"):
-            return (95, group_key)
+            return (area_priority + 95, group_key)
         if group_key.startswith("individual:"):
-            return (200, group_key)
-        return (100, group_key)
+            return (area_priority + 200, group_key)
+        return (area_priority + 100, group_key)
 
     sorted_keys = sorted(group_order, key=_sort_key)
 

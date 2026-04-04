@@ -47,6 +47,12 @@
 - Vendor aliases for parent/subsidiary: Daltile=Marazzi (Daltile owns Marazzi), Interface=Flor, Mohawk=Daltile/Marazzi
 
 ## Sound Mat (Pliteq Genie Mat) Rules
+- RFMS may have BOTH Standard and Premium sound mat lines (one per LVT scheme)
+- e.g. "Pliteq Genie Mat RST05 @Standard Unit LVT" and "@Premium Unit LVT"
+- Parser dedupes by item_code so the Premium one gets dropped — needs manual add or parser fix
+- RFMS may have typo "Preminum" instead of "Premium" — handle both spellings
+
+
 - Material type: `sound_mat` (NOT rubber_sheet)
 - Price: $93.02 per ROLL (120 SF/roll), round up to full rolls
 - Adhesive: Taylor Dynamics stocked $73/pail at 700 SF/pail (NO freight — stocked)
@@ -69,6 +75,12 @@
 - When RFMS has it: bundler uses that material directly, applies sundry rules for pails + mesh
 - When RFMS doesn't have it: bundler derives from tub_shower_surround SF
 - NEVER double-count: skip derived bundle if RFMS waterproofing material exists
+
+## Bundle Ordering
+- ALL unit bundles MUST come before ALL common area bundles — no exceptions
+- Unit order: CPT → LVT → Backsplash → Tile Surrounds → Waterproofing → Sound Mat → Transitions → Stairs
+- Common area order follows same pattern but after ALL unit bundles
+- Custom/renamed bundles preserve their position relative to neighbors on regenerate
 
 ## Schluter Product Pricing Rules
 - Schluter products are priced from `price_book_items` table (imported via Schluter catalog)
