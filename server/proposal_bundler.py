@@ -729,31 +729,57 @@ def auto_bundle_materials(
             if op is not None:
                 option_priority = op
                 break
+
+        # For common area individual bundles, sort by material type group then numeric code
+        # CPT tiles together (numerical), then LVT, then RF, then Tile (T-xxx)
+        # F-codes are floor finish callouts (F-101, F-102) — sort separately
+        _TYPE_GROUP = {
+            "cpt_tile": 100, "unit_cpt_tile": 100,
+            "unit_lvt": 200, "boh_lvt": 200,
+            "rubber_sheet": 300, "rubber_tile": 300, "rubber_base": 300,
+            "floor_tile": 400, "wall_tile": 410, "backsplash": 420,
+            "tub_shower_surround": 430,
+        }
+
+        # Extract numeric code for sub-sorting (CPT-100 → 100, T-105 → 105)
+        import re as _re
+        code_num = 9999
+        code_part = parts[-1] if len(parts) > 1 else group_key
+        num_match = _re.search(r'(\d+)', code_part)
+        if num_match:
+            code_num = int(num_match.group(1))
+
+        # F-codes (floor finish callouts) get their own priority range
+        is_f_code = group_key.startswith("f_code:") or (not group_key.startswith("common:") and stripped.startswith("f_code:"))
+        is_w_code = group_key.startswith("w_code:") or (not group_key.startswith("common:") and stripped.startswith("w_code:"))
+
         priority = _ORDER_PRIORITY.get(base)
         if priority is not None:
-            return (area_priority + priority, option_priority, group_key)
+            return (area_priority + priority, option_priority, code_num, group_key)
         if group_key.startswith("backsplash:") or base == "backsplash":
-            return (area_priority + 30, option_priority, group_key)
+            return (area_priority + 30, option_priority, code_num, group_key)
         if base == "tub_shower":
-            return (area_priority + 40, option_priority, group_key)
+            return (area_priority + 40, option_priority, code_num, group_key)
         if base == "waterproofing" or group_key.startswith("waterproofing:"):
-            return (area_priority + 50, option_priority, group_key)
+            return (area_priority + 50, option_priority, code_num, group_key)
         if base == "sound_mat":
-            return (area_priority + 25, option_priority, group_key)
+            return (area_priority + 25, option_priority, code_num, group_key)
         if group_key.startswith("transitions:") or base == "transitions":
             loc = group_key.split(":", 1)[1] if ":" in group_key else "unit"
-            return (area_priority + (60 if loc == "unit" else 61), option_priority, group_key)
-        if group_key.startswith("f_code:"):
-            return (area_priority + 70, option_priority, group_key)
-        if group_key.startswith("w_code:"):
-            return (area_priority + 80, option_priority, group_key)
+            return (area_priority + (60 if loc == "unit" else 61), option_priority, code_num, group_key)
+        if is_f_code:
+            return (area_priority + 70, option_priority, code_num, group_key)
+        if is_w_code:
+            return (area_priority + 80, option_priority, code_num, group_key)
         if base in ("rubber_base", "boh_rubber_base"):
-            return (area_priority + 90, option_priority, group_key)
+            return (area_priority + 90, option_priority, code_num, group_key)
         if base in ("boh_lvt", "boh_cpt", "boh_cpt_tile"):
-            return (area_priority + 95, option_priority, group_key)
+            return (area_priority + 95, option_priority, code_num, group_key)
+        # Common area individual bundles: sort by type group then numeric code
+        type_group = _TYPE_GROUP.get(base, 500)
         if group_key.startswith("individual:"):
-            return (area_priority + 200, option_priority, group_key)
-        return (area_priority + 100, option_priority, group_key)
+            return (area_priority + 200, type_group, code_num, group_key)
+        return (area_priority + type_group, option_priority, code_num, group_key)
 
     sorted_keys = sorted(group_order, key=_sort_key)
 

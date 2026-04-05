@@ -95,6 +95,9 @@
   5. Waterproofing
   6. Transitions
 - Sound mat follows LVT because it's underlayment FOR the LVT
+- Common area ordering: CPT tiles (numerical) → LVT → RF (rubber) → Tile (T-xxx numerical)
+- Within each type, sort by numeric code (CPT-100, CPT-101, CPT-102...)
+- F-codes (F-101, F-102) are floor finish callouts from the finish schedule, NOT material types — sort separately
 - Common area follows same type ordering but after ALL unit bundles
 - Custom/renamed bundles preserve their position relative to neighbors on regenerate
 
