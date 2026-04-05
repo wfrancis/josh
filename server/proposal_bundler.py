@@ -501,6 +501,11 @@ def _classify_material(mat: dict) -> tuple[str, str]:
     elif material_type == "cpt_tile":
         if _is_boh(mat):
             group_key, tmpl = "boh_cpt_tile", "cpt_tile"
+        elif area_type == "common":
+            # Common area CPT tiles are different products in different locations
+            # — each gets its own bundle, like floor_tile and wall_tile
+            code = bare_code or desc[:30]
+            group_key, tmpl = f"cpt_tile:{code}", "cpt_tile"
         else:
             group_key, tmpl = "unit_cpt_tile", "cpt_tile"
     # ── Rule 5: Unit LVT
