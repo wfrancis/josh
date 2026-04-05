@@ -699,42 +699,56 @@ def auto_bundle_materials(
     # Define display order priorities so proposal reads logically:
     #   unit carpet -> unit lvt -> backsplash -> surrounds -> waterproofing
     #   -> transitions -> F-codes -> W-codes -> BOH -> everything else
+    # Bundle order: each material type with Standard before Premium,
+    # related sub-items (stairs, sound mat) follow their parent.
+    # ALL unit bundles before ALL common area bundles.
     _ORDER_PRIORITY = {
-        "unit_cpt": 10,
+        "unit_cpt": 10,           # Unit CPT (Standard then Premium)
         "unit_cpt_tile": 11,
-        "corridor_broadloom": 12,
-        "unit_lvt": 20,
+        "corridor_broadloom": 15, # Stairs / stair broadloom after CPT
+        "unit_lvt": 20,           # Unit LVT (Standard then Premium)
+        "sound_mat": 25,          # Sound mat follows LVT (it's underlayment FOR LVT)
     }
 
     def _sort_key(group_key: str) -> tuple:
         # Top-level: ALL unit bundles before ALL common area bundles
         area_priority = 1000 if group_key.startswith("common:") else 0
-        base = group_key.replace("common:", "").split(":")[0] if ":" in group_key else group_key
+        stripped = group_key.replace("common:", "")
+        parts = stripped.split(":")
+        base = parts[0]
+        # Sub-sort: Standard before Premium before Alternate before others
+        _OPTION_ORDER = {"standard": 0, "premium": 1, "alternate": 2}
+        option_priority = 9  # default for no option
+        for p in parts[1:]:
+            op = _OPTION_ORDER.get(p.lower())
+            if op is not None:
+                option_priority = op
+                break
         priority = _ORDER_PRIORITY.get(base)
         if priority is not None:
-            return (area_priority + priority, group_key)
+            return (area_priority + priority, option_priority, group_key)
         if group_key.startswith("backsplash:") or base == "backsplash":
-            return (area_priority + 30, group_key)
+            return (area_priority + 30, option_priority, group_key)
         if base == "tub_shower":
-            return (area_priority + 40, group_key)
+            return (area_priority + 40, option_priority, group_key)
         if base == "waterproofing" or group_key.startswith("waterproofing:"):
-            return (area_priority + 50, group_key)
+            return (area_priority + 50, option_priority, group_key)
         if base == "sound_mat":
-            return (area_priority + 55, group_key)
+            return (area_priority + 25, option_priority, group_key)
         if group_key.startswith("transitions:") or base == "transitions":
             loc = group_key.split(":", 1)[1] if ":" in group_key else "unit"
-            return (area_priority + (60 if loc == "unit" else 61), group_key)
+            return (area_priority + (60 if loc == "unit" else 61), option_priority, group_key)
         if group_key.startswith("f_code:"):
-            return (area_priority + 70, group_key)
+            return (area_priority + 70, option_priority, group_key)
         if group_key.startswith("w_code:"):
-            return (area_priority + 80, group_key)
+            return (area_priority + 80, option_priority, group_key)
         if base in ("rubber_base", "boh_rubber_base"):
-            return (area_priority + 90, group_key)
+            return (area_priority + 90, option_priority, group_key)
         if base in ("boh_lvt", "boh_cpt", "boh_cpt_tile"):
-            return (area_priority + 95, group_key)
+            return (area_priority + 95, option_priority, group_key)
         if group_key.startswith("individual:"):
-            return (area_priority + 200, group_key)
-        return (area_priority + 100, group_key)
+            return (area_priority + 200, option_priority, group_key)
+        return (area_priority + 100, option_priority, group_key)
 
     sorted_keys = sorted(group_order, key=_sort_key)
 

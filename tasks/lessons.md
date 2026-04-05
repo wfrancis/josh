@@ -86,8 +86,16 @@
 
 ## Bundle Ordering
 - ALL unit bundles MUST come before ALL common area bundles — no exceptions
-- Unit order: CPT → LVT → Backsplash → Tile Surrounds → Waterproofing → Sound Mat → Transitions → Stairs
-- Common area order follows same pattern but after ALL unit bundles
+- Within each type: Standard before Premium before Alternate
+- Related sub-items follow their parent immediately:
+  1. CPT (Standard → Premium) → Stairs (broadloom stair carpet follows CPT)
+  2. LVT (Standard) → Sound Mat (Standard) → LVT (Premium) → Sound Mat (Premium)
+  3. Backsplash (Standard → Premium → Alternate)
+  4. Tile Surrounds (Standard → Premium)
+  5. Waterproofing
+  6. Transitions
+- Sound mat follows LVT because it's underlayment FOR the LVT
+- Common area follows same type ordering but after ALL unit bundles
 - Custom/renamed bundles preserve their position relative to neighbors on regenerate
 
 ## Schluter Product Pricing Rules
