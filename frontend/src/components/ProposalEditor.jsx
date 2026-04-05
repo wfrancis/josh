@@ -1428,6 +1428,17 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           }
           result.splice(insertAfter + 1, 0, ub)
         }
+
+        // Preserve the user's previous bundle order — re-sort result to match prevBundles order
+        // Bundles that existed before keep their position; new bundles go at the end
+        const prevOrder = new Map()
+        prevBundles.forEach((b, idx) => prevOrder.set(b.bundle_name, idx))
+        result.sort((a, b) => {
+          const aIdx = prevOrder.has(a.bundle_name) ? prevOrder.get(a.bundle_name) : 99999
+          const bIdx = prevOrder.has(b.bundle_name) ? prevOrder.get(b.bundle_name) : 99999
+          return aIdx - bIdx
+        })
+
         return result
       })
 
