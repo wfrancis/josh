@@ -1197,6 +1197,7 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
 /* ─── Main Component ──────────────────────────────────────────────────── */
 export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   const [bundles, setBundles] = useState([])
+  const [deletedBundleNames, setDeletedBundleNames] = useState(new Set())
   const [notes, setNotes] = useState([])
   const [terms, setTerms] = useState([])
   const [exclusions, setExclusions] = useState([])
@@ -1429,6 +1430,9 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           result.splice(insertAfter + 1, 0, ub)
         }
 
+        // Filter out bundles the user previously deleted
+        result = result.filter(b => !deletedBundleNames.has(b.bundle_name))
+
         // Preserve the user's previous bundle order — re-sort result to match prevBundles order
         // Bundles that existed before keep their position; new bundles go at the end
         const prevOrder = new Map()
@@ -1473,6 +1477,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           const savedGpm = saved.gpm_pct != null ? saved.gpm_pct : (job?.gpm_pct || 0)
           setGpmPct((savedGpm || job?.gpm_pct || 0) * 100)
           if (saved.textura_fee != null) setTexturaEnabled(!!saved.textura_fee)
+          if (saved.deleted_bundles?.length) setDeletedBundleNames(new Set(saved.deleted_bundles))
           setHasGenerated(true)
           setLoading(false)
           return
@@ -1510,6 +1515,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           gpm_labor: gpmLabor,
           gpm_material: gpmMaterial,
           textura_amount: texturaAmount,
+          deleted_bundles: [...deletedBundleNames],
         }),
       })
       setIsDirty(false)
@@ -1576,9 +1582,15 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     })
   }, [setBundlesAndDirty, taxRate])
 
-  // Delete a bundle
+  // Delete a bundle — track name so it doesn't come back on regenerate
   const deleteBundle = useCallback((idx) => {
-    setBundlesAndDirty(prev => prev.filter((_, i) => i !== idx))
+    setBundlesAndDirty(prev => {
+      const deleted = prev[idx]
+      if (deleted?.bundle_name) {
+        setDeletedBundleNames(names => new Set([...names, deleted.bundle_name]))
+      }
+      return prev.filter((_, i) => i !== idx)
+    })
   }, [setBundlesAndDirty])
 
   // Move a bundle up/down
