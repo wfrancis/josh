@@ -143,10 +143,8 @@ SUNDRY_RULES: dict[str, list[dict]] = {
         {"sundry_name": "moisture_barrier", "coverage": 500, "unit": "SF/roll", "unit_price": 75.00},
     ],
     "waterproofing": [
-        {"sundry_name": "redgard_pail", "coverage": 275, "unit": "SF/pail", "unit_price": 156.00,
-         "notes": "Custom RedGard 5 Gal Pail, 275 SF/pail coverage at 2 coats"},
         {"sundry_name": "mesh_fabric", "coverage": 300, "unit": "SF/roll", "unit_price": 42.00,
-         "notes": "Mesh tape for corners and seams"},
+         "notes": "Mesh tape for corners and seams. RedGard pails are the material, not a sundry."},
     ],
     "tread_riser": [
         {"sundry_name": "adhesive", "coverage": 50, "unit": "LF/tube", "unit_price": 12.00},
@@ -265,8 +263,11 @@ DERIVED_BUNDLE_RULES: dict[str, dict] = {
         "material_name": "Custom RedGard Fluid Applied Membrane",
         "coverage_sf": 275,
         "pail_cost": 156.00,
-        "mesh_per_100_units": 300.00,
-        "labor_rate_sf": 0.55,
+        "mesh_coverage_sf": 300,
+        "mesh_cost": 42.00,
+        "labor_rate_sf": 0.54,
+        "labor_description": "Waterproofing Roll On",
+        "notes": "Roll-on application, NOT Kerdi. No separate membrane sundry — RedGard pails ARE the membrane.",
     },
     "crack_isolation": {
         "source_type": "floor_tile",

@@ -69,12 +69,20 @@
 
 ## Waterproofing (RedGard) Pricing
 - Custom RedGard 5 Gal Pail: $156.00, coverage 275 SF/pail (2 coats)
-- Mesh fabric: $42.00/roll, 300 SF/roll
-- Labor: $0.55/SF
+- Mesh fabric: $42.00/roll, 300 SF/roll (corners and seams only)
+- Labor: **$0.54/SF Waterproofing Roll On** (NOT Kerdi at $1.07 — Kerdi is sheet membrane, RedGard is roll-on)
+- RedGard pails ARE the membrane material — do NOT add a separate "membrane" sundry line
+- The only sundry is mesh fabric for corners/seams
 - RFMS may include waterproofing as a material line ("Liquid-Latex Rubber...Redgard")
-- When RFMS has it: bundler uses that material directly, applies sundry rules for pails + mesh
+- When RFMS has it: bundler uses that material directly
 - When RFMS doesn't have it: bundler derives from tub_shower_surround SF
 - NEVER double-count: skip derived bundle if RFMS waterproofing material exists
+
+## RFMS By Item Sheet Can Over-Count
+- The By Item sheet totals can be WRONG — they may over-count materials that appear in multiple schemes
+- Always cross-check against the Main sheet row sums for suspicious quantities
+- T-202 tub surround: By Item said 58,651 SF but Main sheet rows sum to 34,331 SF (1.71x inflated)
+- The parser uses By Item install qty which can be wrong — need validation against Main sheet
 
 ## Bundle Ordering
 - ALL unit bundles MUST come before ALL common area bundles — no exceptions

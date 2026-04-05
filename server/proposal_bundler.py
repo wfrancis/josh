@@ -787,24 +787,33 @@ def _generate_derived_bundles(job: dict, materials: list[dict]) -> list[dict]:
     if surround_sf > 0 and not has_rfms_waterproofing:
         pails = math.ceil(surround_sf / wp_rule["coverage_sf"])
         material_cost = round(pails * wp_rule["pail_cost"], 2)
-        mesh_cost = round(math.ceil(unit_count / 100) * wp_rule["mesh_per_100_units"], 2) if unit_count > 0 else 0
-        labor_cost = round(surround_sf * wp_rule["labor_rate_sf"], 2)
+        # Mesh fabric based on coverage, not per-100-units
+        mesh_coverage = wp_rule.get("mesh_coverage_sf", 300)
+        mesh_price = wp_rule.get("mesh_cost", 42.00)
+        mesh_rolls = math.ceil(surround_sf / mesh_coverage)
+        mesh_cost = round(mesh_rolls * mesh_price, 2)
+        labor_rate = wp_rule.get("labor_rate_sf", 0.54)
+        labor_cost = round(surround_sf * labor_rate, 2)
         total = material_cost + mesh_cost + labor_cost
 
+        labor_desc = wp_rule.get("labor_description", "Waterproofing Roll On")
         desc_lines = [
             f"Furnish, deliver and install {wp_rule['material_name']}",
-            f"2 Coats of Fluid Applied Membrane on Tub/Shower Surround Walls",
+            f"2 Coats of Fluid Applied Roll-On Membrane on Tub/Shower Surround Walls",
             f"Includes Mesh Fabric for Corners and Seams",
             f"Coverage: {wp_rule['coverage_sf']} SF/pail, {pails} pails needed",
             f"Net Area: {round(surround_sf, 2)} SF",
         ]
 
+        # No separate membrane sundry — RedGard pails ARE the membrane
         sundry_items = [
-            {"sundry_name": "RedGard 5 Gal Pail", "qty": pails,
-             "unit": "EA", "unit_price": wp_rule["pail_cost"],
-             "extended_cost": material_cost},
+            {"sundry_name": "Mesh Fabric", "qty": mesh_rolls,
+             "unit": "SF/roll", "unit_price": mesh_price,
+             "extended_cost": mesh_cost},
         ]
-        if mesh_cost > 0:
+
+        # Keep backward compat — skip old mesh_per_100_units block
+        if False:
             sundry_items.append({
                 "sundry_name": "Mesh Tape", "qty": math.ceil(unit_count / 100),
                 "unit": "EA", "unit_price": wp_rule["mesh_per_100_units"],
@@ -812,10 +821,10 @@ def _generate_derived_bundles(job: dict, materials: list[dict]) -> list[dict]:
             })
 
         labor_items = [{
-            "labor_description": "Waterproofing Application",
+            "labor_description": labor_desc,
             "qty": round(surround_sf, 2),
             "unit": "SF",
-            "rate": wp_rule["labor_rate_sf"],
+            "rate": labor_rate,
             "extended_cost": labor_cost,
         }]
 
