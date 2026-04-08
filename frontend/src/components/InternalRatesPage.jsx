@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import {
-  DollarSign, HardHat, FileSpreadsheet, ShoppingCart, Droplets,
+  DollarSign, HardHat, FileSpreadsheet, Droplets,
   Wrench, Truck, Loader2, Check, AlertTriangle, Plus, Trash2,
   ChevronDown, ChevronRight, X
 } from 'lucide-react'
@@ -40,21 +40,6 @@ export default function InternalRatesPage() {
   const [laborSaving, setLaborSaving] = useState(false)
   const [laborSaveSuccess, setLaborSaveSuccess] = useState(false)
 
-  // Price List
-  const [priceListLoading, setPriceListLoading] = useState(false)
-  const [priceListSuccess, setPriceListSuccess] = useState(false)
-  const [priceListError, setPriceListError] = useState(null)
-  const [priceList, setPriceList] = useState(null)
-  const [priceListFetching, setPriceListFetching] = useState(true)
-  const [showAddRow, setShowAddRow] = useState(false)
-  const [newEntry, setNewEntry] = useState({ product_name: '', material_type: '', unit: '', unit_price: '', vendor: '' })
-  const [addingEntry, setAddingEntry] = useState(false)
-  const [deletingId, setDeletingId] = useState(null)
-  const [editedPriceList, setEditedPriceList] = useState([])
-  const [priceListDirty, setPriceListDirty] = useState(false)
-  const [priceListSaving, setPriceListSaving] = useState(false)
-  const [priceListSaveSuccess, setPriceListSaveSuccess] = useState(false)
-
   // Waste Factors
   const [wasteFactors, setWasteFactors] = useState(null)
   const [wasteLoading, setWasteLoading] = useState(true)
@@ -87,11 +72,6 @@ export default function InternalRatesPage() {
       .catch(() => setLaborCatalog({ entries: [], count: 0 }))
       .finally(() => setCatalogLoading(false))
 
-    api.getPriceList()
-      .then(data => setPriceList(data))
-      .catch(() => setPriceList({ entries: [], count: 0 }))
-      .finally(() => setPriceListFetching(false))
-
     api.getCompanyRate('waste_factors')
       .then(res => { setWasteFactors(res.data); setEditedWaste(res.data || {}) })
       .catch(() => { setWasteFactors({}); setEditedWaste({}) })
@@ -112,10 +92,6 @@ export default function InternalRatesPage() {
   useEffect(() => {
     if (laborCatalog?.entries) setEditedLabor(laborCatalog.entries.map(e => ({ ...e })))
   }, [laborCatalog])
-
-  useEffect(() => {
-    if (priceList?.entries) setEditedPriceList(priceList.entries.map(e => ({ ...e })))
-  }, [priceList])
 
   // Labor edit handlers
   const updateLaborEntry = (index, field, value) => {
@@ -168,47 +144,6 @@ export default function InternalRatesPage() {
     }
   }
 
-  // Price list edit handlers
-  const updatePriceListEntry = (index, field, value) => {
-    setEditedPriceList(prev => {
-      const updated = [...prev]
-      updated[index] = { ...updated[index], [field]: value }
-      return updated
-    })
-    setPriceListDirty(true)
-  }
-
-  const handlePriceListSaveAll = async () => {
-    setPriceListSaving(true)
-    setPriceListError(null)
-    try {
-      for (const entry of editedPriceList) {
-        if (entry.id) await api.updatePriceListEntry(entry.id, entry)
-      }
-      const data = await api.getPriceList()
-      setPriceList(data)
-      setPriceListDirty(false)
-      setPriceListSaveSuccess(true)
-      setTimeout(() => setPriceListSaveSuccess(false), 3000)
-    } catch (err) {
-      setPriceListError(err.message)
-    } finally {
-      setPriceListSaving(false)
-    }
-  }
-
-  const handleClearPriceList = async () => {
-    if (!confirm('Clear all price list entries? This cannot be undone.')) return
-    try {
-      await api.clearPriceList()
-      setPriceList({ entries: [], count: 0 })
-      setEditedPriceList([])
-      setPriceListDirty(false)
-    } catch (err) {
-      setPriceListError(err.message)
-    }
-  }
-
   // Handlers — Labor
   const handleLaborUpload = async (file) => {
     setLaborLoading(true)
@@ -222,54 +157,6 @@ export default function InternalRatesPage() {
       setLaborError(err.message)
     } finally {
       setLaborLoading(false)
-    }
-  }
-
-  // Handlers — Price List
-  const handlePriceListUpload = async (file) => {
-    setPriceListLoading(true)
-    setPriceListError(null)
-    try {
-      await api.uploadPriceList(file)
-      setPriceListSuccess(true)
-      const data = await api.getPriceList()
-      setPriceList(data)
-    } catch (err) {
-      setPriceListError(err.message)
-    } finally {
-      setPriceListLoading(false)
-    }
-  }
-
-  const handleAddEntry = async () => {
-    if (!newEntry.product_name || !newEntry.unit_price) return
-    setAddingEntry(true)
-    try {
-      await api.addPriceListEntry({
-        ...newEntry,
-        unit_price: parseFloat(newEntry.unit_price),
-      })
-      const data = await api.getPriceList()
-      setPriceList(data)
-      setNewEntry({ product_name: '', material_type: '', unit: '', unit_price: '', vendor: '' })
-      setShowAddRow(false)
-    } catch (err) {
-      setPriceListError(err.message)
-    } finally {
-      setAddingEntry(false)
-    }
-  }
-
-  const handleDeleteEntry = async (id) => {
-    setDeletingId(id)
-    try {
-      await api.deletePriceListEntry(id)
-      const data = await api.getPriceList()
-      setPriceList(data)
-    } catch (err) {
-      setPriceListError(err.message)
-    } finally {
-      setDeletingId(null)
     }
   }
 
@@ -499,246 +386,7 @@ export default function InternalRatesPage() {
           )}
         </div>
 
-        {/* ── 2. Material Price List ──────────────────────── */}
-        <div className="glass-card p-8">
-          <div className="flex items-start gap-4 mb-6">
-            <div className="w-11 h-11 rounded-xl bg-emerald-500/10 flex items-center justify-center flex-shrink-0">
-              <ShoppingCart className="w-5 h-5 text-emerald-400" />
-            </div>
-            <div>
-              <h2 className="text-lg font-bold text-white">Material Price List</h2>
-              <p className="text-sm text-gray-500 mt-1">
-                Upload or manually manage your material pricing. Used to match against vendor quotes.
-              </p>
-            </div>
-          </div>
-          <FileUpload
-            accept=".csv,.xlsx,.pdf"
-            label="Upload Price List"
-            description="CSV, Excel, or PDF with material pricing"
-            icon={FileSpreadsheet}
-            onUpload={handlePriceListUpload}
-            onReset={() => setPriceListSuccess(false)}
-            loading={priceListLoading}
-            success={priceListSuccess}
-            successMessage="Price list uploaded successfully"
-          />
-          {priceListError && (
-            <div className="mt-3 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-400 flex items-center justify-between">
-              <span>{priceListError}</span>
-              <button onClick={() => setPriceListError(null)} className="p-0.5 hover:bg-white/[0.06] rounded">
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          )}
-
-          {priceListFetching ? (
-            <div className="mt-4 flex items-center justify-center py-6">
-              <Loader2 className="w-4 h-4 text-gray-500 animate-spin" />
-            </div>
-          ) : (
-            <div className="mt-4">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-bold text-gray-500 uppercase tracking-[0.12em]">
-                    Price Entries
-                  </span>
-                  {priceList && priceList.count > 0 && (
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400">
-                      {priceList.count} entries
-                    </span>
-                  )}
-                </div>
-                <div className="flex items-center gap-2">
-                  {priceList && priceList.count > 0 && (
-                    <button
-                      onClick={handleClearPriceList}
-                      className="btn-ghost text-xs px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-500/10 flex items-center gap-1.5"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" /> Clear All
-                    </button>
-                  )}
-                  <button
-                    onClick={() => setShowAddRow(!showAddRow)}
-                    className="btn-ghost text-xs px-3 py-1.5 flex items-center gap-1.5"
-                  >
-                    {showAddRow ? <X className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
-                    {showAddRow ? 'Cancel' : 'Add Entry'}
-                  </button>
-                </div>
-              </div>
-
-              {showAddRow && (
-                <div className="mb-3 p-4 bg-white/[0.03] border border-white/[0.06] rounded-xl space-y-3">
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="text-[10px] font-bold text-gray-500 uppercase tracking-wider block mb-1">Product Name</label>
-                      <input
-                        type="text"
-                        className="input w-full text-sm"
-                        value={newEntry.product_name}
-                        onChange={e => setNewEntry(prev => ({ ...prev, product_name: e.target.value }))}
-                        placeholder="e.g. Shaw Floors LVT"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[10px] font-bold text-gray-500 uppercase tracking-wider block mb-1">Material Type</label>
-                      <select
-                        className="input w-full text-sm"
-                        value={newEntry.material_type}
-                        onChange={e => setNewEntry(prev => ({ ...prev, material_type: e.target.value }))}
-                      >
-                        <option value="">Select type...</option>
-                        {MATERIAL_TYPES.map(t => (
-                          <option key={t} value={t}>{TYPE_LABELS[t]}</option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-3 gap-3">
-                    <div>
-                      <label className="text-[10px] font-bold text-gray-500 uppercase tracking-wider block mb-1">Unit</label>
-                      <input
-                        type="text"
-                        className="input w-full text-sm"
-                        value={newEntry.unit}
-                        onChange={e => setNewEntry(prev => ({ ...prev, unit: e.target.value }))}
-                        placeholder="e.g. SY, SF"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[10px] font-bold text-gray-500 uppercase tracking-wider block mb-1">Unit Price</label>
-                      <input
-                        type="number"
-                        step="0.01"
-                        className="input w-full text-sm"
-                        value={newEntry.unit_price}
-                        onChange={e => setNewEntry(prev => ({ ...prev, unit_price: e.target.value }))}
-                        placeholder="0.00"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[10px] font-bold text-gray-500 uppercase tracking-wider block mb-1">Vendor</label>
-                      <input
-                        type="text"
-                        className="input w-full text-sm"
-                        value={newEntry.vendor}
-                        onChange={e => setNewEntry(prev => ({ ...prev, vendor: e.target.value }))}
-                        placeholder="e.g. Shaw"
-                      />
-                    </div>
-                  </div>
-                  <div className="flex justify-end">
-                    <button
-                      onClick={handleAddEntry}
-                      disabled={addingEntry || !newEntry.product_name || !newEntry.unit_price}
-                      className="btn-primary text-xs px-4 py-2"
-                    >
-                      {addingEntry ? (
-                        <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Adding...</>
-                      ) : (
-                        <><Plus className="w-3.5 h-3.5" /> Add Entry</>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {priceList && priceList.count > 0 ? (
-                <>
-                <div className="overflow-x-auto max-h-64 overflow-y-auto rounded-xl border border-white/[0.06]">
-                  <table className="w-full text-xs">
-                    <thead className="sticky top-0 bg-gray-900/95 backdrop-blur-sm">
-                      <tr className="border-b border-white/[0.06]">
-                        <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Product Name</th>
-                        <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Type</th>
-                        <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Unit</th>
-                        <th className="py-2 px-3 text-right font-bold text-gray-500 uppercase tracking-wider">Unit Price</th>
-                        <th className="py-2 px-3 text-left font-bold text-gray-500 uppercase tracking-wider">Vendor</th>
-                        <th className="py-2 px-3 w-10"></th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-white/[0.03]">
-                      {editedPriceList.map((entry, i) => (
-                        <tr key={entry.id || i} className="hover:bg-white/[0.02] transition-colors group">
-                          <td className="py-2 px-3 text-gray-300 font-medium">
-                            <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-300 font-medium cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
-                              value={entry.product_name || ''}
-                              onChange={e => updatePriceListEntry(i, 'product_name', e.target.value)} />
-                          </td>
-                          <td className="py-2 px-3 text-gray-400">
-                            <select className="bg-transparent border-0 outline-none w-full text-xs text-gray-400 cursor-pointer focus:bg-white/[0.06] focus:rounded-md transition-colors appearance-none"
-                              value={entry.material_type || ''}
-                              onChange={e => updatePriceListEntry(i, 'material_type', e.target.value)}>
-                              <option value="">— Select type —</option>
-                              {MATERIAL_TYPES.map(t => (
-                                <option key={t} value={t}>{TYPE_LABELS[t]}</option>
-                              ))}
-                              {entry.material_type && !MATERIAL_TYPES.includes(entry.material_type) && (
-                                <option value={entry.material_type}>{entry.material_type}</option>
-                              )}
-                            </select>
-                          </td>
-                          <td className="py-2 px-3 text-gray-500">
-                            <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-500 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
-                              value={entry.unit || ''}
-                              onChange={e => updatePriceListEntry(i, 'unit', e.target.value)} />
-                          </td>
-                          <td className="py-2 px-3 text-right tabular-nums text-gray-300">
-                            <input type="number" step="0.01" min="0" className="bg-transparent border-0 outline-none w-full text-xs text-right tabular-nums text-gray-300 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
-                              value={entry.unit_price ?? ''}
-                              onChange={e => updatePriceListEntry(i, 'unit_price', e.target.value === '' ? 0 : parseFloat(e.target.value))} />
-                          </td>
-                          <td className="py-2 px-3 text-gray-500">
-                            <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-500 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
-                              value={entry.vendor || ''}
-                              onChange={e => updatePriceListEntry(i, 'vendor', e.target.value)} />
-                          </td>
-                          <td className="py-2 px-1">
-                            <button
-                              onClick={() => handleDeleteEntry(entry.id)}
-                              disabled={deletingId === entry.id}
-                              className="p-1 rounded hover:bg-red-500/10 text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
-                            >
-                              {deletingId === entry.id ? (
-                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                              ) : (
-                                <Trash2 className="w-3.5 h-3.5" />
-                              )}
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <div className="flex items-center gap-3 mt-3">
-                  <button
-                    onClick={handlePriceListSaveAll}
-                    disabled={priceListSaving || !priceListDirty}
-                    className="btn-primary text-xs"
-                  >
-                    {priceListSaving ? (
-                      <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Saving...</>
-                    ) : priceListSaveSuccess ? (
-                      <><Check className="w-3.5 h-3.5" /> Saved</>
-                    ) : (
-                      'Save Changes'
-                    )}
-                  </button>
-                </div>
-                </>
-              ) : (
-                <div className="text-center py-6 bg-white/[0.02] rounded-xl border border-white/[0.04]">
-                  <ShoppingCart className="w-8 h-8 text-gray-600 mx-auto mb-2 opacity-40" />
-                  <p className="text-xs text-gray-500">No price list entries yet</p>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* ── 3. Waste Factors ────────────────────────────── */}
+        {/* ── 2. Waste Factors ────────────────────────────── */}
         <div className="glass-card p-8">
           <div className="flex items-start gap-4 mb-6">
             <div className="w-11 h-11 rounded-xl bg-amber-500/10 flex items-center justify-center flex-shrink-0">
