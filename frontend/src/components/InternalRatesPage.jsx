@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import {
   DollarSign, HardHat, FileSpreadsheet, Droplets,
   Wrench, Truck, Loader2, Check, AlertTriangle, Plus, Trash2,
-  ChevronDown, ChevronRight, X
+  ChevronDown, ChevronRight, X, Search
 } from 'lucide-react'
 import { api } from '../api'
 import FileUpload from './FileUpload'
@@ -30,6 +30,7 @@ const MATERIAL_TYPES = Object.keys(TYPE_LABELS)
 
 export default function InternalRatesPage() {
   // Labor Catalog
+  const [laborSearch, setLaborSearch] = useState('')
   const [laborLoading, setLaborLoading] = useState(false)
   const [laborSuccess, setLaborSuccess] = useState(false)
   const [laborError, setLaborError] = useState(null)
@@ -309,6 +310,21 @@ export default function InternalRatesPage() {
                   </button>
                 </div>
               </div>
+              <div className="relative mb-2">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500 pointer-events-none" />
+                <input
+                  type="text"
+                  placeholder="Search by type or description..."
+                  value={laborSearch}
+                  onChange={e => setLaborSearch(e.target.value)}
+                  className="input w-full pl-8 text-xs py-1.5"
+                />
+                {laborSearch && (
+                  <button onClick={() => setLaborSearch('')} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300">
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
               <div className="overflow-x-auto max-h-64 overflow-y-auto rounded-xl border border-white/[0.06]">
                 <table className="w-full text-xs">
                   <thead className="sticky top-0 bg-gray-900/95 backdrop-blur-sm">
@@ -322,32 +338,36 @@ export default function InternalRatesPage() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/[0.03]">
-                    {editedLabor.map((entry, i) => (
-                      <tr key={entry.id || i} className="hover:bg-white/[0.02] transition-colors group">
+                    {editedLabor.map((entry, realIdx) => ({ entry, realIdx })).filter(({ entry }) => {
+                      if (!laborSearch) return true
+                      const q = laborSearch.toLowerCase()
+                      return (entry.labor_type || '').toLowerCase().includes(q) || (entry.description || '').toLowerCase().includes(q)
+                    }).map(({ entry, realIdx }) => (
+                      <tr key={entry.id || realIdx} className="hover:bg-white/[0.02] transition-colors group">
                         <td className="py-2 px-3 text-gray-300 font-medium">
                           <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-300 font-medium cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
                             value={entry.labor_type || ''}
-                            onChange={e => updateLaborEntry(i, 'labor_type', e.target.value)} />
+                            onChange={e => updateLaborEntry(realIdx, 'labor_type', e.target.value)} />
                         </td>
                         <td className="py-2 px-3 text-gray-400">
                           <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-400 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
                             value={entry.description || ''}
-                            onChange={e => updateLaborEntry(i, 'description', e.target.value)} />
+                            onChange={e => updateLaborEntry(realIdx, 'description', e.target.value)} />
                         </td>
                         <td className="py-2 px-3 text-right tabular-nums text-gray-300">
                           <input type="number" step="0.01" min="0" className="bg-transparent border-0 outline-none w-full text-xs text-right tabular-nums text-gray-300 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
                             value={entry.cost ?? ''}
-                            onChange={e => updateLaborEntry(i, 'cost', e.target.value === '' ? 0 : parseFloat(e.target.value))} />
+                            onChange={e => updateLaborEntry(realIdx, 'cost', e.target.value === '' ? 0 : parseFloat(e.target.value))} />
                         </td>
                         <td className="py-2 px-3 text-gray-500">
                           <input type="text" className="bg-transparent border-0 outline-none w-full text-xs text-gray-500 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
                             value={entry.unit || ''}
-                            onChange={e => updateLaborEntry(i, 'unit', e.target.value)} />
+                            onChange={e => updateLaborEntry(realIdx, 'unit', e.target.value)} />
                         </td>
                         <td className="py-2 px-3 text-right tabular-nums text-gray-500">
                           <input type="number" step="1" min="0" max="100" className="bg-transparent border-0 outline-none w-full text-xs text-right tabular-nums text-gray-500 cursor-text focus:bg-white/[0.06] focus:px-1.5 focus:py-0.5 focus:-mx-1.5 focus:-my-0.5 focus:rounded-md transition-colors"
                             value={entry.gpm_markup != null ? Math.round(entry.gpm_markup * 100) : ''}
-                            onChange={e => updateLaborEntry(i, 'gpm_markup', e.target.value === '' ? 0 : parseFloat(e.target.value) / 100)} />
+                            onChange={e => updateLaborEntry(realIdx, 'gpm_markup', e.target.value === '' ? 0 : parseFloat(e.target.value) / 100)} />
                         </td>
                         <td className="py-2 px-1">
                           <button
