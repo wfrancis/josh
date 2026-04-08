@@ -8,7 +8,6 @@ import json
 import os
 import re
 import shutil
-import smtplib
 import sqlite3
 import threading
 import time
@@ -39,14 +38,16 @@ STATIC_DIR = APP_DIR / "static"
 # ── AI Settings (read from SI Bid Tool DB) ───────────────────────────────────
 
 _ai_settings: dict = {}
+_ai_settings_lock = threading.Lock()
 
 
 def _load_ai_settings():
-    """Read API keys and model from the SI Bid Tool database."""
+    """Read API keys and model from the SI Bid Tool database.
+    Returns True if at least one AI key was found."""
     global _ai_settings
     if not SI_DB_PATH.exists():
         print(f"[VendorSim] WARNING: SI Bid Tool DB not found at {SI_DB_PATH}")
-        return
+        return False
     try:
         conn = sqlite3.connect(str(SI_DB_PATH))
         conn.row_factory = sqlite3.Row
@@ -55,14 +56,17 @@ def _load_ai_settings():
             "WHERE key IN ('openai_api_key', 'openai_model', 'anthropic_api_key')"
         ).fetchall()
         conn.close()
-        _ai_settings.update({row["key"]: row["value"] for row in rows})
+        with _ai_settings_lock:
+            _ai_settings.update({row["key"]: row["value"] for row in rows})
         provider = "Anthropic" if _ai_settings.get("anthropic_api_key") else (
             "OpenAI" if _ai_settings.get("openai_api_key") else "None"
         )
         print(f"[VendorSim] AI settings loaded — provider: {provider}, "
               f"model: {_ai_settings.get('openai_model', 'gpt-5-mini')}")
+        return provider != "None"
     except Exception as e:
         print(f"[VendorSim] Error loading AI settings: {e}")
+        return False
 
 
 # ── Model Mapping ────────────────────────────────────────────────────────────
@@ -80,9 +84,10 @@ def _chat_complete(system: str, user: str, json_mode: bool = False) -> str:
     Call OpenAI or Anthropic API directly via httpx.
     Uses whichever key is available from SI Bid Tool settings.
     """
-    anthropic_key = _ai_settings.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
-    openai_key = _ai_settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
-    model = _ai_settings.get("openai_model", "gpt-5-mini")
+    with _ai_settings_lock:
+        anthropic_key = _ai_settings.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+        openai_key = _ai_settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+        model = _ai_settings.get("openai_model", "gpt-5-mini")
 
     if anthropic_key:
         return _anthropic_complete(anthropic_key, system, user, model, json_mode)
@@ -380,6 +385,23 @@ app.add_middleware(
 _watcher: Optional[VendorInboxWatcher] = None
 
 
+_ai_retry_status = "idle"  # idle | retrying | loaded | gave_up
+
+
+def _retry_ai_settings():
+    """Background thread: retry loading AI settings every 5s until found."""
+    global _ai_retry_status
+    _ai_retry_status = "retrying"
+    for attempt in range(24):  # up to 2 minutes
+        time.sleep(5)
+        if _load_ai_settings():
+            _ai_retry_status = "loaded"
+            print("[VendorSim] AI settings loaded on retry")
+            return
+    _ai_retry_status = "gave_up"
+    print("[VendorSim] WARNING: gave up waiting for AI settings after 2 minutes")
+
+
 @app.on_event("startup")
 def startup():
     global _watcher
@@ -388,8 +410,13 @@ def startup():
     print("  http://localhost:8100")
     print("=" * 60)
 
-    _load_ai_settings()
+    has_ai = _load_ai_settings()
     _init_sim_db()
+
+    # If no AI keys yet (bid tool DB not ready), retry in background
+    if not has_ai:
+        print("[VendorSim] No AI keys found — will retry in background until bid tool DB is ready")
+        threading.Thread(target=_retry_ai_settings, daemon=True, name="ai-settings-retry").start()
 
     # Ensure mailbox dirs
     for d in [VENDOR_INBOX, VENDOR_INBOX / "processed",
@@ -592,7 +619,8 @@ def send_reply(request_id: int, payload: SendReplyBody = None):
 
     eml_content = msg.as_string()
 
-    # 1) Write .eml to bidtool_inbox/
+    # Write .eml directly to bidtool_inbox/ (no SMTP — avoids duplicate delivery
+    # since the relay would route it right back to the same folder)
     BIDTOOL_INBOX.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_vendor = re.sub(r"[^a-zA-Z0-9_-]", "_", req["vendor_name"] or "vendor")
@@ -601,19 +629,7 @@ def send_reply(request_id: int, payload: SendReplyBody = None):
     eml_path.write_text(eml_content, encoding="utf-8")
     print(f"[VendorSim] Reply .eml written to {eml_path}")
 
-    # 2) Try SMTP to localhost:2525 (don't fail if relay isn't running)
-    smtp_sent = False
-    try:
-        server = smtplib.SMTP("localhost", 2525, timeout=5)
-        server.ehlo()
-        server.sendmail(vendor_email, [from_email], eml_content)
-        server.quit()
-        smtp_sent = True
-        print(f"[VendorSim] Reply sent via SMTP to localhost:2525")
-    except Exception as e:
-        print(f"[VendorSim] SMTP send skipped (relay not running?): {e}")
-
-    # 3) Update database
+    # Update database
     conn.execute(
         """UPDATE requests
            SET reply_body = ?, status = 'sent', replied_at = ?
@@ -626,14 +642,20 @@ def send_reply(request_id: int, payload: SendReplyBody = None):
     return {
         "status": "sent",
         "eml_file": eml_filename,
-        "smtp_sent": smtp_sent,
         "reply_subject": reply_subject,
     }
 
 
+_reply_all_status = {"running": False, "processed": 0, "total": 0, "errors": 0}
+_reply_all_lock = threading.Lock()
+
+
 @app.post("/api/requests/reply-all")
 def reply_all():
-    """Generate AI reply and send for ALL pending requests."""
+    """Generate AI reply and send for ALL pending requests (background thread)."""
+    if _reply_all_status["running"]:
+        return {"message": "Already processing", **_reply_all_status}
+
     conn = _get_sim_conn()
     rows = conn.execute(
         "SELECT id FROM requests WHERE status = 'pending' ORDER BY received_at ASC"
@@ -641,21 +663,38 @@ def reply_all():
     conn.close()
 
     if not rows:
-        return {"processed": 0, "results": [], "message": "No pending requests"}
+        return {"processed": 0, "total": 0, "results": [], "message": "No pending requests"}
 
-    results = []
-    for row in rows:
-        rid = row["id"]
-        try:
-            # Generate
-            gen_result = generate_reply(rid)
-            # Send
-            send_result = send_reply(rid)
-            results.append({"id": rid, "status": "sent", "products": len(gen_result.get("products", []))})
-        except Exception as e:
-            results.append({"id": rid, "status": "error", "error": str(e)})
+    ids = [row["id"] for row in rows]
+    with _reply_all_lock:
+        _reply_all_status.update({"running": True, "processed": 0, "total": len(ids), "errors": 0})
 
-    return {"processed": len(results), "results": results}
+    def _process():
+        for rid in ids:
+            try:
+                generate_reply(rid)
+                send_reply(rid)
+                with _reply_all_lock:
+                    _reply_all_status["processed"] += 1
+            except Exception as e:
+                with _reply_all_lock:
+                    _reply_all_status["processed"] += 1
+                    _reply_all_status["errors"] += 1
+                print(f"[VendorSim] Reply-all error for #{rid}: {e}")
+        with _reply_all_lock:
+            _reply_all_status["running"] = False
+        print(f"[VendorSim] Reply-all complete: {_reply_all_status['processed']}/{_reply_all_status['total']}, "
+              f"{_reply_all_status['errors']} errors")
+
+    threading.Thread(target=_process, daemon=True, name="reply-all").start()
+    return {"message": "Processing started", "total": len(ids)}
+
+
+@app.get("/api/requests/reply-all/status")
+def reply_all_status():
+    """Poll progress of a reply-all operation."""
+    with _reply_all_lock:
+        return dict(_reply_all_status)
 
 
 @app.get("/api/status")
@@ -676,6 +715,7 @@ def health_check():
         "watcher_active": _watcher is not None and _watcher.is_alive(),
         "ai_available": anthropic_key or openai_key,
         "ai_provider": "anthropic" if anthropic_key else ("openai" if openai_key else "none"),
+        "ai_retry_status": _ai_retry_status,
         "model": _ai_settings.get("openai_model", "gpt-5-mini"),
         "counts": {
             "total": total,

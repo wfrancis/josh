@@ -232,21 +232,42 @@
         btn.disabled = true;
         btn.innerHTML = '<span class="spinner"></span> Processing...';
         status.classList.remove('hidden');
-        status.textContent = 'Generating and sending replies...';
+        status.textContent = 'Starting...';
         try {
             const res = await fetch(`${API}/api/requests/reply-all`, { method: 'POST' });
             if (!res.ok) throw new Error(res.statusText);
             const data = await res.json();
-            status.textContent = `Processed ${data.processed} requests` + (data.errors?.length ? `, ${data.errors.length} errors` : '');
-            await fetchRequests();
-            await fetchStatus();
+            if (data.total === 0) {
+                status.textContent = 'No pending requests';
+                btn.disabled = false;
+                btn.innerHTML = `<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10h1m4 0h1m4 0h1m4 0h1M3 14h1m4 0h1m4 0h1m4 0h1M5 6l-2 4 2 4M19 6l2 4-2 4"/></svg> Reply All Pending`;
+                setTimeout(() => { status.classList.add('hidden'); }, 3000);
+                return;
+            }
+            // Poll for progress
+            const total = data.total;
+            status.textContent = `Processing 0/${total}...`;
+            const poll = setInterval(async () => {
+                try {
+                    const pr = await fetch(`${API}/api/requests/reply-all/status`);
+                    const ps = await pr.json();
+                    status.textContent = `Processing ${ps.processed}/${ps.total}...` + (ps.errors ? ` (${ps.errors} errors)` : '');
+                    btn.innerHTML = `<span class="spinner"></span> ${ps.processed}/${ps.total}`;
+                    if (!ps.running) {
+                        clearInterval(poll);
+                        status.textContent = `Done: ${ps.processed} processed` + (ps.errors ? `, ${ps.errors} errors` : '');
+                        btn.disabled = false;
+                        btn.innerHTML = `<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10h1m4 0h1m4 0h1m4 0h1M3 14h1m4 0h1m4 0h1m4 0h1M5 6l-2 4 2 4M19 6l2 4-2 4"/></svg> Reply All Pending`;
+                        await fetchRequests();
+                        await fetchStatus();
+                        setTimeout(() => { status.classList.add('hidden'); }, 5000);
+                    }
+                } catch (e) { /* poll failed, keep trying */ }
+            }, 2000);
         } catch (e) {
             status.textContent = 'Error: ' + e.message;
-        } finally {
             btn.disabled = false;
-            btn.innerHTML = `<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M3 10h1m4 0h1m4 0h1m4 0h1M3 14h1m4 0h1m4 0h1m4 0h1M5 6l-2 4 2 4M19 6l2 4-2 4"/>
-            </svg> Reply All Pending`;
+            btn.innerHTML = `<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10h1m4 0h1m4 0h1m4 0h1M3 14h1m4 0h1m4 0h1m4 0h1M5 6l-2 4 2 4M19 6l2 4-2 4"/></svg> Reply All Pending`;
             setTimeout(() => { status.classList.add('hidden'); }, 5000);
         }
     }
