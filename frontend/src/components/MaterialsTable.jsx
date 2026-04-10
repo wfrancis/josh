@@ -529,10 +529,19 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
     return `${area}:${option}`
   }
 
+  // Parse item_code into prefix + number for natural sorting (e.g. "T-108" → ["T", 108])
+  const parseItemCode = (code) => {
+    if (!code) return { prefix: 'zzz', num: 99999, suffix: '' }
+    const match = code.match(/^([A-Za-z]+)-?(\d+(?:\.\d+)?)(.*)$/)
+    if (match) return { prefix: match[1].toUpperCase(), num: parseFloat(match[2]), suffix: match[3] || '' }
+    return { prefix: code.toUpperCase(), num: 0, suffix: '' }
+  }
+
   const displayMaterials = useMemo(() => {
     const sorted = [...filteredMaterials]
 
-    // Default sort: area_type (unit first), then option prefix (Standard, Premium, none), then user sort
+    // Default sort: area_type (unit first), then option prefix (Standard, Premium, none),
+    // then item code prefix + number (e.g. CPT-100, CPT-101, T-100, T-101)
     const areaOrder = { unit: 0, common: 1 }
     const optionOrder = { Standard: 0, Premium: 1, Alternate: 2, '': 3 }
 
@@ -547,7 +556,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
       const bOpt = optionOrder[getOptionPrefix(b)] ?? 3
       if (aOpt !== bOpt) return aOpt - bOpt
 
-      // Tertiary: user-selected sort column
+      // Tertiary: user-selected sort column OR default item code sort
       if (sortCol) {
         const getVal = (m) => {
           switch (sortCol) {
@@ -565,7 +574,13 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
         if (typeof va === 'string') return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va)
         return sortDir === 'asc' ? va - vb : vb - va
       }
-      return 0
+
+      // Default: sort by item code prefix alphabetically, then number
+      const aCode = parseItemCode(a.item_code)
+      const bCode = parseItemCode(b.item_code)
+      if (aCode.prefix !== bCode.prefix) return aCode.prefix.localeCompare(bCode.prefix)
+      if (aCode.num !== bCode.num) return aCode.num - bCode.num
+      return aCode.suffix.localeCompare(bCode.suffix)
     })
     return sorted
   }, [filteredMaterials, sortCol, sortDir])
