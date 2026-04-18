@@ -171,6 +171,9 @@
 - Sort numerically by item code within each material type
 - Walk-off mat (WM-xxx) goes after the last CPT tile
 - Ordering: CPT tiles → WM (walk-off) → LVT → RF (rubber) → Tile (T-xxx)
+- **Common Area T-xxx tiles (floor AND wall) MUST sort together numerically** — T-100, T-101, T-102, T-103... regardless of floor vs wall type
+- floor_tile and wall_tile use the SAME type_group (400) in `_TYPE_GROUP` so code_num drives the sort
+- Never let wall_tile (410) sort after all floor_tile (400) — this breaks the T-number sequence
 
 ## Schluter Jolly for Tub/Shower Surrounds
 - Every tub/shower gets 2 sticks of Schluter Jolly AE

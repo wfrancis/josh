@@ -737,7 +737,7 @@ def auto_bundle_materials(
             "cpt_tile": 100, "unit_cpt_tile": 100,
             "unit_lvt": 200, "boh_lvt": 200,
             "rubber_sheet": 300, "rubber_tile": 300, "rubber_base": 300,
-            "floor_tile": 400, "wall_tile": 410, "backsplash": 420,
+            "floor_tile": 400, "wall_tile": 400, "backsplash": 420,
             "tub_shower_surround": 430,
         }
 
