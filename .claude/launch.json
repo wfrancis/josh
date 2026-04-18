@@ -1,1 +1,19 @@
-{"version":"0.0.1","configurations":[{"name":"si-bid-tool","runtimeExecutable":"python","runtimeArgs":["-m","uvicorn","main:app","--host","0.0.0.0","--port","8000"],"port":8000,"cwd":"server"}]}
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "si-bid-tool-backend",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"],
+      "port": 8000,
+      "cwd": "server"
+    },
+    {
+      "name": "si-bid-tool-frontend",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["vite", "--port", "5173"],
+      "port": 5173,
+      "cwd": "frontend"
+    }
+  ]
+}

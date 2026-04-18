@@ -2433,7 +2433,7 @@ class CompanyRateUpdate(BaseModel):
 def api_update_company_rate(rate_type: str, body: CompanyRateUpdate):
     """Update a company rate."""
     import json as _json
-    if rate_type not in ("sundry_rules", "waste_factors", "freight_rates"):
+    if rate_type not in ("sundry_rules", "waste_factors", "freight_rates", "sundry_prices"):
         raise HTTPException(status_code=400, detail=f"Invalid rate type: {rate_type}")
     save_company_rate(rate_type, _json.dumps(body.data))
     return {"message": f"{rate_type} updated"}

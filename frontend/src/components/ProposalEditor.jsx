@@ -469,13 +469,14 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
   const STAIR_KITS = {
     stretched: [
       { sundry_name: 'Stair Pad (6lb 3/8″)', ratio_per_stair: 0.74, unit: 'SY', unit_price: 1.38, roll_size: 30 },
-      { sundry_name: 'Stair Tack Strip', ratio_per_stair: 6.0, unit: 'LF', unit_price: 0.055 },
+      { sundry_name: 'Stair Tack Strip', ratio_per_stair: 6.0, unit: 'LF/carton', unit_price: 36.99, carton_size: 400 },
       { sundry_name: 'Stair Seam Sealer', ratio_per_stair: 5.307, unit: 'LF', unit_price: 0.1515 },
     ],
   }
 
   const calcSundryQty = (rule, count) => {
     const raw = rule.ratio_per_stair * count
+    if (rule.carton_size) return Math.ceil(raw / rule.carton_size)
     if (rule.roll_size) return Math.ceil(raw / rule.roll_size) * rule.roll_size
     return round2(raw)
   }
@@ -510,7 +511,10 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
     })
 
     const updatedLabor = [...(bundle.labor_items || []), laborItem]
-    const updatedSundries = [...(bundle.sundry_items || []), ...kitSundries]
+    // Remove regular pad/tackstrip/seam_tape — stair-specific versions replace them
+    const STAIR_REPLACED = ['pad', 'tack_strip', 'seam_tape']
+    const filteredSundries = (bundle.sundry_items || []).filter(s => !STAIR_REPLACED.includes(s.sundry_name))
+    const updatedSundries = [...filteredSundries, ...kitSundries]
     const newLaborCost = round2(updatedLabor.reduce((s, l) => s + (l.extended_cost || 0), 0))
     const newSundryCost = round2(updatedSundries.reduce((s, item) => s + (item.extended_cost || 0), 0))
     const laborDiff = newLaborCost - (bundle.labor_cost || 0)

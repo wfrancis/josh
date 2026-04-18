@@ -135,8 +135,50 @@
 
 ## Stair Sundry Ratios (Commercial)
 - Pad: 0.74 SY/stair (6lb 3/8", $1.38/SY, 30 SY rolls — round up to full rolls)
-- Tack strip: 6.0 LF/stair (amenity situation)
+- Tack strip: 6.0 LF/stair — priced per CARTON (400 LF/carton @ $36.99), round up to full boxes
+  - Same carton pricing as regular CPT tack strip
+  - qty = Math.ceil(totalLF / 400) cartons, NOT raw LF
 - Seam sealer: 5.307 LF/stair
+
+## Stair Sundries: Remove Regular Duplicates
+- When stair sundries (Stair Pad, Stair Tack Strip, Stair Seam Sealer) are added, REMOVE the regular pad, tack_strip, and seam_tape sundries
+- The stair-specific versions REPLACE the regular ones — they are NOT additive
+- pad_cement should STAY (still needed to glue pad on stairs)
+- Code fix is in ProposalEditor.jsx `addStairLabor()` — filters out ['pad', 'tack_strip', 'seam_tape'] before combining
+
+## Sound Mat: Net Area + 5% Waste
+- Sound mat quantity = net installed area of the LVT it goes under + 5% waste
+- Do NOT use the LVT's order_qty (which includes LVT's own waste factor)
+- The bid_assembler.py has a special case: for sound_mat with unit EA, apply waste to order_qty even though it's pre-calculated
+- Formula: `order_qty = ceil(original_order_qty * 1.05)`
+
+## RFMS Unit Conversion: SY vs SF
+- RFMS quantities can be in SY even when the material is sold by SF
+- Rubber sheet (RF-xxx) is a common case: RFMS measures in SY, vendor sells by SF
+- ALWAYS check RFMS unit vs vendor quote unit — if mismatched, convert: SF = SY × 9
+- The installed_qty, order_qty, and extended_cost all need updating after conversion
+- Labor may use different units (SY for sheet set, LF for welding) — check before changing
+
+## Vendor Quote Sundry Pricing
+- When a vendor quote includes sundries (adhesive, primer, etc.), use THOSE prices, not config defaults
+- Eco Surfaces/Spartan: ES-90 Adhesive 4 Gal = $308.71/pail (180-480 SF coverage), E-Cleaner = $73.64/gal (6000 SF)
+- Config defaults ($95 adhesive, $65 primer) are generic fallbacks — vendor quotes override
+- Always note the quote number in sundry notes for traceability
+
+## Common Area Bundle Ordering
+- Each common area material gets its OWN bundle — never combine multiple materials into one mega-bundle
+- Naming: "Common Area {item_code}" (e.g., "Common Area CPT-100")
+- Sort numerically by item code within each material type
+- Walk-off mat (WM-xxx) goes after the last CPT tile
+- Ordering: CPT tiles → WM (walk-off) → LVT → RF (rubber) → Tile (T-xxx)
+
+## Schluter Jolly for Tub/Shower Surrounds
+- Every tub/shower gets 2 sticks of Schluter Jolly AE
+- Sticks are 8' (8' 2-1/2") each
+- qty = tub_shower_count × 2
+- Price from price_book_items: JOLLY J 100 AE = $9.78/stick (net after 55% discount)
+- Goes in the Unit Transitions bundle alongside Schiene and silver pin metal
+- If missing from transitions bundle, it needs to be added manually
 
 ## Tax Calculation
 - Tax must be computed as derived state from current cost components, NOT stored from generation time
@@ -149,7 +191,46 @@
 - If function A references variable B, B must be declared BEFORE A in source order
 - Symptom: `ReferenceError: Cannot access 'X' before initialization` only in production builds
 
+## EA Materials: Never Recalculate order_qty from installed_qty
+- When unit is "EA" and installed_qty is in SF but order_qty is in BUCKETS/ROLLS/UNITS, they are DIFFERENT units
+- order_qty = number of physical products to order (buckets, rolls, boxes)
+- installed_qty = area in SF that those products cover
+- When scaling qty: use the RATIO, e.g. `new_order_qty = ceil(old_order_qty * (new_sf / old_sf))`
+- NEVER do `order_qty = installed_qty * (1 + waste)` for EA materials — this confuses SF with product count
+- Example: Redgard 214 buckets for 58,651 SF → scaled to 39,052 SF = ceil(214 * 0.666) = 143 buckets
+- Same applies to: sound mat rolls, adhesive pails, primer buckets, etc.
+
 ## Server / Frontend
 - Python changes require server restart (no auto-reload)
 - Frontend JSX changes require `npx vite build` in frontend/ dir (serves from dist/)
 - Kill old server process before restarting if port is in use
+
+## Waterproofing: No Separate Membrane Sundry
+- RedGard pails ARE the membrane — NEVER add a separate `membrane` sundry line
+- If a `membrane` sundry appears in the bundle, it is wrong and must be removed
+- Only valid sundry for RedGard waterproofing is `mesh_fabric` (corners/seams only)
+- Material line: RedGard 5 Gal pail @ $156.00, coverage 275 SF/pail (2 coats)
+- Mesh fabric: $42.00/roll, 300 SF/roll
+
+## Schluter @Tub/Shower Surrounds: Use RFMS LF for Labor and Stick Count
+- RFMS Main sheet contains "Schluter - Schiene #AE-100 - Metal Edge Strip @Tub/Shower Surrounds" rows
+- Sum all those rows across all unit types to get total installed LF (e.g., 8,384.93 LF for Sun Valley Blk 2)
+- Sticks to order: ceil(total_lf / 8.208) — round up to full sticks
+- Labor: total_lf × $0.50/LF (Schluter Schiene rate)
+- The By Item sheet shows this as a bare number row with no description (e.g., `'8385'`) — parser skips it
+- NEVER calculate from tub_count × 2 sticks × 8.208 LF — use RFMS measured LF instead
+- This is separate from the Schiene @Kitchen Backsplash line (also in RFMS, also parsed)
+
+## RFMS By Item Parser Gap: Bare Number Rows
+- The By Item sheet sometimes has rows where description = a bare number (e.g., `'8385'`)
+- These represent RFMS totals for items that weren't labeled correctly in the export
+- For Schiene @Tub/Shower, the bare number matches the sum of Main sheet rows exactly
+- Workaround: sum the Main sheet rows directly for these items
+- Long-term fix: parser should cross-reference Main sheet when By Item description is non-descriptive
+
+## Schluter Jolly Labor: Must Be Added Manually for Manually-Added Materials
+- Materials added manually to proposal_data with id=None bypass labor_calc.py entirely
+- labor_calc only runs on job_materials table entries (from RFMS import)
+- For Schluter Jolly (tub surrounds), labor must be explicitly added to the bundle's labor_items
+- Rate: $0.50/LF (Schluter Schiene from labor catalog) — no separate "Jolly" catalog entry
+- Qty: use RFMS measured LF, not sticks × 8.208

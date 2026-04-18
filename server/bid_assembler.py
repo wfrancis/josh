@@ -3,6 +3,8 @@ Bid assembler: combines materials, sundries, labor, and freight
 into bundled line items with descriptions and totals.
 """
 
+import math
+
 from config import BID_TEMPLATES, WASTE_FACTORS, FREIGHT_RATES, EXCLUSIONS_TEMPLATE
 
 
@@ -123,9 +125,13 @@ def assemble_bid(
 
         # Calculate order qty with waste
         # If unit is EA, the order_qty is already pre-calculated (rolls, pails, sticks)
-        # — don't recalculate from installed_qty
+        # — don't recalculate from installed_qty.
+        # Exception: sound_mat needs waste applied to its pre-calculated order_qty
         if unit == "EA" and mat.get("order_qty"):
-            order_qty = mat["order_qty"]
+            if material_type == "sound_mat" and waste_pct > 0:
+                order_qty = math.ceil(mat["order_qty"] * (1 + waste_pct))
+            else:
+                order_qty = mat["order_qty"]
         else:
             order_qty = installed_qty * (1 + waste_pct)
 
