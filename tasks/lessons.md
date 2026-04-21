@@ -165,15 +165,20 @@
 - Config defaults ($95 adhesive, $65 primer) are generic fallbacks — vendor quotes override
 - Always note the quote number in sundry notes for traceability
 
-## Common Area Bundle Ordering
+## Common Area Bundle Ordering (Josh's spec)
 - Each common area material gets its OWN bundle — never combine multiple materials into one mega-bundle
-- Naming: "Common Area {item_code}" (e.g., "Common Area CPT-100")
-- Sort numerically by item code within each material type
-- Walk-off mat (WM-xxx) goes after the last CPT tile
-- Ordering: CPT tiles → WM (walk-off) → LVT → RF (rubber) → Tile (T-xxx)
-- **Common Area T-xxx tiles (floor AND wall) MUST sort together numerically** — T-100, T-101, T-102, T-103... regardless of floor vs wall type
-- floor_tile and wall_tile use the SAME type_group (400) in `_TYPE_GROUP` so code_num drives the sort
-- Never let wall_tile (410) sort after all floor_tile (400) — this breaks the T-number sequence
+- **Order of common area sections:**
+  1. CPT Tile (CPT-xxx, then WM-xxx walk-off) — sort numerically within each
+  2. Resilient floors (RF-xxx rubber sheet)
+  3. Ceramic/Porcelain Tile (T-xxx) — includes T-116 tub_shower_surround in sequence
+  4. BOH LVT (LVT-xxx)
+  5. Common Transitions (all amenity/common transitions)
+  6. Waterproofing (Dog Wash, etc)
+  7. Crack Isolation
+  8. Rubber Base (B-xxx), Sound Mat (amenity), other
+- T-116 is tub_shower_surround type but MUST sort with T-100..T-115 (drive by T-code number)
+- WM-100 (walk-off mat) material_type=cpt_tile, sorts AFTER last CPT-xxx (not mixed in)
+- proposal_bundler.py `_sort_key` uses priority ranges 1100/1200/1300/... for common-area categories
 
 ## Schluter Jolly for Tub/Shower Surrounds
 - Every tub/shower gets 2 sticks of Schluter Jolly AE

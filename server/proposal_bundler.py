@@ -717,7 +717,7 @@ def auto_bundle_materials(
 
     def _sort_key(group_key: str) -> tuple:
         # Top-level: ALL unit bundles before ALL common area bundles
-        area_priority = 1000 if group_key.startswith("common:") else 0
+        is_common = group_key.startswith("common:")
         stripped = group_key.replace("common:", "")
         parts = stripped.split(":")
         base = parts[0]
@@ -730,28 +730,65 @@ def auto_bundle_materials(
                 option_priority = op
                 break
 
-        # For common area individual bundles, sort by material type group then numeric code
-        # CPT tiles together (numerical), then LVT, then RF, then Tile (T-xxx)
-        # F-codes are floor finish callouts (F-101, F-102) — sort separately
-        _TYPE_GROUP = {
-            "cpt_tile": 100, "unit_cpt_tile": 100,
-            "unit_lvt": 200, "boh_lvt": 200,
-            "rubber_sheet": 300, "rubber_tile": 300, "rubber_base": 300,
-            "floor_tile": 400, "wall_tile": 400, "backsplash": 420,
-            "tub_shower_surround": 430,
-        }
-
-        # Extract numeric code for sub-sorting (CPT-100 → 100, T-105 → 105)
+        # Extract numeric code for sub-sorting (CPT-100 → 100, T-105 → 105, T-200.1 → 20010)
         import re as _re
         code_num = 9999
         code_part = parts[-1] if len(parts) > 1 else group_key
+        tcode_match = _re.search(r'T-(\d+)(?:\.(\d+))?', code_part)
         num_match = _re.search(r'(\d+)', code_part)
-        if num_match:
+        if tcode_match:
+            code_num = int(tcode_match.group(1)) * 100 + (int(tcode_match.group(2)) if tcode_match.group(2) else 0)
+        elif num_match:
             code_num = int(num_match.group(1))
 
-        # F-codes (floor finish callouts) get their own priority range
-        is_f_code = group_key.startswith("f_code:") or (not group_key.startswith("common:") and stripped.startswith("f_code:"))
-        is_w_code = group_key.startswith("w_code:") or (not group_key.startswith("common:") and stripped.startswith("w_code:"))
+        # ── COMMON AREA ORDER (per Josh's spec) ──
+        # 1. CPT Tile (CPT-xxx, WM-xxx walk-off)
+        # 2. Resilient floors (RF-xxx rubber sheet)
+        # 3. Ceramic/Porcelain Tile (T-xxx, including T-116 tub_shower)
+        # 4. BOH LVT (LVT-xxx)
+        # 5. Common Transitions
+        # 6. Waterproofing
+        # 7. Crack Isolation
+        # 8. Rubber Base / other
+        if is_common:
+            # CPT tiles (CPT-xxx get sub-priority 0, WM-xxx get sub-priority 1)
+            if base in ("cpt_tile", "unit_cpt_tile"):
+                is_wm = "wm" in code_part.lower() or "wm-" in group_key.lower()
+                return (1100, 1 if is_wm else 0, code_num, group_key)
+            # Resilient floor (rubber sheet - RF-xxx)
+            if base in ("rubber_sheet", "rubber_tile"):
+                return (1200, 0, code_num, group_key)
+            # Ceramic/Porcelain tile (any T-xxx: floor, wall, or tub_shower_surround for T-116)
+            if base in ("floor_tile", "wall_tile", "tub_shower_surround") and tcode_match:
+                return (1300, 0, code_num, group_key)
+            # BOH LVT
+            if base in ("unit_lvt", "boh_lvt", "boh_cpt", "boh_cpt_tile"):
+                return (1400, 0, code_num, group_key)
+            # Common Transitions (amenity or common-area transitions)
+            if base == "transitions" or group_key.startswith("transitions:"):
+                return (1500, 0, code_num, group_key)
+            # Waterproofing
+            if base == "waterproofing" or group_key.startswith("waterproofing:"):
+                return (1600, 0, code_num, group_key)
+            # Crack Isolation (derived bundle uses _sort_priority, but fallback)
+            if "crack_isolation" in group_key.lower() or "crack" in base.lower():
+                return (1700, 0, code_num, group_key)
+            # Rubber base
+            if base in ("rubber_base", "boh_rubber_base"):
+                return (1800, 0, code_num, group_key)
+            # Sound mat (amenity)
+            if base == "sound_mat":
+                return (1850, 0, code_num, group_key)
+            # Backsplash (common — rare)
+            if base == "backsplash" or group_key.startswith("backsplash:"):
+                return (1900, option_priority, code_num, group_key)
+            # Anything else
+            return (1999, option_priority, code_num, group_key)
+
+        # ── UNIT ORDER (unchanged) ──
+        area_priority = 0
+        is_f_code = stripped.startswith("f_code:")
+        is_w_code = stripped.startswith("w_code:")
 
         priority = _ORDER_PRIORITY.get(base)
         if priority is not None:
@@ -765,21 +802,12 @@ def auto_bundle_materials(
         if base == "sound_mat":
             return (area_priority + 25, option_priority, code_num, group_key)
         if group_key.startswith("transitions:") or base == "transitions":
-            loc = group_key.split(":", 1)[1] if ":" in group_key else "unit"
-            return (area_priority + (60 if loc == "unit" else 61), option_priority, code_num, group_key)
+            return (area_priority + 60, option_priority, code_num, group_key)
         if is_f_code:
             return (area_priority + 70, option_priority, code_num, group_key)
         if is_w_code:
             return (area_priority + 80, option_priority, code_num, group_key)
-        if base in ("rubber_base", "boh_rubber_base"):
-            return (area_priority + 90, option_priority, code_num, group_key)
-        if base in ("boh_lvt", "boh_cpt", "boh_cpt_tile"):
-            return (area_priority + 95, option_priority, code_num, group_key)
-        # Common area individual bundles: sort by type group then numeric code
-        type_group = _TYPE_GROUP.get(base, 500)
-        if group_key.startswith("individual:"):
-            return (area_priority + 200, type_group, code_num, group_key)
-        return (area_priority + type_group, option_priority, code_num, group_key)
+        return (area_priority + 500, option_priority, code_num, group_key)
 
     sorted_keys = sorted(group_order, key=_sort_key)
 
