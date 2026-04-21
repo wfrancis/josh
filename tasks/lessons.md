@@ -165,6 +165,13 @@
 - Config defaults ($95 adhesive, $65 primer) are generic fallbacks — vendor quotes override
 - Always note the quote number in sundry notes for traceability
 
+## Common Area Transitions: Single Bundle
+- All common-area / amenity transitions collapse into ONE "Amenity Transitions" bundle
+- Grouping key: "transitions:amenity" (for any material_type=transitions where area_type=common or description has amenity location)
+- Description: "Furnish, deliver and install Amenity Transitions\nQuote is figured per the ID Finish Schedule"
+- Unit-level transitions stay separate as "transitions:unit" → "Unit Transitions"
+- NEVER create multiple "Amenity Transitions" bundles — they must merge
+
 ## Common Area Bundle Ordering (Josh's spec)
 - Each common area material gets its OWN bundle — never combine multiple materials into one mega-bundle
 - **Order of common area sections:**

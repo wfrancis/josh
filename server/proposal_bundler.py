@@ -479,10 +479,13 @@ def _classify_material(mat: dict) -> tuple[str, str]:
     elif _W_CODE_RE.match(bare_code):
         group_key, tmpl = f"w_code:{bare_code.upper()}", "wall_tile"
     # ── Rule 3: Transitions
+    # All common-area / amenity transitions collapse into a single "Amenity Transitions"
+    # bundle per Josh's proposal format. Unit-level transitions stay as "Unit Transitions".
     elif material_type == "transitions":
+        area_type = (mat.get("area_type") or "").lower()
         location = _description_contains_location(mat)
-        if location:
-            group_key, tmpl = f"transitions:{location}", "transitions"
+        if area_type == "common" or location:
+            group_key, tmpl = "transitions:amenity", "transitions"
         else:
             group_key, tmpl = "transitions:unit", "transitions"
     # ── Rule 4: Carpet / Broadloom
@@ -597,6 +600,8 @@ def _bundle_display_name(group_key: str, materials: list[dict]) -> str:
     # Transitions
     if group_key == "transitions:unit":
         return "Unit Transitions"
+    if group_key == "transitions:amenity":
+        return "Amenity Transitions"
     if group_key.startswith("transitions:"):
         location = group_key.split(":", 1)[1].title()
         return f"{location} Transitions"
