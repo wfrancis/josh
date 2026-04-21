@@ -2138,10 +2138,31 @@ async def api_save_proposal_bundles(job_id: str, request: Request):
 
 @app.post("/api/jobs/{job_id}/proposal/generate")
 def api_generate_proposal(job_id: str):
-    """Auto-bundle materials into proposal line items."""
+    """Auto-bundle materials into proposal line items.
+
+    Preserves AI-rewritten bundle names and descriptions from prior runs
+    by snapshotting them keyed on material item_code before regeneration,
+    then re-applying after.
+    """
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # ── Snapshot existing rewrites so Regenerate doesn't destroy them ──────
+    # Key by the first material's item_code per bundle.
+    existing_rewrites: dict[str, dict] = {}
+    existing_pd = job.get("proposal_data") or {}
+    for b in (existing_pd.get("bundles") or []):
+        mats = b.get("materials") or []
+        if not mats:
+            continue
+        key = (mats[0].get("item_code") or "").strip()
+        if not key:
+            continue
+        existing_rewrites[key] = {
+            "bundle_name": b.get("bundle_name"),
+            "description_text": b.get("description_text"),
+        }
 
     # Always recalculate sundries and labor to reflect latest rules/flags
     materials = job.get("materials", [])
@@ -2165,6 +2186,20 @@ def api_generate_proposal(job_id: str):
         job = load_job(job_id)
 
     proposal = generate_proposal_data(job["id"], job)
+
+    # ── Re-apply snapshotted rewrites where item_codes match ───────────────
+    for b in proposal.get("bundles", []):
+        mats = b.get("materials") or []
+        if not mats:
+            continue
+        key = (mats[0].get("item_code") or "").strip()
+        rw = existing_rewrites.get(key)
+        if rw:
+            if rw.get("bundle_name"):
+                b["bundle_name"] = rw["bundle_name"]
+            if rw.get("description_text"):
+                b["description_text"] = rw["description_text"]
+
     return proposal
 
 

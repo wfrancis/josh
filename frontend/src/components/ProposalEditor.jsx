@@ -1644,8 +1644,13 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           const next = [...prev]
           for (const d of descriptions) {
             const idx = d.index
-            if (idx >= 0 && idx < next.length && d.description) {
-              next[idx] = { ...next[idx], description_text: d.description }
+            if (idx >= 0 && idx < next.length) {
+              const patch = {}
+              if (d.description) patch.description_text = d.description
+              if (d.bundle_name) patch.bundle_name = d.bundle_name
+              if (Object.keys(patch).length > 0) {
+                next[idx] = { ...next[idx], ...patch }
+              }
             }
           }
           return next

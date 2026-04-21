@@ -237,3 +237,18 @@
 - For Schluter Jolly (tub surrounds), labor must be explicitly added to the bundle's labor_items
 - Rate: $0.50/LF (Schluter Schiene from labor catalog) — no separate "Jolly" catalog entry
 - Qty: use RFMS measured LF, not sticks × 8.208
+
+## Freight Stale After Manual proposal_data Edits
+- proposal_bundler.py correctly calculates freight (freight_per_unit OR config FREIGHT_RATES × order_qty)
+- BUT when we hand-edit proposal_data (remove sundries, add labor, re-sort bundles), freight_cost is NOT recomputed
+- After any manual edit to materials/sundries/qtys, recompute freight_cost per bundle THEN redistribute GPM THEN recalculate tax
+- Formula per bundle: freight_cost = sum(config_freight(mt) × order_qty for each material) + sum(sundry.freight_cost)
+- FREIGHT_RATES: cpt_tile=$1.25, broadloom=$0.65, lvt_2mm=$0.11, lvt_5mm=$0.25
+- FREIGHT_MAP covers only: cpt_tile, corridor_broadloom, unit_carpet_*, unit_lvt
+- Floor/wall tile, backsplash, rubber sheet, sound mat, transitions, waterproofing → NO freight per config (vendor FOB or included)
+
+## Material Classification: unknown → No Freight
+- Materials with material_type="unknown" get ZERO freight even if they should (CPT tile, walk-off mat)
+- Parser misclassifies when description doesn't match classifier heuristics (e.g., CPT-110 with only dimensions, WM-100 walk-off mat)
+- Fix: reclassify by item_code prefix — CPT-* → cpt_tile, WM-* → cpt_tile (carpet construction), T-* → floor_tile/wall_tile, B-* → rubber_base
+- Root-cause fix belongs in classifier.py: add regex rules for CPT-\d+, WM-\d+, T-\d+, B-\d+ item codes
