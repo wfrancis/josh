@@ -244,6 +244,34 @@ You MUST classify EVERY material line — one entry per material. Return ALL of 
 Example response format: {"classifications": [{"index": 0, "material_type": "floor_tile", "confidence": 0.95}, {"index": 1, "material_type": "wall_tile", "confidence": 0.8}]}"""
 
 
+def _infer_material_type_fallback(item_code: str, description: str) -> str:
+    """Deterministic fallback classifier for when AI returns 'unknown'.
+    Only used when AI can't decide — AI's answer wins when present.
+    """
+    code = (item_code or "").upper()
+    desc = (description or "").lower()
+
+    if code.startswith("B-") or code.startswith("WB-"):
+        return "rubber_base"
+    if code.startswith("WM-"):
+        return "cpt_tile"
+    if code.startswith("RF-"):
+        return "rubber_sheet"
+    if code.startswith("VCT-"):
+        return "vct"
+
+    if any(kw in desc for kw in ("cove base", "rubber base", "vinyl base", "wall base")):
+        return "rubber_base"
+    if "walk off mat" in desc or "walk-off mat" in desc or "entrance mat" in desc:
+        return "cpt_tile"
+    if "carpet tile" in desc:
+        return "cpt_tile"
+    if "sound mat" in desc or "acoustical underlayment" in desc:
+        return "sound_mat"
+
+    return "unknown"
+
+
 def _classify_with_ai(material_lines: list[tuple[int, str]],
                        install_lines: list[str]) -> dict[int, dict]:
     """
@@ -431,7 +459,9 @@ def parse_rfms(file_path: str) -> dict:
     # ── Build materials list ─────────────────────────────────────────────────
     materials = []
     for i, desc, qty in material_lines:
-        # Use AI result — no fallback, stays "unknown" if AI didn't classify
+        # AI is primary classifier; if it returns "unknown" we fall back to
+        # deterministic item-code/keyword rules so B-xxx/WM-xxx/RF-xxx etc.
+        # don't end up as empty "individual" bundles with no labor/sundries.
         ai_result = ai_results.get(i, {"type": "unknown", "confidence": None})
         if isinstance(ai_result, str):
             # Backwards compat: old format returned just a string
@@ -447,6 +477,12 @@ def parse_rfms(file_path: str) -> dict:
 
         unit = _extract_unit(desc, material_type)
         item_code = _extract_item_label(desc)
+
+        if material_type == "unknown":
+            fallback = _infer_material_type_fallback(item_code, desc)
+            if fallback != "unknown":
+                material_type = fallback
+                ai_confidence = 0.5  # deterministic fallback: medium confidence
 
         # Use install line qty (net installed area) when available.
         # The material line qty from RFMS includes RFMS-calculated waste,
@@ -671,14 +707,14 @@ NEW MATERIALS ({len(new_for_ai)} items):
 
         if verify_parsed.get("correct"):
             print("[ai_merge] Pass 2: merge verified correct")
-            return merged
+            return _backfill_unknowns(merged)
         elif verify_parsed.get("materials"):
             corrected = verify_parsed["materials"]
             print(f"[ai_merge] Pass 2: corrected to {len(corrected)} materials")
-            return corrected
+            return _backfill_unknowns(corrected)
         else:
             print("[ai_merge] Pass 2: unclear response, using pass 1 result")
-            return merged
+            return _backfill_unknowns(merged)
 
     except Exception as e:
         print(f"[ai_merge] AI merge failed: {e}")
@@ -708,4 +744,20 @@ def _fallback_merge(existing: list[dict], new_parsed: list[dict]) -> list[dict]:
             "unit": m.get("unit"),
             "area_type": m.get("area_type", "unit"),
         })
-    return result
+    return _backfill_unknowns(result)
+
+
+def _backfill_unknowns(materials: list[dict]) -> list[dict]:
+    """Post-process: for any material still typed 'unknown' (or missing type),
+    apply the deterministic fallback classifier so B-xxx/WM-xxx/RF-xxx etc.
+    get proper bundles with labor and sundries."""
+    for m in materials:
+        current = (m.get("material_type") or "unknown").strip().lower()
+        if current in ("", "unknown"):
+            inferred = _infer_material_type_fallback(
+                m.get("item_code") or "",
+                m.get("description") or "",
+            )
+            if inferred != "unknown":
+                m["material_type"] = inferred
+    return materials

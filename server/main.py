@@ -2130,6 +2130,8 @@ async def api_save_proposal_bundles(job_id: str, request: Request):
         "gpm_labor": body.get("gpm_labor", 0),
         "gpm_material": body.get("gpm_material", 0),
         "textura_amount": body.get("textura_amount", 0),
+        "deleted_bundles": body.get("deleted_bundles", []),
+        "deleted_material_codes": body.get("deleted_material_codes", []),
     }
     job["proposal_data"] = proposal_data
     save_job(job)
@@ -2168,6 +2170,31 @@ def api_generate_proposal(job_id: str):
     materials = job.get("materials", [])
     unit_count = job.get("unit_count", 0) or 0
     tub_shower_count = job.get("tub_shower_count", 0) or 0
+
+    # Re-apply current waste rules to materials so rule changes propagate.
+    # Skip piece-priced EA items (Schluter sticks) whose order_qty isn't waste-based.
+    import json as _json
+    _waste_data = get_company_rate("waste_factors")
+    _waste_factors = _json.loads(_waste_data) if _waste_data else WASTE_FACTORS
+    waste_touched = False
+    for mat in materials:
+        mtype = mat.get("material_type", "")
+        new_waste = _waste_factors.get(mtype)
+        if new_waste is None:
+            continue
+        mat_unit = (mat.get("unit") or "").upper()
+        if mat_unit == "EA" and mtype != "sound_mat":
+            continue  # Piece-counted materials — waste doesn't apply to order_qty
+        old_waste = mat.get("waste_pct", 0) or 0
+        if abs(new_waste - old_waste) < 1e-6:
+            continue
+        installed_qty = mat.get("installed_qty", 0) or 0
+        mat["waste_pct"] = new_waste
+        mat["order_qty"] = round(installed_qty * (1 + new_waste), 2)
+        mat["extended_cost"] = round(mat["order_qty"] * (mat.get("unit_price", 0) or 0), 2)
+        waste_touched = True
+    if waste_touched:
+        save_materials(job["id"], materials)
 
     # Stamp job-level counts onto materials so sundry_calc can use them
     for mat in materials:

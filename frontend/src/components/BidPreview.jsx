@@ -526,7 +526,7 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
               <div className="flex items-center gap-1">
                 <input
                   type="number"
-                  step="0.5"
+                  step="0.01"
                   min="0"
                   max="99"
                   value={gpm}
@@ -623,7 +623,7 @@ export default function BidPreview({ job, api, onGoBack, onBidCleared }) {
                     <span className="text-gray-400 tabular-nums">{formatCurrency(bidData.total_cost)}</span>
                   </div>
                   <div className="flex justify-between text-sm">
-                    <span className="text-emerald-400/80">GPM ({((bidData.gpm_pct || 0) * 100).toFixed(1)}%)</span>
+                    <span className="text-emerald-400/80">GPM ({((bidData.gpm_pct || 0) * 100).toFixed(2)}%)</span>
                     <span className="text-emerald-400/80 tabular-nums">{formatCurrency(bidData.gpm_profit)}</span>
                   </div>
                   <div className="pl-4 space-y-1">

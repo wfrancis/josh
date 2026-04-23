@@ -481,7 +481,17 @@ def _classify_material(mat: dict) -> tuple[str, str]:
     # ── Rule 3: Transitions
     # All common-area / amenity transitions collapse into a single "Amenity Transitions"
     # bundle per Josh's proposal format. Unit-level transitions stay as "Unit Transitions".
-    elif material_type == "transitions":
+    # Also catch misclassified (unknown-type) rows whose description looks like a
+    # transition — RFMS sometimes tags edge-trim/transition lines as unknown.
+    elif material_type == "transitions" or (
+        material_type in ("", "unknown") and (
+            "transition" in desc
+            or "edge trim" in desc
+            or "schluter" in desc
+            or "jolly" in desc
+            or "schiene" in desc
+        )
+    ):
         area_type = (mat.get("area_type") or "").lower()
         location = _description_contains_location(mat)
         if area_type == "common" or location:
@@ -1018,6 +1028,87 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
         sundries=sundries,
         labor_items=labor_items,
     )
+
+    # ── Inject Schluter Jolly @ tub/shower surrounds into Unit Transitions ─
+    # Every tub/shower surround needs 2 sticks of Schluter Jolly AE (1 per side).
+    # Qty = tub_shower_count * 2, price $9.78/stick (8' stick), labor $0.50/stick.
+    tub_count = int(_safe_float(job.get("tub_shower_count", 0)))
+    if tub_count > 0:
+        jolly_qty = tub_count * 2  # 2 sticks per tub/shower
+        stick_lf = 8.208  # Schluter 8'-2.5" stick length
+        jolly_lf = round(jolly_qty * stick_lf, 2)
+        jolly_mat_cost = round(jolly_qty * 9.78, 2)
+        jolly_labor_cost = round(jolly_lf * 0.50, 2)
+        jolly_material = {
+            "id": "synthetic_jolly_tub",
+            "item_code": "synthetic_jolly_tub",
+            "description": "Schluter - Jolly #AE-100 - Exposed Edge Trim @Tub/Shower Surrounds",
+            "material_type": "transitions",
+            "installed_qty": jolly_lf,
+            "unit": "LF",
+            "unit_price": 9.78,
+            "extended_cost": jolly_mat_cost,
+            "order_qty": jolly_qty,
+            "waste_pct": 0,
+            "area_type": "unit",
+        }
+        jolly_labor = {
+            "material_id": "synthetic_jolly_tub",
+            "labor_description": "Project Tile Add Ons - Schluter Jolly",
+            "qty": jolly_lf,
+            "unit": "LF",
+            "rate": 0.50,
+            "extended_cost": jolly_labor_cost,
+        }
+        unit_trans = next((b for b in bundles if b.get("bundle_name") == "Unit Transitions"), None)
+        already_has_jolly = unit_trans and any(
+            (m.get("item_code") == "synthetic_jolly_tub") or (m.get("id") == "synthetic_jolly_tub")
+            for m in (unit_trans.get("materials") or [])
+        )
+        if unit_trans and not already_has_jolly:
+            unit_trans.setdefault("materials", []).append(jolly_material)
+            unit_trans.setdefault("labor_items", []).append(jolly_labor)
+            unit_trans["material_cost"] = round(unit_trans.get("material_cost", 0) + jolly_mat_cost, 2)
+            unit_trans["labor_cost"] = round(unit_trans.get("labor_cost", 0) + jolly_labor_cost, 2)
+            unit_trans["installed_qty"] = round(unit_trans.get("installed_qty", 0) + jolly_lf, 2)
+            unit_trans["total_price"] = round(
+                unit_trans["material_cost"] + unit_trans.get("sundry_cost", 0)
+                + unit_trans["labor_cost"] + unit_trans.get("freight_cost", 0), 2
+            )
+            existing_desc = unit_trans.get("description_text", "")
+            jolly_line = "Schluter Jolly - AE - Exposed Edge Trim @Tub/Shower Surrounds"
+            if jolly_line not in existing_desc:
+                unit_trans["description_text"] = existing_desc.rstrip() + "\n" + jolly_line
+        elif unit_trans:
+            # Already has Jolly — leave as-is (user may have customized qty/price)
+            pass
+        else:
+            # No Unit Transitions bundle yet — create one and insert after unit backsplash
+            unit_trans = {
+                "bundle_name": "Unit Transitions",
+                "description_text": (
+                    "Furnish, deliver and install Unit Transitions\n"
+                    "Quote is figured as\n"
+                    "Schluter Jolly - AE - Exposed Edge Trim @Tub/Shower Surrounds"
+                ),
+                "materials": [jolly_material],
+                "sundry_items": [],
+                "labor_items": [jolly_labor],
+                "material_cost": jolly_mat_cost,
+                "sundry_cost": 0,
+                "labor_cost": jolly_labor_cost,
+                "freight_cost": 0,
+                "total_price": round(jolly_mat_cost + jolly_labor_cost, 2),
+                "installed_qty": jolly_lf,
+                "unit": "LF",
+                "editable": True,
+            }
+            insert_idx = len(bundles)
+            for i, b in enumerate(bundles):
+                bn = b.get("bundle_name", "").lower()
+                if bn.startswith("unit ") and ("backsplash" in bn or "surround" in bn or "waterproofing" in bn):
+                    insert_idx = i + 1
+            bundles.insert(insert_idx, unit_trans)
 
     # ── Insert derived bundles (waterproofing, crack isolation) ───────────
     derived = _generate_derived_bundles(job, materials)

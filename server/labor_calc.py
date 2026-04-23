@@ -141,7 +141,7 @@ LABOR_RULES: dict[str, dict] = {
     },
     "sound_mat": {
         "labor_type": "Project Resilient Rolled Sheet",
-        "base": ["install sound mat", "less than 3mm"],
+        "base": ["install sound mat"],
         "size_tiers": [],
         "size_field": "installed_qty",
         "addons": [],
@@ -180,7 +180,7 @@ LABOR_RULES: dict[str, dict] = {
     },
     "waterproofing": {
         "labor_type": "Project Tile Add Ons",
-        "base": ["waterproofing kerdi"],
+        "base": ["waterproofing roll on"],
         "size_tiers": [],
         "addons": [],
     },
@@ -312,6 +312,30 @@ def _tile_dim_tier(w: float, h: float) -> str:
         return "12x24"
 
 
+_THICKNESS_MM_RE = re.compile(r'(\d+(?:\.\d+)?)\s*mm\b', re.IGNORECASE)
+
+
+def _parse_mat_thickness_mm(description: str):
+    """Parse mm thickness from material description, e.g. '8.2mm Thick', '5mm Acoustical'.
+    Returns a float or None if no mm value found."""
+    m = _THICKNESS_MM_RE.search(description or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sound_mat_tier_kw(thickness_mm: float) -> str:
+    """Map sound mat thickness to the catalog keyword used to pick the right labor row."""
+    if thickness_mm < 3:
+        return "less than 3mm"
+    if thickness_mm <= 6:
+        return "4mm to 6mm"
+    return "more than 7mm"
+
+
 def _find_labor_entries(
     material_type: str,
     installed_qty: float,
@@ -357,6 +381,21 @@ def _find_labor_entries(
             dim_filtered = [c for c in candidates if tier_kw in c["description"].lower()]
             if dim_filtered:
                 candidates = dim_filtered
+
+    # For sound mat, pick the catalog row that matches the material's mm thickness
+    if material_type == "sound_mat" and material and candidates:
+        thickness = _parse_mat_thickness_mm(material.get("description", ""))
+        if thickness is not None:
+            tier_kw = _sound_mat_tier_kw(thickness)
+            thickness_filtered = [c for c in candidates if tier_kw in c["description"].lower()]
+            if thickness_filtered:
+                candidates = thickness_filtered
+        else:
+            # No thickness in description — default to the thinnest (<3mm) tier so
+            # we don't accidentally pick an expensive rate by alphabetical luck.
+            thin = [c for c in candidates if "less than 3mm" in c["description"].lower()]
+            if thin:
+                candidates = thin
 
     # Apply size tier selection if defined
     size_tiers = rule.get("size_tiers", [])

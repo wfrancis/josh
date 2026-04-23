@@ -510,6 +510,8 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
       }
     })
 
+    // Stair labor is ADDITIVE: we pay the installed-area labor (broadloom/CPT)
+    // PLUS the per-stair add-labor. Keep all existing labor and append the new stair line.
     const updatedLabor = [...(bundle.labor_items || []), laborItem]
     // Remove regular pad/tackstrip/seam_tape — stair-specific versions replace them
     const STAIR_REPLACED = ['pad', 'tack_strip', 'seam_tape']
@@ -1202,6 +1204,7 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
 export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   const [bundles, setBundles] = useState([])
   const [deletedBundleNames, setDeletedBundleNames] = useState(new Set())
+  const [deletedMaterialCodes, setDeletedMaterialCodes] = useState(new Set())
   const [notes, setNotes] = useState([])
   const [terms, setTerms] = useState([])
   const [exclusions, setExclusions] = useState([])
@@ -1366,8 +1369,12 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           if (prev.gpm_labor_adder != null) edits.gpm_labor_adder = prev.gpm_labor_adder
           if (prev.gpm_material_adder != null) edits.gpm_material_adder = prev.gpm_material_adder
 
-          // Preserve manually added labor lines (stair labor, custom labor)
-          const manualLabor = (prev.labor_items || []).filter(l => l.is_stair_labor || !fresh.labor_items?.some(fl => fl.labor_description === l.labor_description))
+          // Preserve labor lines explicitly flagged as manually added (stair labor,
+          // or future is_manual lines). Auto-generated labor always comes from fresh
+          // so labor-catalog changes (e.g. Kerdi → Roll On) don't leave stale lines.
+          // Stair labor is ADDITIVE to installed-area labor: keep fresh's base labor
+          // (broadloom/CPT installed area) and re-attach prev's stair/manual lines.
+          const manualLabor = (prev.labor_items || []).filter(l => l.is_manual || l.is_stair_labor)
           if (manualLabor.length > 0) {
             edits.labor_items = [...(fresh.labor_items || []), ...manualLabor]
             edits.labor_cost = round2(edits.labor_items.reduce((s, l) => s + (l.extended_cost || 0), 0))
@@ -1434,8 +1441,18 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           result.splice(insertAfter + 1, 0, ub)
         }
 
-        // Filter out bundles the user previously deleted
-        result = result.filter(b => !deletedBundleNames.has(b.bundle_name))
+        // Filter out bundles the user previously deleted — match by exact name OR
+        // by any material item_code overlap (catches bundles regenerated under a
+        // different bundle_name than the one the user deleted).
+        result = result.filter(b => {
+          if (deletedBundleNames.has(b.bundle_name)) return false
+          const codes = (b.materials || [])
+            .map(m => m.item_code || m.id)
+            .filter(Boolean)
+            .map(String)
+          if (codes.length > 0 && codes.every(c => deletedMaterialCodes.has(c))) return false
+          return true
+        })
 
         // Preserve the user's previous bundle order — re-sort result to match prevBundles order
         // Bundles that existed before keep their position; new bundles go at the end
@@ -1460,7 +1477,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     } finally {
       setLoading(false)
     }
-  }, [job, setBundlesAndDirty])
+  }, [job, setBundlesAndDirty, deletedBundleNames, deletedMaterialCodes])
 
   // Load saved bundles on mount, or auto-generate if none saved
   useEffect(() => {
@@ -1482,6 +1499,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           setGpmPct((savedGpm || job?.gpm_pct || 0) * 100)
           if (saved.textura_fee != null) setTexturaEnabled(!!saved.textura_fee)
           if (saved.deleted_bundles?.length) setDeletedBundleNames(new Set(saved.deleted_bundles))
+          if (saved.deleted_material_codes?.length) setDeletedMaterialCodes(new Set(saved.deleted_material_codes))
           setHasGenerated(true)
           setLoading(false)
           return
@@ -1520,6 +1538,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           gpm_material: gpmMaterial,
           textura_amount: texturaAmount,
           deleted_bundles: [...deletedBundleNames],
+          deleted_material_codes: [...deletedMaterialCodes],
         }),
       })
       setIsDirty(false)
@@ -1529,7 +1548,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     } finally {
       setSaving(false)
     }
-  }, [bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, job?.id])
+  }, [bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, deletedBundleNames, deletedMaterialCodes, job?.id])
 
   // Auto-save: immediate on every dirty change, debounced 500ms to batch rapid edits
   useEffect(() => {
@@ -1540,9 +1559,9 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   }, [isDirty, bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, job?.id, doSave])
 
   // Ref to hold latest state for flush-on-unmount (avoids stale closures)
-  const stateRef = useRef({ bundles: [], notes: [], terms: [], exclusions: [], taxRate: 0, gpmPct: 0, texturaEnabled: false, subtotal: 0, taxAmount: 0, grandTotal: 0, gpmTotal: 0, gpmLabor: 0, gpmMaterial: 0, texturaAmount: 0, isDirty: false })
+  const stateRef = useRef({ bundles: [], notes: [], terms: [], exclusions: [], taxRate: 0, gpmPct: 0, texturaEnabled: false, subtotal: 0, taxAmount: 0, grandTotal: 0, gpmTotal: 0, gpmLabor: 0, gpmMaterial: 0, texturaAmount: 0, isDirty: false, deletedBundleNames: new Set(), deletedMaterialCodes: new Set() })
   useEffect(() => {
-    stateRef.current = { bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, isDirty }
+    stateRef.current = { bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, isDirty, deletedBundleNames, deletedMaterialCodes }
   })
 
   // Flush pending save immediately on unmount or beforeunload
@@ -1557,6 +1576,8 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         subtotal: s.subtotal, tax_amount: s.taxAmount, grand_total: s.grandTotal,
         gpm_profit: s.gpmTotal, gpm_labor: s.gpmLabor, gpm_material: s.gpmMaterial,
         textura_amount: s.texturaAmount,
+        deleted_bundles: [...(s.deletedBundleNames || [])],
+        deleted_material_codes: [...(s.deletedMaterialCodes || [])],
       })
       navigator.sendBeacon(`/api/jobs/${job.id}/proposal/bundles/save`, new Blob([payload], { type: 'application/json' }))
     }
@@ -1586,12 +1607,20 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     })
   }, [setBundlesAndDirty, taxRate])
 
-  // Delete a bundle — track name so it doesn't come back on regenerate
+  // Delete a bundle — track name AND material item_codes so Regenerate can't
+  // resurrect it under a different (raw vs AI-renamed) bundle name.
   const deleteBundle = useCallback((idx) => {
     setBundlesAndDirty(prev => {
       const deleted = prev[idx]
       if (deleted?.bundle_name) {
         setDeletedBundleNames(names => new Set([...names, deleted.bundle_name]))
+      }
+      const codes = (deleted?.materials || [])
+        .map(m => m.item_code || m.id)
+        .filter(Boolean)
+        .map(String)
+      if (codes.length > 0) {
+        setDeletedMaterialCodes(s => new Set([...s, ...codes]))
       }
       return prev.filter((_, i) => i !== idx)
     })
@@ -1775,7 +1804,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   // Download PDF
   const downloadPdf = useCallback(() => {
     if (!job?.id) return
-    window.open(`/api/jobs/${job.id}/proposal.pdf`, '_blank')
+    window.open(`/api/jobs/${job.id}/proposal.pdf?t=${Date.now()}`, '_blank')
   }, [job])
 
   return (

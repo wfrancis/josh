@@ -146,6 +146,62 @@
 - pad_cement should STAY (still needed to glue pad on stairs)
 - Code fix is in ProposalEditor.jsx `addStairLabor()` — filters out ['pad', 'tack_strip', 'seam_tape'] before combining
 
+## CPT Stair Labor: Installed Area + Stair Add-Labor (BOTH paid)
+- For CPT stairs, we pay the **Installed Area labor** (broadloom/CPT rate × installed SY) **PLUS** the **stair add-labor** (per-stair rate × stair count) — they are ADDITIVE, not mutually exclusive
+- Earlier rule (WRONG) had stair labor REPLACE the broadloom labor; this under-billed the bid
+- Code: `ProposalEditor.jsx` `addStairLabor()` appends the stair labor line to the existing labor list without filtering out broadloom
+- Merge logic on bundle regenerate: take fresh's auto-generated labor (installed area) AND re-attach prev's `is_stair_labor` / `is_manual` lines — do NOT short-circuit to "use prev entirely when prev has stair labor"
+- Sundries rule is unchanged: stair-specific pad/tack_strip/seam_sealer REPLACE the regular versions (sundries NOT additive; labor IS additive)
+
+## Sundry Prices Authoritative per Job Runner (Sun Valley Block 2 — 2026-04-23)
+- Pad Cement 1 gal: **$29.16/EA** (100 SY/each coverage)
+- Concrete Tack Strip: **$36.39/carton** (400 LF/carton)
+- **Gypcrete Tack Strip: $50.00/carton** — used on elevated floors (stairs, townhomes); Concrete used on slab (standard unit)
+- Seam Tape 4": **$9.54/roll** (60 LF/roll)
+- Taylor 2025 Primer 1 gal: **$15.94/bucket** ($15.78 base + $0.16 freight, 350 SF coverage) — applies to unit_lvt, cpt_tile, sound_mat primers only
+- Prism 17 lb Grout: **$32.91/bag** ($32.58 + $0.33 freight, 100 SF coverage)
+- Commercial 100% Silicone Caulk: **$13.41/tube**
+- Cove Base Adhesive: **$4.38/tube** (60 LF/tube) — NOT $12; old config was ~3× over. Different SKU from stair/construction adhesive at $12.
+- Crack Isolation labor: **$0.27/SF** (was $0.28)
+- Source: Job Runner Breakout for quote #293113 ($2.33M Sun Valley Block 2). JR is the authoritative bid system.
+
+## Source of Truth: company_rates DB Overrides config.py at Runtime
+- At runtime, `sundry_calc.py` and `bid_assembler.py` read from the `company_rates` SQLite table first and only fall back to `config.py` defaults on miss.
+- `_seed_company_rates()` in main.py seeds the DB from config ONLY on first boot (does not overwrite existing rows).
+- **Consequence:** updating config.py alone does NOT change rates used by the live app — must also PUT to `/api/company-rates/{rate_type}` or edit via admin UI.
+- Recipe: write a one-off Python script that GETs current JSON, patches entries, PUTs back. See `_update_live_sundry_rules.py` (temp, delete after use).
+
+## RFMS Rubber Sheet: SY-Stored-As-SF Bug
+- RFMS pivot often reports rubber sheet flooring (RF-xxx) in **SY** while the vendor sells in **SF**.
+- Our parser doesn't extract the RFMS unit — `_extract_unit(desc, material_type)` returns a guess from material_type. For `rubber_sheet` it defaults to `SF`, so the raw SY number gets stored as if it were SF → 9× low.
+- Symptom: RF-xxx qty looks tiny relative to the described area (e.g., 309 SF for a fitness room that's actually ~2,800 SF).
+- Cross-check: multiply SY number by 9 for SF. Formula for Sun Valley RF-100: 309.28 SY × 9 = 2,783.52 SF; +20% waste = 3,340 SF (matches JR's 3,400 material qty).
+- Short-term remediation: correct the material row directly via PUT `/api/jobs/{job_id}/materials` with updated `installed_qty` and `waste_pct`.
+- Long-term: parser should read RFMS unit column (or cross-check against vendor quote unit) before storing. Deferred until we have more RFMS sample files to confirm the column location.
+
+## Sound Mat Labor Picked by mm Thickness
+- Labor catalog has three sound-mat install rows: "less than 3mm" ($0.50/SF), "4mm to 6mm" ($0.75/SF), "more than 7mm" ($1.50/SF).
+- `LABOR_RULES["sound_mat"].base` must be just `["install sound mat"]`, NOT `["install sound mat", "less than 3mm"]` — otherwise the picker locks onto the thin row and can never select thicker tiers.
+- `_parse_mat_thickness_mm(desc)` regex matches `\d+(\.\d+)?\s*mm\b` in material description. `_sound_mat_tier_kw(mm)` maps: <3 → "less than 3mm", 3-6 → "4mm to 6mm", >6 → "more than 7mm".
+- In `_find_labor_entries`, sound_mat candidates get filtered by tier_kw (parallel to how tile types filter by `_tile_dim_tier`). If no mm in description, default to "<3mm" to avoid accidentally picking an expensive catalog row by alphabetical luck.
+- Sun Valley reference: Amenity FT Sound Mat uses RST05 5mm product → "4mm to 6mm" tier → $0.75/SF (JR confirmed).
+
+## Material Classifier: AI + Deterministic Fallback
+- Primary classifier is AI (`_classify_with_ai` in rfms_parser.py) — it inspects RFMS material lines + install lines and returns material_type per row.
+- If AI returns `"unknown"` (or fails), materials land in the catch-all `individual:` bundle in proposal_bundler.py with an empty template → **zero labor, zero sundries**.
+- Known offenders: `B-xxx` rubber base, `WM-xxx` walk-off mats — AI sometimes misses them.
+- Fix: `_infer_material_type_fallback(item_code, description)` in rfms_parser.py runs after AI when type is "unknown". Rules (item code prefix > description keyword):
+  - `B-`/`WB-` → rubber_base
+  - `WM-` → cpt_tile (walk-off mats install like CPT tile)
+  - `RF-` → rubber_sheet
+  - `VCT-` → vct
+  - desc contains "cove base"/"rubber base"/"vinyl base"/"wall base" → rubber_base
+  - desc contains "walk off mat"/"walk-off mat"/"entrance mat"/"carpet tile" → cpt_tile
+  - desc contains "sound mat"/"acoustical underlayment" → sound_mat
+- Fallback runs in both fresh parse (`parse_rfms`) and merge (`ai_merge_materials` post-process via `_backfill_unknowns`).
+- Sets `ai_confidence = 0.5` so downstream UI can flag these for human verification.
+- Backfilling existing jobs: call `PUT /api/jobs/{job_id}/materials` with the materials list and updated `material_type` per row. Does NOT regenerate bundles — bundles must be regenerated separately in the UI for labor/sundries to materialize.
+
 ## Sound Mat: Net Area + 5% Waste
 - Sound mat quantity = net installed area of the LVT it goes under + 5% waste
 - Do NOT use the LVT's order_qty (which includes LVT's own waste factor)
