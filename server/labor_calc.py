@@ -297,9 +297,15 @@ def _parse_tile_dims(description: str):
 
 
 def _tile_dim_tier(w: float, h: float) -> str:
-    """Map tile dimensions to the catalog dimension keyword for filtering."""
+    """Map tile dimensions to the catalog dimension keyword for filtering.
+    Order matters: most specific first so 48x48 doesn't get caught by "greater than 36in".
+    """
     max_edge = max(w, h)
     min_edge = min(w, h)
+    if min_edge >= 48 and max_edge >= 48:
+        return "48x48"
+    if max_edge >= 48 and min_edge >= 24:
+        return "24x48"
     if max_edge > 36:
         return "greater than 36in"
     elif max_edge > 24:

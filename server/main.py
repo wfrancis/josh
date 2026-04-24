@@ -2418,6 +2418,14 @@ def api_get_stair_labor():
     return {"entries": stair_entries}
 
 
+@app.post("/api/labor-catalog/entry")
+def api_insert_labor_catalog_entry(body: dict):
+    """Insert a single labor catalog entry; returns the new entry id."""
+    from models import insert_labor_catalog_entry
+    new_id = insert_labor_catalog_entry(body)
+    return {"id": new_id}
+
+
 @app.put("/api/labor-catalog/{entry_id}")
 def api_update_labor_catalog_entry(entry_id: int, body: dict):
     """Update a single labor catalog entry."""

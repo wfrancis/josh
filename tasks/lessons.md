@@ -179,6 +179,23 @@
 - Short-term remediation: correct the material row directly via PUT `/api/jobs/{job_id}/materials` with updated `installed_qty` and `waste_pct`.
 - Long-term: parser should read RFMS unit column (or cross-check against vendor quote unit) before storing. Deferred until we have more RFMS sample files to confirm the column location.
 
+## CPT Tile Labor: Always $3.85/SY (Josh correction 2026-04-24)
+- All carpet tile (cpt_tile) bills at **$3.85/SY** regardless of tile size or bundle size. No size tier, no exceptions.
+- The size tiers visible in the labor catalog (0-13x0-13, 12x24, 24x24, 24x48, 48x48, etc.) refer to **ceramic/porcelain tile only**, not carpet tile.
+- Earlier JR Breakout data showed some amenity CPT bundles at $5.00/SY — that was likely a Josh manual override on individual bundles, not a standing rule. Do not infer a size tier rule from it.
+
+## Ceramic/Porcelain Size Tiers (2026-04-24)
+- Labor catalog tile rows are organized by dimension tier. Current rates (Project Tile):
+  - 0-13x0-13: $4.00/SF (≤1000 SF) / $3.75 (>1000 SF)
+  - 12x24: $4.00 / $3.75
+  - 24x24: $5.00 / $4.55
+  - Rectangular >24 <36: $5.00 across qty tiers
+  - Rectangular >36 <48: $5.50 across qty tiers
+  - **24x48: $7.50/SF (flat)** — added 2026-04-24
+  - **48x48: $10.50/SF (flat)** — added 2026-04-24
+- `_tile_dim_tier(w,h)` in labor_calc.py must return "48x48" and "24x48" BEFORE falling into "greater than 36in", else those rows are never picked.
+- Order: `min>=48 and max>=48` → 48x48; `max>=48 and min>=24` → 24x48; then the existing cascade.
+
 ## Sound Mat Labor Picked by mm Thickness
 - Labor catalog has three sound-mat install rows: "less than 3mm" ($0.50/SF), "4mm to 6mm" ($0.75/SF), "more than 7mm" ($1.50/SF).
 - `LABOR_RULES["sound_mat"].base` must be just `["install sound mat"]`, NOT `["install sound mat", "less than 3mm"]` — otherwise the picker locks onto the thin row and can never select thicker tiers.

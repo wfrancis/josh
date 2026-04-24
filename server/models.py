@@ -762,6 +762,25 @@ def update_labor_catalog_entry(entry_id: int, data: dict) -> bool:
         conn.close()
 
 
+def insert_labor_catalog_entry(data: dict) -> int:
+    """Insert a single labor catalog entry; returns new id."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute("""
+            INSERT INTO labor_catalog
+                (labor_type, description, cost, retail_display, unit, gpm_markup)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            data.get("labor_type", ""), data.get("description", ""),
+            data.get("cost", 0), data.get("retail_display", ""),
+            data.get("unit", ""), data.get("gpm_markup", 0),
+        ))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
 def delete_labor_catalog_entry(entry_id: int) -> bool:
     """Delete a single labor catalog entry."""
     conn = _get_conn()
