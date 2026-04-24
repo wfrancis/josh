@@ -513,12 +513,15 @@ def parse_rfms(file_path: str) -> dict:
         desc_lower = m.get("description", "").lower()
         # Check keywords
         is_mosaic = any(kw in desc_lower for kw in _MOSAIC_KEYWORDS | _PENNY_HEX_KEYWORDS)
-        # Check small tile dimensions (both dims ≤ 6") — pattern like 1" x 6", 2x4, etc.
+        # Check small tile dimensions — if MIN edge is ≤ 3", treat as mosaic.
+        # Catches true mini tiles (1x1, 2x2, 3x3) AND linear mosaics (1x6, 2x12, 3x16).
+        # Does NOT catch 4x4/5x5/6x6 field tiles, which were being false-flagged under
+        # the older "both dims ≤ 6"" rule and billing at the mosaic labor rate.
         if not is_mosaic:
             dim_match = re.findall(r'(\d+(?:\.\d+)?)\s*["\u201d]?\s*x\s*(\d+(?:\.\d+)?)\s*["\u201d]?', desc_lower)
             if dim_match:
                 w, h = float(dim_match[0][0]), float(dim_match[0][1])
-                if w <= 6 and h <= 6:
+                if min(w, h) <= 3:
                     is_mosaic = True
         if is_mosaic:
             m["is_mosaic"] = True

@@ -179,6 +179,12 @@
 - Short-term remediation: correct the material row directly via PUT `/api/jobs/{job_id}/materials` with updated `installed_qty` and `waste_pct`.
 - Long-term: parser should read RFMS unit column (or cross-check against vendor quote unit) before storing. Deferred until we have more RFMS sample files to confirm the column location.
 
+## Auto-Mosaic Detection: MIN Edge ≤ 3" (Josh spec 2026-04-24)
+- RFMS parser auto-flags tiles as mosaic when `min(w, h) ≤ 3"`. Catches true mini (1x1, 2x2, 3x3) AND linear mosaics (1x6, 2x12, 3x16).
+- Earlier rule was `w ≤ 6 and h ≤ 6` which falsely flagged 4x4, 5x5, 6x6 field tiles as mosaic → they got billed at Mosaic Sheet Backed labor ($5/SF) instead of regular 0-13 labor ($3.75–$4/SF). Sun Valley T-200 (Flash 5x5) was over-billed by ~$12K because of this.
+- Keyword detection (`mosaic`, `penny round`, `hex`, `hexagon` in description) still takes precedence regardless of dimensions.
+- Changes in [rfms_parser.py](si-bid-tool/server/rfms_parser.py) around line 485.
+
 ## CPT Tile Labor: Always $3.85/SY (Josh correction 2026-04-24)
 - All carpet tile (cpt_tile) bills at **$3.85/SY** regardless of tile size or bundle size. No size tier, no exceptions.
 - The size tiers visible in the labor catalog (0-13x0-13, 12x24, 24x24, 24x48, 48x48, etc.) refer to **ceramic/porcelain tile only**, not carpet tile.
