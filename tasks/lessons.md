@@ -185,6 +185,28 @@
 - Keyword detection (`mosaic`, `penny round`, `hex`, `hexagon` in description) still takes precedence regardless of dimensions.
 - Changes in [rfms_parser.py](si-bid-tool/server/rfms_parser.py) around line 485.
 
+## Caulking / Job-Level Sundries: Apply Once per (material_type, sundry_name)
+- Sundry rules with `qty_basis = "tub_shower_total"` or `"unit_count"` use job-level counts, NOT per-material qty. Without dedup they fire on EVERY material of that material_type → caulking gets billed 3-5× for tile/backsplash bundles (e.g. SI was billing 231 tubes to T-202 + 231 to T-203 + 231 to T-116 even though only one of those is the "primary" tile).
+- Fix in `sundry_calc.py` `calculate_sundries_for_materials`: sort materials by (material_type, -installed_qty) and emit the job-level sundry only on the FIRST occurrence per (material_type, sundry_name). Largest qty wins.
+- Sun Valley Block 2: caulking went $14,604 → $5,800 (down $8,800).
+
+## Premium Sound Mat: Same Material, Different Labor Rate
+- For Sun Valley, JR bills Standard Sound Mat at $0.50/SF and Premium Sound Mat at $0.75/SF, even though both use the same Pliteq Genie Mat RST05 material. This is a billing convention not a thickness-driven rule.
+- `labor_calc.py` `_find_labor_entries` sound_mat branch: if material description contains "premium" (case-insensitive) and no explicit mm, force the 4-6mm catalog tier ($0.75). Without this, both bundles defaulted to <3mm ($0.50) since "RST05" doesn't include mm.
+- Materials with explicit mm in description still take precedence (e.g. "5mm Acoustical Underlayment" routes by thickness, not bundle name).
+
+## Rolled Rubber Labor Routing (rubber_sheet ≠ vinyl)
+- `LABOR_RULES["rubber_sheet"]` previously matched "Commercial Sheet Vinyl Over 1/4 in" for all rubber_sheet materials. JR uses "Install Rolled Rubber 8.2mm" at $2.75/SF for thicker rubber underlayment products like Ecofit (no "rubber" in product name though — just "Ecofit").
+- Fix in `labor_calc.py`: when material_type is rubber_sheet and the description does NOT contain "vinyl", route to "rolled rubber" catalog rows. Pick by thickness tier (≤3mm = "3mm or under", >3mm = "over 3mm").
+- Use **exclusion on "vinyl"** rather than inclusion on "rubber" — many rubber underlayment products (Ecofit, Mondo, Sportec) don't contain the word "rubber" in their name.
+- Added new catalog row: "Rolled Rubber over 3mm" @ $2.75/SF (id=140) since SI had no entry for thick rolled rubber.
+
+## DOUBLE-TAX bug in deletion-handler (lesson learned)
+- `bundle.total_price` already includes tax (per the per-bundle tax loop in `generate_proposal_data`). So `subtotal = sum(bundle.total_price) = revenue + tax`.
+- An earlier fix that filtered deleted bundles in `api_generate_proposal` (main.py) recomputed `grand_total = subtotal + tax + textura` — but subtotal already had tax → tax counted twice. Sun Valley jumped from $2,286K to $2,412K.
+- Fix: moved the deletion filter INTO `generate_proposal_data` (proposal_bundler.py) BEFORE the GPM/tax loop, so kept bundles get GPM redistributed and taxed correctly. main.py just carries deleted_bundles through.
+- Lesson: when adding a "filter the result" path, recompute totals using the SAME formula the original logic uses — don't invent a parallel formula.
+
 ## CPT Tile Labor: Always $3.85/SY (Josh correction 2026-04-24)
 - All carpet tile (cpt_tile) bills at **$3.85/SY** regardless of tile size or bundle size. No size tier, no exceptions.
 - The size tiers visible in the labor catalog (0-13x0-13, 12x24, 24x24, 24x48, 48x48, etc.) refer to **ceramic/porcelain tile only**, not carpet tile.

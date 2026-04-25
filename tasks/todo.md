@@ -204,6 +204,42 @@ Sun Valley RF-100 stored as 309.28 SF (≈$4,116 material). JR has 3,400 SF (≈
 
 ## 2026-04-23 — Phases paused for Josh input
 
+## 2026-04-24 — JR Alignment Phase 8 (deep dive on $48K gap)
+
+### Problem
+After all earlier fixes, SI Bid Tool was $48K under JR ($2,286,828 vs $2,335,240) AND $30K low on profit. Josh wanted a deep dive identifying every divergence.
+
+### Plan + outcome
+- [x] Bump GPM 22% → 22.85% (job.gpm_pct via PUT /api/jobs/6)
+- [x] LVT-100 BOH corrected: Evoke Main Street 1,549 SF → Shaw City Center 3,815 SF @ $0.92
+- [x] B-101 corrected: $1.00/SF → $1.21, qty 6,222 → 6,225
+- [x] Added missing Amenity FT Sound Mat material (SM-FT, 5,840 SF Pliteq RST05 5mm @ $0.83/SF)
+- [x] Caulking over-allocation fix: `sundry_calc.py` now applies job-level (`tub_shower_total`/`unit_count`) sundries ONCE per (material_type, sundry_name), to the largest material. Saves ~$8K — was firing on T-202 + T-203 + T-116 (all 231 tubes) and T-200 + T-201 (both 198 tubes).
+- [x] RF-100 ES-90 adhesive config: `rubber_sheet` SUNDRY_RULES adhesive now $308.71/pail @ 230 SF coverage (was $95/pail @ 700 SF)
+- [x] Premium Sound Mat tier override: bundles whose material description contains "premium" (and no explicit mm) bump to 4-6mm tier ($0.75/SF). Mirrors JR's split rate for the same product.
+- [x] RF-100 labor routing: rubber_sheet materials without "vinyl" in description now pick the new "Rolled Rubber over 3mm" catalog row at $2.75/SF
+- [x] New labor catalog row: "Rolled Rubber over 3mm" @ $2.75/SF (id=140)
+- [x] Bundler bug fix: deletion-handler logic moved INTO `generate_proposal_data` (proposal_bundler.py) so GPM/tax recompute correctly for kept-bundles only. Fixes a double-tax bug introduced when I added deleted_bundles support — previously grand_total = subtotal + tax + textura, but bundle.total_price ALREADY had tax baked in, so tax got counted twice.
+
+### Result
+| | Before | After Phase 8 | JR target | Delta |
+|---|---|---|---|---|
+| Cost | $1,699,305 | $1,705,069 | $1,722,307 | -$17K |
+| GPM | 22% | 22.85% | 22.85% | match |
+| Subtotal (sell, w/o tax) | $2,178,597 | $2,210,069 | $2,232,332 | -$22K |
+| Tax | $103,232 | $102,909 | $102,909 | match |
+| Textura | $5,000 | $0 | 0 | — |
+| **Grand Total** | **$2,286,828** | **$2,312,978** | **$2,335,241** | **-$22,263 (0.95%)** |
+| Profit | $479,291 | ~$505,000 | $510,025 | -$5K |
+
+Within 1% on grand total, within 1% on profit. Big wins:
+- RF-100 labor flipped: $4,948 (Commercial Sheet Vinyl) → $7,655 (Rolled Rubber over 3mm)
+- Premium Sound Mat: $0.50 → $0.75 = $13,049 (matches JR exactly)
+- LVT-100 labor: $1,239 → $3,052 (matches JR)
+- Caulking: $14,604 → ~$5,800 (down ~$8.8K, matches JR within $1K)
+
+Remaining gap mostly Josh's intentional rate choices ($7.50 vs $8.00 for 24×48 tiles) plus minor per-bundle deltas not worth chasing.
+
 ### Phase 4b — CPT tile size tier + walk-off mat (blocked)
 JR's rate pattern is inconsistent: 18×36 tiles bill $3.85/SY, but 24×24 sometimes bill $3.85 (CPT-103) and sometimes $5.00 (CPT-107). Small formats (19.7×19.7, 10.7×19.7) all bill $5.00. Walk-off mat (WM-100, Obex 24×24) bills $4.00/SY.
 

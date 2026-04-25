@@ -123,8 +123,9 @@ SUNDRY_RULES: dict[str, list[dict]] = {
          "notes": "Taylor 2025 1-gal ($15.78 base + $0.16 freight)"},
     ],
     "rubber_sheet": [
-        {"sundry_name": "adhesive", "coverage": 700, "unit": "SF/pail", "unit_price": 95.00,
-         "freight_per_unit": 5.00},
+        {"sundry_name": "adhesive", "coverage": 230, "unit": "SF/pail", "unit_price": 308.71,
+         "freight_per_unit": 5.00,
+         "notes": "Eco Surfaces ES-90 4 gal ($308.71 + $5 freight). Coverage ~180-480 SF/pail for rubber sheet."},
         {"sundry_name": "primer", "coverage": 350, "unit": "SF/pail", "unit_price": 65.00},
         {"sundry_name": "weld_rod", "coverage": 500, "unit": "LF/roll", "unit_price": 45.00,
          "qty_source": "weld_rod_lf"},
