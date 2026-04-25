@@ -5,6 +5,7 @@ import {
   GripVertical, Pencil, Trash2, Plus, Save, RotateCcw, Eye, Check, X,
   Package, FileText, AlertTriangle, ArrowLeft, Combine, Square, CheckSquare, Sparkles
 } from 'lucide-react'
+import AuditTraceButton, { resolveAuditTrace } from './AuditTraceButton'
 
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
@@ -249,7 +250,7 @@ function CombineBundlesDialog({ bundles, selectedIndices, onCombine, onCancel })
 }
 
 /* ─── Bundle Card ─────────────────────────────────────────────────────── */
-function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate, selectMode, selected, onToggleSelect }) {
+function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate, selectMode, selected, onToggleSelect, externalAudit }) {
   const [expanded, setExpanded] = useState(false)
   const [editingName, setEditingName] = useState(false)
   const [nameVal, setNameVal] = useState(bundle.bundle_name)
@@ -586,6 +587,14 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
   const displayPrice = bundle.price_override ?? bundleTotal
   const descPreview = (bundle.description_text || '').split('\n').slice(0, 2).join('\n')
   const hasMoreDesc = (bundle.description_text || '').split('\n').length > 2
+  const auditFor = (field, record = bundle, lineIndex = null) => resolveAuditTrace({
+    record,
+    field,
+    external: externalAudit,
+    bundleIndex: index,
+    bundleName: bundle.bundle_name,
+    lineIndex,
+  })
 
   return (
     <div className="overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.02] transition-colors">
@@ -646,8 +655,9 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
         )}
 
         {/* Price */}
-        <div className="flex-shrink-0 text-right">
+        <div className="flex-shrink-0 text-right flex items-center gap-1">
           <span className="font-bold text-white text-sm tabular-nums">{formatCurrency(displayPrice)}</span>
+          <AuditTraceButton trace={auditFor('total_price') || auditFor('bundle_total')} label={`${bundle.bundle_name} total`} />
         </div>
 
         {/* Actions */}
@@ -779,7 +789,10 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                           )}
                         </td>
                         <td className="px-3 py-2 text-white tabular-nums text-right font-medium whitespace-nowrap">
-                          {mat.extended_cost != null ? formatCurrency(mat.extended_cost) : '—'}
+                          <span className="inline-flex items-center justify-end gap-1">
+                            {mat.extended_cost != null ? formatCurrency(mat.extended_cost) : '—'}
+                            <AuditTraceButton trace={auditFor('extended_cost', mat, mi)} label={`${mat.item_code || 'Material'} extended cost`} />
+                          </span>
                         </td>
                       </tr>
                     ))}
@@ -787,7 +800,12 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                   <tfoot>
                     <tr className="border-t border-white/[0.08]">
                       <td colSpan={6} className="px-3 py-2 text-gray-500 text-right font-medium">Material Total</td>
-                      <td className="px-3 py-2 text-white tabular-nums text-right font-bold">{formatCurrency(bundle.material_cost)}</td>
+                      <td className="px-3 py-2 text-white tabular-nums text-right font-bold">
+                        <span className="inline-flex items-center justify-end gap-1">
+                          {formatCurrency(bundle.material_cost)}
+                          <AuditTraceButton trace={auditFor('material_cost')} label={`${bundle.bundle_name} material total`} />
+                        </span>
+                      </td>
                     </tr>
                   </tfoot>
                 </table>
@@ -840,14 +858,24 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                             </span>
                           )}
                         </td>
-                        <td className="px-3 py-2 text-white tabular-nums text-right font-medium">{s.extended_cost != null ? formatCurrency(s.extended_cost) : '—'}</td>
+                        <td className="px-3 py-2 text-white tabular-nums text-right font-medium">
+                          <span className="inline-flex items-center justify-end gap-1">
+                            {s.extended_cost != null ? formatCurrency(s.extended_cost) : '—'}
+                            <AuditTraceButton trace={auditFor('extended_cost', s, si)} label={`${s.sundry_name || 'Sundry'} extended cost`} />
+                          </span>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
                   <tfoot>
                     <tr className="border-t border-white/[0.08]">
                       <td colSpan={4} className="px-3 py-2 text-gray-500 text-right font-medium">Sundry Total</td>
-                      <td className="px-3 py-2 text-white tabular-nums text-right font-bold">{formatCurrency(bundle.sundry_cost)}</td>
+                      <td className="px-3 py-2 text-white tabular-nums text-right font-bold">
+                        <span className="inline-flex items-center justify-end gap-1">
+                          {formatCurrency(bundle.sundry_cost)}
+                          <AuditTraceButton trace={auditFor('sundry_cost')} label={`${bundle.bundle_name} sundry total`} />
+                        </span>
+                      </td>
                     </tr>
                   </tfoot>
                 </table>
@@ -975,7 +1003,12 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                           </span>
                         )}
                       </td>
-                      <td className="px-3 py-2 text-white tabular-nums text-right font-medium">{l.extended_cost != null ? formatCurrency(l.extended_cost) : '—'}</td>
+                      <td className="px-3 py-2 text-white tabular-nums text-right font-medium">
+                        <span className="inline-flex items-center justify-end gap-1">
+                          {l.extended_cost != null ? formatCurrency(l.extended_cost) : '—'}
+                          <AuditTraceButton trace={auditFor('extended_cost', l, li)} label={`${l.labor_description || 'Labor'} extended cost`} />
+                        </span>
+                      </td>
                       <td className="px-1 py-2">
                         <button
                           onClick={() => deleteLabor(li)}
@@ -1055,7 +1088,12 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                   <tfoot>
                     <tr className="border-t border-white/[0.08]">
                       <td colSpan={5} className="px-3 py-2 text-gray-500 text-right font-medium">Labor Total</td>
-                      <td className="px-3 py-2 text-white tabular-nums text-right font-bold">{formatCurrency(bundle.labor_cost)}</td>
+                      <td className="px-3 py-2 text-white tabular-nums text-right font-bold">
+                        <span className="inline-flex items-center justify-end gap-1">
+                          {formatCurrency(bundle.labor_cost)}
+                          <AuditTraceButton trace={auditFor('labor_cost')} label={`${bundle.bundle_name} labor total`} />
+                        </span>
+                      </td>
                     </tr>
                   </tfoot>
                 )}
@@ -1068,16 +1106,19 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
             <label className="text-[10px] font-bold uppercase tracking-wider text-gray-500 mb-1.5 block">Cost Summary</label>
             <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] p-3 space-y-1.5 text-xs">
               <div className="flex justify-between text-gray-400">
-                <span>Material</span><span className="tabular-nums text-gray-300">{formatCurrency(bundle.material_cost)}</span>
+                <span>Material</span>
+                <span className="tabular-nums text-gray-300 inline-flex items-center gap-1">{formatCurrency(bundle.material_cost)}<AuditTraceButton trace={auditFor('material_cost')} label={`${bundle.bundle_name} material total`} /></span>
               </div>
               {bundle.sundry_cost > 0 && (
                 <div className="flex justify-between text-gray-400">
-                  <span>Sundries</span><span className="tabular-nums text-gray-300">{formatCurrency(bundle.sundry_cost)}</span>
+                  <span>Sundries</span>
+                  <span className="tabular-nums text-gray-300 inline-flex items-center gap-1">{formatCurrency(bundle.sundry_cost)}<AuditTraceButton trace={auditFor('sundry_cost')} label={`${bundle.bundle_name} sundry total`} /></span>
                 </div>
               )}
               {bundle.labor_cost > 0 && (
                 <div className="flex justify-between text-gray-400">
-                  <span>Labor</span><span className="tabular-nums text-gray-300">{formatCurrency(bundle.labor_cost)}</span>
+                  <span>Labor</span>
+                  <span className="tabular-nums text-gray-300 inline-flex items-center gap-1">{formatCurrency(bundle.labor_cost)}<AuditTraceButton trace={auditFor('labor_cost')} label={`${bundle.bundle_name} labor total`} /></span>
                 </div>
               )}
               {(bundle.freight_override ?? bundle.freight_cost) > 0 || editingFreight ? (
@@ -1102,7 +1143,10 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                       onClick={() => setEditingFreight(true)}
                       title="Click to edit freight"
                     >
-                      {formatCurrency(bundle.freight_override ?? bundle.freight_cost)}
+                      <span className="inline-flex items-center gap-1">
+                        {formatCurrency(bundle.freight_override ?? bundle.freight_cost)}
+                        <AuditTraceButton trace={auditFor('freight_cost') || auditFor('freight_override')} label={`${bundle.bundle_name} freight`} />
+                      </span>
                     </span>
                   )}
                 </div>
@@ -1125,7 +1169,10 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                     onClick={() => { setGpmLaborVal(String(bundle.gpm_labor_adder || 0)); setEditingGpmLabor(true) }}
                     title="Click to edit GPM labor"
                   >
-                    {formatCurrency(bundle.gpm_labor_adder || 0)}
+                    <span className="inline-flex items-center gap-1">
+                      {formatCurrency(bundle.gpm_labor_adder || 0)}
+                      <AuditTraceButton trace={auditFor('gpm_labor_adder')} label={`${bundle.bundle_name} GPM labor`} />
+                    </span>
                   </span>
                 )}
               </div>
@@ -1147,17 +1194,22 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                     onClick={() => { setGpmMaterialVal(String(bundle.gpm_material_adder || 0)); setEditingGpmMaterial(true) }}
                     title="Click to edit GPM material"
                   >
-                    {formatCurrency(bundle.gpm_material_adder || 0)}
+                    <span className="inline-flex items-center gap-1">
+                      {formatCurrency(bundle.gpm_material_adder || 0)}
+                      <AuditTraceButton trace={auditFor('gpm_material_adder')} label={`${bundle.bundle_name} GPM material`} />
+                    </span>
                   </span>
                 )}
               </div>
               {bundleTax > 0 && (
                 <div className="flex justify-between text-gray-400">
-                  <span>Tax</span><span className="tabular-nums text-gray-300">{formatCurrency(bundleTax)}</span>
+                  <span>Tax</span>
+                  <span className="tabular-nums text-gray-300 inline-flex items-center gap-1">{formatCurrency(bundleTax)}<AuditTraceButton trace={auditFor('tax_amount')} label={`${bundle.bundle_name} tax`} /></span>
                 </div>
               )}
               <div className="flex justify-between text-white font-bold pt-1.5 border-t border-white/[0.06]">
-                <span>Bundle Total</span><span className="tabular-nums">{formatCurrency(bundleTotal)}</span>
+                <span>Bundle Total</span>
+                <span className="tabular-nums inline-flex items-center gap-1">{formatCurrency(bundleTotal)}<AuditTraceButton trace={auditFor('total_price') || auditFor('bundle_total')} label={`${bundle.bundle_name} total`} /></span>
               </div>
             </div>
           </div>
@@ -1228,6 +1280,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   const [gpmLabor, setGpmLabor] = useState(0)
   const [gpmMaterial, setGpmMaterial] = useState(0)
   const [gpmTotal, setGpmTotal] = useState(0)
+  const [auditTrace, setAuditTrace] = useState(null)
 
   // Auto-save state
   const [isDirty, setIsDirty] = useState(false)
@@ -1278,7 +1331,14 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     const tax = currentBundles.reduce((sum, b) => {
       const freight = b.freight_override ?? b.freight_cost ?? 0
       const taxable = (b.material_cost || 0) + (b.sundry_cost || 0) + freight + (b.gpm_material_adder || 0)
-      return sum + Math.round(taxable * rate * 100) / 100
+      const taxAmount = Math.round(taxable * rate * 100) / 100
+      const preTax = (b.material_cost || 0) + (b.sundry_cost || 0) + (b.labor_cost || 0) + freight + (b.gpm_adder || 0)
+      b.taxable = round2(taxable)
+      b.tax_amount = taxAmount
+      if (b.price_override == null) {
+        b.total_price = round2(preTax + taxAmount)
+      }
+      return sum + taxAmount
     }, 0)
 
     const sellPrice = totalBaseCost + profit
@@ -1295,6 +1355,15 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   useEffect(() => {
     recalcTotals(bundles, taxRate, texturaEnabled, gpmPct)
   }, [bundles, taxRate, texturaEnabled, gpmPct, recalcTotals])
+
+  useEffect(() => {
+    if (!job?.id || !apiProp?.getJobAuditTrace) return
+    let cancelled = false
+    apiProp.getJobAuditTrace(job.id)
+      .then((data) => { if (!cancelled) setAuditTrace(data) })
+      .catch(() => { if (!cancelled) setAuditTrace(null) })
+    return () => { cancelled = true }
+  }, [job?.id, apiProp])
 
   // Helper: set bundles + mark dirty (must be before generateBundles/doSave)
   const setBundlesAndDirty = useCallback((updater) => {
@@ -1471,13 +1540,20 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
       setTerms(prev => prev.length > 0 ? prev : data.terms || [])
       setExclusions(prev => prev.length > 0 ? prev : data.exclusions || [])
       setTaxRate(data.tax_rate || job.tax_rate || 0)
+      if (apiProp?.getJobAuditTrace) {
+        apiProp.getJobAuditTrace(job.id)
+          .then(setAuditTrace)
+          .catch(() => setAuditTrace(data.audit || null))
+      } else {
+        setAuditTrace(data.audit || null)
+      }
       setHasGenerated(true)
     } catch (err) {
       setError(err.message)
     } finally {
       setLoading(false)
     }
-  }, [job, setBundlesAndDirty, deletedBundleNames, deletedMaterialCodes])
+  }, [job, apiProp, setBundlesAndDirty, deletedBundleNames, deletedMaterialCodes])
 
   // Load saved bundles on mount, or auto-generate if none saved
   useEffect(() => {
@@ -1493,6 +1569,9 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           setNotes(saved.notes || [])
           setTerms(saved.terms || [])
           setExclusions(saved.exclusions || [])
+          if (saved.audit_trace || saved.audit || saved.audit_traces) {
+            setAuditTrace(saved.audit_trace || saved.audit || saved.audit_traces)
+          }
           setTaxRate(saved.tax_rate ?? job.tax_rate ?? 0)
           // Use saved gpm_pct if non-zero, otherwise fall back to job's gpm_pct
           const savedGpm = saved.gpm_pct != null ? saved.gpm_pct : (job?.gpm_pct || 0)
@@ -1515,11 +1594,11 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   }, [job?.id])
 
   // Save proposal data to backend
-  const doSave = useCallback(async () => {
-    if (!job?.id || bundles.length === 0) return
+  const doSave = useCallback(async ({ throwOnError = false } = {}) => {
+    if (!job?.id || bundles.length === 0) return null
     setSaving(true)
     try {
-      await fetch(`/api/jobs/${job.id}/proposal/bundles`, {
+      const res = await fetch(`/api/jobs/${job.id}/proposal/bundles`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1541,10 +1620,21 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           deleted_material_codes: [...deletedMaterialCodes],
         }),
       })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }))
+        throw new Error(err.detail || 'Auto-save failed')
+      }
+      const saved = await res.json().catch(() => ({}))
+      if (saved.audit_trace || saved.audit || saved.audit_traces) {
+        setAuditTrace(saved.audit_trace || saved.audit || saved.audit_traces)
+      }
       setIsDirty(false)
       setLastSaved(new Date())
+      return saved
     } catch (e) {
       console.error('Auto-save failed:', e)
+      if (throwOnError) throw e
+      return null
     } finally {
       setSaving(false)
     }
@@ -1559,9 +1649,9 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   }, [isDirty, bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, job?.id, doSave])
 
   // Ref to hold latest state for flush-on-unmount (avoids stale closures)
-  const stateRef = useRef({ bundles: [], notes: [], terms: [], exclusions: [], taxRate: 0, gpmPct: 0, texturaEnabled: false, subtotal: 0, taxAmount: 0, grandTotal: 0, gpmTotal: 0, gpmLabor: 0, gpmMaterial: 0, texturaAmount: 0, isDirty: false, deletedBundleNames: new Set(), deletedMaterialCodes: new Set() })
+  const stateRef = useRef({ bundles: [], notes: [], terms: [], exclusions: [], taxRate: 0, gpmPct: 0, texturaEnabled: false, subtotal: 0, taxAmount: 0, grandTotal: 0, gpmTotal: 0, gpmLabor: 0, gpmMaterial: 0, texturaAmount: 0, auditTrace: null, isDirty: false, deletedBundleNames: new Set(), deletedMaterialCodes: new Set() })
   useEffect(() => {
-    stateRef.current = { bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, isDirty, deletedBundleNames, deletedMaterialCodes }
+    stateRef.current = { bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, auditTrace, isDirty, deletedBundleNames, deletedMaterialCodes }
   })
 
   // Flush pending save immediately on unmount or beforeunload
@@ -1764,6 +1854,10 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     setGenerating(true)
     setError(null)
     try {
+      const saved = await doSave({ throwOnError: true })
+      if (!saved?.audit_trace && !saved?.audit) {
+        throw new Error('Cannot generate PDF until the proposal has a current audit trace.')
+      }
       const proposalData = {
         bundles: bundles.map((b, i) => ({
           ...b,
@@ -1783,6 +1877,8 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         textura_fee: texturaEnabled ? 1 : 0,
         textura_amount: texturaAmount,
         grand_total: grandTotal,
+        deleted_bundles: [...deletedBundleNames],
+        deleted_material_codes: [...deletedMaterialCodes],
       }
       const res = await fetch(`/api/jobs/${job.id}/proposal/pdf`, {
         method: 'POST',
@@ -1799,7 +1895,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     } finally {
       setGenerating(false)
     }
-  }, [job, bundles, notes, terms, exclusions, subtotal, taxRate, taxAmount, gpmPct, gpmTotal, gpmLabor, gpmMaterial, texturaEnabled, texturaAmount, grandTotal])
+  }, [job, bundles, notes, terms, exclusions, subtotal, taxRate, taxAmount, gpmPct, gpmTotal, gpmLabor, gpmMaterial, texturaEnabled, texturaAmount, grandTotal, deletedBundleNames, deletedMaterialCodes, doSave])
 
   // Download PDF
   const downloadPdf = useCallback(() => {
@@ -1922,6 +2018,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
               selectMode={selectMode}
               selected={selectedIndices.has(i)}
               onToggleSelect={toggleSelect}
+              externalAudit={auditTrace}
             />
           ))}
         </div>
@@ -1955,6 +2052,11 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         const totalGpmLabor = bundles.reduce((s, b) => s + (b.gpm_labor_adder || 0), 0)
         const totalGpmMaterial = bundles.reduce((s, b) => s + (b.gpm_material_adder || 0), 0)
         const totalGpm = totalGpmLabor + totalGpmMaterial
+        const totalAuditFor = (field) => resolveAuditTrace({
+          record: { audit: auditTrace?.totals || auditTrace?.proposal || auditTrace?.summary },
+          field,
+          external: auditTrace,
+        })
         return (
         <div className="glass-card p-4 sm:p-6">
           {/* Cost Breakdown */}
@@ -1965,29 +2067,29 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-gray-400">Materials</span>
-                  <span className="text-gray-300 tabular-nums">{formatCurrency(totalMaterial)}</span>
+                  <span className="text-gray-300 tabular-nums inline-flex items-center gap-1">{formatCurrency(totalMaterial)}<AuditTraceButton trace={totalAuditFor('material_cost')} label="Proposal material total" /></span>
                 </div>
                 {totalSundry > 0 && (
                   <div className="flex justify-between">
                     <span className="text-gray-400">Sundries</span>
-                    <span className="text-gray-300 tabular-nums">{formatCurrency(totalSundry)}</span>
+                    <span className="text-gray-300 tabular-nums inline-flex items-center gap-1">{formatCurrency(totalSundry)}<AuditTraceButton trace={totalAuditFor('sundry_cost')} label="Proposal sundry total" /></span>
                   </div>
                 )}
                 {totalLabor > 0 && (
                   <div className="flex justify-between">
                     <span className="text-gray-400">Labor</span>
-                    <span className="text-gray-300 tabular-nums">{formatCurrency(totalLabor)}</span>
+                    <span className="text-gray-300 tabular-nums inline-flex items-center gap-1">{formatCurrency(totalLabor)}<AuditTraceButton trace={totalAuditFor('labor_cost')} label="Proposal labor total" /></span>
                   </div>
                 )}
                 {totalFreight > 0 && (
                   <div className="flex justify-between">
                     <span className="text-gray-400">Freight</span>
-                    <span className="text-gray-300 tabular-nums">{formatCurrency(totalFreight)}</span>
+                    <span className="text-gray-300 tabular-nums inline-flex items-center gap-1">{formatCurrency(totalFreight)}<AuditTraceButton trace={totalAuditFor('freight_cost')} label="Proposal freight total" /></span>
                   </div>
                 )}
                 <div className="flex justify-between border-t border-white/[0.06] pt-2">
                   <span className="text-white font-semibold">Total Cost</span>
-                  <span className="text-white font-semibold tabular-nums">{formatCurrency(totalCost)}</span>
+                  <span className="text-white font-semibold tabular-nums inline-flex items-center gap-1">{formatCurrency(totalCost)}<AuditTraceButton trace={totalAuditFor('total_cost')} label="Proposal total cost" /></span>
                 </div>
                 <div className="border-t border-white/[0.06] pt-2 mt-1">
                   <div className="flex justify-between">
@@ -2005,17 +2107,17 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
                       />
                       <span className="text-emerald-600 text-xs">%</span>
                     </div>
-                    <span className="text-emerald-400 font-semibold tabular-nums">{formatCurrency(gpmTotal)}</span>
+                    <span className="text-emerald-400 font-semibold tabular-nums inline-flex items-center gap-1">{formatCurrency(gpmTotal)}<AuditTraceButton trace={totalAuditFor('gpm_profit')} label="GPM profit" /></span>
                   </div>
                   {gpmTotal > 0 && (
                     <>
                       <div className="flex justify-between text-xs pl-3 mt-2">
                         <span className="text-gray-500">Labor (97.93%)</span>
-                        <span className="text-gray-400 tabular-nums">{formatCurrency(gpmLabor)}</span>
+                        <span className="text-gray-400 tabular-nums inline-flex items-center gap-1">{formatCurrency(gpmLabor)}<AuditTraceButton trace={totalAuditFor('gpm_labor')} label="GPM labor split" /></span>
                       </div>
                       <div className="flex justify-between text-xs pl-3">
                         <span className="text-gray-500">Material (2.07%)</span>
-                        <span className="text-gray-400 tabular-nums">{formatCurrency(gpmMaterial)}</span>
+                        <span className="text-gray-400 tabular-nums inline-flex items-center gap-1">{formatCurrency(gpmMaterial)}<AuditTraceButton trace={totalAuditFor('gpm_material')} label="GPM material split" /></span>
                       </div>
                     </>
                   )}
@@ -2029,7 +2131,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-gray-400">Subtotal (Sell Price)</span>
-                  <span className="text-white font-semibold tabular-nums">{formatCurrency(subtotal)}</span>
+                  <span className="text-white font-semibold tabular-nums inline-flex items-center gap-1">{formatCurrency(subtotal)}<AuditTraceButton trace={totalAuditFor('subtotal')} label="Proposal subtotal" /></span>
                 </div>
                 <div className="flex justify-between">
                   <div className="flex items-center gap-2 text-gray-400">
@@ -2045,7 +2147,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
                     />
                     <span className="text-gray-600 text-xs">%</span>
                   </div>
-                  <span className="text-white font-semibold tabular-nums">{formatCurrency(taxAmount)}</span>
+                  <span className="text-white font-semibold tabular-nums inline-flex items-center gap-1">{formatCurrency(taxAmount)}<AuditTraceButton trace={totalAuditFor('tax_amount')} label="Proposal tax" /></span>
                 </div>
                 {/* Textura fee toggle + display */}
                 <div className="flex justify-between">
@@ -2058,11 +2160,11 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
                     />
                     <span>Textura (0.22%)</span>
                   </div>
-                  <span className="text-white font-semibold tabular-nums">{texturaEnabled ? formatCurrency(texturaAmount) : '—'}</span>
+                  <span className="text-white font-semibold tabular-nums inline-flex items-center gap-1">{texturaEnabled ? formatCurrency(texturaAmount) : '—'}<AuditTraceButton trace={totalAuditFor('textura_amount')} label="Textura fee" /></span>
                 </div>
                 <div className="border-t border-white/[0.06] pt-2 flex justify-between">
                   <span className="text-white font-bold text-base">Grand Total</span>
-                  <span className="text-white font-bold text-lg tabular-nums">{formatCurrency(grandTotal)}</span>
+                  <span className="text-white font-bold text-lg tabular-nums inline-flex items-center gap-1">{formatCurrency(grandTotal)}<AuditTraceButton trace={totalAuditFor('grand_total')} label="Proposal grand total" /></span>
                 </div>
               </div>
             </div>

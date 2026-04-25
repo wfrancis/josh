@@ -1,0 +1,101 @@
+{
+  "name": "Josh rules and audit permanent cases",
+  "job": {
+    "project_name_prefix": "Rules Audit Harness",
+    "gc_name": "Harness QA",
+    "city": "Denver",
+    "state": "CO",
+    "tax_rate": 0.08375,
+    "gpm_pct": 0.2
+  },
+  "rfms_rows": [
+    {
+      "description": "T-055 - Arizona Tile - Flash - Ivory 5\" x 5\"",
+      "quantity": 110
+    },
+    {
+      "description": "Install T-055 Floor Tile",
+      "quantity": 100
+    },
+    {
+      "description": "T-212 - Arizona Tile - Linear Plank 2\" x 12\"",
+      "quantity": 66
+    },
+    {
+      "description": "Install T-212 Floor Tile",
+      "quantity": 60
+    },
+    {
+      "description": "B-101 - Opaque Finish 4 inch Cove",
+      "quantity": 240
+    },
+    {
+      "description": "WM-100 - Opaque Modular 24\" x 24\"",
+      "quantity": 36
+    },
+    {
+      "description": "RF-100 - Opaque Resilient 8mm Roll",
+      "quantity": 300
+    },
+    {
+      "description": "VCT-100 - Opaque Tile 12\" x 12\"",
+      "quantity": 180
+    }
+  ],
+  "expected_materials": {
+    "T-055": {
+      "description_contains": "5\" x 5\"",
+      "material_type": "floor_tile",
+      "installed_qty": 100,
+      "is_mosaic": false,
+      "labor_description_excludes": "mosaic"
+    },
+    "T-212": {
+      "description_contains": "2\" x 12\"",
+      "material_type": "floor_tile",
+      "installed_qty": 60,
+      "is_mosaic": true,
+      "labor_description_contains": "mosaic"
+    },
+    "B-101": {
+      "material_type": "rubber_base",
+      "requires_labor": true
+    },
+    "WM-100": {
+      "material_type": "cpt_tile",
+      "requires_labor": true,
+      "labor_rate": 3.85,
+      "labor_unit": "SY",
+      "labor_qty": 36
+    },
+    "RF-100": {
+      "material_type": "rubber_sheet",
+      "requires_labor": true
+    },
+    "VCT-100": {
+      "material_type": "vct",
+      "requires_labor": true
+    }
+  },
+  "pricing": {
+    "default_unit_price": 10.0,
+    "by_item_code": {
+      "T-055": 8.25,
+      "T-212": 13.75,
+      "B-101": 2.15,
+      "WM-100": 18.5,
+      "RF-100": 6.4,
+      "VCT-100": 1.35
+    }
+  },
+  "deletion_case": {
+    "item_code": "VCT-100"
+  },
+  "audit_categories": [
+    "material",
+    "sundry",
+    "labor",
+    "tax",
+    "gpm"
+  ]
+}

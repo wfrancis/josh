@@ -66,6 +66,37 @@ export const api = {
   saveProposalBundles: (jobId, data) =>
     request(`/jobs/${jobId}/proposal/bundles`, { method: 'PUT', body: JSON.stringify(data) }),
 
+  // Rules registry / audit traces
+  listRules: (params = {}) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, value]) => value != null && value !== '' && value !== 'all')
+    ).toString()
+    return request('/rules' + (qs ? '?' + qs : ''))
+  },
+  getRule: (ruleId) => request('/rules/' + encodeURIComponent(ruleId)),
+  getRuleVersions: (ruleId) => request('/rules/' + encodeURIComponent(ruleId) + '/versions'),
+  createRule: (data) =>
+    request('/rules', { method: 'POST', body: JSON.stringify(data) }),
+  draftRuleFromLesson: (data) =>
+    request('/rules/draft-from-lesson', { method: 'POST', body: JSON.stringify(data) }),
+  listRulesets: (params = {}) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, value]) => value != null && value !== '')
+    ).toString()
+    return request('/rulesets' + (qs ? '?' + qs : ''))
+  },
+  getRuleset: (version) => request('/rulesets/' + encodeURIComponent(version)),
+  rollbackRuleset: (version, data = {}) =>
+    request('/rulesets/' + encodeURIComponent(version) + '/rollback', { method: 'POST', body: JSON.stringify(data) }),
+  updateRule: (ruleId, data) =>
+    request('/rules/' + encodeURIComponent(ruleId), { method: 'PUT', body: JSON.stringify(data) }),
+  archiveRule: (ruleId, data = {}) =>
+    request('/rules/' + encodeURIComponent(ruleId) + '/archive', { method: 'POST', body: JSON.stringify(data) }),
+  deleteRule: (ruleId) => request('/rules/' + encodeURIComponent(ruleId), { method: 'DELETE' }),
+  getJobAuditTrace: (jobId) => request(`/jobs/${jobId}/audit`),
+  runRulesAuditHarness: (payload) =>
+    request('/rules/audit-harness', { method: 'POST', body: JSON.stringify(payload) }),
+
   // Calculate
   calculate: (jobId) => request(`/jobs/${jobId}/calculate`, { method: 'POST' }),
 

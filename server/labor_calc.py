@@ -457,6 +457,7 @@ def calculate_labor(
     waste_pct: Optional[float] = None,
     measure_qty: Optional[float] = None,
     material: dict = None,
+    trace=None,
 ) -> list[dict]:
     """
     Calculate labor for a single material line item.
@@ -481,28 +482,64 @@ def calculate_labor(
     rule = _get_labor_qty_rule(material_type)
     if rule == "with_waste":
         labor_qty = installed_qty * (1 + waste_pct)
+        qty_formula = "installed_qty * (1 + waste_pct)"
     elif rule == "no_waste":
         labor_qty = installed_qty
+        qty_formula = "installed_qty"
     elif rule == "from_measure" and measure_qty is not None:
         labor_qty = measure_qty
+        qty_formula = "measure_qty"
     else:
         labor_qty = installed_qty * (1 + waste_pct)
+        qty_formula = "installed_qty * (1 + waste_pct)"
 
     results = []
     for entry in entries:
         rate = entry["cost"]
         extended_cost = labor_qty * rate
-        results.append({
+        item = {
             "labor_description": f"{entry['labor_type']} - {entry['description']}",
             "qty": round(labor_qty, 2),
             "unit": entry["unit"],
             "rate": rate,
             "extended_cost": round(extended_cost, 2),
-        })
+        }
+        results.append(item)
+        if trace:
+            material_id = (material or {}).get("id") or (material or {}).get("item_code")
+            entity_key = f"{material_id}:{item['labor_description']}" if material_id else item["labor_description"]
+            rule_id = f"labor:{material_type}:{entry.get('id', entry.get('description', 'catalog'))}"
+            trace.record(
+                entity_type="labor",
+                entity_id=material_id,
+                entity_key=entity_key,
+                output_field="qty",
+                formula=qty_formula,
+                inputs={
+                    "installed_qty": installed_qty,
+                    "waste_pct": waste_pct,
+                    "measure_qty": measure_qty,
+                    "qty_rule": rule,
+                },
+                result=item["qty"],
+                rule_id=rule_id,
+                source="labor_catalog",
+            )
+            trace.record(
+                entity_type="labor",
+                entity_id=material_id,
+                entity_key=entity_key,
+                output_field="extended_cost",
+                formula="qty * rate",
+                inputs={"qty": item["qty"], "rate": rate},
+                result=item["extended_cost"],
+                rule_id=rule_id,
+                source="labor_catalog",
+            )
     return results
 
 
-def calculate_labor_for_materials(materials: list[dict]) -> list[dict]:
+def calculate_labor_for_materials(materials: list[dict], trace=None) -> list[dict]:
     """
     Calculate labor for a list of material line items.
     Loads labor catalog from DB once for efficiency.
@@ -544,10 +581,13 @@ def calculate_labor_for_materials(materials: list[dict]) -> list[dict]:
         rule = _get_labor_qty_rule(material_type)
         if rule == "with_waste":
             labor_qty = installed_qty * (1 + waste_pct)
+            qty_formula = "installed_qty * (1 + waste_pct)"
         elif rule == "no_waste":
             labor_qty = installed_qty
+            qty_formula = "installed_qty"
         else:
             labor_qty = installed_qty * (1 + waste_pct)
+            qty_formula = "installed_qty * (1 + waste_pct)"
 
         for entry in entries:
             rate = entry["cost"]
@@ -558,26 +598,64 @@ def calculate_labor_for_materials(materials: list[dict]) -> list[dict]:
             if "weld" in entry_desc and entry_desc.startswith("x add"):
                 weld_lf = _safe_float(mat.get("weld_rod_lf", 0))
                 qty = weld_lf if weld_lf > 0 else labor_qty
+                line_qty_formula = "weld_rod_lf if present else labor_qty"
             # Convert units if needed (catalog SY vs material SF)
             elif entry_unit == "SY" and material_type not in ("unit_carpet_no_pattern", "unit_carpet_pattern", "corridor_broadloom", "cpt_tile"):
                 # Material is in SF, convert qty to SY
                 qty = labor_qty / 9
+                line_qty_formula = f"({qty_formula}) / 9"
             elif entry_unit in ("SF", "") and material_type in ("unit_carpet_no_pattern", "unit_carpet_pattern", "corridor_broadloom"):
                 # Material is in SY, convert qty to SF
                 qty = labor_qty * 9
+                line_qty_formula = f"({qty_formula}) * 9"
             else:
                 qty = labor_qty
+                line_qty_formula = qty_formula
 
             extended_cost = qty * rate
 
-            results.append({
+            item = {
                 "labor_description": f"{entry['labor_type']} - {entry['description']}",
                 "qty": round(qty, 2),
                 "unit": entry_unit or entry.get("unit", ""),
                 "rate": rate,
                 "extended_cost": round(extended_cost, 2),
                 "material_id": material_id,
-            })
+            }
+            results.append(item)
+
+            if trace:
+                entity_key = f"{material_id}:{item['labor_description']}" if material_id else item["labor_description"]
+                rule_id = f"labor:{material_type}:{entry.get('id', entry.get('description', 'catalog'))}"
+                trace.record(
+                    entity_type="labor",
+                    entity_id=material_id,
+                    entity_key=entity_key,
+                    output_field="qty",
+                    formula=line_qty_formula,
+                    inputs={
+                        "installed_qty": installed_qty,
+                        "waste_pct": waste_pct,
+                        "labor_qty": round(labor_qty, 2),
+                        "qty_rule": rule,
+                        "catalog_unit": entry_unit,
+                        "weld_rod_lf": _safe_float(mat.get("weld_rod_lf", 0)),
+                    },
+                    result=item["qty"],
+                    rule_id=rule_id,
+                    source="labor_catalog",
+                )
+                trace.record(
+                    entity_type="labor",
+                    entity_id=material_id,
+                    entity_key=entity_key,
+                    output_field="extended_cost",
+                    formula="qty * rate",
+                    inputs={"qty": item["qty"], "rate": rate},
+                    result=item["extended_cost"],
+                    rule_id=rule_id,
+                    source="labor_catalog",
+                )
 
     return results
 

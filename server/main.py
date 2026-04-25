@@ -3,9 +3,12 @@ FastAPI application for the Standard Interiors Bid Tool.
 """
 
 import csv
+import hashlib
 import io
+import json
 import os
 import shutil
+import sqlite3
 import tempfile
 from typing import Optional
 
@@ -36,6 +39,12 @@ from models import (
     create_quote_request, list_quote_requests, update_quote_request, delete_quote_request,
     _normalize_product, _get_conn,
     import_price_book, search_price_book, match_price_book, get_price_book_summary,
+    list_rules, get_rule, create_rule, update_rule, delete_rule,
+    archive_rule, list_rule_versions,
+    list_ruleset_versions, get_ruleset_version, rollback_ruleset_version,
+    get_active_rules, seed_rules_registry_defaults,
+    create_calculation_run, save_calculation_traces, complete_calculation_run,
+    list_calculation_runs, get_calculation_traces,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
@@ -49,6 +58,7 @@ from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, 
 from email_agent import compose_quote_request, send_email, generate_quote_request_text
 from ai_client import chat_complete, get_provider_info
 from inbox_monitor import InboxMonitor
+from audit_engine import AuditTraceBuilder
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="SI Bid Tool", version="1.0.0")
@@ -340,6 +350,7 @@ def startup():
     init_db()
     _apply_openai_config()
     _seed_company_rates()
+    _seed_rules_registry()
     _auto_import_price_books()
     _start_inbox_monitor()
     _start_sim_watcher()
@@ -357,6 +368,13 @@ def _auto_import_price_books():
             items = _json.load(f)
         count = import_price_book("Schluter", items, discount_pct=0.55, category="transitions")
         print(f"Auto-imported Schluter price book: {count} items (45% of list)")
+
+
+def _seed_rules_registry():
+    """Seed hard estimating rules if they are not already in the registry."""
+    result = seed_rules_registry_defaults()
+    if result.get("inserted"):
+        print(f"[seed] Seeded {result['inserted']} estimating rules")
 
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
@@ -402,7 +420,324 @@ class SettingsUpdate(BaseModel):
     vendor_quote_test_mode: Optional[str] = None
 
 
+class RuleCreate(BaseModel):
+    rule_id: str
+    name: str
+    category: str = ""
+    stage: str = ""
+    status: str = "draft"
+    priority: int = 0
+    condition_json: Optional[dict] = None
+    action_json: Optional[dict] = None
+    source: str = ""
+    description: str = ""
+    effective_from: Optional[str] = None
+    effective_to: Optional[str] = None
+    version: int = 1
+    implementation_ref: str = ""
+    test_ref: str = ""
+    notes: str = ""
+    changed_by: Optional[str] = None
+    change_note: Optional[str] = None
+
+
+class RuleUpdate(BaseModel):
+    name: Optional[str] = None
+    category: Optional[str] = None
+    stage: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[int] = None
+    condition_json: Optional[dict] = None
+    action_json: Optional[dict] = None
+    source: Optional[str] = None
+    description: Optional[str] = None
+    effective_from: Optional[str] = None
+    effective_to: Optional[str] = None
+    version: Optional[int] = None
+    implementation_ref: Optional[str] = None
+    test_ref: Optional[str] = None
+    notes: Optional[str] = None
+    changed_by: Optional[str] = None
+    change_note: Optional[str] = None
+
+
+class RuleChangeMeta(BaseModel):
+    changed_by: Optional[str] = None
+    change_note: Optional[str] = None
+
+
+class RuleDraftRequest(BaseModel):
+    lesson_text: str
+    changed_by: Optional[str] = "Josh"
+
+
+class RulesetRollbackRequest(BaseModel):
+    changed_by: Optional[str] = "Josh"
+    change_note: Optional[str] = None
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/api/rules")
+def api_list_rules(category: str = None, stage: str = None, status: str = None):
+    """List hard estimating rules with optional category/stage/status filters."""
+    rules = list_rules(category=category, stage=stage, status=status)
+    return {"rules": rules, "count": len(rules)}
+
+
+@app.get("/api/rules/active")
+def api_get_active_rules(stage: str = None, category: str = None, as_of: str = None):
+    """List currently active estimating rules for audit/calculation consumers."""
+    rules = get_active_rules(stage=stage, category=category, as_of=as_of)
+    return {"rules": rules, "count": len(rules)}
+
+
+@app.post("/api/rules/seed")
+def api_seed_rules(overwrite: bool = False):
+    """Seed built-in hard estimating rules."""
+    return seed_rules_registry_defaults(overwrite=overwrite)
+
+
+@app.get("/api/rulesets")
+def api_list_rulesets(limit: int = 25):
+    """List whole-registry ruleset versions."""
+    versions = list_ruleset_versions(limit=limit)
+    current = versions[0] if versions else None
+    return {
+        "versions": versions,
+        "current": current,
+        "current_version": current["version"] if current else None,
+        "count": len(versions),
+    }
+
+
+@app.get("/api/rulesets/{version}")
+def api_get_ruleset(version: int):
+    """Fetch a whole-registry ruleset snapshot."""
+    ruleset = get_ruleset_version(version)
+    if not ruleset:
+        raise HTTPException(status_code=404, detail="Ruleset version not found")
+    return ruleset
+
+
+@app.post("/api/rulesets/{version}/rollback")
+def api_rollback_ruleset(version: int, body: Optional[RulesetRollbackRequest] = None):
+    """Restore rules to a previous whole-registry snapshot as a new ruleset version."""
+    body = body or RulesetRollbackRequest()
+    try:
+        new_version = rollback_ruleset_version(
+            version,
+            changed_by=body.changed_by or "Josh",
+            change_note=body.change_note or f"Rolled registry back to ruleset v{version}.",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "status": "ok",
+        "rolled_back_to": version,
+        "new_version": new_version,
+        "current": get_ruleset_version(new_version),
+    }
+
+
+@app.post("/api/rules/draft-from-lesson")
+def api_draft_rule_from_lesson(body: RuleDraftRequest):
+    """Use AI to turn a spoken/plain-English lesson into a rule draft."""
+    lesson = (body.lesson_text or "").strip()
+    if len(lesson) < 8:
+        raise HTTPException(status_code=400, detail="Tell me a little more about the rule.")
+
+    settings = get_settings()
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+    model = settings.get("openai_model", "gpt-5-mini")
+    provider = get_provider_info(api_key)
+    if not provider["available"]:
+        raise HTTPException(status_code=400, detail="AI is not configured. Add an API key in Settings first.")
+
+    import json as _json
+    import re as _re
+
+    system_msg = """You turn spoken estimating lessons into draft rules for a commercial flooring bid platform.
+Return ONLY valid JSON. Do not include markdown.
+
+Output shape:
+{
+  "rule_id": "custom.short.stable.id",
+  "name": "Short human name",
+  "category": "material|pricing|labor|sundry|freight|tax|proposal|classification|audit",
+  "stage": "classification|pricing|sundry|labor|proposal|audit|rfms_parse|quote_parse|sundry_calc|labor_calc|proposal_generate",
+  "status": "draft",
+  "priority": 10,
+  "description": "What Josh wants this to do.",
+  "condition_json": {},
+  "action_json": {},
+  "source": "Josh spoken lesson",
+  "notes": "Important assumptions or examples.",
+  "change_note": "Initial spoken lesson from Josh.",
+  "assumptions": [],
+  "needs_review": true
+}
+
+Rules:
+- Use status "draft" unless the lesson is extremely precise.
+- Never claim the app already enforces the rule.
+- Use condition_json for WHEN the rule applies.
+- Use action_json for WHAT should happen.
+- Keep JSON simple and readable for a human reviewer.
+- If the spoken lesson is ambiguous, preserve the ambiguity in notes/assumptions instead of inventing specifics."""
+
+    user_msg = f"""Josh said this rule out loud:
+
+{lesson}
+
+Draft the rule fields for the registry. Use a stable rule_id starting with custom."""
+
+    try:
+        raw = chat_complete(
+            system=system_msg,
+            user=user_msg,
+            api_key=api_key,
+            model=model,
+            json_mode=True,
+        )
+        parsed = _json.loads(raw)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not draft rule: {e}")
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=500, detail="AI returned an invalid rule draft.")
+
+    def _slug(value: str) -> str:
+        value = _re.sub(r"[^a-z0-9]+", ".", (value or "").lower()).strip(".")
+        return value[:72] or "spoken.lesson"
+
+    name = str(parsed.get("name") or lesson[:80]).strip()
+    rule_id = str(parsed.get("rule_id") or "").strip()
+    if not rule_id.startswith("custom."):
+        rule_id = f"custom.{_slug(rule_id or name)}"
+
+    condition_json = parsed.get("condition_json")
+    action_json = parsed.get("action_json")
+    if not isinstance(condition_json, dict):
+        condition_json = {"spoken_condition": str(condition_json or lesson)}
+    if not isinstance(action_json, dict):
+        action_json = {"spoken_action": str(action_json or "Needs review")}
+
+    try:
+        priority = int(parsed.get("priority") or 10)
+    except (TypeError, ValueError):
+        priority = 10
+
+    return {
+        "draft": {
+            "rule_id": rule_id,
+            "name": name,
+            "category": str(parsed.get("category") or "material").strip() or "material",
+            "stage": str(parsed.get("stage") or "classification").strip() or "classification",
+            "status": "draft",
+            "priority": priority,
+            "description": str(parsed.get("description") or lesson).strip(),
+            "condition_json": condition_json,
+            "action_json": action_json,
+            "source": str(parsed.get("source") or "Josh spoken lesson").strip(),
+            "implementation_ref": "",
+            "test_ref": "",
+            "notes": str(parsed.get("notes") or "").strip(),
+            "changed_by": body.changed_by or "Josh",
+            "change_note": str(parsed.get("change_note") or "Initial spoken lesson from Josh.").strip(),
+        },
+        "assumptions": parsed.get("assumptions") if isinstance(parsed.get("assumptions"), list) else [],
+        "needs_review": bool(parsed.get("needs_review", True)),
+        "transcript": lesson,
+    }
+
+
+@app.get("/api/rules/{rule_id}/versions")
+def api_get_rule_versions(rule_id: str):
+    """List all saved versions for a rule."""
+    rule = get_rule(rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    versions = list_rule_versions(rule_id)
+    return {"rule": rule, "versions": versions, "count": len(versions)}
+
+
+@app.get("/api/rules/{rule_id}")
+def api_get_rule(rule_id: str):
+    """Get a single estimating rule."""
+    rule = get_rule(rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return rule
+
+
+@app.post("/api/rules")
+def api_create_rule(body: RuleCreate):
+    """Create a hard estimating rule."""
+    data = body.model_dump()
+    data["condition_json"] = data.get("condition_json") or {}
+    data["action_json"] = data.get("action_json") or {}
+    try:
+        rule_id = create_rule(data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Rule already exists")
+    return get_rule(rule_id)
+
+
+@app.put("/api/rules/{rule_id}")
+def api_update_rule(rule_id: str, body: RuleUpdate):
+    """Update a hard estimating rule. Each edit creates a new version."""
+    updates = body.model_dump(exclude_unset=True)
+    changed_by = updates.pop("changed_by", None) or "Rules Registry"
+    change_note = updates.pop("change_note", None) or "Rule updated from registry."
+    if updates.get("name") is None and "name" in updates:
+        raise HTTPException(status_code=400, detail="name cannot be null")
+    for key in ("category", "stage", "status", "source", "description", "implementation_ref", "test_ref", "notes"):
+        if updates.get(key) is None and key in updates:
+            updates[key] = ""
+    for key in ("priority", "version"):
+        if updates.get(key) is None and key in updates:
+            raise HTTPException(status_code=400, detail=f"{key} cannot be null")
+    if "condition_json" in updates and updates["condition_json"] is None:
+        updates["condition_json"] = {}
+    if "action_json" in updates and updates["action_json"] is None:
+        updates["action_json"] = {}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No rule fields supplied")
+    try:
+        updated = update_rule(rule_id, updates, changed_by=changed_by, change_note=change_note)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not updated:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return get_rule(rule_id)
+
+
+@app.post("/api/rules/{rule_id}/archive")
+def api_archive_rule(rule_id: str, body: Optional[RuleChangeMeta] = None):
+    """Archive a rule without erasing its history."""
+    body = body or RuleChangeMeta()
+    archived = archive_rule(
+        rule_id,
+        changed_by=(body.changed_by or "Rules Registry"),
+        change_note=(body.change_note or "Rule archived from registry."),
+    )
+    if not archived:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return get_rule(rule_id)
+
+
+@app.delete("/api/rules/{rule_id}")
+def api_delete_rule(rule_id: str):
+    """Archive a hard estimating rule. History is preserved for old bids."""
+    if not delete_rule(rule_id):
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return {"message": "Rule archived", "rule": get_rule(rule_id)}
+
 
 @app.get("/api/jobs")
 def api_list_jobs():
@@ -600,12 +935,16 @@ def api_duplicate_job(job_id: str):
         "state": job.get("state"),
         "zip": job.get("zip"),
         "tax_rate": job.get("tax_rate", 0),
+        "gpm_pct": job.get("gpm_pct", 0),
         "unit_count": job.get("unit_count", 0),
+        "tub_shower_count": job.get("tub_shower_count", 0),
         "salesperson": job.get("salesperson"),
         "notes": job.get("notes"),
         "exclusions": job.get("exclusions"),
+        "markup_pct": job.get("markup_pct", 0),
         "architect": job.get("architect"),
         "designer": job.get("designer"),
+        "textura_fee": job.get("textura_fee", 0),
     }
     new_id = save_job(new_job)
 
@@ -733,11 +1072,18 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         "state": rfms_job_info.get("state") or job.get("state"),
         "zip": rfms_job_info.get("zip") or job.get("zip"),
         "tax_rate": job.get("tax_rate", 0),
+        "gpm_pct": job.get("gpm_pct", 0),
         "unit_count": job.get("unit_count", 0),
+        "tub_shower_count": job.get("tub_shower_count", 0),
         "salesperson": job.get("salesperson"),
         "notes": job.get("notes"),
+        "exclusions": job.get("exclusions"),
+        "markup_pct": job.get("markup_pct", 0),
+        "bid_data": job.get("bid_data"),
+        "proposal_data": job.get("proposal_data"),
         "architect": job.get("architect"),
         "designer": job.get("designer"),
+        "textura_fee": job.get("textura_fee", 0),
     }
     save_job(job_update)
 
@@ -1800,16 +2146,30 @@ def api_calculate(job_id: str):
             mat["fixture_count"] = tub_shower_count
 
     # Calculate sundries
-    sundries = calculate_sundries_for_materials(materials)
+    trace = AuditTraceBuilder(job["id"])
+
+    sundries = calculate_sundries_for_materials(materials, trace=trace)
     save_sundries(job["id"], sundries)
 
     # Calculate labor
-    labor_items = calculate_labor_for_materials(materials)
+    labor_items = calculate_labor_for_materials(materials, trace=trace)
     save_labor(job["id"], labor_items)
+
+    run_id = create_calculation_run(
+        job["id"],
+        "bid_calculation",
+        metadata=_audit_metadata({"endpoint": "calculate"}),
+    )
+    trace_count = save_calculation_traces(job["id"], run_id, trace.records)
+    complete_calculation_run(run_id, summary=trace.summary())
 
     log_activity(job["id"], "bid_calculated", f"Calculated {len(sundries)} sundries and {len(labor_items)} labor items")
 
-    return {"sundries": sundries, "labor": labor_items}
+    return {
+        "sundries": sundries,
+        "labor": labor_items,
+        "audit": {"run_id": run_id, "trace_count": trace_count, "summary": trace.summary()},
+    }
 
 
 @app.put("/api/jobs/{job_id}/materials")
@@ -1980,6 +2340,7 @@ def api_generate_bid(job_id: str):
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _validate_bid_job_ready(job)
 
     materials = job.get("materials", [])
     sundries = job.get("sundries", [])
@@ -2012,6 +2373,7 @@ def api_generate_bid(job_id: str):
             pass
 
     bid_data = assemble_bid(job_info, materials, sundries, labor_items, exclusions=custom_exclusions)
+    bid_audit = _record_bid_audit(job["id"], bid_data)
 
     # Save bundles
     save_bundles(job["id"], bid_data["bundles"])
@@ -2029,6 +2391,23 @@ def api_generate_bid(job_id: str):
         "tax_amount": bid_data["tax_amount"],
         "grand_total": bid_data["grand_total"],
         "exclusions": bid_data.get("exclusions", []),
+        "audit": {
+            "run_id": bid_audit["run"]["id"],
+            "trace_count": bid_audit["trace_count"],
+            "summary": bid_audit["run"].get("summary", {}),
+            "ruleset_version": bid_audit["run"].get("metadata", {}).get("ruleset_version"),
+        },
+        "pdf_audit_run_id": bid_audit["run"]["id"],
+        "pdf_ruleset_version": bid_audit["run"].get("metadata", {}).get("ruleset_version"),
+        "pdf_source_fingerprint": _bid_source_fingerprint(job),
+        "pdf_totals": {
+            "subtotal": bid_data["subtotal"],
+            "tax_amount": bid_data["tax_amount"],
+            "grand_total": bid_data["grand_total"],
+            "total_cost": bid_data.get("total_cost", 0),
+            "gpm_profit": bid_data.get("gpm_profit", 0),
+            "markup_amount": bid_data.get("markup_amount", 0),
+        },
     }
     job["bid_data"] = _json.dumps(bid_persist)
     save_job(job)
@@ -2041,6 +2420,7 @@ def api_generate_bid(job_id: str):
     grand_total = bid_data.get("grand_total", 0)
     log_activity(job["id"], "bid_generated", f"Bid generated: {bundle_count} bundles, total ${grand_total:,.2f}", {"bundle_count": bundle_count, "grand_total": grand_total})
 
+    bid_data["audit"] = bid_persist["audit"]
     return bid_data
 
 
@@ -2064,6 +2444,7 @@ def api_download_bid_pdf(job_id: str):
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _validate_bid_pdf_download_ready(job)
     pdf_path = os.path.join(PDF_DIR, f"bid_{job['id']}.pdf")
     if not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="PDF not found. Generate bid first.")
@@ -2106,6 +2487,969 @@ def api_get_proposal_bundles(job_id: str):
     return {"bundles": [], "notes": [], "terms": [], "exclusions": []}
 
 
+# ── Calculation Audit Endpoints ─────────────────────────────────────────────
+
+@app.get("/api/jobs/{job_id}/audit/runs")
+def api_get_calculation_runs(job_id: str, limit: int = 20):
+    """List calculation audit runs for a job."""
+    db_id = _resolve_job_id(job_id)
+    return {"runs": list_calculation_runs(db_id, limit=limit)}
+
+
+@app.get("/api/jobs/{job_id}/audit")
+def api_get_latest_calculation_audit(job_id: str, limit: int = 1000):
+    """Fetch the latest calculation run and trace rows for the job."""
+    db_id = _resolve_job_id(job_id)
+    runs = list_calculation_runs(db_id, limit=50)
+    run = runs[0] if runs else None
+    traces = []
+    if run:
+        traces = get_calculation_traces(db_id, run_id=run["id"], limit=limit)
+        if run.get("run_type") in ("proposal_manual_save", "proposal_editor_save"):
+            prior = next(
+                (r for r in runs[1:] if r.get("run_type") in ("proposal_generation", "bid_calculation")),
+                None,
+            )
+            if prior:
+                remaining = max(limit - len(traces), 0)
+                if remaining:
+                    traces.extend(get_calculation_traces(db_id, run_id=prior["id"], limit=remaining))
+    return {
+        "run": run,
+        "traces": traces,
+        "events": traces,
+        "audit": run.get("summary", {}) if run else {},
+    }
+
+
+@app.get("/api/jobs/{job_id}/audit/trace")
+def api_get_calculation_trace(
+    job_id: str,
+    run_id: Optional[int] = None,
+    entity_type: Optional[str] = None,
+    entity_id: Optional[str] = None,
+    entity_key: Optional[str] = None,
+    limit: int = 1000,
+):
+    """Fetch calculation trace rows. Defaults to the latest run for the job."""
+    db_id = _resolve_job_id(job_id)
+    selected_run_id = run_id
+    run = None
+    if selected_run_id is None:
+        runs = list_calculation_runs(db_id, limit=10)
+        if runs:
+            run = runs[0]
+            selected_run_id = run["id"]
+    elif selected_run_id is not None:
+        runs = [r for r in list_calculation_runs(db_id, limit=100) if r["id"] == selected_run_id]
+        run = runs[0] if runs else None
+
+    traces = []
+    if selected_run_id is not None:
+        traces = get_calculation_traces(
+            db_id,
+            run_id=selected_run_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            entity_key=entity_key,
+            limit=limit,
+        )
+        if run and run.get("run_type") in ("proposal_manual_save", "proposal_editor_save") and not any([run_id, entity_type, entity_id, entity_key]):
+            prior = next(
+                (r for r in list_calculation_runs(db_id, limit=10)[1:] if r.get("run_type") in ("proposal_generation", "bid_calculation")),
+                None,
+            )
+            if prior:
+                remaining = max(limit - len(traces), 0)
+                if remaining:
+                    traces.extend(get_calculation_traces(db_id, run_id=prior["id"], limit=remaining))
+    return {"run": run, "traces": traces}
+
+
+@app.get("/api/jobs/{job_id}/audit/runs/{run_id}/trace")
+def api_get_calculation_run_trace(
+    job_id: str,
+    run_id: int,
+    entity_type: Optional[str] = None,
+    entity_id: Optional[str] = None,
+    entity_key: Optional[str] = None,
+    limit: int = 1000,
+):
+    """Fetch calculation trace rows for a specific run."""
+    db_id = _resolve_job_id(job_id)
+    traces = get_calculation_traces(
+        db_id,
+        run_id=run_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_key=entity_key,
+        limit=limit,
+    )
+    return {"run_id": run_id, "traces": traces}
+
+
+@app.post("/api/rules/audit-harness")
+def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
+    """Small UI probe for rules/audit visibility; full harness lives in scripts/."""
+    body = body or {}
+    job_ref = body.get("job_id")
+    stage = body.get("stage")
+    category = body.get("category")
+    field = body.get("field")
+    rules = get_active_rules(stage=stage if stage not in ("", "all") else None,
+                             category=category if category not in ("", "all") else None)
+    response = {
+        "status": "ok",
+        "rule_count": len(rules),
+        "rules": rules[:25],
+        "note": "Full deployed harness: scripts/rules_audit_harness.py --base-url <fly-url>",
+    }
+    if field:
+        response["field"] = field
+    if job_ref:
+        db_id = _resolve_job_id(str(job_ref))
+        runs = list_calculation_runs(db_id, limit=1)
+        response["latest_run"] = runs[0] if runs else None
+        response["trace_count"] = 0
+        if runs:
+            traces = get_calculation_traces(db_id, run_id=runs[0]["id"], limit=1000)
+            response["trace_count"] = len(traces)
+            matching = [t for t in traces if not field or t.get("output_field") == field]
+            response["field_trace"] = matching[-1] if matching else None
+            response["field_trace_count"] = len(matching)
+            response["sample_traces"] = (matching or traces)[:10]
+            response["summary"] = {
+                "run_type": runs[0].get("run_type"),
+                "field": field,
+                "field_found": bool(matching),
+                "formula": (matching[-1].get("formula") if matching else None),
+                "result": (matching[-1].get("result") if matching else None),
+                "source": (matching[-1].get("source") if matching else None),
+                "rule_id": (matching[-1].get("rule_id") if matching else None),
+            }
+    return response
+
+
+def _as_number(value):
+    try:
+        if value is None or value == "":
+            return None
+        return round(float(value), 4)
+    except (TypeError, ValueError):
+        return None
+
+
+def _audit_metadata(extra: dict = None) -> dict:
+    """Attach the current whole-ruleset version to every audit run."""
+    metadata = dict(extra or {})
+    ruleset = get_ruleset_version()
+    if ruleset:
+        metadata.update({
+            "ruleset_version": ruleset.get("version"),
+            "ruleset_rule_count": ruleset.get("rule_count"),
+            "ruleset_active_count": ruleset.get("active_count"),
+            "ruleset_created_at": ruleset.get("created_at"),
+        })
+    return metadata
+
+
+def _current_ruleset_version() -> int | None:
+    ruleset = get_ruleset_version()
+    return ruleset.get("version") if ruleset else None
+
+
+def _ensure_audit_ruleset_current(run: dict | None, *, label: str) -> None:
+    current_version = _current_ruleset_version()
+    run_version = (run.get("metadata") or {}).get("ruleset_version") if run else None
+    if current_version is not None and run_version is not None and int(run_version) != int(current_version):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{label} audit was created under ruleset v{run_version}; current ruleset is v{current_version}. Regenerate first.",
+        )
+
+
+def _fingerprint_payload(payload) -> str:
+    raw = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _job_source_snapshot(job: dict) -> dict:
+    return {
+        "project_name": job.get("project_name"),
+        "gc_name": job.get("gc_name"),
+        "address": job.get("address"),
+        "city": job.get("city"),
+        "state": job.get("state"),
+        "zip": job.get("zip"),
+        "tax_rate": job.get("tax_rate", 0),
+        "gpm_pct": job.get("gpm_pct", 0),
+        "markup_pct": job.get("markup_pct", 0),
+        "unit_count": job.get("unit_count", 0),
+        "tub_shower_count": job.get("tub_shower_count", 0),
+        "salesperson": job.get("salesperson"),
+        "exclusions": job.get("exclusions"),
+        "textura_fee": job.get("textura_fee", 0),
+    }
+
+
+def _line_snapshot(items: list[dict], fields: tuple[str, ...]) -> list[dict]:
+    rows = []
+    for item in items or []:
+        if isinstance(item, dict):
+            rows.append({field: item.get(field) for field in fields})
+    return rows
+
+
+def _bid_source_fingerprint(job: dict) -> str:
+    return _fingerprint_payload({
+        "job": _job_source_snapshot(job),
+        "materials": _line_snapshot(job.get("materials", []), (
+            "id", "item_code", "description", "material_type", "installed_qty",
+            "unit", "waste_pct", "order_qty", "unit_price", "extended_cost",
+            "freight_per_unit", "freight_source", "fixture_count", "labor_rate_lf",
+            "labor_catalog", "tack_strip_lf", "seam_tape_lf", "pad_sy", "area_type",
+            "is_mosaic", "is_penny_hex", "crack_isolation_sf", "weld_rod_lf",
+        )),
+        "sundries": _line_snapshot(job.get("sundries", []), (
+            "id", "material_id", "sundry_name", "qty", "unit", "unit_price",
+            "extended_cost", "freight_cost",
+        )),
+        "labor": _line_snapshot(job.get("labor", []), (
+            "id", "material_id", "labor_description", "qty", "unit", "rate", "extended_cost",
+        )),
+        "ruleset_version": _current_ruleset_version(),
+    })
+
+
+def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -> str:
+    proposal_data = proposal_data if isinstance(proposal_data, dict) else (job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {})
+    return _fingerprint_payload({
+        "job": _job_source_snapshot(job),
+        "materials": _line_snapshot(job.get("materials", []), (
+            "id", "item_code", "description", "material_type", "installed_qty",
+            "unit", "waste_pct", "order_qty", "unit_price", "extended_cost",
+            "freight_per_unit", "freight_source", "fixture_count", "labor_rate_lf",
+            "labor_catalog", "tack_strip_lf", "seam_tape_lf", "pad_sy", "area_type",
+            "is_mosaic", "is_penny_hex", "crack_isolation_sf", "weld_rod_lf",
+        )),
+        "proposal": {
+            "bundles": proposal_data.get("bundles", []),
+            "notes": proposal_data.get("notes", []),
+            "terms": proposal_data.get("terms", []),
+            "exclusions": proposal_data.get("exclusions", []),
+            "tax_rate": proposal_data.get("tax_rate", 0),
+            "gpm_pct": proposal_data.get("gpm_pct", 0),
+            "textura_fee": proposal_data.get("textura_fee", 0),
+            "subtotal": proposal_data.get("subtotal", 0),
+            "tax_amount": proposal_data.get("tax_amount", 0),
+            "grand_total": proposal_data.get("grand_total", 0),
+            "gpm_profit": proposal_data.get("gpm_profit", 0),
+            "gpm_labor": proposal_data.get("gpm_labor", 0),
+            "gpm_material": proposal_data.get("gpm_material", 0),
+            "textura_amount": proposal_data.get("textura_amount", 0),
+            "deleted_bundles": proposal_data.get("deleted_bundles", []),
+            "deleted_material_codes": proposal_data.get("deleted_material_codes", []),
+        },
+        "ruleset_version": _current_ruleset_version(),
+    })
+
+
+def _latest_completed_run(job_id: int, run_types: set[str]) -> dict | None:
+    runs = list_calculation_runs(job_id, limit=50)
+    for run in runs:
+        if run.get("status") == "completed" and run.get("run_type") in run_types:
+            return run
+    return None
+
+
+def _required_job_field_gaps(job: dict) -> list[str]:
+    missing = []
+    for field in ("project_name", "gc_name", "salesperson"):
+        if not str(job.get(field) or "").strip():
+            missing.append(field)
+    return missing
+
+
+def _validate_bid_job_ready(job: dict) -> None:
+    """Block bid/PDF generation when the bid cannot be trusted."""
+    missing = _required_job_field_gaps(job)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot generate bid PDF until required job fields are filled: {', '.join(missing)}.",
+        )
+
+    materials = [m for m in (job.get("materials") or []) if isinstance(m, dict)]
+    if not materials:
+        raise HTTPException(status_code=400, detail="Cannot generate bid PDF until materials are loaded.")
+
+    unpriced = [
+        m.get("item_code") or m.get("description") or f"material {index + 1}"
+        for index, m in enumerate(materials)
+        if _as_number(m.get("unit_price")) is None or _as_number(m.get("unit_price")) <= 0
+    ]
+    if unpriced:
+        sample = ", ".join(str(item) for item in unpriced[:5])
+        suffix = "..." if len(unpriced) > 5 else ""
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot generate bid PDF until all materials have prices. Missing: {sample}{suffix}",
+        )
+
+    unknown = [
+        m.get("item_code") or m.get("description") or f"material {index + 1}"
+        for index, m in enumerate(materials)
+        if not str(m.get("material_type") or "").strip() or str(m.get("material_type") or "").lower() == "unknown"
+    ]
+    if unknown:
+        sample = ", ".join(str(item) for item in unknown[:5])
+        suffix = "..." if len(unknown) > 5 else ""
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot generate bid PDF until unknown material types are classified. Unknown: {sample}{suffix}",
+        )
+
+
+def _validate_bid_pdf_download_ready(job: dict) -> None:
+    """Reject old bid PDFs after the job or bid audit has changed."""
+    _validate_bid_job_ready(job)
+    bid_data = job.get("bid_data")
+    if not isinstance(bid_data, dict) or not bid_data.get("pdf_audit_run_id"):
+        raise HTTPException(status_code=409, detail="Bid PDF is missing its audit receipt. Regenerate the bid.")
+    latest = _latest_completed_run(job["id"], {"bid_pdf_generation"})
+    if not latest or int(latest["id"]) != int(bid_data.get("pdf_audit_run_id")):
+        raise HTTPException(status_code=409, detail="Bid PDF is stale. Regenerate the bid before downloading.")
+    _ensure_audit_ruleset_current(latest, label="Bid PDF")
+    if bid_data.get("pdf_source_fingerprint") != _bid_source_fingerprint(job):
+        raise HTTPException(status_code=409, detail="Bid PDF is stale because the job source changed. Regenerate the bid before downloading.")
+    traces = get_calculation_traces(job["id"], run_id=latest["id"], entity_type="bid", entity_key="bid", limit=200)
+    by_field = {trace.get("output_field"): trace for trace in traces}
+    totals = bid_data.get("pdf_totals") or {}
+    for field in ("subtotal", "tax_amount", "grand_total", "total_cost", "gpm_profit", "markup_amount"):
+        _trace_result_matches(by_field.get(field), totals.get(field), label=f"bid {field}")
+
+
+def _record_bid_audit(job_id: int, bid_data: dict) -> dict:
+    """Persist audit rows for every displayed bid total."""
+    trace = AuditTraceBuilder(job_id, default_source="bid_assembler")
+
+    def _money(value) -> float:
+        try:
+            return round(float(value or 0), 2)
+        except (TypeError, ValueError):
+            return 0.0
+
+    bundles = [b for b in (bid_data.get("bundles") or []) if isinstance(b, dict)]
+    bundle_components = []
+    for index, bundle in enumerate(bundles):
+        bundle_name = bundle.get("bundle_name") or f"bundle:{index}"
+        component = {
+            "bundle_name": bundle_name,
+            "material_cost": _money(bundle.get("material_cost")),
+            "sundry_cost": _money(bundle.get("sundry_cost")),
+            "labor_cost": _money(bundle.get("labor_cost")),
+            "freight_cost": _money(bundle.get("freight_cost")),
+            "gpm_labor_adder": _money(bundle.get("gpm_labor_adder")),
+            "gpm_material_adder": _money(bundle.get("gpm_material_adder")),
+            "gpm_adder": _money(bundle.get("gpm_adder")),
+            "total_price": _money(bundle.get("total_price")),
+        }
+        bundle_components.append(component)
+        for field, value in component.items():
+            if field == "bundle_name":
+                continue
+            inputs = {"bundle_name": bundle_name, "bundle_index": index}
+            if field == "material_cost":
+                inputs.update({
+                    "order_qty": _money(bundle.get("order_qty")),
+                    "unit_price": _money(bundle.get("unit_price")),
+                    "waste_pct": bundle.get("waste_pct"),
+                })
+                formula = "order_qty * unit_price"
+            elif field == "freight_cost":
+                inputs.update({
+                    "order_qty": _money(bundle.get("order_qty")),
+                    "freight_rate": _money(bundle.get("freight_rate")),
+                })
+                formula = "order_qty * freight_rate"
+            elif field == "total_price":
+                inputs.update({
+                    "material_cost": component["material_cost"],
+                    "sundry_cost": component["sundry_cost"],
+                    "labor_cost": component["labor_cost"],
+                    "freight_cost": component["freight_cost"],
+                    "gpm_adder": component["gpm_adder"],
+                })
+                formula = "material_cost + sundry_cost + labor_cost + freight_cost + gpm_adder"
+            elif field == "gpm_adder":
+                inputs.update({
+                    "gpm_labor_adder": component["gpm_labor_adder"],
+                    "gpm_material_adder": component["gpm_material_adder"],
+                })
+                formula = "gpm_labor_adder + gpm_material_adder"
+            else:
+                inputs[field] = value
+                formula = f"bundle.{field}"
+            trace.record(
+                entity_type="bid_bundle",
+                entity_key=bundle_name,
+                output_field=field,
+                formula=formula,
+                inputs=inputs,
+                result=value,
+                rule_id=f"bid_assembler:bundle:{field}",
+                source="bid_assembler",
+            )
+
+    def _bundle_values(field: str) -> list[dict]:
+        return [{"bundle_name": b["bundle_name"], "value": b.get(field, 0)} for b in bundle_components]
+
+    total_material = _money(sum(b.get("material_cost", 0) for b in bundle_components))
+    total_sundry = _money(sum(b.get("sundry_cost", 0) for b in bundle_components))
+    total_labor = _money(sum(b.get("labor_cost", 0) for b in bundle_components))
+    total_freight = _money(sum(b.get("freight_cost", 0) for b in bundle_components))
+    total_gpm_labor = _money(sum(b.get("gpm_labor_adder", 0) for b in bundle_components))
+    total_gpm_material = _money(sum(b.get("gpm_material_adder", 0) for b in bundle_components))
+    subtotal = _money(bid_data.get("subtotal"))
+    markup_amount = _money(bid_data.get("markup_amount"))
+    tax_amount = _money(bid_data.get("tax_amount"))
+    grand_total = _money(bid_data.get("grand_total"))
+
+    proposal_specs = [
+        ("material_cost", "sum(bundle.material_cost)", total_material, {"bundles": _bundle_values("material_cost")}),
+        ("sundry_cost", "sum(bundle.sundry_cost)", total_sundry, {"bundles": _bundle_values("sundry_cost")}),
+        ("labor_cost", "sum(bundle.labor_cost)", total_labor, {"bundles": _bundle_values("labor_cost")}),
+        ("freight_cost", "sum(bundle.freight_cost)", total_freight, {"bundles": _bundle_values("freight_cost")}),
+        ("total_cost", "sum(bundle.total_price before profit)", _money(bid_data.get("total_cost")), {
+            "material_cost": total_material,
+            "sundry_cost": total_sundry,
+            "labor_cost": total_labor,
+            "freight_cost": total_freight,
+        }),
+        ("gpm_profit", "total_cost / (1 - gpm_pct) - total_cost", _money(bid_data.get("gpm_profit")), {
+            "total_cost": _money(bid_data.get("total_cost")),
+            "gpm_pct": bid_data.get("gpm_pct", 0),
+        }),
+        ("gpm_labor", "sum(bundle.gpm_labor_adder)", total_gpm_labor, {"bundles": _bundle_values("gpm_labor_adder")}),
+        ("gpm_material", "sum(bundle.gpm_material_adder)", total_gpm_material, {"bundles": _bundle_values("gpm_material_adder")}),
+        ("subtotal", "sum(bundle.total_price)", subtotal, {"bundles": _bundle_values("total_price")}),
+        ("markup_amount", "subtotal * markup_pct", markup_amount, {
+            "subtotal": subtotal,
+            "markup_pct": bid_data.get("markup_pct", 0),
+        }),
+        ("tax_amount", "taxable * tax_rate", tax_amount, {
+            "tax_rate": bid_data.get("tax_rate", 0),
+            "taxable_components": ["material_cost", "sundry_cost", "freight_cost", "gpm_material_adder"],
+            "markup_amount": markup_amount,
+        }),
+        ("grand_total", "subtotal + markup_amount + tax_amount", grand_total, {
+            "subtotal": subtotal,
+            "markup_amount": markup_amount,
+            "tax_amount": tax_amount,
+        }),
+    ]
+    for field, formula, result, inputs in proposal_specs:
+        trace.record(
+            entity_type="bid",
+            entity_id=job_id,
+            entity_key="bid",
+            output_field=field,
+            formula=formula,
+            inputs=inputs,
+            result=result,
+            rule_id=f"bid_assembler:{field}",
+            source="bid_assembler",
+        )
+
+    run_id = create_calculation_run(
+        job_id,
+        "bid_pdf_generation",
+        source="system",
+        metadata=_audit_metadata({"endpoint": "generate-bid"}),
+    )
+    for record in trace._records:
+        record["run_id"] = run_id
+    trace_count = save_calculation_traces(job_id, run_id, trace.records)
+    complete_calculation_run(run_id, summary=trace.summary())
+    run = list_calculation_runs(job_id, limit=1)[0]
+    return {"run": run, "trace_count": trace_count}
+
+
+def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) -> dict:
+    """Persist a complete audit receipt for the currently displayed proposal."""
+    previous = previous or {}
+    current = current or {}
+    trace = AuditTraceBuilder(job_id, default_source="proposal_editor")
+
+    def _money(value) -> float:
+        try:
+            return round(float(value or 0), 2)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _bundle_freight(bundle: dict) -> float:
+        return _money(bundle.get("freight_override") if bundle.get("freight_override") is not None else bundle.get("freight_cost"))
+
+    bundles = [b for b in (current.get("bundles") or []) if isinstance(b, dict)]
+    bundle_components = []
+    for index, bundle in enumerate(bundles):
+        bundle_components.append({
+            "bundle_name": bundle.get("bundle_name") or f"bundle:{index}",
+            "material_cost": _money(bundle.get("material_cost")),
+            "sundry_cost": _money(bundle.get("sundry_cost")),
+            "labor_cost": _money(bundle.get("labor_cost")),
+            "freight_cost": _bundle_freight(bundle),
+            "gpm_labor_adder": _money(bundle.get("gpm_labor_adder")),
+            "gpm_material_adder": _money(bundle.get("gpm_material_adder")),
+            "gpm_adder": _money(bundle.get("gpm_adder")),
+            "taxable": _money(bundle.get("taxable")),
+            "tax_amount": _money(bundle.get("tax_amount")),
+            "total_price": _money(bundle.get("price_override") if bundle.get("price_override") is not None else bundle.get("total_price")),
+            "price_override": bundle.get("price_override"),
+        })
+    totals = {
+        "material_cost": _money(sum(_money(b.get("material_cost")) for b in bundles)),
+        "sundry_cost": _money(sum(_money(b.get("sundry_cost")) for b in bundles)),
+        "labor_cost": _money(sum(_money(b.get("labor_cost")) for b in bundles)),
+        "freight_cost": _money(sum(_bundle_freight(b) for b in bundles)),
+        "gpm_profit": _money(current.get("gpm_profit")),
+        "gpm_labor": _money(current.get("gpm_labor")),
+        "gpm_material": _money(current.get("gpm_material")),
+        "subtotal": _money(current.get("subtotal")),
+        "tax_amount": _money(current.get("tax_amount")),
+        "textura_amount": _money(current.get("textura_amount")),
+        "grand_total": _money(current.get("grand_total")),
+    }
+    totals["total_cost"] = _money(
+        totals["material_cost"] + totals["sundry_cost"] + totals["labor_cost"] + totals["freight_cost"]
+    )
+
+    component_values = {
+        field: [{"bundle_name": b["bundle_name"], "value": b[field]} for b in bundle_components]
+        for field in ("material_cost", "sundry_cost", "labor_cost", "freight_cost", "tax_amount", "total_price")
+    }
+    proposal_trace_specs = [
+        ("material_cost", "sum(bundle.material_cost)", {"bundles": component_values["material_cost"]}),
+        ("sundry_cost", "sum(bundle.sundry_cost)", {"bundles": component_values["sundry_cost"]}),
+        ("labor_cost", "sum(bundle.labor_cost)", {"bundles": component_values["labor_cost"]}),
+        ("freight_cost", "sum(bundle.freight_override ?? bundle.freight_cost)", {"bundles": component_values["freight_cost"]}),
+        ("total_cost", "material_cost + sundry_cost + labor_cost + freight_cost", {
+            "material_cost": totals["material_cost"],
+            "sundry_cost": totals["sundry_cost"],
+            "labor_cost": totals["labor_cost"],
+            "freight_cost": totals["freight_cost"],
+        }),
+        ("gpm_profit", "total_cost / (1 - gpm_pct) - total_cost", {
+            "total_cost": totals["total_cost"],
+            "gpm_pct": current.get("gpm_pct", 0),
+        }),
+        ("gpm_labor", "gpm_profit * 0.9793", {"gpm_profit": totals["gpm_profit"], "split_pct": 0.9793}),
+        ("gpm_material", "gpm_profit - gpm_labor", {
+            "gpm_profit": totals["gpm_profit"],
+            "gpm_labor": totals["gpm_labor"],
+        }),
+        ("subtotal", "total_cost + gpm_profit", {
+            "total_cost": totals["total_cost"],
+            "gpm_profit": totals["gpm_profit"],
+        }),
+        ("tax_amount", "sum(bundle.tax_amount)", {
+            "tax_rate": current.get("tax_rate", 0),
+            "bundles": component_values["tax_amount"],
+        }),
+        ("textura_amount", "min((subtotal + tax_amount) * 0.0022, 5000) when enabled else 0", {
+            "textura_fee": current.get("textura_fee", 0),
+            "subtotal": totals["subtotal"],
+            "tax_amount": totals["tax_amount"],
+            "cap": 5000,
+            "rate": 0.0022,
+        }),
+        ("grand_total", "subtotal + tax_amount + textura_amount", {
+            "subtotal": totals["subtotal"],
+            "tax_amount": totals["tax_amount"],
+            "textura_amount": totals["textura_amount"],
+        }),
+    ]
+
+    for field, formula, inputs in proposal_trace_specs:
+        trace.record(
+            entity_type="proposal",
+            entity_id=job_id,
+            entity_key="proposal",
+            output_field=field,
+            formula=formula,
+            inputs=inputs,
+            result=totals[field],
+            rule_id=f"proposal_editor:{field}",
+            source="proposal_editor",
+        )
+
+    for index, bundle in enumerate(bundles):
+        bundle_name = bundle.get("bundle_name") or f"bundle:{index}"
+        freight = _bundle_freight(bundle)
+        bundle_total = _money(bundle.get("price_override") if bundle.get("price_override") is not None else bundle.get("total_price"))
+        component = bundle_components[index] if index < len(bundle_components) else {}
+        bundle_values = {
+            "material_cost": _money(bundle.get("material_cost")),
+            "sundry_cost": _money(bundle.get("sundry_cost")),
+            "labor_cost": _money(bundle.get("labor_cost")),
+            "freight_cost": freight,
+            "gpm_labor_adder": _money(bundle.get("gpm_labor_adder")),
+            "gpm_material_adder": _money(bundle.get("gpm_material_adder")),
+            "gpm_adder": _money(bundle.get("gpm_adder")),
+            "taxable": _money(bundle.get("taxable")),
+            "tax_amount": _money(bundle.get("tax_amount")),
+            "total_price": bundle_total,
+        }
+        for field, value in bundle_values.items():
+            inputs = {"bundle_name": bundle_name, "bundle_index": index}
+            if field in ("gpm_adder", "total_price", "tax_amount"):
+                inputs.update({
+                    "material_cost": component.get("material_cost"),
+                    "sundry_cost": component.get("sundry_cost"),
+                    "labor_cost": component.get("labor_cost"),
+                    "freight_cost": component.get("freight_cost"),
+                    "gpm_labor_adder": component.get("gpm_labor_adder"),
+                    "gpm_material_adder": component.get("gpm_material_adder"),
+                    "gpm_adder": component.get("gpm_adder"),
+                    "taxable": component.get("taxable"),
+                    "tax_amount": component.get("tax_amount"),
+                    "price_override": component.get("price_override"),
+                })
+            elif field == "freight_cost":
+                inputs.update({
+                    "freight_cost": _money(bundle.get("freight_cost")),
+                    "freight_override": bundle.get("freight_override"),
+                })
+            else:
+                inputs[field] = value
+            trace.record(
+                entity_type="bundle",
+                entity_key=bundle_name,
+                output_field=field,
+                formula={
+                    "freight_cost": "freight_override if present else freight_cost",
+                    "total_price": "price_override if present else material_cost + sundry_cost + labor_cost + freight_cost + gpm_adder + tax_amount",
+                    "gpm_adder": "gpm_labor_adder + gpm_material_adder",
+                    "tax_amount": "taxable * tax_rate",
+                }.get(field, f"bundle.{field}"),
+                inputs=inputs,
+                result=value,
+                rule_id=f"proposal_editor:bundle:{field}",
+                source="proposal_editor",
+            )
+
+        for material_index, material in enumerate(bundle.get("materials") or []):
+            if not isinstance(material, dict):
+                continue
+            order_qty = _money(material.get("order_qty") or material.get("installed_qty"))
+            unit_price = _money(material.get("unit_price"))
+            trace.record(
+                entity_type="material",
+                entity_id=material.get("id") or material.get("material_id"),
+                entity_key=material.get("item_code") or material.get("description"),
+                output_field="extended_cost",
+                formula="order_qty * unit_price",
+                inputs={
+                    "bundle_name": bundle_name,
+                    "bundle_index": index,
+                    "line_index": material_index,
+                    "order_qty": order_qty,
+                    "unit_price": unit_price,
+                },
+                result=_money(material.get("extended_cost")),
+                rule_id=f"proposal_editor:material:{material.get('material_type', '')}:extended_cost",
+                source=material.get("price_source") or "proposal_editor",
+            )
+
+        for sundry_index, sundry in enumerate(bundle.get("sundry_items") or []):
+            if not isinstance(sundry, dict):
+                continue
+            qty = _money(sundry.get("qty"))
+            unit_price = _money(sundry.get("unit_price"))
+            material_id = sundry.get("material_id")
+            sundry_name = sundry.get("sundry_name") or "sundry"
+            trace.record(
+                entity_type="sundry",
+                entity_id=material_id,
+                entity_key=f"{material_id}:{sundry_name}",
+                output_field="extended_cost",
+                formula="qty * unit_price",
+                inputs={
+                    "bundle_name": bundle_name,
+                    "bundle_index": index,
+                    "line_index": sundry_index,
+                    "qty": qty,
+                    "unit_price": unit_price,
+                    "unit": sundry.get("unit"),
+                },
+                result=_money(sundry.get("extended_cost")),
+                rule_id=f"proposal_editor:sundry:{sundry_name}",
+                source="proposal_editor",
+            )
+
+        for labor_index, labor in enumerate(bundle.get("labor_items") or []):
+            if not isinstance(labor, dict):
+                continue
+            qty = _money(labor.get("qty"))
+            rate = _money(labor.get("rate"))
+            material_id = labor.get("material_id")
+            labor_description = labor.get("labor_description") or "labor"
+            trace.record(
+                entity_type="labor",
+                entity_id=material_id,
+                entity_key=f"{material_id}:{labor_description}",
+                output_field="extended_cost",
+                formula="qty * rate",
+                inputs={
+                    "bundle_name": bundle_name,
+                    "bundle_index": index,
+                    "line_index": labor_index,
+                    "qty": qty,
+                    "rate": rate,
+                    "unit": labor.get("unit"),
+                },
+                result=_money(labor.get("extended_cost")),
+                rule_id=f"proposal_editor:labor:{labor.get('unit', '')}",
+                source="proposal_editor",
+            )
+
+    manual_trace_count = 0
+    proposal_fields = [
+        "tax_rate", "gpm_pct", "textura_fee", "subtotal", "tax_amount",
+        "grand_total", "gpm_profit", "gpm_labor", "gpm_material", "textura_amount",
+    ]
+    for field in proposal_fields:
+        old = _as_number(previous.get(field))
+        new = _as_number(current.get(field))
+        if old != new:
+            trace.manual_override(
+                entity_type="proposal",
+                entity_id=job_id,
+                entity_key="proposal",
+                output_field=field,
+                prior_value=previous.get(field),
+                value=current.get(field),
+                note="Proposal editor save changed a proposal-level numeric field.",
+            )
+            manual_trace_count += 1
+
+    bundle_fields = [
+        "material_cost", "sundry_cost", "labor_cost", "freight_cost",
+        "gpm_labor_adder", "gpm_material_adder", "gpm_adder",
+        "taxable", "tax_amount", "total_price", "price_override",
+    ]
+    previous_bundles = previous.get("bundles") or []
+    previous_by_name = {
+        b.get("bundle_name"): b for b in previous_bundles
+        if isinstance(b, dict) and b.get("bundle_name")
+    }
+    for index, bundle in enumerate(current.get("bundles") or []):
+        if not isinstance(bundle, dict):
+            continue
+        bundle_name = bundle.get("bundle_name") or f"bundle:{index}"
+        prior = previous_by_name.get(bundle.get("bundle_name"))
+        if prior is None and index < len(previous_bundles):
+            prior = previous_bundles[index] if isinstance(previous_bundles[index], dict) else {}
+        prior = prior or {}
+        for field in bundle_fields:
+            old = _as_number(prior.get(field))
+            new = _as_number(bundle.get(field))
+            if old != new:
+                trace.manual_override(
+                    entity_type="bundle",
+                    entity_key=bundle_name,
+                    output_field=field,
+                    prior_value=prior.get(field),
+                    value=bundle.get(field),
+                    note="Proposal editor save changed a bundle numeric field.",
+                )
+                manual_trace_count += 1
+
+    if not trace.records:
+        return {"trace_count": 0, "manual_trace_count": 0, "audit_trace": None}
+
+    run_id = create_calculation_run(
+        job_id,
+        "proposal_editor_save",
+        source="user",
+        metadata=_audit_metadata({"endpoint": "proposal/bundles/save"}),
+    )
+    for record in trace._records:
+        record["run_id"] = run_id
+    trace_count = save_calculation_traces(job_id, run_id, trace.records)
+    complete_calculation_run(run_id, summary=trace.summary())
+    run = list_calculation_runs(job_id, limit=1)[0]
+    return {
+        "trace_count": trace_count,
+        "manual_trace_count": manual_trace_count,
+        "audit_trace": {"run": run, "traces": get_calculation_traces(job_id, run_id=run_id, limit=2000), "events": trace.records, "audit": trace.summary()},
+    }
+
+
+def _append_proposal_totals_snapshot(trace: AuditTraceBuilder, job_id: int, proposal: dict) -> None:
+    """Append final editor-style proposal totals to a generation audit run."""
+    if not trace or not isinstance(proposal, dict):
+        return
+
+    def _money(value) -> float:
+        try:
+            return round(float(value or 0), 2)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _float(value) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _freight(bundle: dict) -> float:
+        return _money(bundle.get("freight_override") if bundle.get("freight_override") is not None else bundle.get("freight_cost"))
+
+    bundles = [b for b in (proposal.get("bundles") or []) if isinstance(b, dict)]
+    tax_rate = _float(proposal.get("tax_rate"))
+    gpm_pct = _float(proposal.get("gpm_pct"))
+
+    material_total = _money(sum(_money(b.get("material_cost")) for b in bundles))
+    sundry_total = _money(sum(_money(b.get("sundry_cost")) for b in bundles))
+    labor_total = _money(sum(_money(b.get("labor_cost")) for b in bundles))
+    freight_total = _money(sum(_freight(b) for b in bundles))
+    total_cost = _money(material_total + sundry_total + labor_total + freight_total)
+
+    if 0 < gpm_pct < 1 and total_cost > 0:
+        gpm_profit = _money(total_cost / (1 - gpm_pct) - total_cost)
+        gpm_labor = _money(gpm_profit * 0.9793)
+        gpm_material = _money(gpm_profit - gpm_labor)
+    else:
+        gpm_profit = gpm_labor = gpm_material = 0.0
+
+    bundle_rows = []
+    for index, bundle in enumerate(bundles):
+        bundle_name = bundle.get("bundle_name") or f"bundle:{index}"
+        freight = _freight(bundle)
+        bundle_cost = _money(
+            _money(bundle.get("material_cost"))
+            + _money(bundle.get("sundry_cost"))
+            + _money(bundle.get("labor_cost"))
+            + freight
+        )
+        share = bundle_cost / total_cost if total_cost > 0 else 0
+        bundle["gpm_labor_adder"] = _money(gpm_labor * share) if gpm_profit else 0.0
+        bundle["gpm_material_adder"] = _money(gpm_material * share) if gpm_profit else 0.0
+        bundle["gpm_adder"] = _money(bundle["gpm_labor_adder"] + bundle["gpm_material_adder"])
+        bundle["taxable"] = _money(_money(bundle.get("material_cost")) + _money(bundle.get("sundry_cost")) + freight + bundle["gpm_material_adder"])
+        bundle["tax_amount"] = _money(bundle["taxable"] * tax_rate)
+        computed_total = _money(bundle_cost + bundle["gpm_adder"] + bundle["tax_amount"])
+        display_total = _money(bundle.get("price_override") if bundle.get("price_override") is not None else computed_total)
+        if bundle.get("price_override") is None:
+            bundle["total_price"] = display_total
+        row = {
+            "bundle_name": bundle_name,
+            "bundle_index": index,
+            "material_cost": _money(bundle.get("material_cost")),
+            "sundry_cost": _money(bundle.get("sundry_cost")),
+            "labor_cost": _money(bundle.get("labor_cost")),
+            "freight_cost": freight,
+            "gpm_labor_adder": bundle["gpm_labor_adder"],
+            "gpm_material_adder": bundle["gpm_material_adder"],
+            "gpm_adder": bundle["gpm_adder"],
+            "taxable": bundle["taxable"],
+            "tax_amount": bundle["tax_amount"],
+            "total_price": display_total,
+            "price_override": bundle.get("price_override"),
+        }
+        bundle_rows.append(row)
+
+    tax_amount = _money(sum(row["tax_amount"] for row in bundle_rows))
+    subtotal = _money(total_cost + gpm_profit)
+    textura_enabled = int(proposal.get("textura_fee") or 0)
+    textura_amount = _money(min(round((subtotal + tax_amount) * 0.0022, 2), 5000.0) if textura_enabled else 0)
+    grand_total = _money(subtotal + tax_amount + textura_amount)
+    proposal.update({
+        "gpm_profit": gpm_profit,
+        "gpm_labor": gpm_labor,
+        "gpm_material": gpm_material,
+        "subtotal": subtotal,
+        "tax_amount": tax_amount,
+        "textura_amount": textura_amount,
+        "grand_total": grand_total,
+    })
+
+    def _bundle_values(field: str) -> list[dict]:
+        return [{"bundle_name": row["bundle_name"], "value": row[field]} for row in bundle_rows]
+
+    proposal_specs = [
+        ("material_cost", "sum(bundle.material_cost)", {"bundles": _bundle_values("material_cost")}, material_total),
+        ("sundry_cost", "sum(bundle.sundry_cost)", {"bundles": _bundle_values("sundry_cost")}, sundry_total),
+        ("labor_cost", "sum(bundle.labor_cost)", {"bundles": _bundle_values("labor_cost")}, labor_total),
+        ("freight_cost", "sum(bundle.freight_override ?? bundle.freight_cost)", {"bundles": _bundle_values("freight_cost")}, freight_total),
+        ("total_cost", "material_cost + sundry_cost + labor_cost + freight_cost", {
+            "material_cost": material_total,
+            "sundry_cost": sundry_total,
+            "labor_cost": labor_total,
+            "freight_cost": freight_total,
+        }, total_cost),
+        ("gpm_profit", "total_cost / (1 - gpm_pct) - total_cost", {"total_cost": total_cost, "gpm_pct": gpm_pct}, gpm_profit),
+        ("gpm_labor", "gpm_profit * 0.9793", {"gpm_profit": gpm_profit, "split_pct": 0.9793}, gpm_labor),
+        ("gpm_material", "gpm_profit - gpm_labor", {"gpm_profit": gpm_profit, "gpm_labor": gpm_labor}, gpm_material),
+        ("subtotal", "total_cost + gpm_profit", {"total_cost": total_cost, "gpm_profit": gpm_profit}, subtotal),
+        ("tax_amount", "sum(bundle.tax_amount)", {"tax_rate": tax_rate, "bundles": _bundle_values("tax_amount")}, tax_amount),
+        ("textura_amount", "min((subtotal + tax_amount) * 0.0022, 5000) when enabled else 0", {
+            "textura_fee": textura_enabled,
+            "subtotal": subtotal,
+            "tax_amount": tax_amount,
+            "rate": 0.0022,
+            "cap": 5000,
+        }, textura_amount),
+        ("grand_total", "subtotal + tax_amount + textura_amount", {
+            "subtotal": subtotal,
+            "tax_amount": tax_amount,
+            "textura_amount": textura_amount,
+        }, grand_total),
+    ]
+    for field, formula, inputs, result in proposal_specs:
+        trace.record(
+            entity_type="proposal",
+            entity_id=job_id,
+            entity_key="proposal",
+            output_field=field,
+            formula=formula,
+            inputs=inputs,
+            result=result,
+            rule_id=f"proposal_generation:{field}",
+            source="proposal_generation",
+        )
+
+    for row in bundle_rows:
+        for field in (
+            "material_cost", "sundry_cost", "labor_cost", "freight_cost",
+            "gpm_labor_adder", "gpm_material_adder", "gpm_adder",
+            "taxable", "tax_amount", "total_price",
+        ):
+            inputs = {"bundle_name": row["bundle_name"], "bundle_index": row["bundle_index"]}
+            if field in ("gpm_adder", "tax_amount", "total_price"):
+                inputs.update(row)
+            elif field == "freight_cost":
+                inputs.update({"freight_cost": row["freight_cost"], "price_override": row.get("price_override")})
+            else:
+                inputs[field] = row[field]
+            trace.record(
+                entity_type="bundle",
+                entity_key=row["bundle_name"],
+                output_field=field,
+                formula={
+                    "freight_cost": "freight_override if present else freight_cost",
+                    "gpm_adder": "gpm_labor_adder + gpm_material_adder",
+                    "tax_amount": "taxable * tax_rate",
+                    "total_price": "price_override if present else material_cost + sundry_cost + labor_cost + freight_cost + gpm_adder + tax_amount",
+                }.get(field, f"bundle.{field}"),
+                inputs=inputs,
+                result=row[field],
+                rule_id=f"proposal_generation:bundle:{field}",
+                source="proposal_generation",
+            )
+
+
 @app.put("/api/jobs/{job_id}/proposal/bundles")
 @app.post("/api/jobs/{job_id}/proposal/bundles/save")
 async def api_save_proposal_bundles(job_id: str, request: Request):
@@ -2115,6 +3459,7 @@ async def api_save_proposal_bundles(job_id: str, request: Request):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     body = await request.json()
+    previous_proposal_data = job.get("proposal_data") or {}
     proposal_data = {
         "bundles": body.get("bundles", []),
         "notes": body.get("notes", []),
@@ -2132,10 +3477,285 @@ async def api_save_proposal_bundles(job_id: str, request: Request):
         "textura_amount": body.get("textura_amount", 0),
         "deleted_bundles": body.get("deleted_bundles", []),
         "deleted_material_codes": body.get("deleted_material_codes", []),
+        "audit": body.get("audit", {}),
     }
+    audit_result = _record_proposal_editor_audit(job["id"], previous_proposal_data, proposal_data)
+    if audit_result.get("audit_trace"):
+        proposal_data["audit"] = {
+            "run_id": audit_result["audit_trace"]["run"]["id"],
+            "trace_count": audit_result["trace_count"],
+            "summary": audit_result["audit_trace"].get("audit", {}),
+        }
     job["proposal_data"] = proposal_data
     save_job(job)
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "manual_trace_count": audit_result.get("manual_trace_count", 0),
+        "trace_count": audit_result.get("trace_count", 0),
+        "audit_trace": audit_result.get("audit_trace"),
+        "audit": audit_result.get("audit_trace"),
+    }
+
+
+def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
+    """Reject PDF generation when required header data or current audit is missing."""
+    missing = _required_job_field_gaps(job)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot generate PDF until required job fields are filled: {', '.join(missing)}.",
+        )
+
+    run = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
+    if not run:
+        raise HTTPException(status_code=409, detail="Cannot generate PDF until this proposal has a current audit trace. Save or regenerate first.")
+    _ensure_audit_ruleset_current(run, label="Proposal PDF")
+    _validate_proposal_body_matches_job_source(job, body)
+    traces = get_calculation_traces(job["id"], run_id=run["id"], limit=5000)
+    proposal_traces = [
+        trace for trace in traces
+        if trace.get("entity_type") == "proposal" and trace.get("entity_key") == "proposal"
+    ]
+    by_field = {}
+    for trace in proposal_traces:
+        by_field[trace.get("output_field")] = trace
+    required = ["subtotal", "tax_amount", "grand_total", "gpm_profit", "gpm_labor", "gpm_material", "textura_amount"]
+    missing_traces = [field for field in required if field not in by_field]
+    if missing_traces:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot generate PDF because audit is missing: {', '.join(missing_traces)}.",
+        )
+    for field in required:
+        body_value = _as_number(body.get(field))
+        trace_value = _as_number(by_field[field].get("result_value"))
+        if body_value is None:
+            body_value = 0
+        if trace_value is None:
+            trace_value = 0
+        if abs(body_value - trace_value) > 0.02:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot generate PDF because audit is stale for {field}. Save the proposal and try again.",
+            )
+    _validate_proposal_body_against_trace(body, traces)
+
+
+def _trace_result_matches(trace: dict | None, expected, *, label: str) -> None:
+    if not trace:
+        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because audit is missing for {label}.")
+    expected_value = _as_number(expected)
+    trace_value = _as_number(trace.get("result_value"))
+    if expected_value is None:
+        expected_value = 0
+    if trace_value is None:
+        trace_value = 0
+    if abs(expected_value - trace_value) > 0.02:
+        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because audit is stale for {label}.")
+
+
+def _find_trace(
+    traces: list[dict],
+    *,
+    entity_type: str,
+    output_field: str,
+    entity_key: str = None,
+    entity_id=None,
+    bundle_index: int = None,
+    line_index: int = None,
+) -> dict | None:
+    matches = [
+        trace for trace in traces
+        if trace.get("entity_type") == entity_type and trace.get("output_field") == output_field
+    ]
+    if entity_key is not None:
+        keyed = [trace for trace in matches if str(trace.get("entity_key") or "") == str(entity_key)]
+        if keyed:
+            matches = keyed
+    if entity_id is not None:
+        identified = [trace for trace in matches if str(trace.get("entity_id") or "") == str(entity_id)]
+        if identified:
+            matches = identified
+    if bundle_index is not None:
+        indexed = [trace for trace in matches if (trace.get("inputs") or {}).get("bundle_index") == bundle_index]
+        if indexed:
+            matches = indexed
+    if line_index is not None:
+        indexed = [trace for trace in matches if (trace.get("inputs") or {}).get("line_index") == line_index]
+        if indexed:
+            matches = indexed
+    return matches[-1] if matches else None
+
+
+def _validate_proposal_body_against_trace(body: dict, traces: list[dict]) -> None:
+    """Make sure every bundle/line number sent to the PDF has a matching trace."""
+    bundles = [b for b in (body.get("bundles") or []) if isinstance(b, dict)]
+    for bundle_index, bundle in enumerate(bundles):
+        bundle_name = bundle.get("bundle_name") or f"bundle:{bundle_index}"
+        bundle_fields = {
+            "material_cost": bundle.get("material_cost"),
+            "sundry_cost": bundle.get("sundry_cost"),
+            "labor_cost": bundle.get("labor_cost"),
+            "freight_cost": bundle.get("freight_override") if bundle.get("freight_override") is not None else bundle.get("freight_cost"),
+            "gpm_labor_adder": bundle.get("gpm_labor_adder"),
+            "gpm_material_adder": bundle.get("gpm_material_adder"),
+            "gpm_adder": bundle.get("gpm_adder"),
+            "taxable": bundle.get("taxable"),
+            "tax_amount": bundle.get("tax_amount"),
+            "total_price": bundle.get("price_override") if bundle.get("price_override") is not None else bundle.get("total_price"),
+        }
+        for field, expected in bundle_fields.items():
+            trace = _find_trace(
+                traces,
+                entity_type="bundle",
+                output_field=field,
+                entity_key=bundle_name,
+                bundle_index=bundle_index,
+            )
+            _trace_result_matches(trace, expected, label=f"{bundle_name} {field}")
+
+        for line_index, material in enumerate(bundle.get("materials") or []):
+            if not isinstance(material, dict):
+                continue
+            trace = _find_trace(
+                traces,
+                entity_type="material",
+                output_field="extended_cost",
+                entity_key=material.get("item_code") or material.get("description"),
+                entity_id=material.get("id") or material.get("material_id"),
+                bundle_index=bundle_index,
+                line_index=line_index,
+            )
+            _trace_result_matches(trace, material.get("extended_cost"), label=f"{bundle_name} material line {line_index + 1}")
+
+        for line_index, sundry in enumerate(bundle.get("sundry_items") or []):
+            if not isinstance(sundry, dict):
+                continue
+            material_id = sundry.get("material_id")
+            sundry_name = sundry.get("sundry_name") or "sundry"
+            trace = _find_trace(
+                traces,
+                entity_type="sundry",
+                output_field="extended_cost",
+                entity_key=f"{material_id}:{sundry_name}",
+                entity_id=material_id,
+                bundle_index=bundle_index,
+                line_index=line_index,
+            )
+            _trace_result_matches(trace, sundry.get("extended_cost"), label=f"{bundle_name} sundry line {line_index + 1}")
+
+        for line_index, labor in enumerate(bundle.get("labor_items") or []):
+            if not isinstance(labor, dict):
+                continue
+            material_id = labor.get("material_id")
+            labor_description = labor.get("labor_description") or "labor"
+            trace = _find_trace(
+                traces,
+                entity_type="labor",
+                output_field="extended_cost",
+                entity_key=f"{material_id}:{labor_description}",
+                entity_id=material_id,
+                bundle_index=bundle_index,
+                line_index=line_index,
+            )
+            _trace_result_matches(trace, labor.get("extended_cost"), label=f"{bundle_name} labor line {line_index + 1}")
+
+
+def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
+    """Reject stale proposal bodies after material source edits."""
+    deleted_codes = {str(code) for code in (body.get("deleted_material_codes") or []) if code}
+    current_by_id = {}
+    current_by_code = {}
+    for material in job.get("materials", []) or []:
+        if not isinstance(material, dict):
+            continue
+        if material.get("id") is not None:
+            current_by_id[str(material.get("id"))] = material
+        if material.get("item_code"):
+            current_by_code[str(material.get("item_code"))] = material
+
+    seen = set()
+    compare_fields = (
+        "material_type", "installed_qty", "waste_pct", "order_qty",
+        "unit_price", "extended_cost", "freight_per_unit",
+        "fixture_count", "labor_rate_lf", "tack_strip_lf", "seam_tape_lf",
+        "pad_sy", "crack_isolation_sf", "weld_rod_lf",
+    )
+
+    for bundle in body.get("bundles") or []:
+        if not isinstance(bundle, dict):
+            continue
+        for material in bundle.get("materials") or []:
+            if not isinstance(material, dict):
+                continue
+            item_code = str(material.get("item_code") or "")
+            current = None
+            if material.get("id") is not None:
+                current = current_by_id.get(str(material.get("id")))
+            if current is None and material.get("material_id") is not None:
+                current = current_by_id.get(str(material.get("material_id")))
+            if current is None and item_code:
+                current = current_by_code.get(item_code)
+            if current is None:
+                raise HTTPException(status_code=409, detail=f"Cannot generate PDF because proposal material {item_code or 'line'} no longer exists. Regenerate the proposal.")
+
+            seen.add(str(current.get("id")))
+            label = item_code or current.get("description") or f"material {current.get('id')}"
+            for field in compare_fields:
+                current_value = current.get(field)
+                body_value = material.get(field)
+                current_number = _as_number(current_value)
+                body_number = _as_number(body_value)
+                if current_number is not None or body_number is not None:
+                    if abs((current_number or 0) - (body_number or 0)) > 0.02:
+                        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because proposal material {label} is stale for {field}. Regenerate the proposal.")
+                elif str(current_value or "") != str(body_value or ""):
+                    raise HTTPException(status_code=409, detail=f"Cannot generate PDF because proposal material {label} is stale for {field}. Regenerate the proposal.")
+
+    missing = []
+    for material in job.get("materials", []) or []:
+        if not isinstance(material, dict):
+            continue
+        item_code = str(material.get("item_code") or "")
+        if item_code in deleted_codes:
+            continue
+        material_id = str(material.get("id"))
+        if material_id and material_id not in seen:
+            missing.append(item_code or material.get("description") or material_id)
+    if missing:
+        sample = ", ".join(str(item) for item in missing[:5])
+        suffix = "..." if len(missing) > 5 else ""
+        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because proposal is missing current materials: {sample}{suffix}. Regenerate the proposal.")
+
+
+def _validate_proposal_pdf_download_ready(job: dict) -> None:
+    """Reject old proposal PDFs after the proposal audit or required job fields change."""
+    missing = _required_job_field_gaps(job)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot download proposal PDF until required job fields are filled: {', '.join(missing)}.",
+        )
+    proposal_data = job.get("proposal_data")
+    if not isinstance(proposal_data, dict) or not proposal_data.get("pdf_audit_run_id"):
+        raise HTTPException(status_code=409, detail="Proposal PDF is missing its audit receipt. Regenerate the proposal PDF.")
+    latest = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
+    if not latest or int(latest["id"]) != int(proposal_data.get("pdf_audit_run_id")):
+        raise HTTPException(status_code=409, detail="Proposal PDF is stale. Regenerate the proposal PDF before downloading.")
+    _ensure_audit_ruleset_current(latest, label="Proposal PDF")
+    if proposal_data.get("pdf_source_fingerprint") != _proposal_source_fingerprint(job, proposal_data):
+        raise HTTPException(status_code=409, detail="Proposal PDF is stale because the job or proposal source changed. Regenerate the proposal PDF before downloading.")
+    traces = get_calculation_traces(
+        job["id"],
+        run_id=latest["id"],
+        entity_type="proposal",
+        entity_key="proposal",
+        limit=200,
+    )
+    by_field = {trace.get("output_field"): trace for trace in traces}
+    totals = proposal_data.get("pdf_totals") or {}
+    for field in ("subtotal", "tax_amount", "grand_total", "gpm_profit", "gpm_labor", "gpm_material", "textura_amount"):
+        _trace_result_matches(by_field.get(field), totals.get(field), label=f"proposal {field}")
 
 
 @app.post("/api/jobs/{job_id}/proposal/generate")
@@ -2149,6 +3769,7 @@ def api_generate_proposal(job_id: str):
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    trace = AuditTraceBuilder(job["id"])
 
     # ── Snapshot existing rewrites so Regenerate doesn't destroy them ──────
     # Key by the first material's item_code per bundle.
@@ -2197,6 +3818,28 @@ def api_generate_proposal(job_id: str):
         mat["waste_pct"] = new_waste
         mat["order_qty"] = round(installed_qty * (1 + new_waste), 2)
         mat["extended_cost"] = round(mat["order_qty"] * (mat.get("unit_price", 0) or 0), 2)
+        trace.record(
+            entity_type="material",
+            entity_id=mat.get("id"),
+            entity_key=mat.get("item_code"),
+            output_field="order_qty",
+            formula="installed_qty * (1 + waste_pct)",
+            inputs={"installed_qty": installed_qty, "waste_pct": new_waste, "old_waste_pct": old_waste},
+            result=mat["order_qty"],
+            rule_id=f"waste_factor:{mtype}",
+            source="waste_factors",
+        )
+        trace.record(
+            entity_type="material",
+            entity_id=mat.get("id"),
+            entity_key=mat.get("item_code"),
+            output_field="extended_cost",
+            formula="order_qty * unit_price",
+            inputs={"order_qty": mat["order_qty"], "unit_price": mat.get("unit_price", 0) or 0},
+            result=mat["extended_cost"],
+            rule_id=f"material:{mtype}:extended_cost",
+            source=mat.get("price_source") or "waste_factors",
+        )
         waste_touched = True
     if waste_touched:
         save_materials(job["id"], materials)
@@ -2210,14 +3853,14 @@ def api_generate_proposal(job_id: str):
             mat["tub_shower_total"] = tub_shower_count  # total tubs/showers on job
 
     if materials:
-        sundries = calculate_sundries_for_materials(materials)
+        sundries = calculate_sundries_for_materials(materials, trace=trace)
         save_sundries(job["id"], sundries)
-        labor_items = calculate_labor_for_materials(materials)
+        labor_items = calculate_labor_for_materials(materials, trace=trace)
         save_labor(job["id"], labor_items)
         # Reload job with freshly calculated sundries/labor
         job = load_job(job_id)
 
-    proposal = generate_proposal_data(job["id"], job)
+    proposal = generate_proposal_data(job["id"], job, trace=trace)
 
     # ── Re-apply snapshotted rewrites where item_codes match ───────────────
     for b in proposal.get("bundles", []):
@@ -2261,7 +3904,62 @@ def api_generate_proposal(job_id: str):
         proposal["grand_total"] = round(sub + tax + textura, 2)
         proposal["deleted_bundles"] = sorted(deleted_bundle_names)
         proposal["deleted_material_codes"] = sorted(deleted_material_codes)
+        trace.record(
+            entity_type="proposal",
+            entity_id=job["id"],
+            entity_key="proposal",
+            output_field="subtotal",
+            formula="sum(kept bundle.total_price)",
+            inputs={"kept_bundle_count": len(kept), "deleted_bundles": sorted(deleted_bundle_names)},
+            result=proposal["subtotal"],
+            rule_id="proposal:deleted_bundle_recalc",
+            source="proposal_bundler",
+        )
+        trace.record(
+            entity_type="proposal",
+            entity_id=job["id"],
+            entity_key="proposal",
+            output_field="tax_amount",
+            formula="taxable * tax_rate",
+            inputs={"taxable": proposal["taxable"], "tax_rate": tax_rate},
+            result=proposal["tax_amount"],
+            rule_id="proposal:deleted_bundle_recalc",
+            source="proposal_bundler",
+        )
+        trace.record(
+            entity_type="proposal",
+            entity_id=job["id"],
+            entity_key="proposal",
+            output_field="grand_total",
+            formula="subtotal + tax_amount + textura_amount",
+            inputs={
+                "subtotal": proposal["subtotal"],
+                "tax_amount": proposal["tax_amount"],
+                "textura_amount": textura,
+            },
+            result=proposal["grand_total"],
+            rule_id="proposal:deleted_bundle_recalc",
+            source="proposal_bundler",
+        )
 
+    _append_proposal_totals_snapshot(trace, job["id"], proposal)
+
+    run_id = create_calculation_run(
+        job["id"],
+        "proposal_generation",
+        metadata=_audit_metadata({"endpoint": "proposal/generate"}),
+    )
+    trace_count = save_calculation_traces(job["id"], run_id, trace.records)
+    summary = trace.summary()
+    complete_calculation_run(run_id, summary=summary)
+    proposal["audit"] = {
+        "run_id": run_id,
+        "trace_count": trace_count,
+        "summary": summary,
+    }
+    saved_job = load_job(job_id) or job
+    saved_job["proposal_data"] = proposal
+    save_job(saved_job)
     return proposal
 
 
@@ -2274,6 +3972,7 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Job not found")
 
     body = await request.json()
+    _validate_proposal_pdf_ready(job, body)
     # Build proposal data from the edited bundles sent by frontend
     job_info = {
         "id": job["id"],
@@ -2285,7 +3984,7 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
         "zip": job.get("zip"),
         "tax_rate": job.get("tax_rate", 0),
         "unit_count": job.get("unit_count", 0),
-        "salesperson": job.get("salesperson"),
+        "salesperson": job.get("salesperson") or "Standard Interiors",
     }
 
     proposal_data = {
@@ -2295,12 +3994,33 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
         "tax_rate": body.get("tax_rate", 0),
         "tax_amount": body.get("tax_amount", 0),
         "grand_total": body.get("grand_total", 0),
+        "gpm_pct": body.get("gpm_pct", 0),
+        "gpm_profit": body.get("gpm_profit", 0),
+        "gpm_labor": body.get("gpm_labor", 0),
+        "gpm_material": body.get("gpm_material", 0),
         "textura_fee": body.get("textura_fee", 0),
         "textura_amount": body.get("textura_amount", 0),
         "notes": body.get("notes", []),
         "terms": body.get("terms", []),
         "exclusions": body.get("exclusions", []),
+        "deleted_bundles": body.get("deleted_bundles", []),
+        "deleted_material_codes": body.get("deleted_material_codes", []),
+        "audit": body.get("audit", (job.get("proposal_data") or {}).get("audit", {})),
     }
+    pdf_run = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
+    if pdf_run:
+        proposal_data["pdf_audit_run_id"] = pdf_run["id"]
+        proposal_data["pdf_ruleset_version"] = (pdf_run.get("metadata") or {}).get("ruleset_version")
+        proposal_data["pdf_source_fingerprint"] = _proposal_source_fingerprint(job, proposal_data)
+        proposal_data["pdf_totals"] = {
+            "subtotal": body.get("subtotal", 0),
+            "tax_amount": body.get("tax_amount", 0),
+            "grand_total": body.get("grand_total", 0),
+            "gpm_profit": body.get("gpm_profit", 0),
+            "gpm_labor": body.get("gpm_labor", 0),
+            "gpm_material": body.get("gpm_material", 0),
+            "textura_amount": body.get("textura_amount", 0),
+        }
 
     pdf_path = os.path.join(PDF_DIR, f"proposal_{job['id']}.pdf")
     generate_proposal_pdf(proposal_data, pdf_path)
@@ -2322,6 +4042,7 @@ def api_download_proposal_pdf(job_id: str):
     job = load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _validate_proposal_pdf_download_ready(job)
     pdf_path = os.path.join(PDF_DIR, f"proposal_{job['id']}.pdf")
     if not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="PDF not found. Generate proposal first.")

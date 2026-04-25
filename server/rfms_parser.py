@@ -478,11 +478,12 @@ def parse_rfms(file_path: str) -> dict:
         unit = _extract_unit(desc, material_type)
         item_code = _extract_item_label(desc)
 
-        if material_type == "unknown":
-            fallback = _infer_material_type_fallback(item_code, desc)
-            if fallback != "unknown":
-                material_type = fallback
-                ai_confidence = 0.5  # deterministic fallback: medium confidence
+        fallback = _infer_material_type_fallback(item_code, desc)
+        code_upper = (item_code or "").upper()
+        force_prefix_rule = code_upper.startswith(("B-", "WB-", "WM-", "RF-", "VCT-"))
+        if fallback != "unknown" and (material_type == "unknown" or force_prefix_rule):
+            material_type = fallback
+            ai_confidence = 0.5  # deterministic hard rule: medium confidence
 
         # Use install line qty (net installed area) when available.
         # The material line qty from RFMS includes RFMS-calculated waste,

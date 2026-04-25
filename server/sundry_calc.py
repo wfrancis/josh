@@ -50,6 +50,7 @@ def calculate_sundries(
     installed_qty: float,
     sundry_rules: dict = None,
     material: dict = None,
+    trace=None,
 ) -> list[dict]:
     """
     Calculate sundry items needed for a given material type and quantity.
@@ -100,6 +101,7 @@ def calculate_sundries(
         # where W,L = tile dims in inches, J = joint width, T = tile thickness
         qty_basis = rule.get("qty_basis")
         if qty_basis == "grout_formula":
+            formula = "ceil(installed_qty / grout_coverage_per_bag)"
             desc = material.get("description", "")
             dims = re.findall(r'(\d+(?:\.\d+)?)\s*["\u201d]?\s*x\s*(\d+(?:\.\d+)?)\s*["\u201d]?', desc.lower())
             if dims:
@@ -118,13 +120,16 @@ def calculate_sundries(
         elif qty_basis == "unit_count":
             basis_qty = _safe_float(material.get("unit_count"))
             qty_needed = math.ceil(basis_qty / coverage) if basis_qty > 0 else 0
+            formula = "ceil(unit_count / coverage)"
         elif qty_basis == "tub_shower_total":
             basis_qty = _safe_float(material.get("tub_shower_total"))
             qty_needed = math.ceil(basis_qty / coverage) if basis_qty > 0 else 0
+            formula = "ceil(tub_shower_total / coverage)"
         elif qty_source and _safe_float(material.get(qty_source)) > 0:
             # Use RFMS-measured quantity if available via qty_source
             source_qty = _safe_float(material.get(qty_source))
             qty_needed = math.ceil(source_qty / coverage)
+            formula = f"ceil({qty_source} / coverage)"
         else:
             # Fallback: estimate from installed_qty
             effective_qty = installed_qty * (1 + waste) if waste else installed_qty
@@ -134,6 +139,7 @@ def calculate_sundries(
             if mat_unit == "SY" and "SF" in coverage_unit:
                 effective_qty = effective_qty * 9
             qty_needed = math.ceil(effective_qty / coverage)
+            formula = "ceil(installed_qty * (1 + waste) / coverage)"
 
         unit_price = rule.get("unit_price", 0)
         # Use white thinset price for mosaic or backsplash materials
@@ -158,10 +164,58 @@ def calculate_sundries(
             "notes": notes,
         })
 
+        if trace:
+            material_id = material.get("id") or material.get("item_code")
+            entity_key = f"{material_id}:{sundry_name}" if material_id else sundry_name
+            inputs = {
+                "material_id": material_id,
+                "material_type": material_type,
+                "installed_qty": installed_qty,
+                "coverage": coverage,
+                "waste": waste,
+                "qty_basis": qty_basis,
+                "qty_source": qty_source,
+                "unit_price": unit_price,
+            }
+            trace.record(
+                entity_type="sundry",
+                entity_id=material_id,
+                entity_key=entity_key,
+                output_field="qty",
+                formula=formula,
+                inputs=inputs,
+                result=qty_needed,
+                rule_id=f"sundry:{material_type}:{sundry_name}",
+                source="sundry_rules",
+            )
+            trace.record(
+                entity_type="sundry",
+                entity_id=material_id,
+                entity_key=entity_key,
+                output_field="extended_cost",
+                formula="qty * unit_price",
+                inputs={"qty": qty_needed, "unit_price": unit_price},
+                result=extended_cost,
+                rule_id=f"sundry:{material_type}:{sundry_name}",
+                source="sundry_rules",
+            )
+            if freight_cost:
+                trace.record(
+                    entity_type="sundry",
+                    entity_id=material_id,
+                    entity_key=entity_key,
+                    output_field="freight_cost",
+                    formula="qty * freight_per_unit",
+                    inputs={"qty": qty_needed, "freight_per_unit": freight_per_unit},
+                    result=freight_cost,
+                    rule_id=f"sundry:{material_type}:{sundry_name}",
+                    source="sundry_rules",
+                )
+
     return results
 
 
-def calculate_sundries_for_materials(materials: list[dict]) -> list[dict]:
+def calculate_sundries_for_materials(materials: list[dict], trace=None) -> list[dict]:
     """
     Calculate sundries for a list of material line items.
     Loads sundry rules from DB once for efficiency.
@@ -174,7 +228,7 @@ def calculate_sundries_for_materials(materials: list[dict]) -> list[dict]:
         material_id = mat.get("id") or mat.get("item_code")
 
         sundries = calculate_sundries(
-            material_type, installed_qty, sundry_rules, material=mat
+            material_type, installed_qty, sundry_rules, material=mat, trace=trace
         )
         for s in sundries:
             s["material_id"] = material_id

@@ -349,6 +349,7 @@ def _sum_material_costs(
     materials: list[dict],
     sundries_by_mat: dict,
     labor_by_mat: dict,
+    trace=None,
 ) -> dict:
     """Sum up costs across a group of materials.
 
@@ -383,12 +384,74 @@ def _sum_material_costs(
 
         # Calculate freight: freight_per_unit * order_qty, fall back to config FREIGHT_RATES
         freight_per_unit = _safe_float(mat.get("freight_per_unit"))
+        freight_source = mat.get("freight_source") or "freight_rates"
         if freight_per_unit <= 0:
             # Fall back to config freight rates by material type
             freight_per_unit = _config_freight_rate(mat.get("material_type", ""))
+            freight_source = "freight_rates"
         order_qty = _safe_float(mat.get("order_qty", mat.get("installed_qty", 0)))
+        freight_line_cost = 0
         if freight_per_unit > 0:
-            freight_cost += round(freight_per_unit * order_qty, 2)
+            freight_line_cost = round(freight_per_unit * order_qty, 2)
+            freight_cost += freight_line_cost
+
+        if trace:
+            entity_key = mat.get("item_code") or str(mat_id)
+            price_source = mat.get("price_source") or "material_table"
+            trace.record(
+                entity_type="material",
+                entity_id=mat_id,
+                entity_key=entity_key,
+                output_field="order_qty",
+                formula="stored order_qty",
+                inputs={
+                    "installed_qty": mat.get("installed_qty"),
+                    "waste_pct": mat.get("waste_pct"),
+                    "unit": mat.get("unit"),
+                },
+                result=round(order_qty, 2),
+                rule_id=f"material:{mat.get('material_type', '')}:order_qty",
+                source="manual_override" if price_source == "manual" else price_source,
+            )
+            if price_source == "manual":
+                trace.manual_override(
+                    entity_type="material",
+                    entity_id=mat_id,
+                    entity_key=entity_key,
+                    output_field="extended_cost",
+                    value=mat_ext,
+                    note="Material total preserved from manual price_source.",
+                )
+            else:
+                trace.record(
+                    entity_type="material",
+                    entity_id=mat_id,
+                    entity_key=entity_key,
+                    output_field="extended_cost",
+                    formula="order_qty * unit_price",
+                    inputs={
+                        "order_qty": round(order_qty, 2),
+                        "unit_price": mat.get("unit_price", 0),
+                    },
+                    result=mat_ext,
+                    rule_id=f"material:{mat.get('material_type', '')}:extended_cost",
+                    source=price_source,
+                )
+            trace.record(
+                entity_type="freight",
+                entity_id=mat_id,
+                entity_key=entity_key,
+                output_field="freight_cost",
+                formula="order_qty * freight_per_unit",
+                inputs={
+                    "order_qty": round(order_qty, 2),
+                    "freight_per_unit": freight_per_unit,
+                    "material_type": mat.get("material_type", ""),
+                },
+                result=freight_line_cost,
+                rule_id=f"freight:{mat.get('material_type', '')}",
+                source=freight_source,
+            )
 
     total_price = material_cost + sundry_cost + labor_cost + freight_cost
 
@@ -412,9 +475,10 @@ def _make_bundle(
     labor_by_mat: dict,
     template_key: str = "",
     extra_desc_lines: list[str] = None,
+    trace=None,
 ) -> dict:
     """Create a single bundle dict from a group of materials."""
-    costs = _sum_material_costs(materials, sundries_by_mat, labor_by_mat)
+    costs = _sum_material_costs(materials, sundries_by_mat, labor_by_mat, trace=trace)
 
     description_text = _build_description(
         template_key=template_key,
@@ -424,7 +488,7 @@ def _make_bundle(
         extra_lines=extra_desc_lines,
     )
 
-    return {
+    bundle = {
         "bundle_name": bundle_name,
         "description_text": description_text,
         "materials": materials,
@@ -439,6 +503,35 @@ def _make_bundle(
         "unit": costs["unit"],
         "editable": True,
     }
+    if trace:
+        inputs = {
+            "material_cost": costs["material_cost"],
+            "sundry_cost": costs["sundry_cost"],
+            "labor_cost": costs["labor_cost"],
+            "freight_cost": costs["freight_cost"],
+        }
+        for field in ("material_cost", "sundry_cost", "labor_cost", "freight_cost"):
+            trace.record(
+                entity_type="bundle",
+                entity_key=bundle_name,
+                output_field=field,
+                formula=f"sum({field} components)",
+                inputs={"materials": [m.get("id") or m.get("item_code") for m in materials]},
+                result=costs[field],
+                rule_id=f"bundle:{field}",
+                source="proposal_bundler",
+            )
+        trace.record(
+            entity_type="bundle",
+            entity_key=bundle_name,
+            output_field="total_price",
+            formula="material_cost + sundry_cost + labor_cost + freight_cost",
+            inputs=inputs,
+            result=bundle["total_price"],
+            rule_id="bundle:total_price",
+            source="proposal_bundler",
+        )
+    return bundle
 
 
 # ─── Classification ─────────────────────────────────────────────────────────
@@ -670,6 +763,7 @@ def auto_bundle_materials(
     materials: list[dict],
     sundries: list[dict] = None,
     labor_items: list[dict] = None,
+    trace=None,
 ) -> list[dict]:
     """Group materials into proposal bundles.
 
@@ -839,6 +933,7 @@ def auto_bundle_materials(
             sundries_by_mat=sundries_by_mat,
             labor_by_mat=labor_by_mat,
             template_key=template_key,
+            trace=trace,
         )
         bundles.append(bundle)
 
@@ -847,7 +942,7 @@ def auto_bundle_materials(
 
 # ─── Derived Bundles (Waterproofing / Crack Isolation) ──────────────────────
 
-def _generate_derived_bundles(job: dict, materials: list[dict]) -> list[dict]:
+def _generate_derived_bundles(job: dict, materials: list[dict], trace=None) -> list[dict]:
     """Auto-generate virtual bundles for waterproofing and crack isolation.
 
     - Unit Waterproofing: from tub_shower_surround net SF.
@@ -916,7 +1011,7 @@ def _generate_derived_bundles(job: dict, materials: list[dict]) -> list[dict]:
             "extended_cost": labor_cost,
         }]
 
-        derived.append({
+        bundle = {
             "bundle_name": "Unit Waterproofing",
             "description_text": "\n".join(desc_lines),
             "materials": [],
@@ -932,7 +1027,46 @@ def _generate_derived_bundles(job: dict, materials: list[dict]) -> list[dict]:
             "editable": True,
             "is_derived": True,
             "_sort_priority": 45,
-        })
+        }
+        derived.append(bundle)
+        if trace:
+            trace.record(
+                entity_type="derived_bundle",
+                entity_key="Unit Waterproofing",
+                output_field="material_cost",
+                formula="ceil(surround_sf / coverage_sf) * pail_cost + ceil(surround_sf / mesh_coverage_sf) * mesh_cost",
+                inputs={
+                    "surround_sf": round(surround_sf, 2),
+                    "coverage_sf": wp_rule["coverage_sf"],
+                    "pails": pails,
+                    "pail_cost": wp_rule["pail_cost"],
+                    "mesh_rolls": mesh_rolls,
+                    "mesh_cost": mesh_price,
+                },
+                result=bundle["material_cost"],
+                rule_id="derived_bundle:waterproofing",
+                source="derived_bundle_rule",
+            )
+            trace.record(
+                entity_type="derived_bundle",
+                entity_key="Unit Waterproofing",
+                output_field="labor_cost",
+                formula="surround_sf * labor_rate_sf",
+                inputs={"surround_sf": round(surround_sf, 2), "labor_rate_sf": labor_rate},
+                result=labor_cost,
+                rule_id="derived_bundle:waterproofing",
+                source="derived_bundle_rule",
+            )
+            trace.record(
+                entity_type="derived_bundle",
+                entity_key="Unit Waterproofing",
+                output_field="total_price",
+                formula="material_cost + labor_cost",
+                inputs={"material_cost": bundle["material_cost"], "labor_cost": labor_cost},
+                result=total,
+                rule_id="derived_bundle:waterproofing",
+                source="derived_bundle_rule",
+            )
 
     # ── Common Area Crack Isolation ───────────────────────────────────────
     ci_rule = DERIVED_BUNDLE_RULES.get("crack_isolation", {})
@@ -974,7 +1108,7 @@ def _generate_derived_bundles(job: dict, materials: list[dict]) -> list[dict]:
             "extended_cost": labor_cost,
         }]
 
-        derived.append({
+        bundle = {
             "bundle_name": "Common Area Crack Isolation",
             "description_text": "\n".join(desc_lines),
             "materials": [],
@@ -990,14 +1124,51 @@ def _generate_derived_bundles(job: dict, materials: list[dict]) -> list[dict]:
             "editable": True,
             "is_derived": True,
             "_sort_priority": 46,
-        })
+        }
+        derived.append(bundle)
+        if trace:
+            trace.record(
+                entity_type="derived_bundle",
+                entity_key="Common Area Crack Isolation",
+                output_field="material_cost",
+                formula="ceil(crack_isolation_sf / coverage_sf) * pail_cost",
+                inputs={
+                    "crack_isolation_sf": round(ci_sf, 2),
+                    "coverage_sf": ci_rule["coverage_sf"],
+                    "pails": pails,
+                    "pail_cost": ci_rule["pail_cost"],
+                },
+                result=material_cost,
+                rule_id="derived_bundle:crack_isolation",
+                source="derived_bundle_rule",
+            )
+            trace.record(
+                entity_type="derived_bundle",
+                entity_key="Common Area Crack Isolation",
+                output_field="labor_cost",
+                formula="crack_isolation_sf * labor_rate_sf",
+                inputs={"crack_isolation_sf": round(ci_sf, 2), "labor_rate_sf": ci_rule["labor_rate_sf"]},
+                result=labor_cost,
+                rule_id="derived_bundle:crack_isolation",
+                source="derived_bundle_rule",
+            )
+            trace.record(
+                entity_type="derived_bundle",
+                entity_key="Common Area Crack Isolation",
+                output_field="total_price",
+                formula="material_cost + labor_cost",
+                inputs={"material_cost": material_cost, "labor_cost": labor_cost},
+                result=total,
+                rule_id="derived_bundle:crack_isolation",
+                source="derived_bundle_rule",
+            )
 
     return derived
 
 
 # ─── Proposal Generator ─────────────────────────────────────────────────────
 
-def generate_proposal_data(job_id: int, job: dict) -> dict:
+def generate_proposal_data(job_id: int, job: dict, trace=None) -> dict:
     """Generate full proposal data with bundles, totals, T&C, exclusions.
 
     Args:
@@ -1027,6 +1198,7 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
         materials=materials,
         sundries=sundries,
         labor_items=labor_items,
+        trace=trace,
     )
 
     # ── Inject Schluter Jolly @ tub/shower surrounds into Unit Transitions ─
@@ -1039,6 +1211,40 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
         jolly_lf = round(jolly_qty * stick_lf, 2)
         jolly_mat_cost = round(jolly_qty * 9.78, 2)
         jolly_labor_cost = round(jolly_lf * 0.50, 2)
+        if trace:
+            trace.record(
+                entity_type="material",
+                entity_id="synthetic_jolly_tub",
+                entity_key="synthetic_jolly_tub",
+                output_field="order_qty",
+                formula="tub_shower_count * 2",
+                inputs={"tub_shower_count": tub_count, "sticks_per_tub_shower": 2},
+                result=jolly_qty,
+                rule_id="synthetic_jolly:tub_shower",
+                source="proposal_bundler",
+            )
+            trace.record(
+                entity_type="material",
+                entity_id="synthetic_jolly_tub",
+                entity_key="synthetic_jolly_tub",
+                output_field="extended_cost",
+                formula="order_qty * unit_price",
+                inputs={"order_qty": jolly_qty, "unit_price": 9.78},
+                result=jolly_mat_cost,
+                rule_id="synthetic_jolly:tub_shower",
+                source="proposal_bundler",
+            )
+            trace.record(
+                entity_type="labor",
+                entity_id="synthetic_jolly_tub",
+                entity_key="synthetic_jolly_tub:Project Tile Add Ons - Schluter Jolly",
+                output_field="extended_cost",
+                formula="linear_feet * rate",
+                inputs={"linear_feet": jolly_lf, "rate": 0.50},
+                result=jolly_labor_cost,
+                rule_id="synthetic_jolly:tub_shower",
+                source="proposal_bundler",
+            )
         jolly_material = {
             "id": "synthetic_jolly_tub",
             "item_code": "synthetic_jolly_tub",
@@ -1111,7 +1317,7 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
             bundles.insert(insert_idx, unit_trans)
 
     # ── Insert derived bundles (waterproofing, crack isolation) ───────────
-    derived = _generate_derived_bundles(job, materials)
+    derived = _generate_derived_bundles(job, materials, trace=trace)
     for db in derived:
         name_lower = db["bundle_name"].lower()
         if "common area crack isolation" in name_lower:
@@ -1161,6 +1367,7 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
         b["material_cost"] + b["sundry_cost"] + b["freight_cost"] + b["labor_cost"]
         for b in bundles
     ), 2)
+    gpm_profit = 0
 
     if gpm_pct > 0 and gpm_pct < 1 and total_cost > 0:
         revenue = total_cost / (1 - gpm_pct)
@@ -1182,6 +1389,58 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
 
             b["gpm_adder"] = b["gpm_labor_adder"] + b["gpm_material_adder"]
             b["total_price"] = round(bundle_cost + b["gpm_adder"], 2)
+            if trace:
+                trace.record(
+                    entity_type="bundle",
+                    entity_key=b.get("bundle_name"),
+                    output_field="gpm_adder",
+                    formula="bundle_cost / total_cost * gpm_profit",
+                    inputs={
+                        "bundle_cost": round(bundle_cost, 2),
+                        "total_cost": total_cost,
+                        "gpm_pct": gpm_pct,
+                        "gpm_profit": gpm_profit,
+                        "gpm_labor_adder": b["gpm_labor_adder"],
+                        "gpm_material_adder": b["gpm_material_adder"],
+                    },
+                    result=b["gpm_adder"],
+                    rule_id="gpm:bundle_distribution",
+                    source="proposal_bundler",
+                )
+                trace.record(
+                    entity_type="bundle",
+                    entity_key=b.get("bundle_name"),
+                    output_field="total_price_after_gpm",
+                    formula="bundle_cost + gpm_adder",
+                    inputs={"bundle_cost": round(bundle_cost, 2), "gpm_adder": b["gpm_adder"]},
+                    result=b["total_price"],
+                    rule_id="gpm:bundle_total",
+                    source="proposal_bundler",
+                )
+        if trace:
+            trace.record(
+                entity_type="proposal",
+                entity_id=job_id,
+                entity_key="proposal",
+                output_field="gpm_profit",
+                formula="total_cost / (1 - gpm_pct) - total_cost",
+                inputs={"total_cost": total_cost, "gpm_pct": gpm_pct},
+                result=gpm_profit,
+                rule_id="gpm:profit",
+                source="proposal_bundler",
+            )
+    elif trace:
+        trace.record(
+            entity_type="proposal",
+            entity_id=job_id,
+            entity_key="proposal",
+            output_field="gpm_profit",
+            formula="0 when gpm_pct is not between 0 and 1 or total_cost is 0",
+            inputs={"total_cost": total_cost, "gpm_pct": gpm_pct},
+            result=0,
+            rule_id="gpm:profit",
+            source="proposal_bundler",
+        )
 
     # ── Calculate per-bundle tax ──────────────────────────────────────────
     # Tax applies only to materials (material + sundry + freight + GPM material adder), not labor
@@ -1190,6 +1449,42 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
         b["taxable"] = round(b_taxable, 2)
         b["tax_amount"] = round(b_taxable * tax_rate, 2)
         b["total_price"] = round(b["total_price"] + b["tax_amount"], 2)
+        if trace:
+            trace.record(
+                entity_type="bundle",
+                entity_key=b.get("bundle_name"),
+                output_field="taxable",
+                formula="material_cost + sundry_cost + freight_cost + gpm_material_adder",
+                inputs={
+                    "material_cost": b["material_cost"],
+                    "sundry_cost": b["sundry_cost"],
+                    "freight_cost": b["freight_cost"],
+                    "gpm_material_adder": b.get("gpm_material_adder", 0),
+                },
+                result=b["taxable"],
+                rule_id="tax:bundle_taxable",
+                source="proposal_bundler",
+            )
+            trace.record(
+                entity_type="bundle",
+                entity_key=b.get("bundle_name"),
+                output_field="tax_amount",
+                formula="taxable * tax_rate",
+                inputs={"taxable": b["taxable"], "tax_rate": tax_rate},
+                result=b["tax_amount"],
+                rule_id="tax:bundle_tax",
+                source="proposal_bundler",
+            )
+            trace.record(
+                entity_type="bundle",
+                entity_key=b.get("bundle_name"),
+                output_field="total_price",
+                formula="total_price_before_tax + tax_amount",
+                inputs={"tax_amount": b["tax_amount"]},
+                result=b["total_price"],
+                rule_id="bundle:total_price_with_tax",
+                source="proposal_bundler",
+            )
 
     subtotal = round(sum(b["total_price"] for b in bundles), 2)
     taxable = round(sum(b["taxable"] for b in bundles), 2)
@@ -1201,6 +1496,63 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
     textura_amount = min(round(grand_total * 0.0022, 2), 5000.00) if textura_fee else 0
     if textura_fee:
         grand_total = round(grand_total + textura_amount, 2)
+    if trace:
+        trace.record(
+            entity_type="proposal",
+            entity_id=job_id,
+            entity_key="proposal",
+            output_field="subtotal",
+            formula="sum(bundle.total_price)",
+            inputs={"bundle_count": len(bundles)},
+            result=subtotal,
+            rule_id="proposal:subtotal",
+            source="proposal_bundler",
+        )
+        trace.record(
+            entity_type="proposal",
+            entity_id=job_id,
+            entity_key="proposal",
+            output_field="taxable",
+            formula="sum(bundle.taxable)",
+            inputs={"bundle_count": len(bundles)},
+            result=taxable,
+            rule_id="proposal:taxable",
+            source="proposal_bundler",
+        )
+        trace.record(
+            entity_type="proposal",
+            entity_id=job_id,
+            entity_key="proposal",
+            output_field="tax_amount",
+            formula="sum(bundle.tax_amount)",
+            inputs={"bundle_count": len(bundles), "tax_rate": tax_rate},
+            result=tax_amount,
+            rule_id="proposal:tax",
+            source="proposal_bundler",
+        )
+        if textura_fee:
+            trace.record(
+                entity_type="proposal",
+                entity_id=job_id,
+                entity_key="proposal",
+                output_field="textura_amount",
+                formula="min(grand_total_before_textura * 0.0022, 5000)",
+                inputs={"subtotal_before_textura": subtotal, "textura_fee": textura_fee},
+                result=textura_amount,
+                rule_id="proposal:textura",
+                source="proposal_bundler",
+            )
+        trace.record(
+            entity_type="proposal",
+            entity_id=job_id,
+            entity_key="proposal",
+            output_field="grand_total",
+            formula="subtotal + textura_amount",
+            inputs={"subtotal": subtotal, "textura_amount": textura_amount},
+            result=grand_total,
+            rule_id="proposal:grand_total",
+            source="proposal_bundler",
+        )
 
     # Qualification notes — auto-generated from the bundles present
     notes = _build_qualification_notes(bundles, job)
@@ -1211,6 +1563,8 @@ def generate_proposal_data(job_id: int, job: dict) -> dict:
         "taxable": taxable,
         "tax_rate": tax_rate,
         "tax_amount": tax_amount,
+        "gpm_pct": gpm_pct,
+        "gpm_profit": gpm_profit,
         "textura_fee": textura_fee,
         "textura_amount": textura_amount,
         "grand_total": grand_total,

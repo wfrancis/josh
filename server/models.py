@@ -7,6 +7,7 @@ import sqlite3
 import os
 import re
 import io
+import json
 from datetime import datetime
 from typing import Optional
 
@@ -256,6 +257,91 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_price_book_vendor ON price_book_items(vendor);
             CREATE INDEX IF NOT EXISTS idx_price_book_product_line ON price_book_items(product_line);
+
+            CREATE TABLE IF NOT EXISTS estimating_rules (
+                rule_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                stage TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                priority INTEGER DEFAULT 0,
+                condition_json TEXT NOT NULL DEFAULT '{}',
+                action_json TEXT NOT NULL DEFAULT '{}',
+                source TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                effective_from TEXT,
+                effective_to TEXT,
+                version INTEGER DEFAULT 1,
+                implementation_ref TEXT DEFAULT '',
+                test_ref TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_est_rules_category ON estimating_rules(category);
+            CREATE INDEX IF NOT EXISTS idx_est_rules_stage ON estimating_rules(stage);
+            CREATE INDEX IF NOT EXISTS idx_est_rules_status ON estimating_rules(status);
+
+            CREATE TABLE IF NOT EXISTS estimating_rule_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                change_type TEXT NOT NULL DEFAULT 'created',
+                changed_by TEXT DEFAULT '',
+                change_note TEXT DEFAULT '',
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(rule_id, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_est_rule_versions_rule ON estimating_rule_versions(rule_id, version DESC);
+
+            CREATE TABLE IF NOT EXISTS ruleset_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version INTEGER NOT NULL UNIQUE,
+                change_type TEXT NOT NULL DEFAULT 'changed',
+                rule_id TEXT DEFAULT '',
+                changed_by TEXT DEFAULT '',
+                change_note TEXT DEFAULT '',
+                rule_count INTEGER DEFAULT 0,
+                active_count INTEGER DEFAULT 0,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ruleset_versions_version ON ruleset_versions(version DESC);
+
+            CREATE TABLE IF NOT EXISTS calculation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                run_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'started',
+                source TEXT DEFAULT 'system',
+                metadata_json TEXT,
+                summary_json TEXT,
+                trace_count INTEGER DEFAULT 0,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS calculation_trace (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                run_id INTEGER NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT,
+                entity_key TEXT,
+                output_field TEXT NOT NULL,
+                formula TEXT,
+                inputs_json TEXT,
+                result_json TEXT,
+                result_value REAL,
+                rule_id TEXT,
+                source TEXT,
+                warnings TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY (run_id) REFERENCES calculation_runs(id) ON DELETE CASCADE
+            );
         """)
         conn.commit()
         # Migrations for existing DBs
@@ -293,6 +379,8 @@ def init_db() -> None:
             ("sundry_freight", "ALTER TABLE job_sundries ADD COLUMN freight_cost REAL DEFAULT 0"),
             ("weld_rod_lf", "ALTER TABLE job_materials ADD COLUMN weld_rod_lf REAL DEFAULT 0"),
             ("textura_fee", "ALTER TABLE jobs ADD COLUMN textura_fee INTEGER DEFAULT 0"),
+            ("rule_implementation_ref", "ALTER TABLE estimating_rules ADD COLUMN implementation_ref TEXT DEFAULT ''"),
+            ("rule_test_ref", "ALTER TABLE estimating_rules ADD COLUMN test_ref TEXT DEFAULT ''"),
         ]:
             try:
                 conn.execute(sql)
@@ -309,12 +397,23 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_vendors_name ON vendors(name)",
             "CREATE INDEX IF NOT EXISTS idx_job_activity_job ON job_activity(job_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_job_comments_job ON job_comments(job_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_calculation_runs_job ON calculation_runs(job_id, started_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_calculation_trace_run ON calculation_trace(run_id, entity_type, output_field)",
+            "CREATE INDEX IF NOT EXISTS idx_calculation_trace_job ON calculation_trace(job_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_est_rules_category ON estimating_rules(category)",
+            "CREATE INDEX IF NOT EXISTS idx_est_rules_stage ON estimating_rules(stage)",
+            "CREATE INDEX IF NOT EXISTS idx_est_rules_status ON estimating_rules(status)",
+            "CREATE INDEX IF NOT EXISTS idx_est_rule_versions_rule ON estimating_rule_versions(rule_id, version DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ruleset_versions_version ON ruleset_versions(version DESC)",
         ]:
             try:
                 conn.execute(idx_sql)
                 conn.commit()
             except sqlite3.OperationalError:
                 pass
+
+        _ensure_rule_history_baseline(conn)
+        _ensure_ruleset_history_baseline(conn)
 
         # Backfill slugs for any jobs missing them
         rows = conn.execute("SELECT id, project_name FROM jobs WHERE slug IS NULL OR slug = ''").fetchall()
@@ -500,6 +599,201 @@ def save_bundles(job_id: int, bundles: list[dict]) -> None:
                 b.get("total_price", 0)
             ))
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Calculation Audit Trace ─────────────────────────────────────────────────
+
+def _json_dumps_safe(value) -> str:
+    import json as _json
+    try:
+        return _json.dumps(value)
+    except (TypeError, ValueError):
+        return _json.dumps(str(value))
+
+
+def create_calculation_run(
+    job_id: int,
+    run_type: str,
+    source: str = "system",
+    metadata: dict = None,
+) -> int:
+    """Start a calculation audit run and return its id."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO calculation_runs
+                (job_id, run_type, status, source, metadata_json, started_at)
+            VALUES (?, ?, 'started', ?, ?, ?)
+            """,
+            (
+                job_id,
+                run_type,
+                source,
+                _json_dumps_safe(metadata or {}),
+                datetime.now().isoformat(),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def save_calculation_traces(job_id: int, run_id: int, traces: list[dict]) -> int:
+    """Persist trace rows for a calculation run."""
+    conn = _get_conn()
+    try:
+        for t in traces:
+            conn.execute(
+                """
+                INSERT INTO calculation_trace
+                    (job_id, run_id, entity_type, entity_id, entity_key,
+                     output_field, formula, inputs_json, result_json,
+                     result_value, rule_id, source, warnings, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    run_id,
+                    t.get("entity_type"),
+                    t.get("entity_id"),
+                    t.get("entity_key"),
+                    t.get("output_field"),
+                    t.get("formula"),
+                    _json_dumps_safe(t.get("inputs", {})),
+                    _json_dumps_safe(t.get("result")),
+                    t.get("result_value"),
+                    t.get("rule_id"),
+                    t.get("source"),
+                    _json_dumps_safe(t.get("warnings", [])),
+                    t.get("created_at") or datetime.now().isoformat(),
+                ),
+            )
+        conn.execute(
+            "UPDATE calculation_runs SET trace_count=? WHERE id=? AND job_id=?",
+            (len(traces), run_id, job_id),
+        )
+        conn.commit()
+        return len(traces)
+    finally:
+        conn.close()
+
+
+def complete_calculation_run(
+    run_id: int,
+    status: str = "completed",
+    summary: dict = None,
+) -> None:
+    """Mark a calculation audit run completed or failed."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """
+            UPDATE calculation_runs
+            SET status=?, summary_json=?, completed_at=?
+            WHERE id=?
+            """,
+            (
+                status,
+                _json_dumps_safe(summary or {}),
+                datetime.now().isoformat(),
+                run_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_calculation_runs(job_id: int, limit: int = 20) -> list[dict]:
+    """List calculation audit runs for a job, newest first."""
+    import json as _json
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM calculation_runs
+            WHERE job_id=?
+            ORDER BY started_at DESC, id DESC
+            LIMIT ?
+            """,
+            (job_id, limit),
+        ).fetchall()
+        results = []
+        for row in rows:
+            d = dict(row)
+            for src, dest in (("metadata_json", "metadata"), ("summary_json", "summary")):
+                raw = d.pop(src, None)
+                if raw:
+                    try:
+                        d[dest] = _json.loads(raw)
+                    except (ValueError, TypeError):
+                        d[dest] = raw
+                else:
+                    d[dest] = {}
+            results.append(d)
+        return results
+    finally:
+        conn.close()
+
+
+def get_calculation_traces(
+    job_id: int,
+    run_id: int = None,
+    entity_type: str = None,
+    entity_id: str = None,
+    entity_key: str = None,
+    limit: int = 1000,
+) -> list[dict]:
+    """Fetch persisted calculation trace rows with optional filters."""
+    import json as _json
+    conn = _get_conn()
+    try:
+        clauses = ["job_id=?"]
+        params = [job_id]
+        if run_id is not None:
+            clauses.append("run_id=?")
+            params.append(run_id)
+        if entity_type:
+            clauses.append("entity_type=?")
+            params.append(entity_type)
+        if entity_id:
+            clauses.append("entity_id=?")
+            params.append(str(entity_id))
+        if entity_key:
+            clauses.append("entity_key=?")
+            params.append(entity_key)
+        params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM calculation_trace
+            WHERE {' AND '.join(clauses)}
+            ORDER BY id
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        results = []
+        for row in rows:
+            d = dict(row)
+            for src, dest in (
+                ("inputs_json", "inputs"),
+                ("result_json", "result"),
+                ("warnings", "warnings"),
+            ):
+                raw = d.pop(src, None)
+                if raw:
+                    try:
+                        d[dest] = _json.loads(raw)
+                    except (ValueError, TypeError):
+                        d[dest] = raw
+                else:
+                    d[dest] = [] if dest == "warnings" else None
+            results.append(d)
+        return results
     finally:
         conn.close()
 
@@ -707,6 +1001,810 @@ def search_all(query: str) -> dict:
                 "material_type": r["material_type"],
             })
         return {"jobs": jobs, "materials": list(mat_by_job.values())}
+    finally:
+        conn.close()
+
+
+# -- Estimating Rules Registry -------------------------------------------------
+
+RULE_FIELDS = (
+    "rule_id", "name", "category", "stage", "status", "priority",
+    "condition_json", "action_json", "source", "description",
+    "effective_from", "effective_to", "version", "implementation_ref",
+    "test_ref", "notes",
+)
+RULE_MUTABLE_FIELDS = tuple(f for f in RULE_FIELDS if f != "rule_id")
+RULE_JSON_FIELDS = ("condition_json", "action_json")
+RULE_LIFECYCLE_STATUSES = {
+    "draft", "approved", "implemented", "tested", "active",
+    "disabled", "archived", "deprecated",
+}
+RULE_WIRING_FILE_EXTS = (".py", ".js", ".jsx", ".ts", ".tsx", ".md", ".json", ".sh")
+
+
+def _encode_rule_json(value) -> str:
+    if value is None or value == "":
+        return "{}"
+    if isinstance(value, str):
+        json.loads(value)
+        return value
+    return json.dumps(value, sort_keys=True)
+
+
+def _prepare_rule_values(data: dict, *, partial: bool = False) -> dict:
+    prepared = {}
+    fields = RULE_MUTABLE_FIELDS if partial else RULE_FIELDS
+    for field in fields:
+        if field not in data:
+            continue
+        value = data.get(field)
+        if field in RULE_JSON_FIELDS:
+            value = _encode_rule_json(value)
+        prepared[field] = value
+
+    if not partial:
+        for field in ("condition_json", "action_json"):
+            prepared.setdefault(field, "{}")
+        prepared.setdefault("status", "active")
+        prepared.setdefault("priority", 0)
+        prepared.setdefault("version", 1)
+        prepared.setdefault("category", "")
+        prepared.setdefault("stage", "")
+        prepared.setdefault("source", "")
+        prepared.setdefault("description", "")
+        prepared.setdefault("notes", "")
+        prepared.setdefault("effective_from", None)
+        prepared.setdefault("effective_to", None)
+        prepared.setdefault("implementation_ref", "")
+        prepared.setdefault("test_ref", "")
+
+    return prepared
+
+
+def _rule_from_row(row) -> dict:
+    rule = dict(row)
+    for field in RULE_JSON_FIELDS:
+        raw = rule.get(field)
+        try:
+            rule[field] = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            rule[field] = raw
+    return rule
+
+
+def _decode_prepared_rule(rule: dict) -> dict:
+    decoded = dict(rule)
+    for field in RULE_JSON_FIELDS:
+        raw = decoded.get(field)
+        try:
+            decoded[field] = json.loads(raw) if isinstance(raw, str) and raw else (raw or {})
+        except (TypeError, ValueError):
+            decoded[field] = raw
+    return decoded
+
+
+def _rule_snapshot(rule: dict) -> str:
+    snapshot = {field: rule.get(field) for field in RULE_FIELDS}
+    return json.dumps(snapshot, sort_keys=True)
+
+
+def _ref_mentions_existing_path(ref: str) -> bool:
+    """Return true when a rule ref points at a real repo file."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return False
+
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    for token in re.split(r"[\s,;]+", ref):
+        clean = token.strip().strip("'\"()[]{}")
+        if not clean:
+            continue
+        for prefix in ("code:", "path:", "test:", "harness:", "file:"):
+            if clean.lower().startswith(prefix):
+                clean = clean[len(prefix):]
+        clean = clean.split("#", 1)[0].split("::", 1)[0]
+        if ":" in clean:
+            before_colon, after_colon = clean.split(":", 1)
+            if before_colon.endswith(RULE_WIRING_FILE_EXTS) or after_colon.isdigit():
+                clean = before_colon
+        if not clean or ("/" not in clean and not clean.endswith(RULE_WIRING_FILE_EXTS)):
+            continue
+        candidate = clean if os.path.isabs(clean) else os.path.join(project_root, clean)
+        if os.path.exists(candidate):
+            return True
+    return False
+
+
+def _ref_mentions_rule_in_existing_path(ref: str, rule_id: str) -> bool:
+    """Return true when a real referenced file contains this specific rule id."""
+    ref = str(ref or "").strip()
+    rule_id = str(rule_id or "").strip()
+    if not ref or not rule_id:
+        return False
+
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    candidates = []
+    for token in re.split(r"[\s,;]+", ref):
+        clean = token.strip().strip("'\"()[]{}")
+        if not clean:
+            continue
+        for prefix in ("code:", "path:", "test:", "harness:", "file:"):
+            if clean.lower().startswith(prefix):
+                clean = clean[len(prefix):]
+        clean = clean.split("#", 1)[0].split("::", 1)[0]
+        if ":" in clean:
+            before_colon, after_colon = clean.split(":", 1)
+            if before_colon.endswith(RULE_WIRING_FILE_EXTS) or after_colon.isdigit():
+                clean = before_colon
+        if not clean or ("/" not in clean and not clean.endswith(RULE_WIRING_FILE_EXTS)):
+            continue
+        candidate = clean if os.path.isabs(clean) else os.path.join(project_root, clean)
+        if os.path.exists(candidate):
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        try:
+            with open(candidate, "r", encoding="utf-8", errors="ignore") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if rule_id in text:
+            return True
+    return False
+
+
+def _validate_rule_lifecycle(data: dict, existing: dict | None = None) -> None:
+    """Enforce the rule lifecycle gate before a rule can become active."""
+    merged = {}
+    if existing:
+        merged.update(existing)
+    merged.update(data or {})
+
+    status = str(merged.get("status") or "draft").strip().lower()
+    if status not in RULE_LIFECYCLE_STATUSES:
+        allowed = ", ".join(sorted(RULE_LIFECYCLE_STATUSES))
+        raise ValueError(f"Invalid rule status '{status}'. Use one of: {allowed}")
+    merged["status"] = status
+    data["status"] = status
+
+    rule_id = str(merged.get("rule_id") or "").strip()
+    custom_rule = rule_id.startswith("custom.")
+    if status == "active" and custom_rule:
+        implementation_ref = str(merged.get("implementation_ref") or "").strip()
+        test_ref = str(merged.get("test_ref") or "").strip()
+        if not implementation_ref or not test_ref:
+            raise ValueError(
+                "Custom rules cannot become active until implementation_ref and test_ref are filled in. "
+                "Use tested/implemented until the rule is wired and verified."
+            )
+        if not _ref_mentions_rule_in_existing_path(implementation_ref, rule_id):
+            raise ValueError(
+                "Custom rules cannot become active until implementation_ref points to real runtime code "
+                "that mentions this rule_id."
+            )
+        if not _ref_mentions_rule_in_existing_path(test_ref, rule_id):
+            raise ValueError(
+                "Custom rules cannot become active until test_ref points to a real test or harness artifact "
+                "that mentions this rule_id."
+            )
+
+
+def _ruleset_snapshot(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM estimating_rules WHERE LOWER(COALESCE(status, '')) != 'archived' ORDER BY rule_id"
+    ).fetchall()
+    return [_rule_from_row(row) for row in rows]
+
+
+def _next_ruleset_version(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(version), 0) AS max_version FROM ruleset_versions").fetchone()
+    return int(row["max_version"] or 0) + 1
+
+
+def _insert_ruleset_version(
+    conn: sqlite3.Connection,
+    *,
+    change_type: str,
+    rule_id: str = "",
+    changed_by: str = "",
+    change_note: str = "",
+) -> int:
+    rules = _ruleset_snapshot(conn)
+    if not rules:
+        return 0
+    version = _next_ruleset_version(conn)
+    active_count = sum(1 for rule in rules if str(rule.get("status") or "").lower() == "active")
+    snapshot = {
+        "version": version,
+        "rules": rules,
+        "rule_count": len(rules),
+        "active_count": active_count,
+    }
+    conn.execute(
+        """
+        INSERT INTO ruleset_versions
+            (version, change_type, rule_id, changed_by, change_note,
+             rule_count, active_count, snapshot_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            version,
+            change_type,
+            rule_id or "",
+            changed_by or "",
+            change_note or "",
+            len(rules),
+            active_count,
+            json.dumps(snapshot, sort_keys=True),
+            datetime.now().isoformat(),
+        ),
+    )
+    return version
+
+
+def _ensure_ruleset_history_baseline(conn: sqlite3.Connection) -> None:
+    existing = conn.execute("SELECT id FROM ruleset_versions LIMIT 1").fetchone()
+    if existing:
+        return
+    if not conn.execute("SELECT rule_id FROM estimating_rules LIMIT 1").fetchone():
+        return
+    _insert_ruleset_version(
+        conn,
+        change_type="baseline",
+        changed_by="System",
+        change_note="Backfilled current rule registry as ruleset baseline.",
+    )
+    conn.commit()
+
+
+def _insert_rule_version(
+    conn: sqlite3.Connection,
+    rule: dict,
+    change_type: str,
+    changed_by: str = "",
+    change_note: str = "",
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO estimating_rule_versions
+            (rule_id, version, change_type, changed_by, change_note, snapshot_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            rule["rule_id"],
+            int(rule.get("version") or 1),
+            change_type,
+            changed_by or "",
+            change_note or "",
+            _rule_snapshot(rule),
+            datetime.now().isoformat(),
+        ),
+    )
+
+
+def _ensure_rule_history_baseline(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT r.*
+        FROM estimating_rules r
+        LEFT JOIN estimating_rule_versions v
+          ON v.rule_id = r.rule_id AND v.version = r.version
+        WHERE v.id IS NULL
+        """
+    ).fetchall()
+    for row in rows:
+        _insert_rule_version(
+            conn,
+            _rule_from_row(row),
+            "baseline",
+            "System",
+            "Backfilled current rule as version history baseline.",
+        )
+    if rows:
+        conn.commit()
+
+
+def create_rule(rule: dict) -> str:
+    """Create an estimating rule. Returns the rule_id."""
+    data = _prepare_rule_values(rule)
+    _validate_rule_lifecycle(data)
+    rule_id = (data.get("rule_id") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not rule_id:
+        raise ValueError("rule_id is required")
+    if not name:
+        raise ValueError("name is required")
+
+    now = datetime.now().isoformat()
+    changed_by = rule.get("changed_by") or "Rules Registry"
+    change_note = rule.get("change_note") or "Rule created."
+    conn = _get_conn()
+    try:
+        conn.execute("""
+            INSERT INTO estimating_rules (
+                rule_id, name, category, stage, status, priority,
+                condition_json, action_json, source, description,
+                effective_from, effective_to, version, implementation_ref,
+                test_ref, notes, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            rule_id, name, data.get("category"), data.get("stage"), data.get("status"),
+            data.get("priority"), data.get("condition_json"), data.get("action_json"),
+            data.get("source"), data.get("description"), data.get("effective_from"),
+            data.get("effective_to"), data.get("version"), data.get("implementation_ref"),
+            data.get("test_ref"), data.get("notes"), now, now,
+        ))
+        row = conn.execute("SELECT * FROM estimating_rules WHERE rule_id=?", (rule_id,)).fetchone()
+        _insert_rule_version(conn, _rule_from_row(row), "created", changed_by, change_note)
+        _insert_ruleset_version(
+            conn,
+            change_type="rule_created",
+            rule_id=rule_id,
+            changed_by=changed_by,
+            change_note=change_note,
+        )
+        conn.commit()
+        return rule_id
+    finally:
+        conn.close()
+
+
+def list_rules(category: str = None, stage: str = None, status: str = None) -> list[dict]:
+    """List estimating rules, optionally filtered by category, stage, and status."""
+    where = []
+    params = []
+    if category:
+        where.append("category=?")
+        params.append(category)
+    if stage:
+        where.append("stage=?")
+        params.append(stage)
+    if status:
+        where.append("status=?")
+        params.append(status)
+    sql = "SELECT * FROM estimating_rules"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY priority DESC, category, stage, rule_id"
+
+    conn = _get_conn()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+        return [_rule_from_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_rule(rule_id: str) -> dict | None:
+    """Fetch a single estimating rule by rule_id."""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM estimating_rules WHERE rule_id=?", (rule_id,)).fetchone()
+        return _rule_from_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_rule_versions(rule_id: str) -> list[dict]:
+    """List saved versions for an estimating rule."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, rule_id, version, change_type, changed_by, change_note, snapshot_json, created_at
+            FROM estimating_rule_versions
+            WHERE rule_id=?
+            ORDER BY version DESC, id DESC
+            """,
+            (rule_id,),
+        ).fetchall()
+        versions = []
+        for row in rows:
+            item = dict(row)
+            raw = item.pop("snapshot_json", "{}")
+            try:
+                item["snapshot"] = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                item["snapshot"] = {}
+            versions.append(item)
+        return versions
+    finally:
+        conn.close()
+
+
+def update_rule(
+    rule_id: str,
+    fields: dict,
+    *,
+    changed_by: str = "",
+    change_note: str = "",
+) -> bool:
+    """Patch mutable fields on an estimating rule and save a new version."""
+    data = _prepare_rule_values(fields, partial=True)
+    if not data:
+        return False
+
+    conn = _get_conn()
+    try:
+        existing = conn.execute("SELECT * FROM estimating_rules WHERE rule_id=?", (rule_id,)).fetchone()
+        if not existing:
+            return False
+        _validate_rule_lifecycle(data, _rule_from_row(existing))
+        current_version = int(existing["version"] or 1)
+        requested_version = int(data["version"]) if "version" in data and data["version"] is not None else 0
+        data["version"] = max(current_version + 1, requested_version)
+        assignments = [f"{field}=?" for field in data]
+        values = list(data.values())
+        assignments.append("updated_at=?")
+        values.append(datetime.now().isoformat())
+        values.append(rule_id)
+        cur = conn.execute(
+            f"UPDATE estimating_rules SET {', '.join(assignments)} WHERE rule_id=?",
+            values,
+        )
+        if cur.rowcount > 0:
+            row = conn.execute("SELECT * FROM estimating_rules WHERE rule_id=?", (rule_id,)).fetchone()
+            _insert_rule_version(
+                conn,
+                _rule_from_row(row),
+                "updated",
+                changed_by or "Rules Registry",
+                change_note or "Rule updated.",
+            )
+            _insert_ruleset_version(
+                conn,
+                change_type="rule_updated",
+                rule_id=rule_id,
+                changed_by=changed_by or "Rules Registry",
+                change_note=change_note or "Rule updated.",
+            )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def archive_rule(rule_id: str, *, changed_by: str = "", change_note: str = "") -> bool:
+    """Archive an estimating rule while preserving history for old bids."""
+    conn = _get_conn()
+    try:
+        existing = conn.execute("SELECT * FROM estimating_rules WHERE rule_id=?", (rule_id,)).fetchone()
+        if not existing:
+            return False
+        now = datetime.now().isoformat()
+        next_version = int(existing["version"] or 1) + 1
+        cur = conn.execute(
+            """
+            UPDATE estimating_rules
+            SET status='archived', effective_to=?, version=?, updated_at=?
+            WHERE rule_id=?
+            """,
+            (now, next_version, now, rule_id),
+        )
+        if cur.rowcount > 0:
+            row = conn.execute("SELECT * FROM estimating_rules WHERE rule_id=?", (rule_id,)).fetchone()
+            _insert_rule_version(
+                conn,
+                _rule_from_row(row),
+                "archived",
+                changed_by or "Rules Registry",
+                change_note or "Rule archived.",
+            )
+            _insert_ruleset_version(
+                conn,
+                change_type="rule_archived",
+                rule_id=rule_id,
+                changed_by=changed_by or "Rules Registry",
+                change_note=change_note or "Rule archived.",
+            )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_rule(rule_id: str) -> bool:
+    """Archive an estimating rule instead of hard deleting it."""
+    return archive_rule(rule_id)
+
+
+def get_active_rules(stage: str = None, category: str = None, as_of: str = None) -> list[dict]:
+    """Return active rules effective for a stage/category at the given ISO timestamp."""
+    as_of = as_of or datetime.now().isoformat()
+    where = [
+        "status='active'",
+        "(effective_from IS NULL OR effective_from='' OR effective_from<=?)",
+        "(effective_to IS NULL OR effective_to='' OR effective_to>=?)",
+    ]
+    params = [as_of, as_of]
+    if stage:
+        where.append("stage=?")
+        params.append(stage)
+    if category:
+        where.append("category=?")
+        params.append(category)
+
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM estimating_rules WHERE "
+            + " AND ".join(where)
+            + " ORDER BY priority DESC, category, stage, rule_id",
+            params,
+        ).fetchall()
+        return [_rule_from_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
+    """Seed built-in hard rules without overwriting user edits by default."""
+    from rules_registry import DEFAULT_HARD_RULES
+
+    inserted = 0
+    updated = 0
+    conn = _get_conn()
+    try:
+        for rule in DEFAULT_HARD_RULES:
+            data = _prepare_rule_values(rule)
+            _validate_rule_lifecycle(data)
+            now = datetime.now().isoformat()
+            existing = conn.execute(
+                "SELECT rule_id, version FROM estimating_rules WHERE rule_id=?",
+                (data["rule_id"],),
+            ).fetchone()
+            if existing and not overwrite:
+                continue
+            if existing and overwrite:
+                next_version = max(int(existing["version"] or 1) + 1, int(data.get("version") or 1))
+                conn.execute("""
+                    UPDATE estimating_rules SET
+                        name=?, category=?, stage=?, status=?, priority=?,
+                        condition_json=?, action_json=?, source=?, description=?,
+                        effective_from=?, effective_to=?, version=?, implementation_ref=?,
+                        test_ref=?, notes=?, updated_at=?
+                    WHERE rule_id=?
+                """, (
+                    data["name"], data["category"], data["stage"], data["status"],
+                    data["priority"], data["condition_json"], data["action_json"],
+                    data["source"], data["description"], data["effective_from"],
+                    data["effective_to"], next_version, data["implementation_ref"],
+                    data["test_ref"], data["notes"], now,
+                    data["rule_id"],
+                ))
+                row = conn.execute(
+                    "SELECT * FROM estimating_rules WHERE rule_id=?",
+                    (data["rule_id"],),
+                ).fetchone()
+                _insert_rule_version(
+                    conn,
+                    _rule_from_row(row),
+                    "seed_overwrite",
+                    "System",
+                    "Built-in seed overwrote this rule.",
+                )
+                updated += 1
+            else:
+                conn.execute("""
+                    INSERT INTO estimating_rules (
+                        rule_id, name, category, stage, status, priority,
+                        condition_json, action_json, source, description,
+                        effective_from, effective_to, version, implementation_ref,
+                        test_ref, notes, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    data["rule_id"], data["name"], data["category"], data["stage"],
+                    data["status"], data["priority"], data["condition_json"],
+                    data["action_json"], data["source"], data["description"],
+                    data["effective_from"], data["effective_to"], data["version"],
+                    data["implementation_ref"], data["test_ref"], data["notes"], now, now,
+                ))
+                row = conn.execute(
+                    "SELECT * FROM estimating_rules WHERE rule_id=?",
+                    (data["rule_id"],),
+                ).fetchone()
+                _insert_rule_version(
+                    conn,
+                    _rule_from_row(row),
+                    "seeded",
+                    "System",
+                    "Built-in hard rule seeded.",
+                )
+                inserted += 1
+        if inserted or updated:
+            _insert_ruleset_version(
+                conn,
+                change_type="seed_overwrite" if updated else "seeded",
+                changed_by="System",
+                change_note="Built-in hard rules seeded." if inserted else "Built-in hard rules overwritten.",
+            )
+        conn.commit()
+        return {"inserted": inserted, "updated": updated, "total": len(DEFAULT_HARD_RULES)}
+    finally:
+        conn.close()
+
+
+def list_ruleset_versions(limit: int = 25) -> list[dict]:
+    """List whole-registry snapshots, newest first."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, version, change_type, rule_id, changed_by, change_note,
+                   rule_count, active_count, created_at
+            FROM ruleset_versions
+            ORDER BY version DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_ruleset_version(version: int = None) -> dict | None:
+    """Fetch a whole-registry snapshot by version, or latest when omitted."""
+    conn = _get_conn()
+    try:
+        if version is None:
+            row = conn.execute(
+                "SELECT * FROM ruleset_versions ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM ruleset_versions WHERE version=?",
+                (version,),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        raw = item.pop("snapshot_json", "{}")
+        try:
+            item["snapshot"] = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            item["snapshot"] = {}
+        return item
+    finally:
+        conn.close()
+
+
+def rollback_ruleset_version(
+    version: int,
+    *,
+    changed_by: str = "",
+    change_note: str = "",
+) -> int:
+    """Restore the registry to a prior ruleset snapshot as a new ruleset version."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT snapshot_json FROM ruleset_versions WHERE version=?",
+            (version,),
+        ).fetchone()
+        if not row:
+            raise ValueError("Ruleset version not found")
+        snapshot = json.loads(row["snapshot_json"] or "{}")
+        target_rules = snapshot.get("rules") or []
+        if not isinstance(target_rules, list):
+            raise ValueError("Ruleset snapshot is invalid")
+
+        now = datetime.now().isoformat()
+        current_rows = {
+            r["rule_id"]: r
+            for r in conn.execute("SELECT * FROM estimating_rules").fetchall()
+        }
+        target_by_id = {}
+        actor = changed_by or "Rules Registry"
+        note = change_note or f"Rolled registry back to ruleset v{version}."
+
+        for raw_rule in target_rules:
+            if not isinstance(raw_rule, dict) or not raw_rule.get("rule_id"):
+                continue
+            data = _prepare_rule_values(raw_rule)
+            _validate_rule_lifecycle(data)
+            rule_id = data["rule_id"]
+            target_by_id[rule_id] = data
+            existing = current_rows.get(rule_id)
+            target_version = int(data.get("version") or 1)
+            existing_rule = _rule_from_row(existing) if existing else None
+            decoded_data = _decode_prepared_rule(data)
+            comparable = {field: decoded_data.get(field) for field in RULE_FIELDS if field != "version"}
+            current_comparable = {
+                field: existing_rule.get(field)
+                for field in RULE_FIELDS
+                if existing_rule and field != "version"
+            }
+            if existing and comparable == current_comparable:
+                continue
+
+            if existing:
+                data["version"] = max(int(existing["version"] or 1) + 1, target_version + 1)
+                assignments = [
+                    "name=?", "category=?", "stage=?", "status=?", "priority=?",
+                    "condition_json=?", "action_json=?", "source=?", "description=?",
+                    "effective_from=?", "effective_to=?", "version=?",
+                    "implementation_ref=?", "test_ref=?", "notes=?", "updated_at=?",
+                ]
+                conn.execute(
+                    f"UPDATE estimating_rules SET {', '.join(assignments)} WHERE rule_id=?",
+                    (
+                        data["name"], data["category"], data["stage"], data["status"],
+                        data["priority"], data["condition_json"], data["action_json"],
+                        data["source"], data["description"], data["effective_from"],
+                        data["effective_to"], data["version"], data["implementation_ref"],
+                        data["test_ref"], data["notes"], now, rule_id,
+                    ),
+                )
+            else:
+                data["version"] = max(target_version, 1)
+                conn.execute(
+                    """
+                    INSERT INTO estimating_rules (
+                        rule_id, name, category, stage, status, priority,
+                        condition_json, action_json, source, description,
+                        effective_from, effective_to, version, implementation_ref,
+                        test_ref, notes, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rule_id, data["name"], data["category"], data["stage"],
+                        data["status"], data["priority"], data["condition_json"],
+                        data["action_json"], data["source"], data["description"],
+                        data["effective_from"], data["effective_to"], data["version"],
+                        data["implementation_ref"], data["test_ref"], data["notes"], now, now,
+                    ),
+                )
+
+            updated = conn.execute(
+                "SELECT * FROM estimating_rules WHERE rule_id=?",
+                (rule_id,),
+            ).fetchone()
+            _insert_rule_version(
+                conn,
+                _rule_from_row(updated),
+                "ruleset_rollback",
+                actor,
+                note,
+            )
+
+        for rule_id, existing in current_rows.items():
+            if rule_id in target_by_id:
+                continue
+            if str(existing["status"] or "").lower() == "archived":
+                continue
+            next_version = int(existing["version"] or 1) + 1
+            conn.execute(
+                """
+                UPDATE estimating_rules
+                SET status='archived', effective_to=?, version=?, updated_at=?
+                WHERE rule_id=?
+                """,
+                (now, next_version, now, rule_id),
+            )
+            archived = conn.execute(
+                "SELECT * FROM estimating_rules WHERE rule_id=?",
+                (rule_id,),
+            ).fetchone()
+            _insert_rule_version(
+                conn,
+                _rule_from_row(archived),
+                "ruleset_rollback_archived",
+                actor,
+                note,
+            )
+
+        new_version = _insert_ruleset_version(
+            conn,
+            change_type="rollback",
+            changed_by=actor,
+            change_note=note,
+        )
+        conn.commit()
+        return new_version
     finally:
         conn.close()
 

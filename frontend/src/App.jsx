@@ -7,6 +7,7 @@ import SettingsPage from './components/SettingsPage'
 import InternalRatesPage from './components/InternalRatesPage'
 import PricingRulesPage from './components/PricingRulesPage'
 import VendorContactsPage from './components/VendorContactsPage'
+import RulesRegistryPage from './components/RulesRegistryPage'
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
         <Route path="/jobs" element={<AllJobs />} />
         <Route path="/jobs/:jobId" element={<JobDetail />} />
         <Route path="/pricing-rules" element={<PricingRulesPage />} />
+        <Route path="/rules" element={<RulesRegistryPage />} />
         <Route path="/internal-rates" element={<PricingRulesPage />} />
         <Route path="/vendor-contacts" element={<VendorContactsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
