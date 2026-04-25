@@ -3875,33 +3875,10 @@ def api_generate_proposal(job_id: str):
             if rw.get("description_text"):
                 b["description_text"] = rw["description_text"]
 
-    # ── Apply deletion flags: drop bundles the user previously removed ─────
+    # Carry deletion lists back so the FE save can persist them.
+    # The bundler already filtered the bundles + recomputed totals consistently,
+    # so we don't recompute totals here (doing so caused a double-tax bug).
     if deleted_bundle_names or deleted_material_codes:
-        kept = []
-        for b in proposal.get("bundles", []):
-            if b.get("bundle_name") in deleted_bundle_names:
-                continue
-            bundle_codes = {m.get("item_code") for m in (b.get("materials") or []) if m.get("item_code")}
-            if bundle_codes and bundle_codes.issubset(deleted_material_codes):
-                continue
-            kept.append(b)
-        proposal["bundles"] = kept
-
-        # Recompute subtotal/tax/grand_total from remaining bundles.
-        # Tax is on material + sundries + freight (not labor) per JR convention.
-        sub = 0.0
-        tax_base = 0.0
-        for b in kept:
-            sub += b.get("total_price") or 0
-            tax_base += (b.get("material_cost") or 0) + (b.get("sundry_cost") or 0) + (b.get("freight_cost") or 0)
-            tax_base += b.get("gpm_material_adder") or 0
-        tax_rate = proposal.get("tax_rate") or 0
-        tax = round(tax_base * tax_rate, 2)
-        textura = proposal.get("textura_amount") or 0
-        proposal["subtotal"] = round(sub, 2)
-        proposal["taxable"] = round(tax_base, 2)
-        proposal["tax_amount"] = tax
-        proposal["grand_total"] = round(sub + tax + textura, 2)
         proposal["deleted_bundles"] = sorted(deleted_bundle_names)
         proposal["deleted_material_codes"] = sorted(deleted_material_codes)
         trace.record(

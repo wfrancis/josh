@@ -1358,6 +1358,29 @@ def generate_proposal_data(job_id: int, job: dict, trace=None) -> dict:
                         break
             bundles.insert(insert_idx, db)
 
+    # ── Apply deletion flags (skip bundles the user removed in a prior session) ──
+    # Read deleted_bundles / deleted_material_codes from existing proposal_data so
+    # they survive regenerate. Done BEFORE GPM/tax so the redistribution is correct
+    # for the kept bundles only and we don't double-count tax later.
+    existing_pd = job.get("proposal_data") or {}
+    if isinstance(existing_pd, str):
+        try:
+            import json as _pd_json
+            existing_pd = _pd_json.loads(existing_pd)
+        except Exception:
+            existing_pd = {}
+    deleted_bundle_names = set(existing_pd.get("deleted_bundles") or [])
+    deleted_material_codes = set(existing_pd.get("deleted_material_codes") or [])
+    if deleted_bundle_names or deleted_material_codes:
+        bundles = [
+            b for b in bundles
+            if b.get("bundle_name") not in deleted_bundle_names
+            and not (
+                {m.get("item_code") for m in (b.get("materials") or []) if m.get("item_code")}
+                and {m.get("item_code") for m in (b.get("materials") or []) if m.get("item_code")}.issubset(deleted_material_codes)
+            )
+        ]
+
     # ── Apply GPM (Gross Profit Margin) ──────────────────────────────────
     # GPM is calculated on the TOTAL project cost (material + sundry + freight + labor).
     # Revenue = TotalCost / (1 - GPM%), profit distributed proportionally across bundles.

@@ -219,10 +219,29 @@ def calculate_sundries_for_materials(materials: list[dict], trace=None) -> list[
     """
     Calculate sundries for a list of material line items.
     Loads sundry rules from DB once for efficiency.
+
+    Job-level sundries (qty_basis = "tub_shower_total" or "unit_count") are
+    allocated to ONE material per (material_type, sundry_name). Without this
+    dedup, a job with multiple tub_shower_surround materials (e.g. T-202,
+    T-203, T-116) would get caulking billed N times instead of once —
+    the rule uses the job's tub_shower_count regardless of which material
+    it fires on.
     """
     sundry_rules = _load_sundry_rules()
     all_sundries = []
-    for mat in materials:
+
+    # Sort so the largest-qty material of each type receives the job-level
+    # sundries; smaller alternates / accent pieces (T-116 mosaic under
+    # tub_shower_surround, premium alternates, etc.) get skipped.
+    ordered = sorted(
+        materials,
+        key=lambda m: (m.get("material_type") or "", -(_safe_float(m.get("installed_qty")))),
+    )
+
+    emitted_job_level: set[tuple[str, str]] = set()
+    JOB_LEVEL_BASES = {"tub_shower_total", "unit_count"}
+
+    for mat in ordered:
         material_type = mat.get("material_type", "")
         installed_qty = mat.get("installed_qty", 0)
         material_id = mat.get("id") or mat.get("item_code")
@@ -230,8 +249,21 @@ def calculate_sundries_for_materials(materials: list[dict], trace=None) -> list[
         sundries = calculate_sundries(
             material_type, installed_qty, sundry_rules, material=mat, trace=trace
         )
+
+        rules_for_type = sundry_rules.get(material_type, [])
+        rule_by_name = {r.get("sundry_name"): r for r in rules_for_type}
+        filtered = []
         for s in sundries:
+            rule = rule_by_name.get(s.get("sundry_name"))
+            if rule and rule.get("qty_basis") in JOB_LEVEL_BASES:
+                key = (material_type, s["sundry_name"])
+                if key in emitted_job_level:
+                    continue  # job-level sundry already allocated to primary material
+                emitted_job_level.add(key)
+            filtered.append(s)
+
+        for s in filtered:
             s["material_id"] = material_id
-        all_sundries.extend(sundries)
+        all_sundries.extend(filtered)
 
     return all_sundries

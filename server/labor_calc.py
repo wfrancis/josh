@@ -388,20 +388,42 @@ def _find_labor_entries(
             if dim_filtered:
                 candidates = dim_filtered
 
-    # For sound mat, pick the catalog row that matches the material's mm thickness
+    # For sound mat, pick the catalog row that matches the material's mm thickness.
+    # Special case: descriptions containing "Premium" (with no explicit mm) bump to
+    # the 4-6mm tier — Josh bills Premium at $0.75 even when the product is the same
+    # as Standard (see Sun Valley Block 2: both are Pliteq RST05, but Standard bills
+    # at $0.50 and Premium at $0.75).
     if material_type == "sound_mat" and material and candidates:
-        thickness = _parse_mat_thickness_mm(material.get("description", ""))
+        desc_lower = (material.get("description") or "").lower()
+        thickness = _parse_mat_thickness_mm(desc_lower)
         if thickness is not None:
             tier_kw = _sound_mat_tier_kw(thickness)
-            thickness_filtered = [c for c in candidates if tier_kw in c["description"].lower()]
-            if thickness_filtered:
-                candidates = thickness_filtered
+        elif "premium" in desc_lower:
+            tier_kw = "4mm to 6mm"
         else:
-            # No thickness in description — default to the thinnest (<3mm) tier so
-            # we don't accidentally pick an expensive rate by alphabetical luck.
-            thin = [c for c in candidates if "less than 3mm" in c["description"].lower()]
-            if thin:
-                candidates = thin
+            # No thickness in description and not Premium — default to thinnest tier
+            # so we don't accidentally pick an expensive rate by alphabetical luck.
+            tier_kw = "less than 3mm"
+        thickness_filtered = [c for c in candidates if tier_kw in c["description"].lower()]
+        if thickness_filtered:
+            candidates = thickness_filtered
+
+    # For rubber_sheet materials, route to "Rolled Rubber" rows when the product
+    # isn't explicitly commercial sheet vinyl. Many rubber products (Ecofit, Mondo,
+    # Sportec, etc.) don't contain the word "rubber" in the description, so we
+    # exclude on "vinyl" rather than include on "rubber".
+    if material_type == "rubber_sheet" and material and candidates:
+        desc_lower = (material.get("description") or "").lower()
+        if "vinyl" not in desc_lower:
+            rolled = [e for e in type_entries if "rolled rubber" in e["description"].lower()]
+            if rolled:
+                thickness = _parse_mat_thickness_mm(desc_lower)
+                if thickness is not None:
+                    tier_kw = "3mm or under" if thickness <= 3 else "over 3mm"
+                    filtered = [c for c in rolled if tier_kw in c["description"].lower()]
+                    if filtered:
+                        rolled = filtered
+                candidates = rolled
 
     # Apply size tier selection if defined
     size_tiers = rule.get("size_tiers", [])
