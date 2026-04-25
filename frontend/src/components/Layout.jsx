@@ -128,7 +128,7 @@ function SidebarContent({ location, onNavigate }) {
       {/* Bottom section */}
       <div className="px-3 pb-4 space-y-1">
         <NavItem to="/pricing-rules" icon={DollarSign} label="Pricing & Rules" active={location.pathname === '/pricing-rules'} onClick={onNavigate} />
-        <NavItem to="/rules" icon={ListChecks} label="Rules Registry" active={location.pathname === '/rules'} onClick={onNavigate} />
+        <NavItem to="/rules" icon={ListChecks} label="Estimating Rules" active={location.pathname === '/rules'} onClick={onNavigate} />
         <NavItem to="/vendor-contacts" icon={Building2} label="Vendor Contacts" active={location.pathname === '/vendor-contacts'} onClick={onNavigate} />
         <NavItem to="/settings" icon={Settings} label="Settings" active={location.pathname === '/settings'} onClick={onNavigate} />
         <div className="px-3 pt-2 text-[10px] text-gray-600">
