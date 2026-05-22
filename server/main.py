@@ -3663,11 +3663,21 @@ def _validate_proposal_body_against_trace(body: dict, traces: list[dict]) -> Non
 
 def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
     """Reject stale proposal bodies after material source edits."""
+    def _is_synthetic_material(material: dict) -> bool:
+        identifiers = (
+            material.get("item_code"),
+            material.get("id"),
+            material.get("material_id"),
+        )
+        return any(str(value or "").startswith("synthetic_") for value in identifiers)
+
     deleted_codes = {str(code) for code in (body.get("deleted_material_codes") or []) if code}
     current_by_id = {}
     current_by_code = {}
     for material in job.get("materials", []) or []:
         if not isinstance(material, dict):
+            continue
+        if _is_synthetic_material(material):
             continue
         if material.get("id") is not None:
             current_by_id[str(material.get("id"))] = material
@@ -3687,6 +3697,8 @@ def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
             continue
         for material in bundle.get("materials") or []:
             if not isinstance(material, dict):
+                continue
+            if _is_synthetic_material(material):
                 continue
             item_code = str(material.get("item_code") or "")
             current = None
@@ -3715,6 +3727,8 @@ def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
     missing = []
     for material in job.get("materials", []) or []:
         if not isinstance(material, dict):
+            continue
+        if _is_synthetic_material(material):
             continue
         item_code = str(material.get("item_code") or "")
         if item_code in deleted_codes:
@@ -3885,37 +3899,14 @@ def api_generate_proposal(job_id: str):
             entity_type="proposal",
             entity_id=job["id"],
             entity_key="proposal",
-            output_field="subtotal",
-            formula="sum(kept bundle.total_price)",
-            inputs={"kept_bundle_count": len(kept), "deleted_bundles": sorted(deleted_bundle_names)},
-            result=proposal["subtotal"],
-            rule_id="proposal:deleted_bundle_recalc",
-            source="proposal_bundler",
-        )
-        trace.record(
-            entity_type="proposal",
-            entity_id=job["id"],
-            entity_key="proposal",
-            output_field="tax_amount",
-            formula="taxable * tax_rate",
-            inputs={"taxable": proposal["taxable"], "tax_rate": tax_rate},
-            result=proposal["tax_amount"],
-            rule_id="proposal:deleted_bundle_recalc",
-            source="proposal_bundler",
-        )
-        trace.record(
-            entity_type="proposal",
-            entity_id=job["id"],
-            entity_key="proposal",
-            output_field="grand_total",
-            formula="subtotal + tax_amount + textura_amount",
+            output_field="bundle_count",
+            formula="filter generated bundles by deleted_bundles and deleted_material_codes before totals",
             inputs={
-                "subtotal": proposal["subtotal"],
-                "tax_amount": proposal["tax_amount"],
-                "textura_amount": textura,
+                "deleted_bundles": sorted(deleted_bundle_names),
+                "deleted_material_codes": sorted(deleted_material_codes),
             },
-            result=proposal["grand_total"],
-            rule_id="proposal:deleted_bundle_recalc",
+            result=len(proposal.get("bundles") or []),
+            rule_id="proposal:deleted_bundle_filter",
             source="proposal_bundler",
         )
 
