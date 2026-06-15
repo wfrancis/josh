@@ -34,6 +34,20 @@ The fixture permanently covers:
 - Tax excludes labor.
 - Deleted proposal bundles stay deleted across regenerate.
 - Audit trace is expected to include material, sundry, labor, tax, and GPM total categories.
+- Golden reproducibility can capture a saved proposal baseline, replay it in baseline mode, and run current mode without mutating the live job.
+
+## Golden Job Reproducibility
+
+Explain it like I am 15: Josh wants the estimator to show its work like a math teacher. A golden job is a saved answer key for a job everyone trusts, such as Sun Valley. It freezes the job inputs, accepted proposal edits, company rates, labor catalog, ruleset version, Job Runner target totals, and tolerance rules. Later, the app can replay the same job without changing the live job and ask, "Did we still get the same answer?"
+
+The deployed harness now exercises this path from `test_data/rules_audit/josh_lessons_cases.json`:
+
+- `POST /api/jobs/{job_id}/reproducibility/baseline` captures the synthetic accepted proposal as a golden baseline.
+- `POST /api/jobs/{job_id}/reproducibility/replay` runs `baseline` mode and must pass.
+- `POST /api/jobs/{job_id}/reproducibility/replay` also runs `current` mode and records pass/warn/fail drift from today's rules and rates.
+- `GET /api/jobs/{job_id}/reproducibility` verifies the saved baseline and latest replay can be read back.
+
+For a real job, capture Sun Valley from the Job UI after the accepted proposal and audit trace are current, then enter the Job Runner target totals from quote `293113`. Baseline replay should pass. Current replay should clearly show any rule, rate, structural, total, or bundle deltas.
 
 ## API Assumptions
 
@@ -46,6 +60,10 @@ Required existing app APIs:
 - `POST /api/jobs/{job_id}/calculate`
 - `POST /api/jobs/{job_id}/proposal/generate`
 - `PUT /api/jobs/{job_id}/proposal/bundles`
+- `GET /api/jobs/{job_id}/reproducibility`
+- `POST /api/jobs/{job_id}/reproducibility/baseline`
+- `POST /api/jobs/{job_id}/reproducibility/replay`
+- `GET /api/reproducibility/replays/{replay_id}`
 - `DELETE /api/jobs/{job_id}` for cleanup when the harness created the job
 
 Rule registry discovery currently accepts either a formal registry endpoint (`/api/rules/registry`, `/api/rule-registry`, `/api/rules`, `/api/audit/rules`, or `/api/pricing-rules/registry`) or the legacy combination of `/api/company-rates` plus `/api/labor-catalog`.

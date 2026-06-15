@@ -561,13 +561,13 @@ def calculate_labor(
     return results
 
 
-def calculate_labor_for_materials(materials: list[dict], trace=None) -> list[dict]:
+def calculate_labor_for_materials(materials: list[dict], trace=None, labor_catalog_override: list[dict] | None = None) -> list[dict]:
     """
     Calculate labor for a list of material line items.
     Loads labor catalog from DB once for efficiency.
     Each material can produce multiple labor line items (base + add-ons).
     """
-    catalog = get_labor_catalog_entries()
+    catalog = labor_catalog_override if labor_catalog_override is not None else get_labor_catalog_entries()
     results = []
     for mat in materials:
         material_type = mat.get("material_type", "")

@@ -15,6 +15,7 @@ import ProposalEditor from './ProposalEditor'
 import QuoteUpload from './QuoteUpload'
 import VendorQuoteFlow from './VendorQuoteFlow'
 import QuoteTracker from './QuoteTracker'
+import ReproducibilityPanel from './ReproducibilityPanel'
 import StatusBadge, { getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
 import ActivityLog from './ActivityLog'
@@ -473,6 +474,8 @@ export default function JobDetail() {
           />
         )}
       </div>
+
+      <ReproducibilityPanel jobId={jobId} />
 
       {/* Stepper */}
       <div className="glass-card px-3 sm:px-6 py-3 sm:py-4 mb-6 sm:mb-8">

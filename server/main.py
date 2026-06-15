@@ -45,6 +45,8 @@ from models import (
     get_active_rules, seed_rules_registry_defaults,
     create_calculation_run, save_calculation_traces, complete_calculation_run,
     list_calculation_runs, get_calculation_traces,
+    upsert_golden_job, get_golden_job_for_source, get_golden_replay,
+    save_golden_replay, list_golden_replays_for_job,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import parse_quote_file, set_openai_config
@@ -54,6 +56,7 @@ from labor_calc import calculate_labor_for_materials, load_labor_catalog, load_l
 from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf, generate_proposal_pdf
 from proposal_bundler import generate_proposal_data
+from reproducibility import DEFAULT_TOLERANCE, make_golden_snapshot, replay_golden_job
 from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE, STAIR_SUNDRY_KITS
 from email_agent import compose_quote_request, send_email, generate_quote_request_text
 from ai_client import chat_complete, get_provider_info
@@ -474,6 +477,17 @@ class RuleDraftRequest(BaseModel):
 class RulesetRollbackRequest(BaseModel):
     changed_by: Optional[str] = "Josh"
     change_note: Optional[str] = None
+
+
+class GoldenBaselineRequest(BaseModel):
+    jr_quote_id: Optional[str] = ""
+    target_totals: Optional[dict] = None
+    tolerance: Optional[dict] = None
+    notes: Optional[str] = ""
+
+
+class GoldenReplayRequest(BaseModel):
+    mode: str = "baseline"
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -2628,6 +2642,191 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
                 "rule_id": (matching[-1].get("rule_id") if matching else None),
             }
     return response
+
+
+def _public_golden_job(golden: dict | None) -> dict | None:
+    if not golden:
+        return None
+    snapshot = golden.get("snapshot") or {}
+    return {
+        "id": golden.get("id"),
+        "source_job_id": golden.get("source_job_id"),
+        "name": golden.get("name"),
+        "jr_quote_id": golden.get("jr_quote_id"),
+        "target_totals": golden.get("target_totals") or snapshot.get("target_totals") or {},
+        "accepted_totals": snapshot.get("accepted_totals") or {},
+        "tolerance": golden.get("tolerance") or snapshot.get("tolerance") or DEFAULT_TOLERANCE,
+        "ruleset_version": golden.get("ruleset_version"),
+        "source_fingerprint": golden.get("source_fingerprint"),
+        "notes": golden.get("notes"),
+        "status": golden.get("status"),
+        "created_at": golden.get("created_at"),
+        "updated_at": golden.get("updated_at"),
+    }
+
+
+def _public_replay(replay: dict | None, include_generated: bool = False) -> dict | None:
+    if not replay:
+        return None
+    result = {
+        "id": replay.get("id"),
+        "golden_job_id": replay.get("golden_job_id"),
+        "source_job_id": replay.get("source_job_id"),
+        "mode": replay.get("mode"),
+        "status": replay.get("status"),
+        "summary": replay.get("summary") or {},
+        "diff": replay.get("diff") or {},
+        "audit_run_id": replay.get("audit_run_id"),
+        "created_at": replay.get("created_at"),
+    }
+    if include_generated:
+        result["generated_proposal"] = replay.get("generated_proposal") or {}
+    return result
+
+
+@app.get("/api/jobs/{job_id}/reproducibility")
+def api_get_job_reproducibility(job_id: str):
+    """Return golden baseline and recent replay status for a job."""
+    db_id = _resolve_job_id(job_id)
+    golden = get_golden_job_for_source(db_id)
+    replays = list_golden_replays_for_job(db_id, limit=10)
+    return {
+        "golden_job": _public_golden_job(golden),
+        "latest_replay": _public_replay(replays[0]) if replays else None,
+        "replays": [_public_replay(replay) for replay in replays],
+        "default_tolerance": DEFAULT_TOLERANCE,
+    }
+
+
+@app.post("/api/jobs/{job_id}/reproducibility/baseline")
+def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
+    """Capture the current accepted proposal as this job's golden baseline."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    missing = _required_job_field_gaps(job)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot capture golden baseline until required job fields are filled: {', '.join(missing)}.",
+        )
+
+    proposal_data = job.get("proposal_data")
+    if not isinstance(proposal_data, dict) or not proposal_data.get("bundles"):
+        raise HTTPException(status_code=409, detail="Cannot capture golden baseline until the proposal has saved bundles.")
+
+    run = _latest_completed_run(job["id"], {"proposal_manual_save", "proposal_editor_save", "proposal_generation"})
+    if not run:
+        raise HTTPException(status_code=409, detail="Cannot capture golden baseline until this proposal has a current audit trace. Save or regenerate first.")
+    _ensure_audit_ruleset_current(run, label="Golden baseline")
+
+    target_totals = {
+        key: value for key, value in (body.target_totals or {}).items()
+        if value not in (None, "")
+    }
+    if not target_totals:
+        raise HTTPException(status_code=400, detail="Enter at least one Job Runner target total before capturing the golden baseline.")
+
+    ruleset = get_ruleset_version()
+    snapshot, fingerprint = make_golden_snapshot(
+        job=job,
+        company_rates=get_all_company_rates(),
+        labor_catalog=get_labor_catalog_entries(),
+        ruleset=ruleset,
+        target_totals=target_totals,
+        tolerance=body.tolerance or DEFAULT_TOLERANCE,
+    )
+    golden = upsert_golden_job(
+        source_job_id=job["id"],
+        name=job.get("project_name") or f"Job {job['id']}",
+        jr_quote_id=body.jr_quote_id or "",
+        target_totals=target_totals,
+        tolerance=snapshot.get("tolerance") or DEFAULT_TOLERANCE,
+        snapshot=snapshot,
+        ruleset_version=(ruleset or {}).get("version"),
+        source_fingerprint=fingerprint,
+        notes=body.notes or "",
+        status="active",
+    )
+    log_activity(
+        job["id"],
+        "golden_baseline_captured",
+        "Captured golden reproducibility baseline",
+        {"golden_job_id": golden["id"], "jr_quote_id": body.jr_quote_id, "source_fingerprint": fingerprint},
+    )
+    return {
+        "golden_job": _public_golden_job(golden),
+        "latest_replay": None,
+        "replays": [],
+        "default_tolerance": DEFAULT_TOLERANCE,
+    }
+
+
+@app.post("/api/jobs/{job_id}/reproducibility/replay")
+def api_replay_golden_job(job_id: str, body: GoldenReplayRequest):
+    """Run a non-mutating golden replay and persist the replay report."""
+    db_id = _resolve_job_id(job_id)
+    golden = get_golden_job_for_source(db_id)
+    if not golden:
+        raise HTTPException(status_code=404, detail="No golden baseline exists for this job yet.")
+
+    mode = (body.mode or "baseline").lower().strip()
+    if mode not in ("baseline", "current"):
+        raise HTTPException(status_code=400, detail="Replay mode must be 'baseline' or 'current'.")
+
+    result, trace = replay_golden_job(
+        golden_job=golden,
+        mode=mode,
+        current_company_rates=get_all_company_rates(),
+        current_labor_catalog=get_labor_catalog_entries(),
+        current_ruleset=get_ruleset_version(),
+    )
+    run_id = create_calculation_run(
+        db_id,
+        "golden_replay",
+        source="system",
+        metadata=_audit_metadata({
+            "endpoint": "reproducibility/replay",
+            "golden_job_id": golden["id"],
+            "mode": mode,
+            "status": result["summary"]["status"],
+            "source_fingerprint": golden.get("source_fingerprint"),
+        }),
+    )
+    for record in trace._records:
+        record["run_id"] = run_id
+    trace_count = save_calculation_traces(db_id, run_id, trace.records)
+    summary = dict(result["summary"])
+    summary["trace_count"] = trace_count
+    complete_calculation_run(run_id, summary=summary)
+
+    replay = save_golden_replay(
+        golden_job_id=golden["id"],
+        source_job_id=db_id,
+        mode=mode,
+        status=summary["status"],
+        summary=summary,
+        diff=result["diff"],
+        generated_proposal=result["proposal"],
+        audit_run_id=run_id,
+    )
+    log_activity(
+        db_id,
+        "golden_replay_ran",
+        f"Golden replay {mode} finished: {summary['status'].upper()}",
+        {"golden_job_id": golden["id"], "replay_id": replay["id"], "mode": mode, "status": summary["status"]},
+    )
+    return _public_replay(replay, include_generated=False)
+
+
+@app.get("/api/reproducibility/replays/{replay_id}")
+def api_get_golden_replay(replay_id: int):
+    """Return a full golden replay report."""
+    replay = get_golden_replay(replay_id)
+    if not replay:
+        raise HTTPException(status_code=404, detail="Replay not found")
+    return _public_replay(replay, include_generated=True)
 
 
 def _as_number(value):

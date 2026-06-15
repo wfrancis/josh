@@ -96,6 +96,12 @@ export const api = {
   getJobAuditTrace: (jobId) => request(`/jobs/${jobId}/audit`),
   runRulesAuditHarness: (payload) =>
     request('/rules/audit-harness', { method: 'POST', body: JSON.stringify(payload) }),
+  getReproducibility: (jobId) => request(`/jobs/${jobId}/reproducibility`),
+  captureGoldenBaseline: (jobId, data) =>
+    request(`/jobs/${jobId}/reproducibility/baseline`, { method: 'POST', body: JSON.stringify(data) }),
+  runGoldenReplay: (jobId, mode = 'baseline') =>
+    request(`/jobs/${jobId}/reproducibility/replay`, { method: 'POST', body: JSON.stringify({ mode }) }),
+  getGoldenReplay: (replayId) => request('/reproducibility/replays/' + replayId),
 
   // Calculate
   calculate: (jobId) => request(`/jobs/${jobId}/calculate`, { method: 'POST' }),

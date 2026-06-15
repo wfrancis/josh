@@ -215,7 +215,7 @@ def calculate_sundries(
     return results
 
 
-def calculate_sundries_for_materials(materials: list[dict], trace=None) -> list[dict]:
+def calculate_sundries_for_materials(materials: list[dict], trace=None, sundry_rules_override: dict | None = None) -> list[dict]:
     """
     Calculate sundries for a list of material line items.
     Loads sundry rules from DB once for efficiency.
@@ -227,7 +227,7 @@ def calculate_sundries_for_materials(materials: list[dict], trace=None) -> list[
     the rule uses the job's tub_shower_count regardless of which material
     it fires on.
     """
-    sundry_rules = _load_sundry_rules()
+    sundry_rules = sundry_rules_override if sundry_rules_override is not None else _load_sundry_rules()
     all_sundries = []
 
     # Sort so the largest-qty material of each type receives the job-level

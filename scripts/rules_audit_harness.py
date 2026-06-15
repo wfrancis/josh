@@ -883,6 +883,59 @@ def validate_deleted_bundle(client: Client, job_id: str, proposal: dict[str, Any
     )
 
 
+def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[str, Any]) -> Check:
+    totals = summarize_proposal(proposal)
+    target_totals = {
+        key: totals.get(key)
+        for key in ("grand_total", "subtotal", "tax_amount", "gpm_profit", "gpm_labor", "gpm_material")
+        if totals.get(key) is not None
+    }
+    try:
+        _, baseline, _ = client.request(
+            "POST",
+            f"/api/jobs/{job_id}/reproducibility/baseline",
+            json_body={
+                "jr_quote_id": "HARNESS",
+                "target_totals": target_totals,
+                "notes": "Synthetic golden baseline from rules_audit_harness.py",
+            },
+        )
+        _, baseline_replay, _ = client.request(
+            "POST",
+            f"/api/jobs/{job_id}/reproducibility/replay",
+            json_body={"mode": "baseline"},
+        )
+        _, current_replay, _ = client.request(
+            "POST",
+            f"/api/jobs/{job_id}/reproducibility/replay",
+            json_body={"mode": "current"},
+        )
+        _, state, _ = client.request("GET", f"/api/jobs/{job_id}/reproducibility")
+    except HarnessError as exc:
+        return Check("golden_reproducibility", "FAIL", f"golden replay endpoint failed: {exc}")
+
+    baseline_status = baseline_replay.get("status")
+    current_status = current_replay.get("status")
+    ok = (
+        baseline.get("golden_job")
+        and baseline_status == "pass"
+        and current_status in {"pass", "warn", "fail"}
+        and state.get("golden_job")
+    )
+    return Check(
+        "golden_reproducibility",
+        "PASS" if ok else "FAIL",
+        "captured synthetic golden baseline and replayed it" if ok else "baseline golden replay did not pass",
+        {
+            "baseline_status": baseline_status,
+            "current_status": current_status,
+            "golden_job": baseline.get("golden_job"),
+            "latest_replay": state.get("latest_replay"),
+            "target_totals": target_totals,
+        },
+    )
+
+
 def fetch_audit_payloads(client: Client, job_id: str, proposal: dict[str, Any]) -> tuple[list[Any], list[dict[str, Any]]]:
     payloads = []
     attempts = []
@@ -991,6 +1044,7 @@ def main() -> int:
         proposal, proposal_check = generate_proposal(client, job_id)
         checks.append(proposal_check)
         checks.append(validate_totals(proposal))
+        checks.append(validate_golden_reproducibility(client, job_id, proposal))
         checks.append(validate_manual_override_audit(client, job_id, proposal))
         checks.append(validate_deleted_bundle(client, job_id, proposal, fixture))
         checks.append(validate_audit_trace(client, job_id, proposal, fixture, args.allow_missing_audit))

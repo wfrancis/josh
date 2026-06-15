@@ -342,6 +342,42 @@ def init_db() -> None:
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
                 FOREIGN KEY (run_id) REFERENCES calculation_runs(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS golden_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_job_id INTEGER NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                jr_quote_id TEXT DEFAULT '',
+                target_totals_json TEXT NOT NULL DEFAULT '{}',
+                tolerance_json TEXT NOT NULL DEFAULT '{}',
+                snapshot_json TEXT NOT NULL,
+                ruleset_version INTEGER,
+                source_fingerprint TEXT NOT NULL DEFAULT '',
+                notes TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (source_job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_golden_jobs_source ON golden_jobs(source_job_id);
+
+            CREATE TABLE IF NOT EXISTS golden_job_replays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                golden_job_id INTEGER NOT NULL,
+                source_job_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                diff_json TEXT NOT NULL DEFAULT '{}',
+                generated_proposal_json TEXT NOT NULL DEFAULT '{}',
+                audit_run_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (golden_job_id) REFERENCES golden_jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY (audit_run_id) REFERENCES calculation_runs(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_golden_replays_job ON golden_job_replays(source_job_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_golden_replays_golden ON golden_job_replays(golden_job_id, created_at DESC);
         """)
         conn.commit()
         # Migrations for existing DBs
@@ -2031,6 +2067,203 @@ def get_all_company_rates() -> dict:
             except (ValueError, TypeError):
                 result[r["rate_type"]] = r["data"]
         return result
+    finally:
+        conn.close()
+
+
+def _json_loads_safe(raw, default=None):
+    import json as _json
+    if raw in (None, ""):
+        return {} if default is None else default
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return _json.loads(raw)
+    except (TypeError, ValueError):
+        return {} if default is None else default
+
+
+def _decode_golden_job_row(row) -> dict:
+    d = dict(row)
+    d["target_totals"] = _json_loads_safe(d.pop("target_totals_json", None), {})
+    d["tolerance"] = _json_loads_safe(d.pop("tolerance_json", None), {})
+    d["snapshot"] = _json_loads_safe(d.pop("snapshot_json", None), {})
+    return d
+
+
+def _decode_golden_replay_row(row) -> dict:
+    d = dict(row)
+    d["summary"] = _json_loads_safe(d.pop("summary_json", None), {})
+    d["diff"] = _json_loads_safe(d.pop("diff_json", None), {})
+    d["generated_proposal"] = _json_loads_safe(d.pop("generated_proposal_json", None), {})
+    return d
+
+
+def upsert_golden_job(
+    *,
+    source_job_id: int,
+    name: str,
+    jr_quote_id: str = "",
+    target_totals: dict = None,
+    tolerance: dict = None,
+    snapshot: dict,
+    ruleset_version: int | None = None,
+    source_fingerprint: str = "",
+    notes: str = "",
+    status: str = "active",
+) -> dict:
+    """Create or replace the golden baseline for a source job."""
+    now = datetime.now().isoformat()
+    conn = _get_conn()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM golden_jobs WHERE source_job_id=?",
+            (source_job_id,),
+        ).fetchone()
+        if existing:
+            golden_id = existing["id"]
+            conn.execute(
+                """
+                UPDATE golden_jobs
+                SET name=?, jr_quote_id=?, target_totals_json=?, tolerance_json=?,
+                    snapshot_json=?, ruleset_version=?, source_fingerprint=?,
+                    notes=?, status=?, updated_at=?
+                WHERE source_job_id=?
+                """,
+                (
+                    name,
+                    jr_quote_id or "",
+                    _json_dumps_safe(target_totals or {}),
+                    _json_dumps_safe(tolerance or {}),
+                    _json_dumps_safe(snapshot),
+                    ruleset_version,
+                    source_fingerprint or "",
+                    notes or "",
+                    status or "active",
+                    now,
+                    source_job_id,
+                ),
+            )
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO golden_jobs
+                    (source_job_id, name, jr_quote_id, target_totals_json, tolerance_json,
+                     snapshot_json, ruleset_version, source_fingerprint, notes, status,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_job_id,
+                    name,
+                    jr_quote_id or "",
+                    _json_dumps_safe(target_totals or {}),
+                    _json_dumps_safe(tolerance or {}),
+                    _json_dumps_safe(snapshot),
+                    ruleset_version,
+                    source_fingerprint or "",
+                    notes or "",
+                    status or "active",
+                    now,
+                    now,
+                ),
+            )
+            golden_id = cur.lastrowid
+        conn.commit()
+        row = conn.execute("SELECT * FROM golden_jobs WHERE id=?", (golden_id,)).fetchone()
+        return _decode_golden_job_row(row)
+    finally:
+        conn.close()
+
+
+def get_golden_job_for_source(source_job_id: int) -> dict | None:
+    """Return the golden baseline attached to a source job, if present."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM golden_jobs WHERE source_job_id=?",
+            (source_job_id,),
+        ).fetchone()
+        return _decode_golden_job_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_golden_job(golden_job_id: int) -> dict | None:
+    """Return a golden baseline by id."""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM golden_jobs WHERE id=?", (golden_job_id,)).fetchone()
+        return _decode_golden_job_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def save_golden_replay(
+    *,
+    golden_job_id: int,
+    source_job_id: int,
+    mode: str,
+    status: str,
+    summary: dict = None,
+    diff: dict = None,
+    generated_proposal: dict = None,
+    audit_run_id: int | None = None,
+) -> dict:
+    """Persist one golden job replay report."""
+    now = datetime.now().isoformat()
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO golden_job_replays
+                (golden_job_id, source_job_id, mode, status, summary_json, diff_json,
+                 generated_proposal_json, audit_run_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                golden_job_id,
+                source_job_id,
+                mode,
+                status,
+                _json_dumps_safe(summary or {}),
+                _json_dumps_safe(diff or {}),
+                _json_dumps_safe(generated_proposal or {}),
+                audit_run_id,
+                now,
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM golden_job_replays WHERE id=?", (cur.lastrowid,)).fetchone()
+        return _decode_golden_replay_row(row)
+    finally:
+        conn.close()
+
+
+def list_golden_replays_for_job(source_job_id: int, limit: int = 20) -> list[dict]:
+    """List recent replay reports for a source job."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM golden_job_replays
+            WHERE source_job_id=?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (source_job_id, limit),
+        ).fetchall()
+        return [_decode_golden_replay_row(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_golden_replay(replay_id: int) -> dict | None:
+    """Return one replay report."""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM golden_job_replays WHERE id=?", (replay_id,)).fetchone()
+        return _decode_golden_replay_row(row) if row else None
     finally:
         conn.close()
 
