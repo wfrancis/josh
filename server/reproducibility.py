@@ -32,6 +32,21 @@ PROPOSAL_TOTAL_FIELDS = (
     "textura_amount",
 )
 
+BUNDLE_ACCEPTED_MONEY_FIELDS = (
+    "material_cost",
+    "sundry_cost",
+    "labor_cost",
+    "freight_cost",
+    "freight_override",
+    "gpm_labor_adder",
+    "gpm_material_adder",
+    "gpm_adder",
+    "taxable",
+    "tax_amount",
+    "total_price",
+    "price_override",
+)
+
 JOB_SNAPSHOT_FIELDS = (
     "id",
     "slug",
@@ -233,6 +248,57 @@ def _reapply_accepted_rewrites(generated: dict, accepted: dict) -> None:
             bundle["bundle_name"] = rewrite["bundle_name"]
         if rewrite.get("description_text"):
             bundle["description_text"] = rewrite["description_text"]
+    for field in ("notes", "terms", "exclusions", "deleted_bundles", "deleted_material_codes"):
+        if field in accepted:
+            generated[field] = copy.deepcopy(accepted[field])
+
+
+def _sync_editor_totals(proposal: dict) -> None:
+    bundles = [b for b in (proposal.get("bundles") or []) if isinstance(b, dict)]
+    proposal["gpm_labor"] = _money(sum(_money(b.get("gpm_labor_adder")) for b in bundles))
+    proposal["gpm_material"] = _money(sum(_money(b.get("gpm_material_adder")) for b in bundles))
+
+
+def _reapply_accepted_money(generated: dict, accepted: dict) -> int:
+    """Replay accepted proposal-level and bundle-level numeric edits for baseline mode."""
+    changed = 0
+    for field in (*PROPOSAL_TOTAL_FIELDS, "taxable", "tax_rate", "gpm_pct", "textura_fee"):
+        if field in accepted:
+            old = generated.get(field)
+            generated[field] = copy.deepcopy(accepted[field])
+            if _money(old) != _money(accepted[field]):
+                changed += 1
+
+    accepted_by_name = {
+        b.get("bundle_name"): b
+        for b in (accepted.get("bundles") or [])
+        if isinstance(b, dict) and b.get("bundle_name")
+    }
+    accepted_by_code = {}
+    for bundle in accepted.get("bundles") or []:
+        if not isinstance(bundle, dict):
+            continue
+        codes = _bundle_codes(bundle)
+        if codes:
+            accepted_by_code[codes[0]] = bundle
+
+    for bundle in generated.get("bundles") or []:
+        if not isinstance(bundle, dict):
+            continue
+        accepted_bundle = accepted_by_name.get(bundle.get("bundle_name"))
+        if not accepted_bundle:
+            codes = _bundle_codes(bundle)
+            accepted_bundle = accepted_by_code.get(codes[0]) if codes else None
+        if not accepted_bundle:
+            continue
+        for field in BUNDLE_ACCEPTED_MONEY_FIELDS:
+            if field not in accepted_bundle:
+                continue
+            old = bundle.get(field)
+            bundle[field] = copy.deepcopy(accepted_bundle[field])
+            if _money(old) != _money(accepted_bundle[field]):
+                changed += 1
+    return changed
 
 
 def _bundle_codes(bundle: dict) -> list[str]:
@@ -482,7 +548,23 @@ def replay_golden_job(
     )
 
     proposal = generate_proposal_data(source_job_id, job, trace=trace)
+    _sync_editor_totals(proposal)
     _reapply_accepted_rewrites(proposal, job.get("proposal_data") or {})
+    accepted_money_replay_count = 0
+    if mode == "baseline":
+        accepted_money_replay_count = _reapply_accepted_money(proposal, job.get("proposal_data") or {})
+        if accepted_money_replay_count:
+            trace.record(
+                entity_type="golden_replay",
+                entity_id=golden_job.get("id"),
+                entity_key=mode,
+                output_field="accepted_numeric_edits",
+                formula="reapply saved accepted proposal numeric fields in baseline mode",
+                inputs={"mode": mode},
+                result=accepted_money_replay_count,
+                rule_id="golden_replay:accepted_numeric_edits",
+                source="golden_replay",
+            )
 
     tolerance = {**DEFAULT_TOLERANCE, **(golden_job.get("tolerance") or snapshot.get("tolerance") or {})}
     diff = compare_replay(proposal, snapshot, tolerance)
@@ -498,6 +580,7 @@ def replay_golden_job(
         "target_totals": snapshot.get("target_totals") or {},
         "accepted_totals": snapshot.get("accepted_totals") or {},
         "generated_totals": proposal_totals(proposal),
+        "accepted_numeric_edit_count": accepted_money_replay_count,
         "failing_structural_count": len([row for row in diff["structural"] if row.get("status") == "fail"]),
         "drift_count": len(diff["drift"]),
         "warning_total_count": len([row for row in diff["totals"] if row.get("status") == "warn"]),

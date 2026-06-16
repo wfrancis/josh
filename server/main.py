@@ -2653,7 +2653,7 @@ def _public_golden_job(golden: dict | None) -> dict | None:
         "source_job_id": golden.get("source_job_id"),
         "name": golden.get("name"),
         "jr_quote_id": golden.get("jr_quote_id"),
-        "target_totals": golden.get("target_totals") or snapshot.get("target_totals") or {},
+        "target_totals": snapshot.get("target_totals") or golden.get("target_totals") or {},
         "accepted_totals": snapshot.get("accepted_totals") or {},
         "tolerance": golden.get("tolerance") or snapshot.get("tolerance") or DEFAULT_TOLERANCE,
         "ruleset_version": golden.get("ruleset_version"),
@@ -2721,10 +2721,13 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
         raise HTTPException(status_code=409, detail="Cannot capture golden baseline until this proposal has a current audit trace. Save or regenerate first.")
     _ensure_audit_ruleset_current(run, label="Golden baseline")
 
-    target_totals = {
-        key: value for key, value in (body.target_totals or {}).items()
-        if value not in (None, "")
-    }
+    target_totals = {}
+    for key, value in (body.target_totals or {}).items():
+        if value in (None, ""):
+            continue
+        number = _as_money_number(value)
+        if number is not None:
+            target_totals[key] = number
     if not target_totals:
         raise HTTPException(status_code=400, detail="Enter at least one Job Runner target total before capturing the golden baseline.")
 
@@ -2836,6 +2839,12 @@ def _as_number(value):
         return round(float(value), 4)
     except (TypeError, ValueError):
         return None
+
+
+def _as_money_number(value):
+    if isinstance(value, str):
+        value = value.replace("$", "").replace(",", "").strip()
+    return _as_number(value)
 
 
 def _audit_metadata(extra: dict = None) -> dict:
