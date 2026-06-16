@@ -116,7 +116,7 @@ def _num(value) -> float:
 
 
 def _copy_jsonable(value):
-    return copy.deepcopy(value or {})
+    return copy.deepcopy({} if value is None else value)
 
 
 def _line_snapshot(items: list[dict], fields: tuple[str, ...]) -> list[dict]:
@@ -312,6 +312,10 @@ def _bundle_codes(bundle: dict) -> list[str]:
 
 def _severity_rank(status: str) -> int:
     return {"pass": 0, "warn": 1, "fail": 2}.get(status, 0)
+
+
+def _max_status(*statuses: str) -> str:
+    return max(statuses, key=_severity_rank)
 
 
 def _money_status(delta: float, target: float, tolerance: dict, scope: str) -> str:
@@ -570,6 +574,8 @@ def replay_golden_job(
 
     diff = compare_replay(proposal, snapshot, tolerance)
     diff["drift"] = _drift_rows(snapshot, rates, labor_catalog, ruleset_meta) if mode == "current" else []
+    if diff["drift"]:
+        diff["status"] = _max_status(diff["status"], "warn")
     diff["engine"] = {
         "status": engine_diff["status"],
         "totals": engine_diff["totals"],

@@ -19,6 +19,11 @@ function money(value) {
   return n.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })
 }
 
+function moneyOrDash(value) {
+  if (value == null || value === '') return '-'
+  return money(value)
+}
+
 function shortMoney(value) {
   const n = Number(value || 0)
   return n.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 })
@@ -347,15 +352,15 @@ export default function ReproducibilityPanel({ jobId }) {
                 <Database className="h-3.5 w-3.5" />
                 JR Target
               </div>
-              <p className="text-lg font-bold text-white">{money(golden.target_totals?.grand_total)}</p>
+              <p className="text-lg font-bold text-white">{moneyOrDash(golden.target_totals?.grand_total)}</p>
             </div>
             <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] p-3">
               <p className="mb-1 text-xs text-gray-500">Accepted Proposal</p>
-              <p className="text-lg font-bold text-white">{money(golden.accepted_totals?.grand_total)}</p>
+              <p className="text-lg font-bold text-white">{moneyOrDash(golden.accepted_totals?.grand_total)}</p>
             </div>
             <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] p-3">
               <p className="mb-1 text-xs text-gray-500">Latest Replay</p>
-              <p className="text-lg font-bold text-white">{money(latest?.summary?.generated_totals?.grand_total)}</p>
+              <p className="text-lg font-bold text-white">{moneyOrDash(latest?.summary?.generated_totals?.grand_total)}</p>
             </div>
           </div>
 

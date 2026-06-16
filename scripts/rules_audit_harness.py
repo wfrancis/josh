@@ -721,6 +721,9 @@ def summarize_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
         "tax_amount": proposal.get("tax_amount"),
         "subtotal": proposal.get("subtotal"),
         "grand_total": proposal.get("grand_total"),
+        "gpm_profit": proposal.get("gpm_profit"),
+        "gpm_labor": proposal.get("gpm_labor"),
+        "gpm_material": proposal.get("gpm_material"),
     }
 
 
@@ -915,10 +918,12 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
         return Check("golden_reproducibility", "FAIL", f"golden replay endpoint failed: {exc}")
 
     baseline_status = baseline_replay.get("status")
+    baseline_engine_status = (baseline_replay.get("summary") or {}).get("engine_status")
     current_status = current_replay.get("status")
     ok = (
         baseline.get("golden_job")
         and baseline_status == "pass"
+        and baseline_engine_status == "pass"
         and current_status in {"pass", "warn", "fail"}
         and state.get("golden_job")
     )
@@ -928,6 +933,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
         "captured synthetic golden baseline and replayed it" if ok else "baseline golden replay did not pass",
         {
             "baseline_status": baseline_status,
+            "baseline_engine_status": baseline_engine_status,
             "current_status": current_status,
             "golden_job": baseline.get("golden_job"),
             "latest_replay": state.get("latest_replay"),
