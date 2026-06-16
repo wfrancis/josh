@@ -148,6 +148,35 @@ function DriftRows({ replay }) {
   )
 }
 
+function EngineReplayNotice({ replay }) {
+  const engine = replay?.diff?.engine
+  if (!engine || engine.status === 'pass') return null
+  const totalDeltas = (engine.totals || []).filter(row => row.status !== 'pass')
+  const bundleDeltas = (engine.bundles || []).filter(row => row.status !== 'pass' || Number(row.delta || 0) !== 0).slice(0, 3)
+  const structural = engine.structural || []
+  return (
+    <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <h3 className="text-xs font-bold uppercase tracking-wider text-blue-300">Engine Replay Before Accepted Edits</h3>
+        <span className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase ${statusClass(engine.status)}`}>
+          {engine.status}
+        </span>
+      </div>
+      <div className="space-y-1.5 text-sm text-blue-100">
+        {totalDeltas.slice(0, 3).map(row => (
+          <p key={row.field}>{row.field.replace(/_/g, ' ')} moved {shortMoney(row.delta)}</p>
+        ))}
+        {bundleDeltas.map(row => (
+          <p key={row.bundle_name}>{row.bundle_name}: {shortMoney(row.delta || 0)}</p>
+        ))}
+        {structural.slice(0, 3).map((row, idx) => (
+          <p key={`${row.check}-${idx}`}>{row.message || row.check}</p>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export default function ReproducibilityPanel({ jobId }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -361,6 +390,7 @@ export default function ReproducibilityPanel({ jobId }) {
               <StructuralIssues replay={latest} />
               <BundleDeltas replay={latest} />
               <DriftRows replay={latest} />
+              <EngineReplayNotice replay={latest} />
             </div>
           )}
         </div>

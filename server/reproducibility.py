@@ -550,6 +550,8 @@ def replay_golden_job(
     proposal = generate_proposal_data(source_job_id, job, trace=trace)
     _sync_editor_totals(proposal)
     _reapply_accepted_rewrites(proposal, job.get("proposal_data") or {})
+    tolerance = {**DEFAULT_TOLERANCE, **(golden_job.get("tolerance") or snapshot.get("tolerance") or {})}
+    engine_diff = compare_replay(copy.deepcopy(proposal), snapshot, tolerance)
     accepted_money_replay_count = 0
     if mode == "baseline":
         accepted_money_replay_count = _reapply_accepted_money(proposal, job.get("proposal_data") or {})
@@ -566,12 +568,18 @@ def replay_golden_job(
                 source="golden_replay",
             )
 
-    tolerance = {**DEFAULT_TOLERANCE, **(golden_job.get("tolerance") or snapshot.get("tolerance") or {})}
     diff = compare_replay(proposal, snapshot, tolerance)
     diff["drift"] = _drift_rows(snapshot, rates, labor_catalog, ruleset_meta) if mode == "current" else []
+    diff["engine"] = {
+        "status": engine_diff["status"],
+        "totals": engine_diff["totals"],
+        "bundles": engine_diff["bundles"],
+        "structural": engine_diff["structural"],
+    }
     summary = {
         "mode": mode,
         "status": diff["status"],
+        "engine_status": engine_diff["status"],
         "golden_job_id": golden_job.get("id"),
         "source_job_id": source_job_id,
         "ruleset_version": ruleset_meta.get("version"),
@@ -582,6 +590,9 @@ def replay_golden_job(
         "generated_totals": proposal_totals(proposal),
         "accepted_numeric_edit_count": accepted_money_replay_count,
         "failing_structural_count": len([row for row in diff["structural"] if row.get("status") == "fail"]),
+        "engine_failing_structural_count": len([row for row in engine_diff["structural"] if row.get("status") == "fail"]),
+        "engine_warning_total_count": len([row for row in engine_diff["totals"] if row.get("status") == "warn"]),
+        "engine_failing_total_count": len([row for row in engine_diff["totals"] if row.get("status") == "fail"]),
         "drift_count": len(diff["drift"]),
         "warning_total_count": len([row for row in diff["totals"] if row.get("status") == "warn"]),
         "failing_total_count": len([row for row in diff["totals"] if row.get("status") == "fail"]),
