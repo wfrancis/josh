@@ -174,7 +174,13 @@ export default function Dashboard() {
 
   useEffect(() => {
     api.listJobs()
-      .then(setJobs)
+      .then(async rows => {
+        const enriched = await Promise.all(rows.map(async job => ({
+          ...job,
+          readiness: await api.getJobReadiness(job.id).catch(() => null),
+        })))
+        setJobs(enriched)
+      })
       .catch(console.error)
       .finally(() => setLoading(false))
   }, [])
@@ -187,7 +193,7 @@ export default function Dashboard() {
     }
   }, [searchParams])
 
-  const completedJobs = jobs.filter(j => j.bundles?.length > 0).length
+  const completedJobs = jobs.filter(j => j.readiness ? j.readiness.status === 'ready' : j.bundles?.length > 0).length
 
   if (loading) {
     return (

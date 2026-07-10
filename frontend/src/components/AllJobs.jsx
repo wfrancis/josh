@@ -19,7 +19,13 @@ export default function AllJobs() {
 
   useEffect(() => {
     api.listJobs()
-      .then(setJobs)
+      .then(async rows => {
+        const enriched = await Promise.all(rows.map(async job => ({
+          ...job,
+          readiness: await api.getJobReadiness(job.id).catch(() => null),
+        })))
+        setJobs(enriched)
+      })
       .catch(console.error)
       .finally(() => setLoading(false))
   }, [])

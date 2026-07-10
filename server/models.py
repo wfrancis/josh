@@ -202,11 +202,26 @@ def init_db() -> None:
                 file_hash TEXT NOT NULL,
                 file_size INTEGER,
                 source TEXT DEFAULT 'manual',
+                artifact_path TEXT,
+                artifact_kind TEXT DEFAULT 'source',
                 imported_at TEXT NOT NULL,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_imported_files_dedup
                 ON imported_files(job_id, file_hash);
+
+            CREATE TABLE IF NOT EXISTS job_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                artifact_kind TEXT NOT NULL,
+                artifact_path TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                file_size INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(job_id, artifact_kind, artifact_path),
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_artifacts_job ON job_artifacts(job_id, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS job_activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -378,6 +393,32 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_golden_replays_job ON golden_job_replays(source_job_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_golden_replays_golden ON golden_job_replays(golden_job_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS golden_job_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                golden_job_id INTEGER NOT NULL,
+                source_job_id INTEGER NOT NULL,
+                version_number INTEGER NOT NULL,
+                jr_quote_id TEXT DEFAULT '',
+                target_totals_json TEXT NOT NULL DEFAULT '{}',
+                tolerance_json TEXT NOT NULL DEFAULT '{}',
+                snapshot_json TEXT NOT NULL,
+                ruleset_version INTEGER,
+                source_fingerprint TEXT NOT NULL DEFAULT '',
+                engine_fingerprint TEXT NOT NULL DEFAULT '',
+                artifact_manifest_json TEXT NOT NULL DEFAULT '[]',
+                rules_registry_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                config_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                notes TEXT DEFAULT '',
+                reviewer_name TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                superseded_at TEXT,
+                UNIQUE(golden_job_id, version_number),
+                FOREIGN KEY (golden_job_id) REFERENCES golden_jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_golden_versions_source ON golden_job_versions(source_job_id, version_number DESC);
         """)
         conn.commit()
         # Migrations for existing DBs
@@ -417,6 +458,10 @@ def init_db() -> None:
             ("textura_fee", "ALTER TABLE jobs ADD COLUMN textura_fee INTEGER DEFAULT 0"),
             ("rule_implementation_ref", "ALTER TABLE estimating_rules ADD COLUMN implementation_ref TEXT DEFAULT ''"),
             ("rule_test_ref", "ALTER TABLE estimating_rules ADD COLUMN test_ref TEXT DEFAULT ''"),
+            ("artifact_path", "ALTER TABLE imported_files ADD COLUMN artifact_path TEXT"),
+            ("artifact_kind", "ALTER TABLE imported_files ADD COLUMN artifact_kind TEXT DEFAULT 'source'"),
+            ("current_version_id", "ALTER TABLE golden_jobs ADD COLUMN current_version_id INTEGER"),
+            ("golden_version_id", "ALTER TABLE golden_job_replays ADD COLUMN golden_version_id INTEGER"),
         ]:
             try:
                 conn.execute(sql)
@@ -1580,10 +1625,14 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
 
     inserted = 0
     updated = 0
+    contract_backfilled = 0
     conn = _get_conn()
     try:
         for rule in DEFAULT_HARD_RULES:
-            data = _prepare_rule_values(rule)
+            seeded_rule = dict(rule)
+            seeded_rule.setdefault("implementation_ref", seeded_rule.get("source") or "")
+            seeded_rule.setdefault("test_ref", "scripts/rules_audit_harness.py")
+            data = _prepare_rule_values(seeded_rule)
             _validate_rule_lifecycle(data)
             now = datetime.now().isoformat()
             existing = conn.execute(
@@ -1591,6 +1640,28 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
                 (data["rule_id"],),
             ).fetchone()
             if existing and not overwrite:
+                current = conn.execute(
+                    "SELECT * FROM estimating_rules WHERE rule_id=?",
+                    (data["rule_id"],),
+                ).fetchone()
+                if current and (not str(current["implementation_ref"] or "").strip() or not str(current["test_ref"] or "").strip()):
+                    now = datetime.now().isoformat()
+                    conn.execute(
+                        "UPDATE estimating_rules SET implementation_ref=?, test_ref=?, updated_at=? WHERE rule_id=?",
+                        (data["implementation_ref"], data["test_ref"], now, data["rule_id"]),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM estimating_rules WHERE rule_id=?",
+                        (data["rule_id"],),
+                    ).fetchone()
+                    _insert_rule_version(
+                        conn,
+                        _rule_from_row(row),
+                        "contract_backfill",
+                        "System",
+                        "Added implementation and test references required by the rules contract.",
+                    )
+                    contract_backfilled += 1
                 continue
             if existing and overwrite:
                 next_version = max(int(existing["version"] or 1) + 1, int(data.get("version") or 1))
@@ -1649,15 +1720,15 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
                     "Built-in hard rule seeded.",
                 )
                 inserted += 1
-        if inserted or updated:
+        if inserted or updated or contract_backfilled:
             _insert_ruleset_version(
                 conn,
-                change_type="seed_overwrite" if updated else "seeded",
+                change_type="seed_overwrite" if updated else ("contract_backfill" if contract_backfilled else "seeded"),
                 changed_by="System",
-                change_note="Built-in hard rules seeded." if inserted else "Built-in hard rules overwritten.",
+                change_note=("Built-in hard rules seeded." if inserted else "Built-in hard rules overwritten.") if not contract_backfilled else "Backfilled implementation and test references for built-in rules.",
             )
         conn.commit()
-        return {"inserted": inserted, "updated": updated, "total": len(DEFAULT_HARD_RULES)}
+        return {"inserted": inserted, "updated": updated, "contract_backfilled": contract_backfilled, "total": len(DEFAULT_HARD_RULES)}
     finally:
         conn.close()
 
@@ -2099,6 +2170,46 @@ def _decode_golden_replay_row(row) -> dict:
     return d
 
 
+def _decode_golden_version_row(row) -> dict:
+    d = dict(row)
+    for key, default in (
+        ("target_totals_json", {}),
+        ("tolerance_json", {}),
+        ("snapshot_json", {}),
+        ("artifact_manifest_json", []),
+        ("rules_registry_snapshot_json", {}),
+        ("config_snapshot_json", {}),
+    ):
+        d[key.removesuffix("_json")] = _json_loads_safe(d.pop(key, None), default)
+    return d
+
+
+def _attach_current_golden_version(conn, golden: dict) -> dict:
+    version_id = golden.get("current_version_id")
+    if not version_id:
+        golden["version_id"] = None
+        golden["version_number"] = 1 if golden.get("snapshot") else None
+        golden["immutable"] = False
+        return golden
+    row = conn.execute("SELECT * FROM golden_job_versions WHERE id=?", (version_id,)).fetchone()
+    if not row:
+        golden["version_id"] = None
+        golden["immutable"] = False
+        return golden
+    version = _decode_golden_version_row(row)
+    golden["version_id"] = version.get("id")
+    for key in (
+        "version_id", "version_number", "jr_quote_id", "target_totals", "tolerance",
+        "snapshot", "ruleset_version", "source_fingerprint", "engine_fingerprint",
+        "artifact_manifest", "rules_registry_snapshot", "config_snapshot", "notes",
+        "reviewer_name", "status", "created_at", "superseded_at",
+    ):
+        if key in version:
+            golden[key] = version[key]
+    golden["immutable"] = True
+    return golden
+
+
 def upsert_golden_job(
     *,
     source_job_id: int,
@@ -2110,40 +2221,55 @@ def upsert_golden_job(
     ruleset_version: int | None = None,
     source_fingerprint: str = "",
     notes: str = "",
+    reviewer_name: str = "",
+    engine_fingerprint: str = "",
+    artifact_manifest: list[dict] | None = None,
+    rules_registry_snapshot: dict | None = None,
+    config_snapshot: dict | None = None,
     status: str = "active",
 ) -> dict:
-    """Create or replace the golden baseline for a source job."""
+    """Create a new immutable golden version and update the compatibility pointer."""
     now = datetime.now().isoformat()
     conn = _get_conn()
     try:
         existing = conn.execute(
-            "SELECT id FROM golden_jobs WHERE source_job_id=?",
+            "SELECT * FROM golden_jobs WHERE source_job_id=?",
             (source_job_id,),
         ).fetchone()
         if existing:
             golden_id = existing["id"]
-            conn.execute(
-                """
-                UPDATE golden_jobs
-                SET name=?, jr_quote_id=?, target_totals_json=?, tolerance_json=?,
-                    snapshot_json=?, ruleset_version=?, source_fingerprint=?,
-                    notes=?, status=?, updated_at=?
-                WHERE source_job_id=?
-                """,
-                (
-                    name,
-                    jr_quote_id or "",
-                    _json_dumps_safe(target_totals or {}),
-                    _json_dumps_safe(tolerance or {}),
-                    _json_dumps_safe(snapshot),
-                    ruleset_version,
-                    source_fingerprint or "",
-                    notes or "",
-                    status or "active",
-                    now,
-                    source_job_id,
-                ),
-            )
+            previous_version = existing["current_version_id"]
+            if not previous_version:
+                legacy_version = conn.execute(
+                    "SELECT COALESCE(MAX(version_number), 0) AS max_version FROM golden_job_versions WHERE golden_job_id=?",
+                    (golden_id,),
+                ).fetchone()["max_version"]
+                legacy_number = int(legacy_version or 0) + 1
+                conn.execute(
+                    """
+                    INSERT INTO golden_job_versions
+                        (golden_job_id, source_job_id, version_number, jr_quote_id,
+                         target_totals_json, tolerance_json, snapshot_json, ruleset_version,
+                         source_fingerprint, engine_fingerprint, artifact_manifest_json,
+                         rules_registry_snapshot_json, config_snapshot_json, notes,
+                         reviewer_name, status, created_at, superseded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'superseded', ?, ?)
+                    """,
+                    (
+                        golden_id, source_job_id, legacy_number,
+                        existing["jr_quote_id"] or "", existing["target_totals_json"] or "{}",
+                        existing["tolerance_json"] or "{}", existing["snapshot_json"] or "{}",
+                        existing["ruleset_version"], existing["source_fingerprint"] or "",
+                        "legacy", "[]", "{}", "{}", existing["notes"] or "", "",
+                        existing["created_at"] or now, now,
+                    ),
+                )
+                previous_version = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            else:
+                conn.execute(
+                    "UPDATE golden_job_versions SET status='superseded', superseded_at=? WHERE id=?",
+                    (now, previous_version),
+                )
         else:
             cur = conn.execute(
                 """
@@ -2154,24 +2280,55 @@ def upsert_golden_job(
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    source_job_id,
-                    name,
-                    jr_quote_id or "",
-                    _json_dumps_safe(target_totals or {}),
-                    _json_dumps_safe(tolerance or {}),
-                    _json_dumps_safe(snapshot),
-                    ruleset_version,
-                    source_fingerprint or "",
-                    notes or "",
-                    status or "active",
-                    now,
-                    now,
+                    source_job_id, name, jr_quote_id or "", _json_dumps_safe(target_totals or {}),
+                    _json_dumps_safe(tolerance or {}), _json_dumps_safe(snapshot), ruleset_version,
+                    source_fingerprint or "", notes or "", status or "active", now, now,
                 ),
             )
             golden_id = cur.lastrowid
+            previous_version = None
+
+        next_number = conn.execute(
+            "SELECT COALESCE(MAX(version_number), 0) + 1 AS next_version FROM golden_job_versions WHERE golden_job_id=?",
+            (golden_id,),
+        ).fetchone()["next_version"]
+        version_cur = conn.execute(
+            """
+            INSERT INTO golden_job_versions
+                (golden_job_id, source_job_id, version_number, jr_quote_id,
+                 target_totals_json, tolerance_json, snapshot_json, ruleset_version,
+                 source_fingerprint, engine_fingerprint, artifact_manifest_json,
+                 rules_registry_snapshot_json, config_snapshot_json, notes,
+                 reviewer_name, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                golden_id, source_job_id, next_number, jr_quote_id or "",
+                _json_dumps_safe(target_totals or {}), _json_dumps_safe(tolerance or {}),
+                _json_dumps_safe(snapshot), ruleset_version, source_fingerprint or "",
+                engine_fingerprint or "", _json_dumps_safe(artifact_manifest or []),
+                _json_dumps_safe(rules_registry_snapshot or {}), _json_dumps_safe(config_snapshot or {}),
+                notes or "", reviewer_name or "", status or "active", now,
+            ),
+        )
+        version_id = version_cur.lastrowid
+        conn.execute(
+            """
+            UPDATE golden_jobs
+            SET name=?, jr_quote_id=?, target_totals_json=?, tolerance_json=?,
+                snapshot_json=?, ruleset_version=?, source_fingerprint=?, notes=?,
+                status=?, current_version_id=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                name, jr_quote_id or "", _json_dumps_safe(target_totals or {}),
+                _json_dumps_safe(tolerance or {}), _json_dumps_safe(snapshot), ruleset_version,
+                source_fingerprint or "", notes or "", status or "active", version_id, now, golden_id,
+            ),
+        )
         conn.commit()
         row = conn.execute("SELECT * FROM golden_jobs WHERE id=?", (golden_id,)).fetchone()
-        return _decode_golden_job_row(row)
+        return _attach_current_golden_version(conn, _decode_golden_job_row(row))
     finally:
         conn.close()
 
@@ -2184,7 +2341,7 @@ def get_golden_job_for_source(source_job_id: int) -> dict | None:
             "SELECT * FROM golden_jobs WHERE source_job_id=?",
             (source_job_id,),
         ).fetchone()
-        return _decode_golden_job_row(row) if row else None
+        return _attach_current_golden_version(conn, _decode_golden_job_row(row)) if row else None
     finally:
         conn.close()
 
@@ -2194,7 +2351,7 @@ def get_golden_job(golden_job_id: int) -> dict | None:
     conn = _get_conn()
     try:
         row = conn.execute("SELECT * FROM golden_jobs WHERE id=?", (golden_job_id,)).fetchone()
-        return _decode_golden_job_row(row) if row else None
+        return _attach_current_golden_version(conn, _decode_golden_job_row(row)) if row else None
     finally:
         conn.close()
 
@@ -2209,6 +2366,7 @@ def save_golden_replay(
     diff: dict = None,
     generated_proposal: dict = None,
     audit_run_id: int | None = None,
+    golden_version_id: int | None = None,
 ) -> dict:
     """Persist one golden job replay report."""
     now = datetime.now().isoformat()
@@ -2218,8 +2376,8 @@ def save_golden_replay(
             """
             INSERT INTO golden_job_replays
                 (golden_job_id, source_job_id, mode, status, summary_json, diff_json,
-                 generated_proposal_json, audit_run_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 generated_proposal_json, audit_run_id, golden_version_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 golden_job_id,
@@ -2230,6 +2388,7 @@ def save_golden_replay(
                 _json_dumps_safe(diff or {}),
                 _json_dumps_safe(generated_proposal or {}),
                 audit_run_id,
+                golden_version_id,
                 now,
             ),
         )
@@ -2729,14 +2888,17 @@ def is_file_imported(job_id: int, file_hash: str) -> bool:
 
 
 def record_imported_file(job_id: int, file_name: str, file_hash: str,
-                         file_size: int = 0, source: str = "manual"):
+                         file_size: int = 0, source: str = "manual",
+                         artifact_path: str | None = None,
+                         artifact_kind: str = "source"):
     """Record that a file has been imported for a job."""
     conn = _get_conn()
     try:
         conn.execute(
-            "INSERT OR IGNORE INTO imported_files (job_id, file_name, file_hash, file_size, source, imported_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (job_id, file_name, file_hash, file_size, source, datetime.now().isoformat())
+            "INSERT OR IGNORE INTO imported_files "
+            "(job_id, file_name, file_hash, file_size, source, artifact_path, artifact_kind, imported_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, file_name, file_hash, file_size, source, artifact_path, artifact_kind, datetime.now().isoformat())
         )
         conn.commit()
     finally:
@@ -2748,11 +2910,50 @@ def list_imported_files(job_id: int) -> list[dict]:
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT file_name, file_hash, file_size, source, imported_at "
+            "SELECT file_name, file_hash, file_size, source, artifact_path, artifact_kind, imported_at "
             "FROM imported_files WHERE job_id=? ORDER BY imported_at DESC",
             (job_id,)
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def record_job_artifact(
+    job_id: int,
+    artifact_kind: str,
+    artifact_path: str,
+    file_hash: str,
+    file_size: int = 0,
+) -> None:
+    """Record a durable artifact receipt for a job."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO job_artifacts (job_id, artifact_kind, artifact_path, file_hash, file_size, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id, artifact_kind, artifact_path) DO UPDATE SET
+                file_hash=excluded.file_hash,
+                file_size=excluded.file_size,
+                created_at=excluded.created_at
+            """,
+            (job_id, artifact_kind, artifact_path, file_hash, file_size, datetime.now().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_job_artifacts(job_id: int) -> list[dict]:
+    """List recorded durable artifact receipts for a job."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, artifact_kind, artifact_path, file_hash, file_size, created_at FROM job_artifacts WHERE job_id=? ORDER BY created_at DESC",
+            (job_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
     finally:
         conn.close()
 

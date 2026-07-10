@@ -510,6 +510,7 @@ def create_or_use_job(client: Client, fixture: dict[str, Any], job_id: str | Non
     payload = {
         "project_name": f"{job_cfg.get('project_name_prefix', 'Rules Audit Harness')} {suffix}",
         "gc_name": job_cfg.get("gc_name", "Harness QA"),
+        "salesperson": job_cfg.get("salesperson", "Harness QA"),
         "city": job_cfg.get("city", ""),
         "state": job_cfg.get("state", ""),
         "tax_rate": float(job_cfg.get("tax_rate", 0)),
@@ -706,6 +707,30 @@ def generate_proposal(client: Client, job_id: str) -> tuple[dict[str, Any], Chec
     )
 
 
+def generate_proposal_pdf(client: Client, job_id: str, proposal: dict[str, Any]) -> Check:
+    """Generate and download the proposal artifact so readiness can verify it."""
+    try:
+        _, generated, _ = client.request(
+            "POST",
+            f"/api/jobs/{job_id}/proposal/pdf",
+            json_body=proposal_save_payload(proposal),
+        )
+        status, _, raw = client.request(
+            "GET",
+            f"/api/jobs/{job_id}/proposal.pdf",
+            ok_statuses=(),
+        )
+    except HarnessError as exc:
+        return Check("proposal_artifact", "FAIL", f"proposal PDF request failed: {exc}")
+    ok = status == 200 and len(raw) > 100
+    return Check(
+        "proposal_artifact",
+        "PASS" if ok else "FAIL",
+        "proposal PDF was generated and downloaded" if ok else f"proposal PDF download returned HTTP {status}",
+        {"generate_response": generated, "download_status": status, "download_bytes": len(raw)},
+    )
+
+
 def summarize_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
     bundles = proposal.get("bundles") or []
     return {
@@ -893,12 +918,23 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
         for key in ("grand_total", "subtotal", "tax_amount", "gpm_profit", "gpm_labor", "gpm_material")
         if totals.get(key) is not None
     }
+    def mutable_state(job: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "materials": job.get("materials") or [],
+            "sundries": job.get("sundries") or [],
+            "labor": job.get("labor") or [],
+            "proposal_data": job.get("proposal_data") or {},
+            "bid_data": job.get("bid_data") or {},
+        }
+
     try:
+        _, before_job, _ = client.request("GET", f"/api/jobs/{job_id}")
         _, baseline, _ = client.request(
             "POST",
             f"/api/jobs/{job_id}/reproducibility/baseline",
             json_body={
                 "jr_quote_id": "HARNESS",
+                "reviewer_name": "Rules Audit Harness",
                 "target_totals": target_totals,
                 "notes": "Synthetic golden baseline from rules_audit_harness.py",
             },
@@ -913,19 +949,26 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
             f"/api/jobs/{job_id}/reproducibility/replay",
             json_body={"mode": "current"},
         )
+        _, after_job, _ = client.request("GET", f"/api/jobs/{job_id}")
         _, state, _ = client.request("GET", f"/api/jobs/{job_id}/reproducibility")
+        _, readiness, _ = client.request("GET", f"/api/jobs/{job_id}/readiness")
     except HarnessError as exc:
         return Check("golden_reproducibility", "FAIL", f"golden replay endpoint failed: {exc}")
 
     baseline_status = baseline_replay.get("status")
-    baseline_engine_status = (baseline_replay.get("summary") or {}).get("engine_status")
+    baseline_summary = baseline_replay.get("summary") or {}
+    baseline_engine_status = baseline_summary.get("raw_engine_status", baseline_summary.get("engine_status"))
+    baseline_accepted_status = baseline_summary.get("accepted_proposal_status")
     current_status = current_replay.get("status")
     ok = (
         baseline.get("golden_job")
         and baseline_status == "pass"
         and baseline_engine_status == "pass"
+        and baseline_accepted_status in {"pass", "warn"}
         and current_status in {"pass", "warn", "fail"}
         and state.get("golden_job")
+        and readiness.get("blocking_count") == 0
+        and mutable_state(before_job) == mutable_state(after_job)
     )
     return Check(
         "golden_reproducibility",
@@ -934,7 +977,10 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
         {
             "baseline_status": baseline_status,
             "baseline_engine_status": baseline_engine_status,
+            "baseline_accepted_status": baseline_accepted_status,
             "current_status": current_status,
+            "readiness": readiness,
+            "live_state_unchanged": mutable_state(before_job) == mutable_state(after_job),
             "golden_job": baseline.get("golden_job"),
             "latest_replay": state.get("latest_replay"),
             "target_totals": target_totals,
@@ -1050,10 +1096,19 @@ def main() -> int:
         proposal, proposal_check = generate_proposal(client, job_id)
         checks.append(proposal_check)
         checks.append(validate_totals(proposal))
+        checks.append(generate_proposal_pdf(client, job_id, proposal))
         checks.append(validate_golden_reproducibility(client, job_id, proposal))
         checks.append(validate_manual_override_audit(client, job_id, proposal))
         checks.append(validate_deleted_bundle(client, job_id, proposal, fixture))
         checks.append(validate_audit_trace(client, job_id, proposal, fixture, args.allow_missing_audit))
+        final_proposal, final_proposal_check = generate_proposal(client, job_id)
+        checks.append(Check(
+            "final_proposal_artifact",
+            final_proposal_check.status,
+            "regenerated the final edited proposal" if final_proposal_check.status == "PASS" else final_proposal_check.summary,
+            final_proposal_check.details,
+        ))
+        checks.append(generate_proposal_pdf(client, job_id, final_proposal))
     except HarnessError as exc:
         checks.append(Check("harness_error", "FAIL", str(exc)))
     except Exception as exc:

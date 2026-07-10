@@ -6,6 +6,7 @@ primary_region = 'sjc'
 
 [env]
   DATABASE_PATH = '/data/si_bid.db'
+  ARTIFACT_ROOT = '/data/artifacts'
 
 [mounts]
   source = 'si_data'

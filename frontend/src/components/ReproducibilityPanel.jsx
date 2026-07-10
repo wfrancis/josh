@@ -40,6 +40,7 @@ function statusClass(status) {
   if (key === 'pass') return 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
   if (key === 'warn') return 'bg-amber-500/10 text-amber-300 border-amber-500/20'
   if (key === 'fail') return 'bg-red-500/10 text-red-300 border-red-500/20'
+  if (key === 'incomparable') return 'bg-purple-500/10 text-purple-300 border-purple-500/20'
   return 'bg-white/[0.04] text-gray-400 border-white/[0.08]'
 }
 
@@ -190,6 +191,7 @@ export default function ReproducibilityPanel({ jobId }) {
   const [runningMode, setRunningMode] = useState(null)
   const [form, setForm] = useState({
     jr_quote_id: '',
+    reviewer_name: '',
     grand_total: '',
     subtotal: '',
     tax_amount: '',
@@ -228,6 +230,7 @@ export default function ReproducibilityPanel({ jobId }) {
     try {
       setData(await api.captureGoldenBaseline(jobId, {
         jr_quote_id: form.jr_quote_id,
+        reviewer_name: form.reviewer_name,
         target_totals,
         notes: form.notes,
       }))
@@ -269,7 +272,9 @@ export default function ReproducibilityPanel({ jobId }) {
           {golden && (
             <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-gray-500">
               <span>JR {golden.jr_quote_id || '-'}</span>
+              <span>Baseline v{golden.version_number || '-'}</span>
               <span>Ruleset v{golden.ruleset_version || '-'}</span>
+              {golden.reviewer_name && <span>Reviewed by {golden.reviewer_name}</span>}
               <span className="font-mono">{String(golden.source_fingerprint || '').slice(0, 10)}</span>
             </div>
           )}
@@ -297,6 +302,15 @@ export default function ReproducibilityPanel({ jobId }) {
                 onChange={e => setForm(f => ({ ...f, jr_quote_id: e.target.value }))}
                 className="input w-full text-sm"
                 placeholder="293113"
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs text-gray-500">Reviewed By</span>
+              <input
+                value={form.reviewer_name}
+                onChange={e => setForm(f => ({ ...f, reviewer_name: e.target.value }))}
+                className="input w-full text-sm"
+                placeholder="Estimator name"
               />
             </label>
             {TOTAL_FIELDS.slice(0, 2).map(([key, label]) => (
@@ -390,6 +404,8 @@ export default function ReproducibilityPanel({ jobId }) {
                 <span>{latest.mode} replay</span>
                 <span>run #{latest.id}</span>
                 <span>audit #{latest.audit_run_id || '-'}</span>
+                <span>engine {latest.summary?.raw_engine_status || latest.summary?.engine_status || '-'}</span>
+                <span>accepted {latest.summary?.accepted_proposal_status || '-'}</span>
               </div>
               <TotalsTable replay={latest} />
               <StructuralIssues replay={latest} />

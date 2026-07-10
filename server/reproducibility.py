@@ -11,6 +11,8 @@ from audit_engine import AuditTraceBuilder
 from labor_calc import calculate_labor_for_materials
 from proposal_bundler import generate_proposal_data
 from sundry_calc import calculate_sundries_for_materials
+from build_info import build_manifest_for_snapshot, engine_fingerprint
+from config import FREIGHT_RATES, LABOR_QTY_RULES, STAIR_SUNDRY_KITS, SUNDRY_RULES, WASTE_FACTORS
 
 
 DEFAULT_TOLERANCE = {
@@ -140,6 +142,9 @@ def make_golden_snapshot(
     ruleset: dict | None,
     target_totals: dict,
     tolerance: dict | None = None,
+    build: dict | None = None,
+    artifact_manifest: list[dict] | None = None,
+    config_snapshot: dict | None = None,
 ) -> tuple[dict, str]:
     """Freeze the structured state needed for deterministic golden replay."""
     proposal_data = _copy_jsonable(job.get("proposal_data") or {})
@@ -160,6 +165,10 @@ def make_golden_snapshot(
             "active_count": (ruleset or {}).get("active_count"),
             "created_at": (ruleset or {}).get("created_at"),
         },
+        "ruleset_snapshot": _copy_jsonable(ruleset or {}),
+        "config_snapshot": _copy_jsonable(config_snapshot or {}),
+        "build": _copy_jsonable(build or build_manifest_for_snapshot()),
+        "artifact_manifest": _copy_jsonable(artifact_manifest or []),
         "tolerance": {**DEFAULT_TOLERANCE, **(tolerance or {})},
     }
     fingerprint = fingerprint_payload({
@@ -170,6 +179,10 @@ def make_golden_snapshot(
         "rates": snapshot["company_rates"],
         "labor_catalog": snapshot["labor_catalog"],
         "ruleset": snapshot["ruleset"],
+        "ruleset_snapshot": snapshot["ruleset_snapshot"],
+        "config_snapshot": snapshot["config_snapshot"],
+        "build": snapshot["build"],
+        "artifact_manifest": snapshot["artifact_manifest"],
     })
     return snapshot, fingerprint
 
@@ -311,7 +324,7 @@ def _bundle_codes(bundle: dict) -> list[str]:
 
 
 def _severity_rank(status: str) -> int:
-    return {"pass": 0, "warn": 1, "fail": 2}.get(status, 0)
+    return {"pass": 0, "warn": 1, "fail": 2, "incomparable": 3}.get(status, 0)
 
 
 def _max_status(*statuses: str) -> str:
@@ -324,7 +337,7 @@ def _money_status(delta: float, target: float, tolerance: dict, scope: str) -> s
     warn_abs = float(tolerance.get(f"{prefix}_warn_abs", pass_abs))
     warn_pct = float(tolerance.get(f"{prefix}_warn_pct", 0))
     abs_delta = abs(delta)
-    pct_delta = abs_delta / abs(target) if target else 0
+    pct_delta = abs_delta / abs(target) if target else float("inf")
     if abs_delta <= pass_abs:
         return "pass"
     if abs_delta <= warn_abs or (warn_pct and pct_delta <= warn_pct):
@@ -454,7 +467,14 @@ def compare_replay(generated: dict, snapshot: dict, tolerance: dict) -> dict:
     }
 
 
-def _drift_rows(snapshot: dict, rates: dict, labor_catalog: list[dict], ruleset_meta: dict) -> list[dict]:
+def _drift_rows(
+    snapshot: dict,
+    rates: dict,
+    labor_catalog: list[dict],
+    ruleset_meta: dict,
+    current_engine_fingerprint: str | None = None,
+    current_config_snapshot: dict | None = None,
+) -> list[dict]:
     baseline_ruleset = snapshot.get("ruleset") or {}
     rows = []
     if baseline_ruleset.get("version") != ruleset_meta.get("version"):
@@ -463,7 +483,19 @@ def _drift_rows(snapshot: dict, rates: dict, labor_catalog: list[dict], ruleset_
             "status": "warn",
             "baseline": baseline_ruleset.get("version"),
             "current": ruleset_meta.get("version"),
-            "message": "Ruleset version changed since the baseline was captured.",
+            "classification": "metadata_only",
+            "message": "Rules registry metadata changed. The engine fingerprint is checked separately to determine whether calculation behavior changed.",
+        })
+
+    baseline_engine = (snapshot.get("build") or {}).get("engine_fingerprint")
+    if baseline_engine and current_engine_fingerprint and baseline_engine != current_engine_fingerprint:
+        rows.append({
+            "check": "engine_fingerprint",
+            "status": "warn",
+            "baseline": baseline_engine,
+            "current": current_engine_fingerprint,
+            "classification": "calculation_behavior_changed",
+            "message": "The calculator build/config fingerprint changed. Current replay is a drift report, not an apples-to-apples proof.",
         })
 
     baseline_rates_hash = fingerprint_payload(snapshot.get("company_rates") or {})
@@ -487,7 +519,38 @@ def _drift_rows(snapshot: dict, rates: dict, labor_catalog: list[dict], ruleset_
             "current": current_labor_hash,
             "message": "Labor catalog changed since the baseline was captured.",
         })
+    baseline_config_hash = fingerprint_payload(snapshot.get("config_snapshot") or {})
+    current_config_hash = fingerprint_payload(current_config_snapshot or {})
+    if baseline_config_hash != current_config_hash:
+        rows.append({
+            "check": "engine_config",
+            "status": "warn",
+            "baseline": baseline_config_hash,
+            "current": current_config_hash,
+            "classification": "calculation_behavior_changed",
+            "message": "Calculation configuration changed since the baseline was captured.",
+        })
     return rows
+
+
+def _engine_status(snapshot: dict, mode: str) -> tuple[str, str | None]:
+    """Baseline replay is only a proof when it uses the same engine build."""
+    baseline_build = snapshot.get("build") or {}
+    baseline_fingerprint = baseline_build.get("engine_fingerprint")
+    current_fingerprint = engine_fingerprint()
+    if mode == "baseline" and baseline_fingerprint and baseline_fingerprint != current_fingerprint:
+        return "incomparable", current_fingerprint
+    return "comparable", current_fingerprint
+
+
+def _config_snapshot() -> dict:
+    return {
+        "waste_factors": _copy_jsonable(WASTE_FACTORS),
+        "sundry_rules": _copy_jsonable(SUNDRY_RULES),
+        "freight_rates": _copy_jsonable(FREIGHT_RATES),
+        "labor_qty_rules": _copy_jsonable(LABOR_QTY_RULES),
+        "stair_sundry_kits": _copy_jsonable(STAIR_SUNDRY_KITS),
+    }
 
 
 def replay_golden_job(
@@ -497,6 +560,7 @@ def replay_golden_job(
     current_company_rates: dict | None = None,
     current_labor_catalog: list[dict] | None = None,
     current_ruleset: dict | None = None,
+    current_config_snapshot: dict | None = None,
 ) -> tuple[dict, AuditTraceBuilder]:
     """Run a dry replay from a golden baseline without mutating the source job."""
     if mode not in ("baseline", "current"):
@@ -515,12 +579,17 @@ def replay_golden_job(
             "active_count": (current_ruleset or {}).get("active_count"),
             "created_at": (current_ruleset or {}).get("created_at"),
         }
+    config = _copy_jsonable(snapshot.get("config_snapshot") or _config_snapshot())
+    if mode == "current":
+        config = _copy_jsonable(current_config_snapshot or _config_snapshot())
 
     job = _copy_jsonable(snapshot.get("job") or {})
     source_job_id = int(golden_job.get("source_job_id") or job.get("id") or 0)
     job["id"] = source_job_id
     job["materials"] = _copy_jsonable(snapshot.get("materials") or [])
     job["proposal_data"] = _copy_jsonable(snapshot.get("proposal_data") or {})
+
+    comparability, current_engine_fingerprint = _engine_status(snapshot, mode)
 
     trace = AuditTraceBuilder(
         source_job_id,
@@ -538,12 +607,12 @@ def replay_golden_job(
         source="golden_replay",
     )
 
-    _apply_waste_rules(job["materials"], rates.get("waste_factors") or {}, trace)
+    _apply_waste_rules(job["materials"], rates.get("waste_factors") or config.get("waste_factors") or {}, trace)
     _stamp_job_counts(job, job["materials"])
     job["sundries"] = calculate_sundries_for_materials(
         job["materials"],
         trace=trace,
-        sundry_rules_override=rates.get("sundry_rules") or {},
+        sundry_rules_override=rates.get("sundry_rules") or config.get("sundry_rules") or {},
     )
     job["labor"] = calculate_labor_for_materials(
         job["materials"],
@@ -573,9 +642,22 @@ def replay_golden_job(
             )
 
     diff = compare_replay(proposal, snapshot, tolerance)
-    diff["drift"] = _drift_rows(snapshot, rates, labor_catalog, ruleset_meta) if mode == "current" else []
+    accepted_proposal_status = diff["status"]
+    diff["drift"] = _drift_rows(
+        snapshot,
+        rates,
+        labor_catalog,
+        ruleset_meta,
+        current_engine_fingerprint=current_engine_fingerprint,
+        current_config_snapshot=config,
+    ) if mode == "current" else []
+    if comparability == "incomparable":
+        diff["status"] = "incomparable"
+        engine_diff["status"] = "incomparable"
     if diff["drift"]:
         diff["status"] = _max_status(diff["status"], "warn")
+    if comparability != "incomparable":
+        diff["status"] = _max_status(engine_diff["status"], diff["status"])
     diff["engine"] = {
         "status": engine_diff["status"],
         "totals": engine_diff["totals"],
@@ -586,6 +668,11 @@ def replay_golden_job(
         "mode": mode,
         "status": diff["status"],
         "engine_status": engine_diff["status"],
+        "raw_engine_status": engine_diff["status"],
+        "accepted_proposal_status": accepted_proposal_status,
+        "engine_comparability": comparability,
+        "baseline_engine_fingerprint": (snapshot.get("build") or {}).get("engine_fingerprint"),
+        "current_engine_fingerprint": current_engine_fingerprint,
         "golden_job_id": golden_job.get("id"),
         "source_job_id": source_job_id,
         "ruleset_version": ruleset_meta.get("version"),

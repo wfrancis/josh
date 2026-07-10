@@ -24,6 +24,7 @@ function SidebarContent({ location, onNavigate }) {
   const navigate = useNavigate()
   const [searchQuery, setSearchQuery] = useState('')
   const [results, setResults] = useState(null)
+  const [build, setBuild] = useState(null)
   const searchRef = useRef(null)
 
   useEffect(() => {
@@ -49,6 +50,10 @@ function SidebarContent({ location, onNavigate }) {
     document.addEventListener('keydown', handleKey)
     document.addEventListener('mousedown', handleClickOutside)
     return () => { document.removeEventListener('keydown', handleKey); document.removeEventListener('mousedown', handleClickOutside) }
+  }, [])
+
+  useEffect(() => {
+    api.getBuildInfo().then(setBuild).catch(() => {})
   }, [])
 
   return (
@@ -132,7 +137,8 @@ function SidebarContent({ location, onNavigate }) {
         <NavItem to="/vendor-contacts" icon={Building2} label="Vendor Contacts" active={location.pathname === '/vendor-contacts'} onClick={onNavigate} />
         <NavItem to="/settings" icon={Settings} label="Settings" active={location.pathname === '/settings'} onClick={onNavigate} />
         <div className="px-3 pt-2 text-[10px] text-gray-600">
-          v1.0 · Standard Interiors
+          {build?.tag && build.tag !== 'unknown' ? `${build.tag} · ` : ''}Standard Interiors
+          {build?.commit && build.commit !== 'unknown' && <span className="ml-1 font-mono">{String(build.commit).slice(0, 8)}</span>}
         </div>
       </div>
     </>

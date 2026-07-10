@@ -34,7 +34,7 @@ from models import (
     create_vendor, delete_vendor,
     get_price_history, import_vendor_prices_csv,
     create_notification, get_notifications, mark_notification_read,
-    is_file_imported, record_imported_file, list_imported_files,
+    is_file_imported, record_imported_file, list_imported_files, record_job_artifact, list_job_artifacts,
     log_activity, get_activity, add_comment, get_comments,
     create_quote_request, list_quote_requests, update_quote_request, delete_quote_request,
     _normalize_product, _get_conn,
@@ -62,6 +62,8 @@ from email_agent import compose_quote_request, send_email, generate_quote_reques
 from ai_client import chat_complete, get_provider_info
 from inbox_monitor import InboxMonitor
 from audit_engine import AuditTraceBuilder
+from build_info import build_manifest_for_snapshot, get_build_info
+from readiness import evaluate_job_readiness
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="SI Bid Tool", version="1.0.0")
@@ -172,10 +174,93 @@ def _match_price_list(material: dict, price_list: list[dict]) -> dict | None:
     return None
 
 
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
-PDF_DIR = os.path.join(os.path.dirname(__file__), "generated_pdfs")
+_artifact_default = "/data/artifacts" if os.path.isdir("/data") else os.path.join(os.path.dirname(__file__), "artifacts")
+ARTIFACT_ROOT = os.environ.get("ARTIFACT_ROOT", _artifact_default)
+UPLOAD_DIR = os.path.join(ARTIFACT_ROOT, "shared", "uploads")
+PDF_DIR = os.path.join(ARTIFACT_ROOT, "shared", "pdfs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(PDF_DIR, exist_ok=True)
+
+
+def _safe_artifact_name(name: str) -> str:
+    """Keep uploaded artifact names inside the intended job directory."""
+    import re as _re
+    clean = os.path.basename(name or "artifact")
+    return _re.sub(r"[^A-Za-z0-9._-]+", "_", clean) or "artifact"
+
+
+def _job_artifact_dir(job_id: int, kind: str) -> str:
+    path = os.path.join(ARTIFACT_ROOT, str(job_id), kind)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _job_upload_path(job_id: int, filename: str, prefix: str) -> str:
+    return os.path.join(_job_artifact_dir(job_id, "uploads"), f"{prefix}_{_safe_artifact_name(filename)}")
+
+
+def _job_pdf_path(job_id: int, kind: str) -> str:
+    return os.path.join(_job_artifact_dir(job_id, "pdfs"), f"{kind}_{job_id}.pdf")
+
+
+def _file_hash(path: str) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _record_artifact(job_id: int, path: str, artifact_kind: str) -> None:
+    """Persist a receipt for a durable file after it has been written."""
+    digest = _file_hash(path)
+    if not digest:
+        return
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    record_job_artifact(
+        job_id,
+        artifact_kind,
+        os.path.relpath(path, ARTIFACT_ROOT),
+        digest,
+        size,
+    )
+
+
+def _job_artifact_manifest(job_id: int) -> list[dict]:
+    root = os.path.join(ARTIFACT_ROOT, str(job_id))
+    manifest = []
+    if not os.path.isdir(root):
+        return manifest
+    for current_root, _, names in os.walk(root):
+        for name in sorted(names):
+            path = os.path.join(current_root, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            manifest.append({
+                "path": os.path.relpath(path, root),
+                "size": size,
+                "sha256": _file_hash(path),
+            })
+    known = {item.get("path") for item in manifest}
+    for receipt in list_job_artifacts(job_id):
+        rel_from_artifact_root = receipt.get("artifact_path") or ""
+        path = os.path.join(ARTIFACT_ROOT, rel_from_artifact_root)
+        rel_from_job = os.path.relpath(path, root) if path.startswith(root + os.sep) else None
+        if rel_from_job and rel_from_job not in known and os.path.isfile(path):
+            manifest.append({
+                "path": rel_from_job,
+                "size": receipt.get("file_size") or 0,
+                "sha256": receipt.get("file_hash"),
+            })
+    return manifest
 
 
 _inbox_monitor: InboxMonitor | None = None
@@ -484,6 +569,7 @@ class GoldenBaselineRequest(BaseModel):
     target_totals: Optional[dict] = None
     tolerance: Optional[dict] = None
     notes: Optional[str] = ""
+    reviewer_name: Optional[str] = ""
 
 
 class GoldenReplayRequest(BaseModel):
@@ -491,6 +577,11 @@ class GoldenReplayRequest(BaseModel):
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/api/system/build")
+def api_system_build():
+    """Return the deployed build and engine identity used for trust checks."""
+    return get_build_info()
 
 @app.get("/api/rules")
 def api_list_rules(category: str = None, stage: str = None, status: str = None):
@@ -504,6 +595,25 @@ def api_get_active_rules(stage: str = None, category: str = None, as_of: str = N
     """List currently active estimating rules for audit/calculation consumers."""
     rules = get_active_rules(stage=stage, category=category, as_of=as_of)
     return {"rules": rules, "count": len(rules)}
+
+
+def _rules_registry_contract() -> dict:
+    active = get_active_rules()
+    gaps = [
+        rule.get("rule_id")
+        for rule in active
+        if not str(rule.get("implementation_ref") or "").strip()
+        or not str(rule.get("test_ref") or "").strip()
+    ]
+    return {
+        "mode": "metadata_with_implementation_refs",
+        "status": "warning" if gaps else "pass",
+        "implementation_gaps": gaps,
+        "active_rule_count": len(active),
+        "calculation_behavior": "engine_code_and_config",
+        "registry_changes_are_metadata_only": True,
+        "behavior_change_signal": "engine_fingerprint",
+    }
 
 
 @app.post("/api/rules/seed")
@@ -522,6 +632,7 @@ def api_list_rulesets(limit: int = 25):
         "current": current,
         "current_version": current["version"] if current else None,
         "count": len(versions),
+        "contract": _rules_registry_contract(),
     }
 
 
@@ -1054,10 +1165,20 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
 
     for file in files:
         # Save uploaded file
-        file_path = os.path.join(UPLOAD_DIR, f"rfms_{db_id}_{file.filename}")
+        file_path = _job_upload_path(db_id, file.filename, "rfms")
+        content = await file.read()
         with open(file_path, "wb") as f:
-            content = await file.read()
             f.write(content)
+        _record_artifact(db_id, file_path, "rfms")
+        record_imported_file(
+            db_id,
+            file.filename,
+            hashlib.sha256(content).hexdigest(),
+            len(content),
+            source="rfms",
+            artifact_path=os.path.relpath(file_path, ARTIFACT_ROOT),
+            artifact_kind="rfms",
+        )
 
         try:
             result = parse_rfms(file_path)
@@ -2037,9 +2158,10 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
             skipped_files.append(upload.filename)
             continue
 
-        file_path = os.path.join(UPLOAD_DIR, f"quote_{db_id}_{upload.filename}")
+        file_path = _job_upload_path(db_id, upload.filename, "quote")
         with open(file_path, "wb") as f:
             f.write(content)
+        _record_artifact(db_id, file_path, "vendor_quote")
 
         try:
             products = parse_quote_file(file_path)
@@ -2048,8 +2170,15 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
             all_products.extend(products)
             # Only record as imported if we actually extracted products
             if products:
-                record_imported_file(db_id, upload.filename, file_hash, len(content),
-                                     source="manual")
+                record_imported_file(
+                    db_id,
+                    upload.filename,
+                    file_hash,
+                    len(content),
+                    source="manual",
+                    artifact_path=os.path.relpath(file_path, ARTIFACT_ROOT),
+                    artifact_kind="vendor_quote",
+                )
         except Exception as e:
             all_products.append({"error": str(e), "file": upload.filename})
 
@@ -2427,8 +2556,9 @@ def api_generate_bid(job_id: str):
     save_job(job)
 
     # Generate PDF
-    pdf_path = os.path.join(PDF_DIR, f"bid_{job['id']}.pdf")
+    pdf_path = _job_pdf_path(job["id"], "bid")
     generate_bid_pdf(bid_data, pdf_path)
+    _record_artifact(job["id"], pdf_path, "bid_pdf")
 
     bundle_count = len(bid_data.get("bundles", []))
     grand_total = bid_data.get("grand_total", 0)
@@ -2459,7 +2589,7 @@ def api_download_bid_pdf(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _validate_bid_pdf_download_ready(job)
-    pdf_path = os.path.join(PDF_DIR, f"bid_{job['id']}.pdf")
+    pdf_path = _job_pdf_path(job["id"], "bid")
     if not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="PDF not found. Generate bid first.")
     return FileResponse(
@@ -2650,6 +2780,9 @@ def _public_golden_job(golden: dict | None) -> dict | None:
     snapshot = golden.get("snapshot") or {}
     return {
         "id": golden.get("id"),
+        "version_id": golden.get("version_id"),
+        "version_number": golden.get("version_number"),
+        "immutable": bool(golden.get("immutable")),
         "source_job_id": golden.get("source_job_id"),
         "name": golden.get("name"),
         "jr_quote_id": golden.get("jr_quote_id"),
@@ -2658,6 +2791,9 @@ def _public_golden_job(golden: dict | None) -> dict | None:
         "tolerance": golden.get("tolerance") or snapshot.get("tolerance") or DEFAULT_TOLERANCE,
         "ruleset_version": golden.get("ruleset_version"),
         "source_fingerprint": golden.get("source_fingerprint"),
+        "engine_fingerprint": golden.get("engine_fingerprint") or (snapshot.get("build") or {}).get("engine_fingerprint"),
+        "artifact_manifest": golden.get("artifact_manifest") or snapshot.get("artifact_manifest") or [],
+        "reviewer_name": golden.get("reviewer_name", ""),
         "notes": golden.get("notes"),
         "status": golden.get("status"),
         "created_at": golden.get("created_at"),
@@ -2671,6 +2807,7 @@ def _public_replay(replay: dict | None, include_generated: bool = False) -> dict
     result = {
         "id": replay.get("id"),
         "golden_job_id": replay.get("golden_job_id"),
+        "golden_version_id": replay.get("golden_version_id"),
         "source_job_id": replay.get("source_job_id"),
         "mode": replay.get("mode"),
         "status": replay.get("status"),
@@ -2682,6 +2819,60 @@ def _public_replay(replay: dict | None, include_generated: bool = False) -> dict
     if include_generated:
         result["generated_proposal"] = replay.get("generated_proposal") or {}
     return result
+
+
+def _golden_readiness_status(job_id: int) -> str | None:
+    golden = get_golden_job_for_source(job_id)
+    if not golden:
+        return None
+    replays = list_golden_replays_for_job(job_id, limit=50)
+    baseline = next((item for item in replays if item.get("mode") == "baseline"), None)
+    if not baseline:
+        return None
+    summary = baseline.get("summary") or {}
+    if baseline.get("status") == "pass" and summary.get("raw_engine_status", summary.get("engine_status")) == "pass":
+        return "golden_verified"
+    if baseline.get("status") == "incomparable" or summary.get("status") == "incomparable":
+        return "incomparable"
+    return "fail"
+
+
+def _evaluate_job_readiness(job: dict) -> dict:
+    proposal = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
+    latest_run = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
+    pdf_ready = False
+    pdf_message = None
+    pdf_path = _job_pdf_path(job["id"], "proposal")
+    if not os.path.exists(pdf_path):
+        pdf_message = "The current proposal PDF is missing. Generate the proposal PDF first."
+    else:
+        try:
+            _validate_proposal_pdf_download_ready(job)
+            pdf_ready = True
+        except HTTPException as exc:
+            pdf_message = str(exc.detail)
+
+    proposal_fingerprint = _proposal_source_fingerprint(job, proposal)
+    return evaluate_job_readiness(
+        job,
+        latest_run=latest_run,
+        current_ruleset_version=_current_ruleset_version(),
+        pdf_ready=pdf_ready,
+        pdf_message=pdf_message,
+        proposal_source_fingerprint=proposal_fingerprint,
+        golden_status=_golden_readiness_status(job["id"]),
+        build=get_build_info(),
+    )
+
+
+@app.get("/api/jobs/{job_id}/readiness")
+def api_get_job_readiness(job_id: str):
+    """Return non-mutating readiness checks for an estimator's current bid."""
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _evaluate_job_readiness(job)
 
 
 @app.get("/api/jobs/{job_id}/reproducibility")
@@ -2701,7 +2892,8 @@ def api_get_job_reproducibility(job_id: str):
 @app.post("/api/jobs/{job_id}/reproducibility/baseline")
 def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     """Capture the current accepted proposal as this job's golden baseline."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -2716,6 +2908,22 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     if not isinstance(proposal_data, dict) or not proposal_data.get("bundles"):
         raise HTTPException(status_code=409, detail="Cannot capture golden baseline until the proposal has saved bundles.")
 
+    current_proposal_fingerprint = _proposal_source_fingerprint(job, proposal_data)
+    if proposal_data.get("audit_source_fingerprint") != current_proposal_fingerprint:
+        raise HTTPException(status_code=409, detail="Cannot capture golden baseline until the saved proposal audit matches the current job source. Save or regenerate the proposal first.")
+
+    deleted_codes = {str(code) for code in (proposal_data.get("deleted_material_codes") or []) if code}
+    active_materials = [m for m in (job.get("materials") or []) if str(m.get("item_code") or "") not in deleted_codes]
+    unknown = [m.get("item_code") or m.get("description") or "material" for m in active_materials if str(m.get("material_type") or "").lower() in ("", "unknown")]
+    unpriced = [m.get("item_code") or m.get("description") or "material" for m in active_materials if _as_number(m.get("unit_price")) is None or _as_number(m.get("unit_price")) <= 0]
+    if unknown or unpriced:
+        details = []
+        if unknown:
+            details.append(f"unknown classifications: {', '.join(str(item) for item in unknown[:5])}")
+        if unpriced:
+            details.append(f"unpriced materials: {', '.join(str(item) for item in unpriced[:5])}")
+        raise HTTPException(status_code=409, detail=f"Cannot capture golden baseline until the proposal is clean ({'; '.join(details)}).")
+
     run = _latest_completed_run(job["id"], {"proposal_manual_save", "proposal_editor_save", "proposal_generation"})
     if not run:
         raise HTTPException(status_code=409, detail="Cannot capture golden baseline until this proposal has a current audit trace. Save or regenerate first.")
@@ -2728,10 +2936,17 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
         number = _as_money_number(value)
         if number is not None:
             target_totals[key] = number
-    if not target_totals:
-        raise HTTPException(status_code=400, detail="Enter at least one Job Runner target total before capturing the golden baseline.")
+    if target_totals.get("grand_total") is None:
+        raise HTTPException(status_code=400, detail="Enter the Job Runner grand total before capturing the golden baseline.")
 
     ruleset = get_ruleset_version()
+    config_snapshot = {
+        "waste_factors": WASTE_FACTORS,
+        "sundry_rules": SUNDRY_RULES,
+        "freight_rates": FREIGHT_RATES,
+        "labor_qty_rules": LABOR_QTY_RULES,
+        "stair_sundry_kits": STAIR_SUNDRY_KITS,
+    }
     snapshot, fingerprint = make_golden_snapshot(
         job=job,
         company_rates=get_all_company_rates(),
@@ -2739,6 +2954,9 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
         ruleset=ruleset,
         target_totals=target_totals,
         tolerance=body.tolerance or DEFAULT_TOLERANCE,
+        build=build_manifest_for_snapshot(),
+        artifact_manifest=_job_artifact_manifest(job["id"]),
+        config_snapshot=config_snapshot,
     )
     golden = upsert_golden_job(
         source_job_id=job["id"],
@@ -2750,6 +2968,11 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
         ruleset_version=(ruleset or {}).get("version"),
         source_fingerprint=fingerprint,
         notes=body.notes or "",
+        reviewer_name=body.reviewer_name or "",
+        engine_fingerprint=build_manifest_for_snapshot().get("engine_fingerprint", ""),
+        artifact_manifest=_job_artifact_manifest(job["id"]),
+        rules_registry_snapshot=ruleset or {},
+        config_snapshot=config_snapshot,
         status="active",
     )
     log_activity(
@@ -2784,6 +3007,13 @@ def api_replay_golden_job(job_id: str, body: GoldenReplayRequest):
         current_company_rates=get_all_company_rates(),
         current_labor_catalog=get_labor_catalog_entries(),
         current_ruleset=get_ruleset_version(),
+        current_config_snapshot={
+            "waste_factors": WASTE_FACTORS,
+            "sundry_rules": SUNDRY_RULES,
+            "freight_rates": FREIGHT_RATES,
+            "labor_qty_rules": LABOR_QTY_RULES,
+            "stair_sundry_kits": STAIR_SUNDRY_KITS,
+        },
     )
     run_id = create_calculation_run(
         db_id,
@@ -2792,6 +3022,7 @@ def api_replay_golden_job(job_id: str, body: GoldenReplayRequest):
         metadata=_audit_metadata({
             "endpoint": "reproducibility/replay",
             "golden_job_id": golden["id"],
+            "golden_version_id": golden.get("version_id"),
             "mode": mode,
             "status": result["summary"]["status"],
             "source_fingerprint": golden.get("source_fingerprint"),
@@ -2813,6 +3044,7 @@ def api_replay_golden_job(job_id: str, body: GoldenReplayRequest):
         diff=result["diff"],
         generated_proposal=result["proposal"],
         audit_run_id=run_id,
+        golden_version_id=golden.get("version_id"),
     )
     log_activity(
         db_id,
@@ -2958,6 +3190,13 @@ def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -
             "deleted_bundles": proposal_data.get("deleted_bundles", []),
             "deleted_material_codes": proposal_data.get("deleted_material_codes", []),
         },
+        "sundries": _line_snapshot(job.get("sundries", []), (
+            "id", "material_id", "sundry_name", "qty", "unit", "unit_price",
+            "extended_cost", "freight_cost",
+        )),
+        "labor": _line_snapshot(job.get("labor", []), (
+            "id", "material_id", "labor_description", "qty", "unit", "rate", "extended_cost",
+        )),
         "ruleset_version": _current_ruleset_version(),
     })
 
@@ -3687,6 +3926,7 @@ async def api_save_proposal_bundles(job_id: str, request: Request):
         "deleted_material_codes": body.get("deleted_material_codes", []),
         "audit": body.get("audit", {}),
     }
+    proposal_data["audit_source_fingerprint"] = _proposal_source_fingerprint(job, proposal_data)
     audit_result = _record_proposal_editor_audit(job["id"], previous_proposal_data, proposal_data)
     if audit_result.get("audit_trace"):
         proposal_data["audit"] = {
@@ -4133,6 +4373,7 @@ def api_generate_proposal(job_id: str):
         "trace_count": trace_count,
         "summary": summary,
     }
+    proposal["audit_source_fingerprint"] = _proposal_source_fingerprint(job, proposal)
     saved_job = load_job(job_id) or job
     saved_job["proposal_data"] = proposal
     save_job(saved_job)
@@ -4183,6 +4424,7 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
         "deleted_material_codes": body.get("deleted_material_codes", []),
         "audit": body.get("audit", (job.get("proposal_data") or {}).get("audit", {})),
     }
+    proposal_data["audit_source_fingerprint"] = _proposal_source_fingerprint(job, proposal_data)
     pdf_run = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
     if pdf_run:
         proposal_data["pdf_audit_run_id"] = pdf_run["id"]
@@ -4198,8 +4440,9 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
             "textura_amount": body.get("textura_amount", 0),
         }
 
-    pdf_path = os.path.join(PDF_DIR, f"proposal_{job['id']}.pdf")
+    pdf_path = _job_pdf_path(job["id"], "proposal")
     generate_proposal_pdf(proposal_data, pdf_path)
+    _record_artifact(job["id"], pdf_path, "proposal_pdf")
 
     # Save proposal data to job
     job["proposal_data"] = _json.dumps(proposal_data)
@@ -4219,7 +4462,7 @@ def api_download_proposal_pdf(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _validate_proposal_pdf_download_ready(job)
-    pdf_path = os.path.join(PDF_DIR, f"proposal_{job['id']}.pdf")
+    pdf_path = _job_pdf_path(job["id"], "proposal")
     if not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="PDF not found. Generate proposal first.")
     return FileResponse(

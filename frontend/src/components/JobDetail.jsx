@@ -16,6 +16,7 @@ import QuoteUpload from './QuoteUpload'
 import VendorQuoteFlow from './VendorQuoteFlow'
 import QuoteTracker from './QuoteTracker'
 import ReproducibilityPanel from './ReproducibilityPanel'
+import ReadinessSummary from './ReadinessSummary'
 import StatusBadge, { getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
 import ActivityLog from './ActivityLog'
@@ -46,11 +47,16 @@ export default function JobDetail() {
   const [editForm, setEditForm] = useState({})
   const [editSaving, setEditSaving] = useState(false)
   const [quoteRequests, setQuoteRequests] = useState([])
+  const [readiness, setReadiness] = useState(null)
 
   const loadJob = async () => {
     try {
       const data = await api.getJob(jobId)
       setJob(data)
+      api.getJobReadiness(data.id).then(result => {
+        setReadiness(result)
+        setJob(current => current ? { ...current, readiness: result } : current)
+      }).catch(() => setReadiness(null))
       setNotes(data.notes || '')
       setNotesOpen(!!data.notes)
       if (data.materials?.length > 0) setRfmsSuccess(true)
@@ -329,7 +335,7 @@ export default function JobDetail() {
                     placeholder="0" />
                 </label>
                 <label className="block">
-                  <span className="text-xs text-gray-500 mb-1 block">Tubs/Showers per Unit</span>
+                  <span className="text-xs text-gray-500 mb-1 block">Total Tubs/Showers</span>
                   <input type="number" value={editForm.tub_shower_count} onChange={e => setEditForm(f => ({ ...f, tub_shower_count: e.target.value }))}
                     className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
                     placeholder="0" />
@@ -397,7 +403,7 @@ export default function JobDetail() {
                 )}
                 {job.tub_shower_count > 0 && (
                   <span className="flex items-center gap-1.5">
-                    <Hash className="w-3.5 h-3.5" /> {job.tub_shower_count} tubs/showers per unit
+                    <Hash className="w-3.5 h-3.5" /> {job.tub_shower_count} total tubs/showers
                   </span>
                 )}
                 {aiSettings && (
@@ -474,6 +480,8 @@ export default function JobDetail() {
           />
         )}
       </div>
+
+      <ReadinessSummary readiness={readiness} onRefresh={() => api.getJobReadiness(job.id).then(result => { setReadiness(result); setJob(current => ({ ...current, readiness: result })) }).catch(err => setError(err.message))} />
 
       <ReproducibilityPanel jobId={jobId} />
 

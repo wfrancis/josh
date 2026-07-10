@@ -1122,6 +1122,7 @@ export default function RulesRegistryPage() {
   const [notice, setNotice] = useState(null)
   const [editor, setEditor] = useState(null)
   const [rollbackTarget, setRollbackTarget] = useState(null)
+  const [rulesetContract, setRulesetContract] = useState(null)
 
   const loadRules = async (preferredId = selectedId) => {
     setLoading(true)
@@ -1149,6 +1150,7 @@ export default function RulesRegistryPage() {
     try {
       const data = await api.listRulesets({ limit: 12 })
       setRulesets(normalizeRulesets(data))
+      setRulesetContract(data?.contract || null)
     } catch {
       setRulesets([])
     } finally {
@@ -1283,6 +1285,14 @@ export default function RulesRegistryPage() {
                 ? `Current rule set: v${currentRuleset.version} · ${currentRuleset.active_count} on · updated ${shortDate(currentRuleset.created_at)}`
                 : 'Current rule set is loading...'}
             </p>
+            {rulesetContract && (
+              <div className="mt-1 space-y-0.5 text-xs">
+                <p className={rulesetContract.status === 'pass' ? 'text-emerald-400/70' : 'text-amber-400/80'}>
+                  Registry contract: {rulesetContract.status === 'pass' ? 'implementation and test references present' : `${rulesetContract.implementation_gaps?.length || 0} active rule(s) need implementation/test references`}
+                </p>
+                <p className="text-gray-600">Registry edits are audit metadata; calculator behavior changes are proven by the engine/config fingerprint.</p>
+              </div>
+            )}
           </div>
           <div className="flex flex-wrap gap-2">
             <button
