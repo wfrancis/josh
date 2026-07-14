@@ -1587,19 +1587,21 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
             edits.freight_cost = round2(adjustedFreightCost)
           }
 
-          // Keep explicit and inferred accepted labor overrides. The raw generated
-          // response still carries today's catalog result for drift evidence; this
-          // merge protects the estimator's accepted line until they replace it.
+          // Keep explicit edits and exact-line legacy numeric overrides. An
+          // unflagged line whose identity disappeared is rules drift; appending it
+          // beside the replacement line would silently double-count labor.
           const freshLaborByIdentity = new Map(
             (fresh.labor_items || []).map(labor => [laborIdentityKey(labor), labor])
           )
           const manualLabor = (prev.labor_items || []).flatMap(labor => {
             const generated = freshLaborByIdentity.get(laborIdentityKey(labor))
-            const acceptedDifference = !generated
-              || Number(labor.qty || 0) !== Number(generated.qty || 0)
+            const explicitManual = !!labor.is_manual || !!labor.is_stair_labor
+            const legacyNumericOverride = !!generated && (
+              Number(labor.qty || 0) !== Number(generated.qty || 0)
               || Number(labor.rate || 0) !== Number(generated.rate || 0)
               || String(labor.unit || '') !== String(generated.unit || '')
-            if (!labor.is_manual && !labor.is_stair_labor && !acceptedDifference) return []
+            )
+            if (!explicitManual && !legacyNumericOverride) return []
             return [{
               ...labor,
               is_manual: true,

@@ -3654,6 +3654,134 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
             "visible_formula_cost": round(labor_qty * 3.48, 2),
         },
     }
+    labor_base = {
+        "tax_rate": 0,
+        "gpm_pct": 0,
+        "textura_fee": 0,
+        "bundles": [{
+            "bundle_name": "Labor identity contract",
+            "materials": [{"item_code": "SM-TEST"}],
+            "sundry_items": [],
+            "labor_items": [{
+                "material_id": 1,
+                "labor_description": "New calculated labor rule",
+                "qty": 100,
+                "unit": "SF",
+                "rate": 0.75,
+                "extended_cost": 75,
+            }],
+            "material_cost": 0,
+            "sundry_cost": 0,
+            "labor_cost": 75,
+            "freight_cost": 0,
+            "installed_qty": 100,
+            "unit": "SF",
+        }],
+    }
+    drift_accepted = copy.deepcopy(labor_base)
+    drift_accepted["bundles"][0]["labor_items"][0].update({
+        "labor_description": "Old calculated labor rule",
+        "rate": 0.50,
+        "extended_cost": 50,
+    })
+    drift_result = copy.deepcopy(labor_base)
+    apply_accepted_numeric_edits(drift_result, drift_accepted)
+
+    manual_accepted = copy.deepcopy(labor_base)
+    manual_accepted["bundles"][0]["labor_items"][0].update({
+        "rate": 0.50,
+        "extended_cost": 50,
+        "is_manual": True,
+    })
+    manual_result = copy.deepcopy(labor_base)
+    apply_accepted_numeric_edits(manual_result, manual_accepted)
+    drift_lines = drift_result["bundles"][0]["labor_items"]
+    manual_lines = manual_result["bundles"][0]["labor_items"]
+    labor_identity_ok = (
+        len(drift_lines) == 1
+        and drift_lines[0].get("labor_description") == "New calculated labor rule"
+        and drift_result["bundles"][0].get("labor_cost") == 75.0
+        and len(manual_lines) == 1
+        and manual_lines[0].get("is_manual") is True
+        and manual_result["bundles"][0].get("labor_cost") == 50.0
+    )
+    response["accepted_labor_identity_contract"] = {
+        "status": "pass" if labor_identity_ok else "fail",
+        "result": {
+            "rule_drift_lines": drift_lines,
+            "rule_drift_labor_cost": drift_result["bundles"][0].get("labor_cost"),
+            "explicit_manual_lines": manual_lines,
+            "explicit_manual_labor_cost": manual_result["bundles"][0].get("labor_cost"),
+        },
+    }
+    sundry_base = {
+        "tax_rate": 0,
+        "gpm_pct": 0,
+        "textura_fee": 0,
+        "bundles": [{
+            "bundle_name": "Sundry identity contract",
+            "materials": [{"item_code": "SM-TEST"}],
+            "sundry_items": [{
+                "material_id": 1,
+                "sundry_name": "New calculated sundry rule",
+                "qty": 10,
+                "unit": "SF",
+                "unit_price": 2,
+                "extended_cost": 20,
+            }],
+            "labor_items": [],
+            "material_cost": 0,
+            "sundry_cost": 20,
+            "labor_cost": 0,
+            "freight_cost": 0,
+            "installed_qty": 10,
+            "unit": "SF",
+        }],
+    }
+    sundry_drift_accepted = copy.deepcopy(sundry_base)
+    sundry_drift_accepted["bundles"][0]["sundry_items"][0].update({
+        "sundry_name": "Old calculated sundry rule",
+        "unit_price": 1,
+        "extended_cost": 10,
+    })
+    sundry_drift_result = copy.deepcopy(sundry_base)
+    apply_accepted_numeric_edits(sundry_drift_result, sundry_drift_accepted)
+
+    sundry_manual_accepted = copy.deepcopy(sundry_base)
+    sundry_manual_accepted["bundles"][0]["sundry_items"].append({
+        "material_id": 1,
+        "sundry_name": "Estimator allowance",
+        "qty": 3,
+        "unit": "EA",
+        "unit_price": 4,
+        "extended_cost": 12,
+        "is_manual_price": True,
+    })
+    sundry_manual_result = copy.deepcopy(sundry_base)
+    apply_accepted_numeric_edits(sundry_manual_result, sundry_manual_accepted)
+    sundry_drift_lines = sundry_drift_result["bundles"][0]["sundry_items"]
+    sundry_manual_lines = sundry_manual_result["bundles"][0]["sundry_items"]
+    sundry_identity_ok = (
+        len(sundry_drift_lines) == 1
+        and sundry_drift_lines[0].get("sundry_name") == "New calculated sundry rule"
+        and sundry_drift_result["bundles"][0].get("sundry_cost") == 20.0
+        and len(sundry_manual_lines) == 2
+        and any(
+            line.get("sundry_name") == "Estimator allowance"
+            and line.get("is_manual_price") is True
+            for line in sundry_manual_lines
+        )
+        and sundry_manual_result["bundles"][0].get("sundry_cost") == 32.0
+    )
+    response["accepted_sundry_identity_contract"] = {
+        "status": "pass" if sundry_identity_ok else "fail",
+        "result": {
+            "rule_drift_lines": sundry_drift_lines,
+            "rule_drift_sundry_cost": sundry_drift_result["bundles"][0].get("sundry_cost"),
+            "explicit_manual_lines": sundry_manual_lines,
+            "explicit_manual_sundry_cost": sundry_manual_result["bundles"][0].get("sundry_cost"),
+        },
+    }
     if field:
         response["field"] = field
     if job_ref:

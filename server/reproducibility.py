@@ -688,6 +688,8 @@ def apply_accepted_numeric_edits(generated: dict, accepted: dict) -> int:
             replayed_sundries.append(sundry)
         for key, accepted_sundry in accepted_sundries.items():
             if key not in generated_sundry_keys:
+                if not (accepted_sundry.get("is_manual_price") or accepted_sundry.get("is_stair_sundry")):
+                    continue
                 replayed = copy.deepcopy(accepted_sundry)
                 if not replayed.get("is_stair_sundry"):
                     replayed["is_manual_price"] = True
@@ -705,13 +707,21 @@ def apply_accepted_numeric_edits(generated: dict, accepted: dict) -> int:
             if not isinstance(accepted_labor, dict):
                 continue
             source_line = generated_by_identity.get(_labor_identity(accepted_labor))
-            differs = bool(
-                source_line is None
-                or _num(accepted_labor.get("qty")) != _num(source_line.get("qty"))
-                or _num(accepted_labor.get("rate")) != _num(source_line.get("rate"))
-                or str(accepted_labor.get("unit") or "") != str(source_line.get("unit") or "")
+            explicit_manual = bool(
+                accepted_labor.get("is_manual")
+                or accepted_labor.get("is_stair_labor")
             )
-            if not (accepted_labor.get("is_manual") or accepted_labor.get("is_stair_labor") or differs):
+            legacy_numeric_override = bool(
+                source_line is not None
+                and (
+                    _num(accepted_labor.get("qty")) != _num(source_line.get("qty"))
+                    or _num(accepted_labor.get("rate")) != _num(source_line.get("rate"))
+                    or str(accepted_labor.get("unit") or "") != str(source_line.get("unit") or "")
+                )
+            )
+            # A missing identity with no manual flag is calculation-rule drift,
+            # not a legacy override. Keeping both rows would double-count labor.
+            if not (explicit_manual or legacy_numeric_override):
                 continue
             replayed = copy.deepcopy(accepted_labor)
             replayed["is_manual"] = True

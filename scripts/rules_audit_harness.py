@@ -241,6 +241,66 @@ def validate_labor_line_rounding_contract(client: "Client") -> Check:
     )
 
 
+def validate_accepted_labor_identity_contract(client: "Client") -> Check:
+    try:
+        _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
+    except HarnessError as exc:
+        return Check("accepted_labor_identity", "FAIL", f"deployed labor-identity probe unavailable: {exc}")
+    contract = probe.get("accepted_labor_identity_contract") or {}
+    result = contract.get("result") or {}
+    drift_lines = result.get("rule_drift_lines") or []
+    manual_lines = result.get("explicit_manual_lines") or []
+    ok = (
+        contract.get("status") == "pass"
+        and len(drift_lines) == 1
+        and drift_lines[0].get("labor_description") == "New calculated labor rule"
+        and result.get("rule_drift_labor_cost") == 75.0
+        and len(manual_lines) == 1
+        and manual_lines[0].get("is_manual") is True
+        and result.get("explicit_manual_labor_cost") == 50.0
+    )
+    return Check(
+        "accepted_labor_identity",
+        "PASS" if ok else "FAIL",
+        (
+            "rule-renamed labor is replaced while explicit estimator labor remains accepted"
+            if ok else "deployed regeneration can lose manual labor or double-count renamed labor"
+        ),
+        contract,
+    )
+
+
+def validate_accepted_sundry_identity_contract(client: "Client") -> Check:
+    try:
+        _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
+    except HarnessError as exc:
+        return Check("accepted_sundry_identity", "FAIL", f"deployed sundry-identity probe unavailable: {exc}")
+    contract = probe.get("accepted_sundry_identity_contract") or {}
+    result = contract.get("result") or {}
+    drift_lines = result.get("rule_drift_lines") or []
+    manual_lines = result.get("explicit_manual_lines") or []
+    allowance_lines = [line for line in manual_lines if line.get("sundry_name") == "Estimator allowance"]
+    ok = (
+        contract.get("status") == "pass"
+        and len(drift_lines) == 1
+        and drift_lines[0].get("sundry_name") == "New calculated sundry rule"
+        and result.get("rule_drift_sundry_cost") == 20.0
+        and len(manual_lines) == 2
+        and len(allowance_lines) == 1
+        and allowance_lines[0].get("is_manual_price") is True
+        and result.get("explicit_manual_sundry_cost") == 32.0
+    )
+    return Check(
+        "accepted_sundry_identity",
+        "PASS" if ok else "FAIL",
+        (
+            "removed calculated sundries stay removed while estimator-added sundries survive"
+            if ok else "deployed regeneration can restore old sundries or lose estimator-added sundries"
+        ),
+        contract,
+    )
+
+
 def validate_classification_fallback_contract(client: "Client") -> Check:
     try:
         _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
@@ -1922,6 +1982,8 @@ def main() -> int:
         checks.append(validate_transition_pricing_contract(client))
         checks.append(validate_proposal_cent_arithmetic_contract(client))
         checks.append(validate_labor_line_rounding_contract(client))
+        checks.append(validate_accepted_labor_identity_contract(client))
+        checks.append(validate_accepted_sundry_identity_contract(client))
         checks.append(validate_classification_fallback_contract(client))
         checks.append(try_rule_registry(client))
         checks.append(try_rule_eval(client, fixture))
