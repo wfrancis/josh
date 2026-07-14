@@ -864,6 +864,101 @@ def validate_parsed_materials(
     )
 
 
+def validate_accepted_proposal_labor_fallback(
+    client: Client,
+    job_id: str,
+    materials: list[dict[str, Any]],
+    created_job: bool,
+) -> Check:
+    """Prove legacy accepted labor is evidence without hiding a truly empty bid."""
+    if not created_job:
+        return Check(
+            "accepted_proposal_labor_fallback",
+            "WARN",
+            "legacy labor fallback probe skipped for an existing job",
+            {"job_id": job_id},
+        )
+
+    _, job_before, _ = client.request("GET", f"/api/jobs/{job_id}")
+    _, readiness_before, _ = client.request("GET", f"/api/jobs/{job_id}/readiness")
+    checks_before = {check.get("id"): check for check in (readiness_before.get("checks") or [])}
+
+    accepted_labor = []
+    for material in materials:
+        material_id = material.get("id")
+        quantity = float(material.get("installed_qty") or material.get("order_qty") or 0)
+        if material_id is None or quantity <= 0:
+            continue
+        accepted_labor.append({
+            "material_id": material_id,
+            "labor_description": "Harness accepted proposal labor evidence",
+            "qty": quantity,
+            "unit": material.get("unit") or "SF",
+            "rate": 1.0,
+            "extended_cost": round(quantity, 2),
+        })
+
+    material_cost = round(sum(float(material.get("extended_cost") or 0) for material in materials), 2)
+    labor_cost = round(sum(float(item["extended_cost"]) for item in accepted_labor), 2)
+    proposal = {
+        "bundles": [{
+            "bundle_name": "Harness Legacy Accepted Labor",
+            "materials": copy.deepcopy(materials),
+            "sundry_items": [],
+            "labor_items": accepted_labor,
+            "material_cost": material_cost,
+            "sundry_cost": 0.0,
+            "labor_cost": labor_cost,
+            "freight_cost": 0.0,
+            "installed_qty": round(sum(float(material.get("installed_qty") or 0) for material in materials), 2),
+            "unit": "LS",
+        }],
+        "tax_rate": 0.08375,
+        "gpm_pct": 0.2,
+        "textura_fee": 0,
+        "notes": [],
+        "terms": [],
+        "exclusions": [],
+        "deleted_bundles": [],
+        "deleted_bundle_reasons": {},
+        "deleted_material_codes": [],
+        "deleted_material_reasons": {},
+    }
+    client.request("PUT", f"/api/jobs/{job_id}/proposal/bundles", json_body=proposal)
+
+    _, job_after, _ = client.request("GET", f"/api/jobs/{job_id}")
+    _, readiness_after, _ = client.request("GET", f"/api/jobs/{job_id}/readiness")
+    checks_after = {check.get("id"): check for check in (readiness_after.get("checks") or [])}
+    before_status = (checks_before.get("labor_coverage") or {}).get("status")
+    after_status = (checks_after.get("labor_coverage") or {}).get("status")
+    top_level_labor_before = job_before.get("labor") or []
+    top_level_labor_after = job_after.get("labor") or []
+    passed = (
+        before_status == "fail"
+        and after_status == "pass"
+        and not top_level_labor_before
+        and not top_level_labor_after
+        and bool(accepted_labor)
+    )
+    return Check(
+        "accepted_proposal_labor_fallback",
+        "PASS" if passed else "FAIL",
+        (
+            "accepted proposal labor passed while a truly empty labor bid stayed blocked"
+            if passed
+            else "legacy accepted proposal labor fallback did not preserve honest blocking"
+        ),
+        {
+            "before_status": before_status,
+            "after_status": after_status,
+            "top_level_labor_before": len(top_level_labor_before),
+            "top_level_labor_after": len(top_level_labor_after),
+            "accepted_labor_rows": len(accepted_labor),
+            "after_message": (checks_after.get("labor_coverage") or {}).get("message"),
+        },
+    )
+
+
 def run_calculate(client: Client, job_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Check]:
     _, parsed, _ = client.request("POST", f"/api/jobs/{job_id}/calculate")
     sundries = parsed.get("sundries") or []
@@ -1527,6 +1622,7 @@ def main() -> int:
 
         materials, pricing_check = price_materials(client, job_id, fixture)
         checks.append(pricing_check)
+        checks.append(validate_accepted_proposal_labor_fallback(client, job_id, materials, created_job))
 
         sundries, labor, calc_check = run_calculate(client, job_id)
         checks.append(calc_check)
