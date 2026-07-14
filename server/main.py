@@ -64,7 +64,13 @@ from proposal_bundler import generate_proposal_data
 from proposal_totals import effective_bundle_total, normalize_proposal_totals
 from material_pricing import material_pricing_context
 from quote_evidence import find_verified_quote_price_conflicts
-from reproducibility import DEFAULT_TOLERANCE, apply_accepted_numeric_edits, make_golden_snapshot, replay_golden_job
+from reproducibility import (
+    DEFAULT_TOLERANCE,
+    apply_accepted_bundle_structure,
+    apply_accepted_numeric_edits,
+    make_golden_snapshot,
+    replay_golden_job,
+)
 from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE, STAIR_SUNDRY_KITS
 from email_agent import compose_quote_request, send_email, generate_quote_request_text
 from ai_client import chat_complete, get_provider_info
@@ -6048,6 +6054,19 @@ def api_generate_proposal(job_id: str):
     for field in ("notes", "terms", "exclusions"):
         if field in existing_pd:
             proposal[field] = list(existing_pd.get(field) or [])
+    accepted_structure_count = apply_accepted_bundle_structure(proposal, existing_pd) if has_saved_accepted_proposal else 0
+    if accepted_structure_count:
+        trace.record(
+            entity_type="proposal",
+            entity_id=job["id"],
+            entity_key="proposal",
+            output_field="accepted_structural_edits",
+            formula="rebuild accepted bundle order/grouping from raw engine bundles without copying accepted totals",
+            inputs={"accepted_proposal_present": True},
+            result=accepted_structure_count,
+            rule_id="proposal:accepted_bundle_structure",
+            source="proposal_regeneration",
+        )
     accepted_edit_count = apply_accepted_numeric_edits(proposal, existing_pd) if has_saved_accepted_proposal else 0
     if accepted_edit_count:
         trace.record(

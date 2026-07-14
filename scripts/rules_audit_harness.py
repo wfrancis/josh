@@ -1620,6 +1620,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
     })
     accepted["bundles"] = accepted_bundles
 
+    regeneration_contract = {}
     try:
         _, saved, _ = client.request(
             "PUT",
@@ -1627,6 +1628,48 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
             json_body=proposal_save_payload(accepted),
         )
         accepted = saved.get("proposal_data") or accepted
+        _, regenerated, _ = client.request(
+            "POST",
+            f"/api/jobs/{job_id}/proposal/generate",
+        )
+
+        def structure_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "bundle_name": bundle.get("bundle_name"),
+                    "item_codes": sorted(
+                        str(item.get("item_code") or item.get("id") or item.get("material_id"))
+                        for item in (bundle.get("materials") or [])
+                        if item.get("item_code") or item.get("id") or item.get("material_id")
+                    ),
+                    "description_text": bundle.get("description_text"),
+                    "price_override": bundle.get("price_override"),
+                }
+                for bundle in (payload.get("bundles") or [])
+                if isinstance(bundle, dict)
+            ]
+
+        accepted_structure = structure_rows(accepted)
+        regenerated_structure = structure_rows(regenerated)
+        regeneration_contract = {
+            "accepted_structure": accepted_structure,
+            "regenerated_structure": regenerated_structure,
+            "structure_matches": regenerated_structure == accepted_structure,
+            "combined_bundle_present": any(
+                row.get("bundle_name") == combined_name for row in regenerated_structure
+            ) if combined_name else True,
+            "custom_bundle_present": any(
+                row.get("bundle_name") == custom_name
+                and round(float(row.get("price_override") or 0), 2) == 123.45
+                for row in regenerated_structure
+            ),
+        }
+        _, saved_regenerated, _ = client.request(
+            "PUT",
+            f"/api/jobs/{job_id}/proposal/bundles",
+            json_body=proposal_save_payload(regenerated),
+        )
+        accepted = saved_regenerated.get("proposal_data") or regenerated
         artifact_check = generate_proposal_pdf(client, job_id, accepted)
     except HarnessError as exc:
         return Check("golden_reproducibility", "FAIL", f"accepted structure setup failed: {exc}")
@@ -1714,6 +1757,9 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
         and baseline_jr_status == "pass"
         and len(baseline_jr_bundle_rows) == len(target_bundles)
         and all(row.get("status") == "pass" for row in baseline_jr_bundle_rows)
+        and regeneration_contract.get("structure_matches") is True
+        and regeneration_contract.get("combined_bundle_present") is True
+        and regeneration_contract.get("custom_bundle_present") is True
         and structural_edit_count >= (2 if combined_name else 1)
         and current_status in {"pass", "warn", "fail"}
         and state.get("golden_job")
@@ -1733,6 +1779,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
             "baseline_overall_status": baseline_overall_status,
             "baseline_jr_status": baseline_jr_status,
             "baseline_jr_bundle_count": len(baseline_jr_bundle_rows),
+            "normal_regeneration": regeneration_contract,
             "accepted_structural_edit_count": structural_edit_count,
             "current_status": current_status,
             "combined_bundle": combined_name,
