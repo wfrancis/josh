@@ -1432,28 +1432,55 @@ def validate_deleted_bundle(client: Client, job_id: str, proposal: dict[str, Any
         if m.get("item_code")
     ]
     kept = [b for b in bundles if b is not target]
-    save_payload = proposal_save_payload(proposal)
-    save_payload.update({
-        "bundles": kept,
-        "deleted_bundles": [target_name],
-        "deleted_bundle_reasons": {target_name: "Harness test deletion"},
-        "deleted_material_codes": target_codes,
-        "deleted_material_reasons": {str(code): "Harness test deletion" for code in target_codes},
-    })
-    client.request("PUT", f"/api/jobs/{job_id}/proposal/bundles", json_body=save_payload)
-    _, regenerated, _ = client.request("POST", f"/api/jobs/{job_id}/proposal/generate")
+    regenerated = {}
+    operation_error = None
+    restoration_error = None
+    try:
+        save_payload = proposal_save_payload(proposal)
+        save_payload.update({
+            "bundles": kept,
+            "deleted_bundles": [target_name],
+            "deleted_bundle_reasons": {target_name: "Harness test deletion"},
+            "deleted_material_codes": target_codes,
+            "deleted_material_reasons": {str(code): "Harness test deletion" for code in target_codes},
+        })
+        client.request("PUT", f"/api/jobs/{job_id}/proposal/bundles", json_body=save_payload)
+        _, regenerated, _ = client.request("POST", f"/api/jobs/{job_id}/proposal/generate")
+    except HarnessError as exc:
+        operation_error = str(exc)
+    finally:
+        try:
+            client.request(
+                "PUT",
+                f"/api/jobs/{job_id}/proposal/bundles",
+                json_body=proposal_save_payload(proposal),
+            )
+        except HarnessError as exc:
+            restoration_error = str(exc)
+
     resurrected = find_bundle_with_code(regenerated.get("bundles") or [], item_code)
     deleted_codes = regenerated.get("deleted_material_codes") or []
-    ok = resurrected is None and item_code in [str(c) for c in deleted_codes]
+    ok = (
+        operation_error is None
+        and restoration_error is None
+        and resurrected is None
+        and item_code in [str(c) for c in deleted_codes]
+    )
     return Check(
         "deleted_bundle",
         "PASS" if ok else "FAIL",
-        f"deleted bundle for {item_code} stayed deleted" if ok else f"deleted bundle for {item_code} was resurrected",
+        (
+            f"deleted bundle for {item_code} stayed deleted"
+            if ok
+            else f"deleted bundle check or restoration failed for {item_code}"
+        ),
         {
             "target_bundle": target_name,
             "target_codes": target_codes,
             "regenerated_bundle_names": [b.get("bundle_name") for b in regenerated.get("bundles") or []],
             "deleted_material_codes": deleted_codes,
+            "operation_error": operation_error,
+            "restoration_error": restoration_error,
         },
     )
 
