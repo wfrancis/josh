@@ -33,6 +33,8 @@ CONFIG_FILES = (
     "config.py",
 )
 
+RUNTIME_FILE_SUFFIXES = {".py", ".json", ".txt"}
+
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -61,6 +63,20 @@ def _file_hashes() -> dict[str, str]:
 
 
 @lru_cache(maxsize=1)
+def _runtime_file_names() -> tuple[str, ...]:
+    root = Path(__file__).resolve().parent
+    return tuple(sorted(
+        path.name
+        for path in root.iterdir()
+        if path.is_file() and path.suffix.lower() in RUNTIME_FILE_SUFFIXES
+    ))
+
+
+def _runtime_file_hashes() -> dict[str, str]:
+    return _named_file_hashes(_runtime_file_names())
+
+
+@lru_cache(maxsize=1)
 def engine_fingerprint() -> str:
     payload = json.dumps(_file_hashes(), sort_keys=True, separators=(",", ":"))
     return _sha256_bytes(payload.encode("utf-8"))
@@ -73,10 +89,43 @@ def config_fingerprint() -> str:
 
 
 @lru_cache(maxsize=1)
-def _frontend_asset_version() -> str | None:
+def runtime_fingerprint() -> str:
+    payload = json.dumps(_runtime_file_hashes(), sort_keys=True, separators=(",", ":"))
+    return _sha256_bytes(payload.encode("utf-8"))
+
+
+def _frontend_roots() -> tuple[Path, ...]:
     root = Path(__file__).resolve().parent
-    candidates = (root / "static" / "index.html", root.parent / "frontend" / "dist" / "index.html")
-    for path in candidates:
+    return (root / "static", root.parent / "frontend" / "dist")
+
+
+@lru_cache(maxsize=1)
+def _frontend_file_hash_items() -> tuple[tuple[str, str], ...]:
+    for root in _frontend_roots():
+        if not root.is_dir():
+            continue
+        return tuple(
+            (path.relative_to(root).as_posix(), _sha256_bytes(path.read_bytes()))
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        )
+    return ()
+
+
+def _frontend_file_hashes() -> dict[str, str]:
+    return dict(_frontend_file_hash_items())
+
+
+@lru_cache(maxsize=1)
+def frontend_fingerprint() -> str:
+    payload = json.dumps(_frontend_file_hashes(), sort_keys=True, separators=(",", ":"))
+    return _sha256_bytes(payload.encode("utf-8"))
+
+
+@lru_cache(maxsize=1)
+def _frontend_asset_version() -> str | None:
+    for root in _frontend_roots():
+        path = root / "index.html"
         try:
             html = path.read_text(encoding="utf-8")
         except OSError:
@@ -100,7 +149,11 @@ def get_build_info() -> dict:
         "engine_fingerprint": engine_fingerprint(),
         "config_fingerprint": config_fingerprint(),
         "engine_files": _file_hashes(),
+        "runtime_fingerprint": runtime_fingerprint(),
+        "runtime_files": _runtime_file_hashes(),
         "frontend_asset": os.getenv("FRONTEND_ASSET", _frontend_asset_version()),
+        "frontend_fingerprint": frontend_fingerprint(),
+        "frontend_files": _frontend_file_hashes(),
     }
 
 
@@ -114,5 +167,7 @@ def build_manifest_for_snapshot() -> dict:
         "environment": info["environment"],
         "engine_fingerprint": info["engine_fingerprint"],
         "config_fingerprint": info["config_fingerprint"],
+        "runtime_fingerprint": info["runtime_fingerprint"],
         "frontend_asset": info["frontend_asset"],
+        "frontend_fingerprint": info["frontend_fingerprint"],
     }

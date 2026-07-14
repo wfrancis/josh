@@ -286,6 +286,64 @@ def bundle_signature(bundle: dict[str, Any]) -> tuple[str, ...]:
     return tuple(sorted(material_code(item) for item in (bundle.get("materials") or []) if material_code(item)))
 
 
+def _find_matching_bundle(
+    target: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    signature = bundle_signature(target)
+    if signature:
+        signature_matches = [bundle for bundle in candidates if bundle_signature(bundle) == signature]
+        named = [bundle for bundle in signature_matches if bundle.get("bundle_name") == target.get("bundle_name")]
+        if len(named) == 1:
+            return named[0]
+        if len(signature_matches) == 1:
+            return signature_matches[0]
+        return None
+    named = [bundle for bundle in candidates if bundle.get("bundle_name") == target.get("bundle_name")]
+    return named[0] if len(named) == 1 else None
+
+
+def accepted_overlay_deltas(
+    raw_engine: dict[str, Any],
+    regenerated: dict[str, Any],
+) -> list[dict[str, Any]]:
+    raw_bundles = [bundle for bundle in (raw_engine.get("bundles") or []) if isinstance(bundle, dict)]
+    component_fields = (
+        "material_cost",
+        "sundry_cost",
+        "labor_cost",
+        "freight_cost",
+        "gpm_labor_adder",
+        "gpm_material_adder",
+        "tax_amount",
+    )
+    rows = []
+    for regenerated_bundle in regenerated.get("bundles") or []:
+        if not isinstance(regenerated_bundle, dict):
+            continue
+        raw_bundle = _find_matching_bundle(regenerated_bundle, raw_bundles)
+        raw_total = money((raw_bundle or {}).get("total_price"))
+        regenerated_total = money(regenerated_bundle.get("total_price"))
+        row = {
+            "bundle_name": regenerated_bundle.get("bundle_name"),
+            "matched_raw_bundle": (raw_bundle or {}).get("bundle_name"),
+            "matched": raw_bundle is not None,
+            "raw_engine_total": raw_total,
+            "accepted_overlay_total": regenerated_total,
+            "delta": round(regenerated_total - raw_total, 2),
+        }
+        for field in component_fields:
+            raw_value = money((raw_bundle or {}).get(field))
+            regenerated_value = money(regenerated_bundle.get(field))
+            row[field] = {
+                "raw_engine": raw_value,
+                "accepted_overlay": regenerated_value,
+                "delta": round(regenerated_value - raw_value, 2),
+            }
+        rows.append(row)
+    return sorted(rows, key=lambda row: abs(row["delta"]), reverse=True)
+
+
 def bundle_line_summary(bundle: dict[str, Any] | None) -> dict[str, Any] | None:
     if not bundle:
         return None
@@ -521,6 +579,20 @@ def main() -> int:
         )
         bundle_deltas = money_deltas(accepted, regenerated)
         result["bundle_money_deltas"] = bundle_deltas
+        overlay_deltas = accepted_overlay_deltas(raw_engine, regenerated)
+        result["accepted_overlay_bundle_deltas"] = overlay_deltas
+        result["accepted_overlay_unmatched_bundles"] = [
+            row["bundle_name"] for row in overlay_deltas if not row["matched"]
+        ]
+        result["accepted_overlay_explained_delta"] = round(
+            sum(row["delta"] for row in overlay_deltas),
+            2,
+        )
+        result["accepted_overlay_unexplained_delta"] = round(
+            result["accepted_overlay_to_raw_engine_delta"]
+            - result["accepted_overlay_explained_delta"],
+            2,
+        )
         result["changed_bundle_lines"] = changed_bundle_line_details(
             accepted,
             raw_engine,

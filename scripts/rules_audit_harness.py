@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import io
 import json
 import os
 import random
 import string
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -57,24 +59,123 @@ AUDIT_ENDPOINTS = [
 ]
 
 
+def _mapping_fingerprint(values: dict[str, str]) -> str:
+    payload = json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _git_tree_hashes(commit: str, prefix: str) -> dict[str, str]:
+    listed = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", commit, prefix],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    paths = listed.stdout.decode("utf-8").splitlines()
+    if prefix == "server":
+        paths = [
+            path for path in paths
+            if os.path.splitext(path)[1].lower() in {".py", ".json", ".txt"}
+        ]
+    hashes = {}
+    prefix_with_slash = f"{prefix.rstrip('/')}"
+    for path in paths:
+        content = subprocess.run(
+            ["git", "show", f"{commit}:{path}"],
+            cwd=ROOT,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        relative = path[len(prefix_with_slash):].lstrip("/")
+        hashes[relative] = hashlib.sha256(content).hexdigest()
+    return hashes
+
+
+def _hash_mismatches(actual: dict[str, str], expected: dict[str, str]) -> dict[str, dict[str, str | None]]:
+    return {
+        name: {"expected": expected.get(name), "actual": actual.get(name)}
+        for name in sorted(set(actual) | set(expected))
+        if actual.get(name) != expected.get(name)
+    }
+
+
 def validate_build_identity(client: "Client", expected_commit: str | None) -> Check:
     try:
         _, build, _ = client.request("GET", "/api/system/build")
     except HarnessError as exc:
         return Check("build_identity", "FAIL", f"build manifest unavailable: {exc}")
-    required = ["commit", "tag", "built_at", "environment", "engine_fingerprint", "config_fingerprint", "frontend_asset"]
+    required = [
+        "commit", "tag", "built_at", "environment", "engine_fingerprint",
+        "config_fingerprint", "runtime_fingerprint", "frontend_asset",
+        "frontend_fingerprint",
+    ]
     missing = [
         field
         for field in required
         if str(build.get(field) or "").strip().lower() in {"", "unknown"}
     ]
     commit_matches = not expected_commit or build.get("commit") == expected_commit
-    ok = not missing and commit_matches
+    runtime_files = build.get("runtime_files") or {}
+    frontend_files = build.get("frontend_files") or {}
+    engine_files = build.get("engine_files") or {}
+    manifest_errors = []
+    if not runtime_files:
+        manifest_errors.append("runtime_files is empty")
+    if not frontend_files:
+        manifest_errors.append("frontend_files is empty")
+    if not engine_files:
+        manifest_errors.append("engine_files is empty")
+    if build.get("runtime_fingerprint") != _mapping_fingerprint(runtime_files):
+        manifest_errors.append("runtime_fingerprint does not match deployed runtime_files")
+    if build.get("frontend_fingerprint") != _mapping_fingerprint(frontend_files):
+        manifest_errors.append("frontend_fingerprint does not match deployed frontend_files")
+    if build.get("frontend_asset") not in frontend_files:
+        manifest_errors.append("frontend_asset is absent from deployed frontend_files")
+
+    git_error = None
+    runtime_mismatches = {}
+    frontend_mismatches = {}
+    engine_mismatches = {}
+    if expected_commit:
+        try:
+            expected_runtime = _git_tree_hashes(expected_commit, "server")
+            expected_frontend = _git_tree_hashes(expected_commit, "frontend/dist")
+            runtime_mismatches = _hash_mismatches(runtime_files, expected_runtime)
+            frontend_mismatches = _hash_mismatches(frontend_files, expected_frontend)
+            expected_engine = {
+                name: expected_runtime.get(name)
+                for name in engine_files
+                if expected_runtime.get(name) is not None
+            }
+            engine_mismatches = _hash_mismatches(engine_files, expected_engine)
+        except (OSError, subprocess.CalledProcessError, UnicodeDecodeError) as exc:
+            git_error = f"{type(exc).__name__}: {exc}"
+
+    ok = bool(
+        not missing
+        and commit_matches
+        and not manifest_errors
+        and not git_error
+        and not runtime_mismatches
+        and not frontend_mismatches
+        and not engine_mismatches
+    )
     return Check(
         "build_identity",
         "PASS" if ok else "FAIL",
         "deployed build matches the intended source" if ok else "deployed build identity is incomplete or mismatched",
-        {"expected_commit": expected_commit, "actual": build, "missing_fields": missing},
+        {
+            "expected_commit": expected_commit,
+            "actual": build,
+            "missing_fields": missing,
+            "manifest_errors": manifest_errors,
+            "git_error": git_error,
+            "runtime_mismatches": runtime_mismatches,
+            "frontend_mismatches": frontend_mismatches,
+            "engine_mismatches": engine_mismatches,
+        },
     )
 
 

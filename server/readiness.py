@@ -253,7 +253,8 @@ def evaluate_job_readiness(
     current_build = build or {}
     required_build_fields = (
         "commit", "tag", "built_at", "environment", "engine_fingerprint",
-        "config_fingerprint", "frontend_asset",
+        "config_fingerprint", "runtime_fingerprint", "frontend_asset",
+        "frontend_fingerprint",
     )
     missing_build_fields = [
         field for field in required_build_fields
