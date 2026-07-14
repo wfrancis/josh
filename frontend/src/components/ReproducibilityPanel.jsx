@@ -477,7 +477,32 @@ export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
                   {enteredBundleTargetCount} / {acceptedBundles.length} entered
                 </span>
               </div>
-              <div className="max-h-96 overflow-auto border-y border-white/[0.06]">
+              <div className="max-h-96 overflow-y-auto border-y border-white/[0.06] sm:hidden">
+                <div className="divide-y divide-white/[0.04]">
+                  {acceptedBundles.map(bundle => (
+                    <div key={`mobile-${bundle.bundle_name}`} className="py-3">
+                      <p className="break-words text-sm font-medium leading-5 text-gray-300">{bundle.bundle_name}</p>
+                      <div className="mt-2 grid grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)] items-end gap-3">
+                        <div>
+                          <p className="text-[10px] font-semibold uppercase text-gray-600">Accepted</p>
+                          <p className="mt-1 text-sm tabular-nums text-gray-400">{shortMoney(bundle.accepted_total)}</p>
+                        </div>
+                        <label className="block">
+                          <span className="mb-1 block text-[10px] font-semibold uppercase text-gray-600">JR target</span>
+                          <input
+                            value={bundleTargets[bundle.bundle_name] ?? ''}
+                            onChange={event => setBundleTargets(current => ({ ...current, [bundle.bundle_name]: event.target.value }))}
+                            className="input w-full text-right text-sm tabular-nums"
+                            placeholder="$0"
+                            aria-label={`JR target for ${bundle.bundle_name}`}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="hidden max-h-96 overflow-auto border-y border-white/[0.06] sm:block">
                 <table className="w-full min-w-[560px] text-sm">
                   <thead className="sticky top-0 bg-[#111827] text-[10px] uppercase text-gray-500">
                     <tr>
