@@ -282,6 +282,107 @@ def money_deltas(accepted: dict[str, Any], regenerated: dict[str, Any]) -> list[
     return sorted(rows, key=lambda row: abs(row["delta"]), reverse=True)
 
 
+def bundle_signature(bundle: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(sorted(material_code(item) for item in (bundle.get("materials") or []) if material_code(item)))
+
+
+def bundle_line_summary(bundle: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not bundle:
+        return None
+    return {
+        "bundle_name": bundle.get("bundle_name"),
+        "costs": {
+            field: money(bundle.get(field))
+            for field in ("material_cost", "sundry_cost", "labor_cost", "freight_cost", "total_price")
+        },
+        "materials": [
+            {
+                "item_code": material_code(item),
+                "order_qty": item.get("order_qty"),
+                "unit": item.get("unit"),
+                "unit_price": item.get("unit_price"),
+                "extended_cost": item.get("extended_cost"),
+            }
+            for item in (bundle.get("materials") or [])
+            if isinstance(item, dict)
+        ],
+        "sundries": [
+            {
+                "material_id": item.get("material_id"),
+                "name": item.get("sundry_name"),
+                "qty": item.get("qty"),
+                "unit": item.get("unit"),
+                "unit_price": item.get("unit_price"),
+                "extended_cost": item.get("extended_cost"),
+                "is_manual_price": bool(item.get("is_manual_price")),
+            }
+            for item in (bundle.get("sundry_items") or [])
+            if isinstance(item, dict)
+        ],
+        "labor": [
+            {
+                "material_id": item.get("material_id"),
+                "description": item.get("labor_description"),
+                "qty": item.get("qty"),
+                "unit": item.get("unit"),
+                "rate": item.get("rate"),
+                "extended_cost": item.get("extended_cost"),
+                "is_manual": bool(item.get("is_manual")),
+                "is_stair_labor": bool(item.get("is_stair_labor")),
+            }
+            for item in (bundle.get("labor_items") or [])
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def changed_bundle_line_details(
+    accepted: dict[str, Any],
+    raw_engine: dict[str, Any],
+    regenerated: dict[str, Any],
+    deltas: list[dict[str, Any]],
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    accepted_bundles = accepted.get("bundles") or []
+    regenerated_bundles = regenerated.get("bundles") or []
+    raw_bundles = [bundle for bundle in (raw_engine.get("bundles") or []) if isinstance(bundle, dict)]
+    raw_by_signature: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for bundle in raw_bundles:
+        signature = bundle_signature(bundle)
+        if signature:
+            raw_by_signature.setdefault(signature, []).append(bundle)
+
+    rows = []
+    for delta in [row for row in deltas if abs(row.get("delta") or 0) >= 0.01][:limit]:
+        index = next(
+            (
+                candidate_index
+                for candidate_index, bundle in enumerate(accepted_bundles)
+                if bundle.get("bundle_name") == delta.get("bundle_name")
+            ),
+            None,
+        )
+        if index is None:
+            continue
+        accepted_bundle = accepted_bundles[index]
+        regenerated_bundle = regenerated_bundles[index] if index < len(regenerated_bundles) else None
+        signature = bundle_signature(accepted_bundle)
+        raw_candidates = raw_by_signature.get(signature, []) if signature else []
+        named_raw = [bundle for bundle in raw_candidates if bundle.get("bundle_name") == accepted_bundle.get("bundle_name")]
+        raw_bundle = named_raw[0] if len(named_raw) == 1 else (raw_candidates[0] if len(raw_candidates) == 1 else None)
+        if not raw_bundle and not signature:
+            named = [bundle for bundle in raw_bundles if bundle.get("bundle_name") == accepted_bundle.get("bundle_name")]
+            raw_bundle = named[0] if len(named) == 1 else None
+        rows.append({
+            "bundle_name": delta.get("bundle_name"),
+            "total_delta": delta.get("delta"),
+            "accepted": bundle_line_summary(accepted_bundle),
+            "raw_engine": bundle_line_summary(raw_bundle),
+            "regenerated": bundle_line_summary(regenerated_bundle),
+        })
+    return rows
+
+
 def readiness_summary(readiness: dict[str, Any]) -> dict[str, Any]:
     checks = readiness.get("checks") or []
     return {
@@ -418,7 +519,14 @@ def main() -> int:
             money(regenerated.get("grand_total")) - money(raw_engine.get("grand_total")),
             2,
         )
-        result["bundle_money_deltas"] = money_deltas(accepted, regenerated)
+        bundle_deltas = money_deltas(accepted, regenerated)
+        result["bundle_money_deltas"] = bundle_deltas
+        result["changed_bundle_lines"] = changed_bundle_line_details(
+            accepted,
+            raw_engine,
+            regenerated,
+            bundle_deltas,
+        )
 
         _, saved, _ = client.request(
             "PUT",
