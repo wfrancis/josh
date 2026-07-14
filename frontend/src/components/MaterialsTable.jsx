@@ -274,6 +274,7 @@ function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimat
           className={`cursor-pointer hover:opacity-80 transition-opacity ${
             priceSource === 'ai_estimate' ? 'text-violet-300' :
             priceSource === 'vendor_quote' ? 'text-sky-300' :
+            priceSource === 'vendor_quote_override' ? 'text-amber-300' :
             priceSource === 'manual' ? 'text-emerald-300' :
             'text-white'
           }`}
@@ -282,6 +283,7 @@ function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimat
           <span className={`block text-[10px] font-normal ${
             priceSource === 'ai_estimate' ? 'text-violet-400/60' :
             priceSource === 'vendor_quote' ? 'text-sky-400/60' :
+            priceSource === 'vendor_quote_override' ? 'text-amber-400/70' :
             priceSource === 'manual' ? 'text-emerald-400/60' :
             'text-gray-500'
           }`}>
@@ -310,6 +312,7 @@ function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimat
             {priceSource && priceSource !== 'none' ? ` · ${
               priceSource === 'ai_estimate' ? 'AI est.' :
               priceSource === 'vendor_quote' ? 'Vendor' :
+              priceSource === 'vendor_quote_override' ? 'Vendor override' :
               priceSource === 'price_book' ? 'Price Book' :
               priceSource === 'default_rule' ? 'Default' :
               priceSource === 'manual' ? 'Manual' : ''
@@ -347,7 +350,7 @@ function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimat
             <Sparkles className="w-3.5 h-3.5 text-violet-400" />
             AI Estimate Price
           </button>
-          {priceSource === 'vendor_quote' && (
+          {(priceSource === 'vendor_quote' || priceSource === 'vendor_quote_override') && (
             <div className="border-t border-white/[0.06] mt-1 px-3 py-2 flex items-start gap-2">
               {material.quote_source_hash ? (
                 <Check className="w-3.5 h-3.5 mt-0.5 text-emerald-400 shrink-0" />

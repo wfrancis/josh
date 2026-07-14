@@ -222,6 +222,7 @@ def evaluate_job_readiness(
     """Evaluate whether a job is safe to send without changing any data."""
     checks = []
     proposal = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
+    trust = trust_summary or {}
 
     def material_key(material: dict) -> str:
         return str(
@@ -411,6 +412,59 @@ def evaluate_job_readiness(
         price_evidence_items,
     ))
 
+    missing_vendor_receipts = int(_number(trust.get("missing_vendor_receipt_count")))
+    vendor_conflicts = [
+        row for row in (trust.get("vendor_price_conflicts") or [])
+        if isinstance(row, dict)
+    ]
+    vendor_conflict_count = max(
+        int(_number(trust.get("vendor_price_conflict_count"))),
+        len(vendor_conflicts),
+    )
+    missing_vendor_files = [str(item) for item in (trust.get("quote_source_files_needed") or [])]
+    vendor_evidence_failures = [
+        *(row.get("item_code") or "material" for row in vendor_conflicts),
+        *missing_vendor_files,
+    ]
+    vendor_evidence_blocked = bool(missing_vendor_receipts or vendor_conflict_count or missing_vendor_files)
+    checks.append(_check(
+        "vendor_quote_evidence",
+        "fail" if vendor_evidence_blocked else "pass",
+        (
+            "Every vendor-priced material has an intact selected quote receipt and no unresolved price conflict."
+            if not vendor_evidence_blocked
+            else (
+                f"Vendor evidence is incomplete: {missing_vendor_receipts} material(s) lack an exact receipt and "
+                f"{vendor_conflict_count} verified quote conflict(s) need an estimator decision; "
+                f"{len(missing_vendor_files)} referenced source file(s) are not durable. "
+                "Dropbox pricing is a user-started scan of a locally synced folder, not automatic cloud sync."
+            )
+        ),
+        vendor_evidence_failures,
+    ))
+
+    vendor_overrides = [
+        row for row in (trust.get("vendor_price_overrides") or [])
+        if isinstance(row, dict)
+    ]
+    vendor_override_count = max(
+        int(_number(trust.get("vendor_price_override_count"))),
+        len(vendor_overrides),
+    )
+    checks.append(_check(
+        "vendor_price_overrides",
+        "warn" if vendor_override_count else "pass",
+        (
+            "No accepted material price differs from its selected verified quote."
+            if not vendor_override_count
+            else f"{vendor_override_count} verified quote difference(s) were kept as documented estimator overrides."
+        ),
+        [
+            f"{row.get('item_code') or 'material'}: {row.get('reviewer_name') or 'reviewer'} - {row.get('reason') or 'reason recorded'}"
+            for row in vendor_overrides
+        ],
+    ))
+
     bundle_material_codes = {
         material_key(material)
         for bundle in (proposal.get("bundles") or [])
@@ -575,5 +629,5 @@ def evaluate_job_readiness(
         "golden_verification_status": golden_verification_status,
         "current_replay_status": current_replay_status,
         "current_replay_drift_classification": current_replay_drift_classification,
-        "trust_summary": trust_summary or {},
+        "trust_summary": trust,
     }

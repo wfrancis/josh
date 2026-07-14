@@ -49,6 +49,7 @@ from models import (
     get_active_rules, seed_rules_registry_defaults,
     create_calculation_run, save_calculation_traces, complete_calculation_run,
     list_calculation_runs, get_latest_completed_calculation_run, get_calculation_traces,
+    record_material_price_decision, list_material_price_decisions,
     upsert_golden_job, get_golden_job_for_source, get_golden_replay,
     save_golden_replay, list_golden_replays_for_job, list_golden_replays_for_version,
     get_latest_golden_replay_for_version,
@@ -63,7 +64,7 @@ from pdf_generator import generate_bid_pdf, generate_proposal_pdf
 from proposal_bundler import generate_proposal_data
 from proposal_totals import effective_bundle_total, normalize_proposal_totals
 from material_pricing import material_pricing_context
-from quote_evidence import find_verified_quote_price_conflicts
+from quote_evidence import find_verified_quote_price_conflicts, normalize_quote_unit
 from reproducibility import (
     DEFAULT_TOLERANCE,
     apply_accepted_bundle_structure,
@@ -386,6 +387,52 @@ def _job_artifact_manifest(job_id: int) -> list[dict]:
     return manifest
 
 
+_VENDOR_EVIDENCE_SOURCES = {"vendor_quote", "vendor_quote_override"}
+
+
+def _price_decision_matches_material(decision: dict, material: dict) -> bool:
+    """Return true only while an immutable decision still describes this row."""
+    if not isinstance(decision, dict) or not isinstance(material, dict):
+        return False
+    try:
+        same_material = int(decision.get("material_id")) == int(material.get("id"))
+    except (TypeError, ValueError):
+        return False
+    if not same_material:
+        return False
+    decision_type = str(decision.get("decision") or "").strip().lower()
+    source = str(material.get("price_source") or "").strip().lower()
+    expected_source = "vendor_quote_override" if decision_type == "keep_accepted" else "vendor_quote"
+    return bool(
+        decision_type in {"keep_accepted", "use_quote"}
+        and source == expected_source
+        and str(decision.get("source_hash") or "").strip()
+        == str(material.get("quote_source_hash") or "").strip()
+        and normalize_quote_unit(decision.get("material_unit"))
+        == normalize_quote_unit(material.get("unit"))
+        and abs(
+            (_as_number(decision.get("resolved_price")) or 0)
+            - (_as_number(material.get("unit_price")) or 0)
+        ) <= 0.005
+    )
+
+
+def _active_price_decisions_for_materials(job_id: int, materials: list[dict]) -> list[dict]:
+    by_id = {
+        str(material.get("id")): material
+        for material in (materials or [])
+        if isinstance(material, dict) and material.get("id") is not None
+    }
+    return [
+        decision
+        for decision in list_material_price_decisions(job_id, active_only=True)
+        if _price_decision_matches_material(
+            decision,
+            by_id.get(str(decision.get("material_id"))) or {},
+        )
+    ]
+
+
 def _artifact_readiness(
     job_id: int,
     proposal_pdf_path: str,
@@ -436,8 +483,13 @@ def _artifact_readiness(
         material
         for material in (materials or [])
         if isinstance(material, dict)
-        and str(material.get("price_source") or "").strip().lower() == "vendor_quote"
+        and str(material.get("price_source") or "").strip().lower() in _VENDOR_EVIDENCE_SOURCES
     ]
+    valid_decisions = _active_price_decisions_for_materials(job_id, materials or [])
+    valid_decisions_by_material = {
+        str(decision.get("material_id")): decision
+        for decision in valid_decisions
+    }
     verified_vendor_hashes = {
         str(item.get("file_hash") or "").strip()
         for item in imported_files
@@ -447,11 +499,17 @@ def _artifact_readiness(
     missing_quote_artifact = []
     for material in vendor_priced:
         label = material.get("item_code") or material.get("description") or "material"
+        source = str(material.get("price_source") or "").strip().lower()
         source_hash = str(material.get("quote_source_hash") or "").strip()
         if not source_hash:
             missing_quote_source.append(str(label))
         elif source_hash not in verified_vendor_hashes:
             missing_quote_artifact.append(str(label))
+        elif (
+            source == "vendor_quote_override"
+            and str(material.get("id")) not in valid_decisions_by_material
+        ):
+            add_failure(f"{label} has a vendor-price override without a current reviewer decision")
     if missing_quote_source:
         labels = ", ".join(missing_quote_source[:5])
         suffix = "..." if len(missing_quote_source) > 5 else ""
@@ -774,6 +832,16 @@ class MaterialUpdate(BaseModel):
     deletion_reasons: dict[str, str] = Field(default_factory=dict)
 
 
+class VendorPriceConflictResolutionRequest(BaseModel):
+    decision: str
+    source_hash: str
+    quote_price: float
+    quote_unit: str
+    accepted_price: float
+    reviewer_name: str
+    reason: str
+
+
 class NotesUpdate(BaseModel):
     notes: str = ""
 
@@ -952,6 +1020,24 @@ def _vendor_price_provenance_status() -> dict:
     return {"verified": not missing, "missing": missing}
 
 
+def _vendor_price_decision_status() -> dict:
+    required = {
+        "job_id", "material_id", "decision", "accepted_price_before",
+        "resolved_price", "quote_price", "source_hash", "reason",
+        "reviewer_name", "created_at", "superseded_at",
+    }
+    conn = _get_conn()
+    try:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(material_price_decisions)").fetchall()
+        }
+    finally:
+        conn.close()
+    missing = sorted(required - columns)
+    return {"verified": not missing, "missing": missing}
+
+
 @app.get("/api/system/vendor-ingestion")
 def api_system_vendor_ingestion():
     """Return non-secret health evidence for vendor-pricing ingestion."""
@@ -964,7 +1050,13 @@ def api_system_vendor_ingestion():
     simulator_running = bool(_sim_watcher and _sim_watcher.is_running)
     idempotency = _vendor_import_idempotency_status()
     provenance = _vendor_price_provenance_status()
-    if not idempotency["verified"] or not provenance["verified"] or not provider.get("available"):
+    decisions = _vendor_price_decision_status()
+    if (
+        not idempotency["verified"]
+        or not provenance["verified"]
+        or not decisions["verified"]
+        or not provider.get("available")
+    ):
         status = "blocked"
     elif test_mode and not simulator_running:
         status = "warning"
@@ -998,7 +1090,11 @@ def api_system_vendor_ingestion():
         },
         "dropbox_import": {
             "mode": "browser_folder_picker",
+            "source_scope": "local_synced_folder",
+            "cloud_connector_configured": False,
+            "automatic_sync": False,
             "requires_user_action": True,
+            "structured_csv_contract": "named_columns_without_ai",
             "supported_extensions": [".eml", ".msg", ".pdf", ".txt", ".csv", ".xlsx"],
             "max_file_mb": MAX_QUOTE_FILE_BYTES // (1024 * 1024),
         },
@@ -1008,6 +1104,8 @@ def api_system_vendor_ingestion():
             "source_fields": ["quote_source_hash", "quote_file_name"],
             "readiness_requires_exact_hash": True,
             "missing_fields": provenance["missing"],
+            "auditable_conflict_decisions": decisions["verified"],
+            "decision_missing_fields": decisions["missing"],
         },
     }
 
@@ -3016,7 +3114,7 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
                 merged["price_source"] = material.get("price_source")
             if material.get("material_type") and base.get("material_type") != material.get("material_type"):
                 merged["ai_confidence"] = 1.0
-            if str(merged.get("price_source") or "").strip().lower() != "vendor_quote":
+            if str(merged.get("price_source") or "").strip().lower() not in _VENDOR_EVIDENCE_SOURCES:
                 merged["quote_source_hash"] = None
                 merged["quote_file_name"] = None
 
@@ -3099,6 +3197,187 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
     return {
         "materials": response_materials,
         "materials_source_fingerprint": source_fingerprint,
+    }
+
+
+@app.get("/api/jobs/{job_id}/price-decisions")
+def api_get_material_price_decisions(job_id: str):
+    """Return immutable vendor-price review history for a job."""
+    db_id = _resolve_job_id(job_id)
+    if not load_job(db_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "decisions": list_material_price_decisions(db_id),
+        "active_decisions": list_material_price_decisions(db_id, active_only=True),
+    }
+
+
+@app.post("/api/jobs/{job_id}/materials/{material_id}/quote-conflict")
+def api_resolve_material_price_conflict(
+    job_id: str,
+    material_id: int,
+    body: VendorPriceConflictResolutionRequest,
+):
+    """Resolve one verified quote conflict without discarding its evidence."""
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    decision_type = str(body.decision or "").strip().lower()
+    reviewer = str(body.reviewer_name or "").strip()
+    reason = str(body.reason or "").strip()
+    source_hash = str(body.source_hash or "").strip().lower()
+    quote_unit = normalize_quote_unit(body.quote_unit)
+    if decision_type not in {"use_quote", "keep_accepted"}:
+        raise HTTPException(status_code=400, detail="Choose either the verified quote or the accepted price.")
+    if len(reviewer) < 2:
+        raise HTTPException(status_code=400, detail="Enter the estimator or reviewer name.")
+    if len(reason) < 5:
+        raise HTTPException(status_code=400, detail="Enter a short reason for this price decision.")
+    if len(source_hash) != 64 or any(character not in "0123456789abcdef" for character in source_hash):
+        raise HTTPException(status_code=400, detail="The selected quote receipt is not a valid SHA-256 source.")
+    if not math.isfinite(body.quote_price) or body.quote_price <= 0:
+        raise HTTPException(status_code=400, detail="The verified quote price must be positive.")
+    if not math.isfinite(body.accepted_price) or body.accepted_price <= 0:
+        raise HTTPException(status_code=400, detail="The accepted price must be positive.")
+
+    proposal = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
+    deleted_reasons = proposal.get("deleted_material_reasons")
+    if not isinstance(deleted_reasons, dict):
+        deleted_reasons = {}
+    deleted_codes = {
+        str(code)
+        for code in (proposal.get("deleted_material_codes") or [])
+        if code and str(deleted_reasons.get(str(code)) or "").strip()
+    }
+    active_materials = [
+        material
+        for material in (job.get("materials") or [])
+        if isinstance(material, dict) and _job_material_key(material) not in deleted_codes
+    ]
+    verified_hashes = {
+        str(item.get("file_hash") or "").strip()
+        for item in list_imported_files(db_id)
+        if _imported_artifact_is_verified(item, "vendor_quote")
+    }
+    conflicts = find_verified_quote_price_conflicts(
+        active_materials,
+        job.get("quotes") or [],
+        verified_hashes,
+    )
+    conflict = next(
+        (
+            row for row in conflicts
+            if str(row.get("material_id")) == str(material_id)
+            and str(row.get("source_hash") or "").strip().lower() == source_hash
+            and abs((_as_number(row.get("quote_price")) or 0) - body.quote_price) <= 0.005
+            and abs((_as_number(row.get("accepted_price")) or 0) - body.accepted_price) <= 0.005
+            and normalize_quote_unit(row.get("quote_unit")) == quote_unit
+        ),
+        None,
+    )
+    if not conflict:
+        raise HTTPException(
+            status_code=409,
+            detail="This quote conflict changed or was already resolved. Refresh readiness and review the current evidence.",
+        )
+
+    conn = _get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current_row = conn.execute(
+            "SELECT * FROM job_materials WHERE id=? AND job_id=?",
+            (material_id, db_id),
+        ).fetchone()
+        if not current_row:
+            raise HTTPException(status_code=404, detail="Material not found")
+        current = dict(current_row)
+        current_price = _as_number(current.get("unit_price")) or 0
+        if abs(current_price - body.accepted_price) > 0.005:
+            raise HTTPException(
+                status_code=409,
+                detail="The material price changed while this decision was open. Refresh and review it again.",
+            )
+
+        resolved_price = conflict["quote_price"] if decision_type == "use_quote" else current_price
+        resolved_source = "vendor_quote" if decision_type == "use_quote" else "vendor_quote_override"
+        resolved_status = "quoted" if decision_type == "use_quote" else "accepted_override"
+        candidate = {
+            **current,
+            "unit_price": resolved_price,
+            "price_source": resolved_source,
+            "quote_status": resolved_status,
+            "quote_source_hash": source_hash,
+            "quote_file_name": conflict.get("source_file") or "",
+        }
+        resolved_extended_cost = (
+            material_pricing_context(candidate)["expected_cost"]
+            if decision_type == "use_quote"
+            else (_as_number(current.get("extended_cost")) or 0)
+        )
+        conn.execute(
+            """UPDATE job_materials
+               SET unit_price=?, extended_cost=?, price_source=?, quote_status=?,
+                   quote_source_hash=?, quote_file_name=?
+               WHERE id=? AND job_id=?""",
+            (
+                round(resolved_price, 2), round(resolved_extended_cost, 2),
+                resolved_source, resolved_status, source_hash,
+                conflict.get("source_file") or "", material_id, db_id,
+            ),
+        )
+        decision = record_material_price_decision(
+            db_id,
+            material_id,
+            item_code=str(current.get("item_code") or current.get("description") or ""),
+            decision=decision_type,
+            accepted_price_before=round(current_price, 2),
+            resolved_price=round(resolved_price, 2),
+            material_unit=normalize_quote_unit(current.get("unit")),
+            quote_price=round(conflict["quote_price"], 2),
+            quote_unit=conflict["quote_unit"],
+            source_hash=source_hash,
+            source_file=conflict.get("source_file") or "",
+            reason=reason,
+            reviewer_name=reviewer,
+            conn=conn,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    action_label = "used the verified quote" if decision_type == "use_quote" else "kept the accepted price"
+    log_activity(
+        db_id,
+        "vendor_price_decision",
+        f"{reviewer} {action_label} for {conflict.get('item_code') or material_id}",
+        {
+            "decision_id": decision["id"],
+            "material_id": material_id,
+            "item_code": conflict.get("item_code"),
+            "decision": decision_type,
+            "accepted_price_before": round(current_price, 2),
+            "resolved_price": round(resolved_price, 2),
+            "quote_price": round(conflict["quote_price"], 2),
+            "source_hash": source_hash,
+            "source_file": conflict.get("source_file") or "",
+            "reason": reason,
+        },
+        user=reviewer,
+    )
+    updated_job = load_job(db_id)
+    return {
+        "decision": decision,
+        "material": next(
+            (material for material in (updated_job.get("materials") or []) if material.get("id") == material_id),
+            None,
+        ),
+        "materials_source_fingerprint": _materials_source_fingerprint(updated_job.get("materials") or []),
+        "readiness": _evaluate_job_readiness(updated_job),
     }
 
 
@@ -3512,7 +3791,7 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
     }
     conflict_probe = find_verified_quote_price_conflicts(
         [
-            {"id": 1, "item_code": "T-100", "unit_price": 5.82, "unit": "SF", "price_source": "vendor_quote"},
+            {"id": 1, "item_code": "T-100", "unit_price": 5.82, "unit": "SF", "price_source": "manual"},
             {"id": 2, "item_code": "ST-100", "unit_price": 13.75, "unit": "SF", "price_source": "vendor_quote"},
             {"id": 3, "item_code": "T-108", "unit_price": 4.65, "unit": "SF", "price_source": "vendor_quote", "quote_source_hash": recovery_hash},
         ],
@@ -3528,6 +3807,7 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
             len(conflict_probe) == 1
             and conflict_probe[0]["item_code"] == "T-100"
             and conflict_probe[0]["delta"] == 0.24
+            and conflict_probe[0]["accepted_source"] == "manual"
         ) else "fail",
         "result": conflict_probe,
     }
@@ -4037,7 +4317,9 @@ def _readiness_trust_summary(
 
     manual_override_count = sum(
         1 for material in active_materials
-        if str(material.get("price_source") or "").strip().lower() == "manual"
+        if str(material.get("price_source") or "").strip().lower() in {
+            "manual", "vendor_quote_override",
+        }
     )
     for bundle in (proposal.get("bundles") or []):
         if not isinstance(bundle, dict):
@@ -4070,11 +4352,20 @@ def _readiness_trust_summary(
     }
     vendor_quote_materials = [
         material for material in active_materials
-        if str(material.get("price_source") or "").strip().lower() == "vendor_quote"
+        if str(material.get("price_source") or "").strip().lower() in _VENDOR_EVIDENCE_SOURCES
     ]
+    valid_price_decisions = _active_price_decisions_for_materials(job["id"], active_materials)
+    valid_price_decisions_by_material = {
+        str(decision.get("material_id")): decision
+        for decision in valid_price_decisions
+    }
     verified_vendor_quote_materials = [
         material for material in vendor_quote_materials
         if str(material.get("quote_source_hash") or "").strip() in verified_vendor_hashes
+        and (
+            str(material.get("price_source") or "").strip().lower() == "vendor_quote"
+            or str(material.get("id")) in valid_price_decisions_by_material
+        )
     ]
     referenced_quote_files = {
         str(quote.get("file_name") or "").strip()
@@ -4098,6 +4389,30 @@ def _readiness_trust_summary(
         job.get("quotes") or [],
         verified_vendor_hashes,
     )
+    vendor_price_overrides = [
+        {
+            "decision_id": decision.get("id"),
+            "material_id": decision.get("material_id"),
+            "item_code": decision.get("item_code") or "material",
+            "accepted_price": _as_money_number(decision.get("resolved_price")),
+            "accepted_unit": decision.get("material_unit"),
+            "quote_price": _as_money_number(decision.get("quote_price")),
+            "quote_unit": decision.get("quote_unit"),
+            "delta": round(
+                (_as_number(decision.get("quote_price")) or 0)
+                - (_as_number(decision.get("resolved_price")) or 0),
+                2,
+            ),
+            "source_hash": decision.get("source_hash"),
+            "source_file": decision.get("source_file"),
+            "reason": decision.get("reason"),
+            "reviewer_name": decision.get("reviewer_name"),
+            "created_at": decision.get("created_at"),
+            "status": "accepted_override",
+        }
+        for decision in valid_price_decisions
+        if str(decision.get("decision") or "").strip().lower() == "keep_accepted"
+    ]
 
     artifact_receipts = list_job_artifacts(job["id"])
     pdf_receipt = next(
@@ -4149,8 +4464,18 @@ def _readiness_trust_summary(
         "missing_vendor_receipt_count": missing_vendor_receipt_count,
         "vendor_price_conflict_count": len(vendor_price_conflicts),
         "vendor_price_conflicts": vendor_price_conflicts[:20],
+        "vendor_price_override_count": len(vendor_price_overrides),
+        "vendor_price_overrides": vendor_price_overrides[:20],
         "quote_source_files_needed": quote_source_files_needed,
         "evidence_recovery_needed": bool(missing_vendor_receipt_count or quote_source_files_needed or vendor_price_conflicts),
+        "vendor_source_mode": "browser_local_sync_folder",
+        "vendor_source_automatic_sync": False,
+        "vendor_source_requires_user_action": True,
+        "vendor_source_status": (
+            "blocked"
+            if missing_vendor_receipt_count or quote_source_files_needed or vendor_price_conflicts
+            else ("reviewed_overrides" if vendor_price_overrides else "verified")
+        ),
         "source_fingerprint": proposal.get("audit_source_fingerprint"),
     }
 
@@ -4410,6 +4735,27 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
             detail="Cannot capture golden baseline because the proposal audit receipt is stale. Save or regenerate the proposal first.",
         )
     _ensure_audit_calculator_current(run, label="Golden baseline")
+
+    capture_trust = _readiness_trust_summary(
+        job,
+        proposal=proposal_data,
+        latest_run=run,
+        build=get_build_info(),
+        ruleset_version=_current_ruleset_version(),
+    )
+    unresolved_vendor_evidence = (
+        int(capture_trust.get("missing_vendor_receipt_count") or 0)
+        + int(capture_trust.get("vendor_price_conflict_count") or 0)
+        + len(capture_trust.get("quote_source_files_needed") or [])
+    )
+    if unresolved_vendor_evidence:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot capture golden baseline while vendor pricing evidence is unresolved. "
+                "Repair the exact quote receipts and review every verified quote difference first."
+            ),
+        )
 
     target_totals = {}
     for key, value in (body.target_totals or {}).items():
@@ -4710,7 +5056,7 @@ def _bid_source_fingerprint(job: dict) -> str:
     build = get_build_info()
     data_fingerprints = _calculator_data_fingerprints()
     return _fingerprint_payload({
-        "fingerprint_schema": 3,
+        "fingerprint_schema": 4,
         "job": _job_source_snapshot(job),
         "materials": _line_snapshot(job.get("materials", []), (
             "id", "item_code", "description", "material_type", "installed_qty",
@@ -4728,6 +5074,11 @@ def _bid_source_fingerprint(job: dict) -> str:
         "labor": _line_snapshot(job.get("labor", []), (
             "id", "material_id", "labor_description", "qty", "unit", "rate", "extended_cost",
         )),
+        "material_price_decisions": _line_snapshot(job.get("material_price_decisions", []), (
+            "id", "material_id", "item_code", "decision", "accepted_price_before",
+            "resolved_price", "material_unit", "quote_price", "quote_unit",
+            "source_hash", "source_file", "reason", "reviewer_name", "created_at",
+        )),
         "engine_fingerprint": build.get("engine_fingerprint"),
         "config_fingerprint": build.get("config_fingerprint"),
         **data_fingerprints,
@@ -4739,7 +5090,7 @@ def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -
     build = get_build_info()
     data_fingerprints = _calculator_data_fingerprints()
     return _fingerprint_payload({
-        "fingerprint_schema": 3,
+        "fingerprint_schema": 4,
         "job": _job_source_snapshot(job),
         "materials": _line_snapshot(job.get("materials", []), (
             "id", "item_code", "description", "material_type", "installed_qty",
@@ -4777,6 +5128,11 @@ def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -
         )),
         "labor": _line_snapshot(job.get("labor", []), (
             "id", "material_id", "labor_description", "qty", "unit", "rate", "extended_cost",
+        )),
+        "material_price_decisions": _line_snapshot(job.get("material_price_decisions", []), (
+            "id", "material_id", "item_code", "decision", "accepted_price_before",
+            "resolved_price", "material_unit", "quote_price", "quote_unit",
+            "source_hash", "source_file", "reason", "reviewer_name", "created_at",
         )),
         "engine_fingerprint": build.get("engine_fingerprint"),
         "config_fingerprint": build.get("config_fingerprint"),

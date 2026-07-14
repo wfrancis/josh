@@ -306,6 +306,24 @@ export default function JobDetail() {
     window.setTimeout(() => quoteSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
   }
 
+  const handleResolveVendorConflict = async (conflict, resolution) => {
+    clearTimeout(autoSaveRef.current)
+    if (isDirty || materialSavePromiseRef.current) {
+      const saved = await saveMaterialsNow({ surfaceError: true })
+      if (!saved) throw new Error('Save the current material edits before reviewing this quote.')
+    }
+    const result = await api.resolveVendorPriceConflict(jobId, conflict.material_id, resolution)
+    const updatedJob = await api.getJob(jobId)
+    materialsStateRef.current = updatedJob.materials || []
+    materialsFingerprintRef.current = updatedJob.materials_source_fingerprint || result.materials_source_fingerprint || ''
+    materialEditVersionRef.current = 0
+    pendingMaterialDeletionReasonsRef.current = {}
+    setJob({ ...updatedJob, readiness: result.readiness })
+    setReadiness(result.readiness)
+    setIsDirty(false)
+    return result
+  }
+
   const getCompletedSteps = () => {
     const completed = []
     if (job?.materials?.length > 0) completed.push('takeoff')
@@ -567,6 +585,7 @@ export default function JobDetail() {
         readiness={readiness}
         onRefresh={() => refreshReadiness(job.id)}
         onRecoverEvidence={openEvidenceRecovery}
+        onResolveVendorConflict={handleResolveVendorConflict}
       />
 
       <ReproducibilityPanel jobId={jobId} onConfidenceChange={refreshReadiness} />

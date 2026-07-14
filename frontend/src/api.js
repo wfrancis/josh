@@ -70,6 +70,12 @@ export const api = {
         deletion_reasons: deletionReasons,
       }),
     }),
+  getMaterialPriceDecisions: (jobId) => request(`/jobs/${jobId}/price-decisions`),
+  resolveVendorPriceConflict: (jobId, materialId, data) =>
+    request(`/jobs/${jobId}/materials/${materialId}/quote-conflict`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   // Proposal Bundles (auto-save)
   loadProposalBundles: (jobId) => request(`/jobs/${jobId}/proposal/bundles`),

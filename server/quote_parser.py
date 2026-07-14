@@ -313,11 +313,87 @@ def _rows_to_quote_text(rows, *, max_rows: int = 5000, max_columns: int = 100) -
     return "\n".join(lines)
 
 
+def _parse_structured_quote_csv(file_path: str) -> list[dict] | None:
+    """Parse a named-column vendor CSV without an AI round trip.
+
+    Return ``None`` when the file is not using the supported structured
+    contract so the existing text/AI parser can handle free-form exports.
+    """
+    import csv
+
+    aliases = {
+        "product": "product_name",
+        "product_name": "product_name",
+        "item": "product_name",
+        "item_code": "item_code",
+        "sku": "item_code",
+        "description": "description",
+        "vendor": "vendor",
+        "manufacturer": "vendor",
+        "unit_price": "unit_price",
+        "price": "unit_price",
+        "cost": "unit_price",
+        "unit": "unit",
+        "uom": "unit",
+        "freight": "freight",
+        "lead_time": "lead_time",
+        "notes": "notes",
+    }
+    with open(file_path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle)
+        raw_fields = reader.fieldnames or []
+        field_map = {
+            field: aliases.get("_".join(str(field or "").strip().lower().split()))
+            for field in raw_fields
+        }
+        mapped_fields = {mapped for mapped in field_map.values() if mapped}
+        if "unit_price" not in mapped_fields or not ({"product_name", "item_code"} & mapped_fields):
+            return None
+
+        products = []
+        for raw_row in reader:
+            row = {
+                mapped: str(raw_row.get(source) or "").strip()
+                for source, mapped in field_map.items()
+                if mapped
+            }
+            raw_price = row.get("unit_price", "").replace("$", "").replace(",", "").strip()
+            try:
+                unit_price = float(raw_price)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(unit_price) or unit_price <= 0:
+                continue
+            item_code = row.get("item_code", "")
+            description = row.get("description", "")
+            product_name = row.get("product_name", "")
+            if not product_name:
+                product_name = " - ".join(value for value in (item_code, description) if value)
+            elif item_code and item_code.lower() not in product_name.lower():
+                product_name = f"{item_code} - {product_name}"
+            if not product_name:
+                continue
+            products.append({
+                "product_name": product_name,
+                "description": description,
+                "vendor": row.get("vendor", ""),
+                "unit_price": unit_price,
+                "unit": row.get("unit", ""),
+                "freight": row.get("freight", ""),
+                "lead_time": row.get("lead_time", ""),
+                "notes": row.get("notes", ""),
+            })
+    return _deduplicate_products(products)
+
+
 def parse_quote_spreadsheet(file_path: str, *, strict: bool = False) -> list[dict]:
     """Convert CSV/XLSX cells to stable text and parse vendor pricing."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".csv":
         import csv
+        structured = _parse_structured_quote_csv(file_path)
+        if structured is not None:
+            return structured
         with open(file_path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
             text = _rows_to_quote_text(csv.reader(handle))
     elif ext == ".xlsx":

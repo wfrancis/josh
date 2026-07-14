@@ -195,6 +195,12 @@ def validate_vendor_ingestion_health(client: "Client") -> Check:
         == "no_pricing_writes_until_every_selected_source_parses"
         and (health.get("pricing_evidence") or {}).get("per_material_source_receipts") is True
         and (health.get("pricing_evidence") or {}).get("readiness_requires_exact_hash") is True
+        and (health.get("pricing_evidence") or {}).get("auditable_conflict_decisions") is True
+        and (health.get("dropbox_import") or {}).get("source_scope") == "local_synced_folder"
+        and (health.get("dropbox_import") or {}).get("cloud_connector_configured") is False
+        and (health.get("dropbox_import") or {}).get("automatic_sync") is False
+        and (health.get("dropbox_import") or {}).get("requires_user_action") is True
+        and (health.get("dropbox_import") or {}).get("structured_csv_contract") == "named_columns_without_ai"
         and bool(health.get("durable_artifact_root"))
     )
     parser_ready = bool((health.get("ai_parser") or {}).get("available"))
@@ -253,12 +259,13 @@ def validate_quote_price_conflict_contract(client: "Client") -> Check:
         and rows[0].get("item_code") == "T-100"
         and rows[0].get("delta") == 0.24
         and rows[0].get("match_basis") == "exact_item_code"
+        and rows[0].get("accepted_source") == "manual"
     )
     return Check(
         "quote_price_conflicts",
         "PASS" if ok else "FAIL",
         (
-            "verified exact-code quote conflicts are visible without replacing accepted prices"
+            "verified exact-code quote conflicts remain visible after a manual relabel"
             if ok else "deployed quote price-conflict contract failed"
         ),
         contract,
@@ -1704,6 +1711,7 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
         and checks.get("unknown_materials") == "fail"
         and checks.get("unpriced_materials") == "fail"
         and checks.get("current_audit") == "fail"
+        and checks.get("vendor_quote_evidence") == "fail"
         and checks.get("durable_artifacts") == "fail"
         and exact_source_blocked
         and trust_summary.get("evidence_recovery_needed") is True
@@ -1732,6 +1740,283 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
             },
         },
     )
+
+
+def validate_vendor_price_decision_workflow(client: Client, fixture: dict[str, Any]) -> Check:
+    """Exercise conflict review, immutable history, invalidation, and quote adoption."""
+    temp_job_id = None
+    details: dict[str, Any] = {}
+    cleanup_error = None
+    try:
+        suffix = f"Price Decision {now_label()}"
+        _, created, _ = client.request(
+            "POST",
+            "/api/jobs",
+            json_body={
+                "project_name": f"Rules Audit {suffix}",
+                "gc_name": "Harness QA",
+                "salesperson": "Harness QA",
+                "tax_rate": float((fixture.get("job") or {}).get("tax_rate", 0)),
+                "gpm_pct": float((fixture.get("job") or {}).get("gpm_pct", 0)),
+                "notes": "Disposable staging job for vendor-price decision proof.",
+            },
+        )
+        temp_job_id = str(created["id"])
+        workbook = build_rfms_workbook(fixture)
+        client.post_multipart(
+            f"/api/jobs/{temp_job_id}/upload-rfms",
+            files=[(
+                "files",
+                f"price_decision_{now_label()}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                workbook,
+            )],
+        )
+        _, source_job, _ = client.request("GET", f"/api/jobs/{temp_job_id}")
+        materials = copy.deepcopy(source_job.get("materials") or [])
+        target_index = next(
+            (
+                index for index, material in enumerate(materials)
+                if str(material.get("item_code") or "").strip()
+                and str(material.get("unit") or "").strip()
+            ),
+            None,
+        )
+        if target_index is None:
+            raise HarnessError("price-decision fixture has no material with an item code and unit")
+
+        default_price = float((fixture.get("pricing") or {}).get("default_unit_price", 10))
+        by_code = {
+            str(key).upper(): float(value)
+            for key, value in ((fixture.get("pricing") or {}).get("by_item_code") or {}).items()
+        }
+        for material in materials:
+            material["unit_price"] = by_code.get(
+                str(material.get("item_code") or "").upper(),
+                default_price,
+            )
+            material["price_source"] = "rules_audit_harness"
+            material["quote_status"] = "quoted"
+        _, priced_response, _ = client.request(
+            "PUT",
+            f"/api/jobs/{temp_job_id}/materials",
+            json_body={
+                "materials": materials,
+                "base_source_fingerprint": source_job.get("materials_source_fingerprint"),
+            },
+        )
+        priced_materials = priced_response.get("materials") or []
+        target = priced_materials[target_index]
+        accepted_price = round(float(target.get("unit_price") or 0), 2)
+        quote_price = round(accepted_price + 1.23, 2)
+        item_code = str(target.get("item_code") or "").strip()
+        unit = str(target.get("unit") or "").strip()
+        _, _, decision_calc = run_calculate(client, temp_job_id)
+        if decision_calc.status != "PASS":
+            raise HarnessError(f"price-decision calculation setup failed: {decision_calc.summary}")
+        decision_proposal, decision_proposal_check = generate_proposal(client, temp_job_id)
+        if decision_proposal_check.status != "PASS":
+            raise HarnessError(f"price-decision proposal setup failed: {decision_proposal_check.summary}")
+        decision_pdf_check = generate_proposal_pdf(client, temp_job_id, decision_proposal)
+        if decision_pdf_check.status != "PASS":
+            raise HarnessError(f"price-decision PDF setup failed: {decision_pdf_check.summary}")
+        csv_bytes = (
+            "item_code,product_name,vendor,unit_price,unit,description\n"
+            f'"{item_code}","{item_code} Harness Verified","Harness Vendor",{quote_price},"{unit}","Deterministic conflict fixture"\n'
+        ).encode("utf-8")
+        source_hash = hashlib.sha256(csv_bytes).hexdigest()
+        client.post_multipart(
+            f"/api/jobs/{temp_job_id}/upload-quotes",
+            files=[("files", "harness_verified_quote.csv", "text/csv", csv_bytes)],
+        )
+
+        _, before_readiness, _ = client.request("GET", f"/api/jobs/{temp_job_id}/readiness")
+        before_trust = before_readiness.get("trust_summary") or {}
+        conflict = next(
+            (
+                row for row in (before_trust.get("vendor_price_conflicts") or [])
+                if str(row.get("material_id")) == str(target.get("id"))
+                and row.get("source_hash") == source_hash
+            ),
+            None,
+        )
+        if not conflict:
+            raise HarnessError("deterministic quote did not create the expected verified price conflict")
+        before_checks = {row.get("id"): row.get("status") for row in (before_readiness.get("checks") or [])}
+        baseline_status, baseline_payload, _ = client.request(
+            "POST",
+            f"/api/jobs/{temp_job_id}/reproducibility/baseline",
+            json_body={
+                "jr_quote_id": "HARNESS-VENDOR-EVIDENCE",
+                "target_totals": {"grand_total": decision_proposal.get("grand_total")},
+                "reviewer_name": "Harness Reviewer",
+                "notes": "This capture must be rejected while quote evidence is unresolved.",
+            },
+            ok_statuses=(409,),
+        )
+        _, baseline_state, _ = client.request("GET", f"/api/jobs/{temp_job_id}/reproducibility")
+
+        _, keep_result, _ = client.request(
+            "POST",
+            f"/api/jobs/{temp_job_id}/materials/{target['id']}/quote-conflict",
+            json_body={
+                "decision": "keep_accepted",
+                "source_hash": source_hash,
+                "quote_price": quote_price,
+                "quote_unit": unit,
+                "accepted_price": accepted_price,
+                "reviewer_name": "Harness Reviewer",
+                "reason": "Accepted contract price is intentionally retained for this proof.",
+            },
+        )
+        _, kept_job, _ = client.request("GET", f"/api/jobs/{temp_job_id}")
+        kept_material = next(
+            material for material in (kept_job.get("materials") or [])
+            if str(material.get("id")) == str(target.get("id"))
+        )
+        kept_readiness = keep_result.get("readiness") or {}
+        kept_trust = kept_readiness.get("trust_summary") or {}
+        kept_checks = {row.get("id"): row.get("status") for row in (kept_readiness.get("checks") or [])}
+        _, kept_history, _ = client.request("GET", f"/api/jobs/{temp_job_id}/price-decisions")
+
+        manually_relabelled = copy.deepcopy(kept_job.get("materials") or [])
+        for material in manually_relabelled:
+            if str(material.get("id")) == str(target.get("id")):
+                material["price_source"] = "manual"
+        client.request(
+            "PUT",
+            f"/api/jobs/{temp_job_id}/materials",
+            json_body={
+                "materials": manually_relabelled,
+                "base_source_fingerprint": kept_job.get("materials_source_fingerprint"),
+            },
+        )
+        _, reopened_readiness, _ = client.request("GET", f"/api/jobs/{temp_job_id}/readiness")
+        reopened_trust = reopened_readiness.get("trust_summary") or {}
+        reopened_conflict = next(
+            (
+                row for row in (reopened_trust.get("vendor_price_conflicts") or [])
+                if str(row.get("material_id")) == str(target.get("id"))
+                and row.get("source_hash") == source_hash
+            ),
+            None,
+        )
+        _, reopened_history, _ = client.request("GET", f"/api/jobs/{temp_job_id}/price-decisions")
+        if not reopened_conflict:
+            raise HarnessError("manual relabel did not invalidate the decision and reopen the conflict")
+
+        _, use_result, _ = client.request(
+            "POST",
+            f"/api/jobs/{temp_job_id}/materials/{target['id']}/quote-conflict",
+            json_body={
+                "decision": "use_quote",
+                "source_hash": source_hash,
+                "quote_price": quote_price,
+                "quote_unit": unit,
+                "accepted_price": accepted_price,
+                "reviewer_name": "Harness Reviewer",
+                "reason": "Verified quote is selected as the final material price for this proof.",
+            },
+        )
+        _, final_job, _ = client.request("GET", f"/api/jobs/{temp_job_id}")
+        final_material = next(
+            material for material in (final_job.get("materials") or [])
+            if str(material.get("id")) == str(target.get("id"))
+        )
+        final_readiness = use_result.get("readiness") or {}
+        final_trust = final_readiness.get("trust_summary") or {}
+        final_checks = {row.get("id"): row.get("status") for row in (final_readiness.get("checks") or [])}
+        _, final_history, _ = client.request("GET", f"/api/jobs/{temp_job_id}/price-decisions")
+
+        keep_active = kept_history.get("active_decisions") or []
+        reopened_active = reopened_history.get("active_decisions") or []
+        reopened_all = reopened_history.get("decisions") or []
+        final_active = final_history.get("active_decisions") or []
+        final_all = final_history.get("decisions") or []
+        ok = bool(
+            before_checks.get("vendor_quote_evidence") == "fail"
+            and baseline_status == 409
+            and "vendor pricing evidence is unresolved" in str(baseline_payload.get("detail") or "").lower()
+            and baseline_state.get("golden_job") is None
+            and kept_material.get("price_source") == "vendor_quote_override"
+            and kept_material.get("quote_source_hash") == source_hash
+            and round(float(kept_material.get("unit_price") or 0), 2) == accepted_price
+            and kept_checks.get("vendor_quote_evidence") == "pass"
+            and kept_checks.get("vendor_price_overrides") == "warn"
+            and kept_trust.get("vendor_price_conflict_count") == 0
+            and kept_trust.get("vendor_price_override_count") == 1
+            and len(keep_active) == 1
+            and keep_active[0].get("decision") == "keep_accepted"
+            and not reopened_active
+            and len(reopened_all) == 1
+            and reopened_all[0].get("superseded_at")
+            and reopened_trust.get("vendor_price_conflict_count") == 1
+            and final_material.get("price_source") == "vendor_quote"
+            and final_material.get("quote_source_hash") == source_hash
+            and round(float(final_material.get("unit_price") or 0), 2) == quote_price
+            and final_checks.get("vendor_quote_evidence") == "pass"
+            and final_checks.get("vendor_price_overrides") == "pass"
+            and final_trust.get("vendor_price_conflict_count") == 0
+            and final_trust.get("vendor_price_override_count") == 0
+            and len(final_active) == 1
+            and final_active[0].get("decision") == "use_quote"
+            and len(final_all) == 2
+            and any(row.get("decision") == "keep_accepted" and row.get("superseded_at") for row in final_all)
+        )
+        details = {
+            "job_id": temp_job_id,
+            "material_id": target.get("id"),
+            "item_code": item_code,
+            "accepted_price": accepted_price,
+            "quote_price": quote_price,
+            "source_hash": source_hash,
+            "before": {
+                "checks": before_checks,
+                "conflict": conflict,
+                "baseline_capture_status": baseline_status,
+                "baseline_capture_response": baseline_payload,
+                "baseline_state": baseline_state,
+            },
+            "kept": {
+                "material": kept_material,
+                "checks": kept_checks,
+                "trust": kept_trust,
+                "active_decisions": keep_active,
+            },
+            "reopened": {
+                "conflict": reopened_conflict,
+                "trust": reopened_trust,
+                "decisions": reopened_all,
+            },
+            "final": {
+                "material": final_material,
+                "checks": final_checks,
+                "trust": final_trust,
+                "decisions": final_all,
+            },
+        }
+        status = "PASS" if ok else "FAIL"
+        summary = (
+            "quote differences require a named decision, survive as history, reopen after manual edits, and can adopt the verified price"
+            if ok else "vendor-price decision workflow did not preserve every audit invariant"
+        )
+    except Exception as exc:
+        status = "FAIL"
+        summary = f"vendor-price decision workflow failed: {type(exc).__name__}: {exc}"
+        details["error"] = str(exc)
+    finally:
+        if temp_job_id:
+            try:
+                client.request("DELETE", f"/api/jobs/{temp_job_id}")
+            except Exception as exc:
+                cleanup_error = f"{type(exc).__name__}: {exc}"
+    if cleanup_error:
+        status = "FAIL"
+        summary = f"{summary}; cleanup failed"
+        details["cleanup_error"] = cleanup_error
+    else:
+        details["cleanup"] = "deleted"
+    return Check("vendor_price_decisions", status, summary, details)
 
 
 def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[str, Any]) -> Check:
@@ -2089,6 +2374,7 @@ def main() -> int:
         checks.append(try_rule_registry(client))
         checks.append(try_rule_eval(client, fixture))
         checks.append(ensure_fixture_labor_catalog(client, fixture, args.seed_fixture_labor_catalog))
+        checks.append(validate_vendor_price_decision_workflow(client, fixture))
 
         job_id, created_job, job_check = create_or_use_job(client, fixture, args.job_id)
         checks.append(job_check)

@@ -43,6 +43,11 @@ def _unit(value) -> str:
     return _UNIT_ALIASES.get(raw, raw)
 
 
+def normalize_quote_unit(value) -> str:
+    """Return the canonical unit used by evidence comparisons and decisions."""
+    return _unit(value)
+
+
 def extract_item_code_tokens(value: str | None) -> set[str]:
     """Return normalized product codes without allowing T-100 to match ST-100."""
     return {
@@ -60,9 +65,11 @@ def find_verified_quote_price_conflicts(
 ) -> list[dict]:
     """Find exact-code price conflicts without changing any accepted value.
 
-    A row is returned only when the material has no intact linked receipt, the
-    quote artifact is verified, the item code appears explicitly in the quote
-    product text, and the units are directly comparable.
+    A row is returned only when the material has no intact selected receipt,
+    the quote artifact is verified, the item code appears explicitly in the
+    quote product text, and the units are directly comparable. The check is
+    deliberately source-agnostic so relabeling a conflicting accepted price as
+    "manual" cannot hide newer exact-code evidence.
     """
     verified_hashes = {str(value or "").strip() for value in verified_source_hashes} - {""}
     quote_candidates: list[dict] = []
@@ -107,8 +114,6 @@ def find_verified_quote_price_conflicts(
     for material in materials or []:
         if not isinstance(material, dict):
             continue
-        if str(material.get("price_source") or "").strip().lower() != "vendor_quote":
-            continue
         linked_hash = str(material.get("quote_source_hash") or "").strip()
         if linked_hash in verified_hashes:
             continue
@@ -140,6 +145,7 @@ def find_verified_quote_price_conflicts(
                 "description": material.get("description") or "",
                 "accepted_price": round(accepted_price, 2),
                 "accepted_unit": accepted_unit,
+                "accepted_source": str(material.get("price_source") or "").strip().lower(),
                 "quote_price": round(quote["quote_price"], 2),
                 "quote_unit": quote["quote_unit"],
                 "delta": delta,

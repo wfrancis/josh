@@ -225,6 +225,34 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_job_artifacts_job ON job_artifacts(job_id, created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS material_price_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                material_id INTEGER,
+                item_code TEXT DEFAULT '',
+                decision TEXT NOT NULL,
+                accepted_price_before REAL NOT NULL,
+                resolved_price REAL NOT NULL,
+                material_unit TEXT DEFAULT '',
+                quote_price REAL NOT NULL,
+                quote_unit TEXT DEFAULT '',
+                source_hash TEXT NOT NULL,
+                source_file TEXT DEFAULT '',
+                reason TEXT NOT NULL,
+                reviewer_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                superseded_at TEXT,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY (material_id) REFERENCES job_materials(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_material_price_decisions_job
+                ON material_price_decisions(job_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_material_price_decisions_active
+                ON material_price_decisions(material_id, superseded_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_material_price_decisions_one_active
+                ON material_price_decisions(material_id)
+                WHERE superseded_at IS NULL AND material_id IS NOT NULL;
+
             CREATE TABLE IF NOT EXISTS job_activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id INTEGER NOT NULL,
@@ -638,17 +666,39 @@ def save_materials(
     owns_connection = conn is None
     conn = conn or _get_conn()
     try:
-        existing_ids = {
-            int(row["id"])
+        existing_rows = {
+            int(row["id"]): dict(row)
             for row in conn.execute(
-                "SELECT id FROM job_materials WHERE job_id=?",
+                "SELECT * FROM job_materials WHERE job_id=?",
                 (job_id,),
             ).fetchall()
         }
+        existing_ids = set(existing_rows)
+
+        def decision_identity(material: dict) -> tuple:
+            try:
+                unit_price = round(float(material.get("unit_price") or 0), 6)
+            except (TypeError, ValueError):
+                unit_price = 0.0
+            price_source = str(material.get("price_source") or "").strip().lower()
+            quote_hash = (
+                str(material.get("quote_source_hash") or "").strip()
+                if price_source in {"vendor_quote", "vendor_quote_override"}
+                else ""
+            )
+            return (
+                str(material.get("item_code") or "").strip(),
+                str(material.get("unit") or "").strip().upper(),
+                unit_price,
+                price_source,
+                quote_hash,
+            )
 
         def material_values(material: dict) -> tuple:
             price_source = material.get("price_source")
-            is_vendor_quote = str(price_source or "").strip().lower() == "vendor_quote"
+            is_vendor_evidence = str(price_source or "").strip().lower() in {
+                "vendor_quote", "vendor_quote_override",
+            }
             return (
                 material.get("item_code"), material.get("description"),
                 material.get("material_type"), material.get("installed_qty", 0),
@@ -657,8 +707,8 @@ def save_materials(
                 material.get("unit_price", 0), material.get("extended_cost", 0),
                 material.get("ai_confidence"), material.get("quote_status"),
                 price_source,
-                material.get("quote_source_hash") if is_vendor_quote else None,
-                material.get("quote_file_name") if is_vendor_quote else None,
+                material.get("quote_source_hash") if is_vendor_evidence else None,
+                material.get("quote_file_name") if is_vendor_evidence else None,
                 material.get("freight_per_unit"),
                 material.get("freight_source"), material.get("fixture_count", 0),
                 material.get("labor_rate_lf", 0), material.get("labor_catalog"),
@@ -679,6 +729,13 @@ def save_materials(
                 requested_id = None
             values = material_values(m)
             if requested_id in existing_ids and requested_id not in retained_ids:
+                if decision_identity(existing_rows[requested_id]) != decision_identity(m):
+                    conn.execute(
+                        """UPDATE material_price_decisions
+                           SET superseded_at=?
+                           WHERE material_id=? AND superseded_at IS NULL""",
+                        (datetime.now().isoformat(), requested_id),
+                    )
                 conn.execute("""
                     UPDATE job_materials SET
                         item_code=?, description=?, material_type=?, installed_qty=?,
@@ -709,12 +766,27 @@ def save_materials(
             ids.append(material_id)
 
         if retained_ids:
+            removed_ids = existing_ids - retained_ids
+            if removed_ids:
+                placeholders = ",".join("?" for _ in removed_ids)
+                conn.execute(
+                    f"""UPDATE material_price_decisions
+                        SET superseded_at=?
+                        WHERE material_id IN ({placeholders}) AND superseded_at IS NULL""",
+                    (datetime.now().isoformat(), *sorted(removed_ids)),
+                )
             placeholders = ",".join("?" for _ in retained_ids)
             conn.execute(
                 f"DELETE FROM job_materials WHERE job_id=? AND id NOT IN ({placeholders})",
                 (job_id, *sorted(retained_ids)),
             )
         else:
+            conn.execute(
+                """UPDATE material_price_decisions
+                   SET superseded_at=?
+                   WHERE job_id=? AND superseded_at IS NULL""",
+                (datetime.now().isoformat(), job_id),
+            )
             conn.execute("DELETE FROM job_materials WHERE job_id=?", (job_id,))
         if owns_connection:
             conn.commit()
@@ -1154,6 +1226,15 @@ def load_job(job_ref) -> Optional[dict]:
         job["quotes"] = [
             dict(r) for r in
             conn.execute("SELECT * FROM job_quotes WHERE job_id=? ORDER BY id", (jid,)).fetchall()
+        ]
+        job["material_price_decisions"] = [
+            dict(r) for r in
+            conn.execute(
+                """SELECT * FROM material_price_decisions
+                   WHERE job_id=? AND superseded_at IS NULL
+                   ORDER BY created_at DESC, id DESC""",
+                (jid,),
+            ).fetchall()
         ]
         return job
     finally:
@@ -3194,6 +3275,75 @@ def list_job_artifacts(job_id: int) -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT id, artifact_kind, artifact_path, file_hash, file_size, created_at FROM job_artifacts WHERE job_id=? ORDER BY created_at DESC",
+            (job_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def record_material_price_decision(
+    job_id: int,
+    material_id: int,
+    *,
+    item_code: str,
+    decision: str,
+    accepted_price_before: float,
+    resolved_price: float,
+    material_unit: str,
+    quote_price: float,
+    quote_unit: str,
+    source_hash: str,
+    source_file: str,
+    reason: str,
+    reviewer_name: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Append an immutable material-price decision and supersede its prior version."""
+    owns_connection = conn is None
+    conn = conn or _get_conn()
+    try:
+        now = datetime.now().isoformat()
+        conn.execute(
+            """UPDATE material_price_decisions
+               SET superseded_at=?
+               WHERE job_id=? AND material_id=? AND superseded_at IS NULL""",
+            (now, job_id, material_id),
+        )
+        cur = conn.execute(
+            """INSERT INTO material_price_decisions
+               (job_id, material_id, item_code, decision, accepted_price_before,
+                resolved_price, material_unit, quote_price, quote_unit, source_hash,
+                source_file, reason, reviewer_name, created_at, superseded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+            (
+                job_id, material_id, item_code or "", decision,
+                accepted_price_before, resolved_price, material_unit or "",
+                quote_price, quote_unit or "", source_hash, source_file or "",
+                reason, reviewer_name, now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM material_price_decisions WHERE id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+        if owns_connection:
+            conn.commit()
+        return dict(row)
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def list_material_price_decisions(job_id: int, *, active_only: bool = False) -> list[dict]:
+    """List current or historical estimator decisions for vendor-price conflicts."""
+    conn = _get_conn()
+    try:
+        where = "job_id=? AND superseded_at IS NULL" if active_only else "job_id=?"
+        rows = conn.execute(
+            f"""SELECT * FROM material_price_decisions
+                WHERE {where}
+                ORDER BY created_at DESC, id DESC""",
             (job_id,),
         ).fetchall()
         return [dict(row) for row in rows]

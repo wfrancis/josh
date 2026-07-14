@@ -153,6 +153,7 @@ def make_golden_snapshot(
         "sundries": _copy_jsonable(job.get("sundries") or []),
         "labor": _copy_jsonable(job.get("labor") or []),
         "quotes": _copy_jsonable(job.get("quotes") or []),
+        "material_price_decisions": _copy_jsonable(job.get("material_price_decisions") or []),
         "proposal_data": proposal_data,
         "accepted_totals": proposal_totals(proposal_data),
         "target_totals": {k: _money(v) for k, v in (target_totals or {}).items() if v not in (None, "")},
@@ -198,6 +199,7 @@ def make_golden_snapshot(
         "config_snapshot": snapshot["config_snapshot"],
         "build": snapshot["build"],
         "artifact_manifest": snapshot["artifact_manifest"],
+        "material_price_decisions": snapshot["material_price_decisions"],
         "proposal_source_fingerprint": snapshot["proposal_source_fingerprint"],
         "raw_engine_proposal": snapshot["raw_engine_proposal"],
     })

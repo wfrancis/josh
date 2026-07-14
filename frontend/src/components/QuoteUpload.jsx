@@ -328,14 +328,14 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
             className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-500/10 border border-blue-500/20 rounded-xl text-blue-400 hover:bg-blue-500/20 transition-colors disabled:opacity-50"
           >
             {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderSearch className="w-4 h-4" />}
-            {scanning ? 'Searching Bid Folder...' : 'Scan Dropbox Bid Folder'}
+            {scanning ? 'Searching Local Bid Folder...' : 'Scan Local Dropbox Bid Folder'}
           </button>
           <button
             onClick={() => handleDropboxScan(true)}
             disabled={scanning || loading}
             className="w-full text-xs text-gray-500 transition-colors hover:text-gray-300 disabled:opacity-50"
           >
-            Choose a different Dropbox folder
+            Choose a different local Dropbox folder
           </button>
           {scanPreview && (
             <div className="px-4 py-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl">
