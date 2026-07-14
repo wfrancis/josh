@@ -1,0 +1,57 @@
+{
+  "status": "PASS",
+  "app": "si-bid-stg-20260714-c0fa",
+  "base_url": "https://si-bid-stg-20260714-c0fa.fly.dev",
+  "build_commit": "30cb6232f60fb2adcc43a1e49785e7e7249019a3",
+  "build_tag": "v1.5.2",
+  "method": {
+    "browser": "Chrome MCP",
+    "locators": "DOM snapshots and unique role locators",
+    "visual_confirmation": "PNG screenshots",
+    "desktop_viewport": "1728x809",
+    "mobile_viewport": "390x844"
+  },
+  "jobs": {
+    "passing_replay_job": 2,
+    "blocked_readiness_job": 1
+  },
+  "verified": {
+    "build_and_footer_visible": true,
+    "readiness_summary_visible": true,
+    "baseline_replay_button_unique": true,
+    "baseline_replay_clicked": true,
+    "baseline_raw_engine_status": "pass",
+    "baseline_accepted_proposal_status": "pass",
+    "current_replay_button_unique": true,
+    "current_replay_clicked": true,
+    "current_raw_engine_status": "pass",
+    "current_accepted_proposal_status": "pass",
+    "job_runner_delta_visible": true,
+    "durable_artifact_count_visible": 2,
+    "pdf_timestamp_visible": true,
+    "unknown_material_blocker_visible": true,
+    "labor_coverage_blocker_visible": true,
+    "stale_audit_blocker_visible": true,
+    "missing_pdf_blocker_visible": true,
+    "durable_artifact_blocker_visible": true,
+    "mobile_layout_readable": true,
+    "desktop_console_errors": 0,
+    "mobile_console_errors": 0,
+    "blocked_mobile_console_errors": 0
+  },
+  "honest_status_notes": [
+    "Job 2 shows Drift Detected because the live proposal was intentionally changed after baseline capture to test accepted manual edits and deleted-bundle persistence.",
+    "The baseline replay itself passed raw-engine and accepted-proposal proof with zero target deltas.",
+    "The current replay also passed because staging is running the same rates, rules, and engine as the captured baseline.",
+    "Job 1 is the retained pre-fix case and correctly displays five explicit readiness blockers."
+  ],
+  "screenshots": [
+    "chrome-job-desktop.png",
+    "chrome-reproducibility-desktop.png",
+    "chrome-readiness-blocked-desktop.png",
+    "chrome-job-mobile.png",
+    "chrome-readiness-artifacts-mobile.png",
+    "chrome-reproducibility-mobile.png",
+    "chrome-readiness-blocked-mobile.png"
+  ]
+}

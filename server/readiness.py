@@ -47,11 +47,12 @@ def proposal_math_errors(proposal: dict) -> list[str]:
     errors = []
     for field in (
         "tax_rate", "gpm_pct", "subtotal", "tax_amount", "grand_total",
-        "gpm_profit", "gpm_labor", "gpm_material", "manual_adjustment",
-        "textura_amount",
+        "gpm_profit", "gpm_labor", "gpm_material", "textura_amount",
     ):
         if _finite_number(proposal.get(field)) is None:
             errors.append(f"Proposal {field} must be a finite number.")
+    if proposal.get("manual_adjustment") is not None and _finite_number(proposal.get("manual_adjustment")) is None:
+        errors.append("Proposal manual_adjustment must be a finite number.")
     tax_rate = _number(proposal.get("tax_rate"))
     gpm_pct = _number(proposal.get("gpm_pct"))
     if tax_rate < 0 or tax_rate > 1:
@@ -315,11 +316,21 @@ def evaluate_job_readiness(
         catalog_missing,
     ))
 
+    labor_rows = [
+        item for item in (job.get("labor") or [])
+        if isinstance(item, dict)
+    ]
+    proposal_labor_rows = [
+        item
+        for bundle in (proposal.get("bundles") or [])
+        if isinstance(bundle, dict)
+        for item in (bundle.get("labor_items") or [])
+        if isinstance(item, dict)
+    ]
     valid_labor_material_ids = {
         str(item.get("material_id"))
-        for item in (job.get("labor") or [])
-        if isinstance(item, dict)
-        and item.get("material_id") is not None
+        for item in [*labor_rows, *proposal_labor_rows]
+        if item.get("material_id") is not None
         and _number(item.get("qty")) > 0
         and _number(item.get("rate")) > 0
         and _number(item.get("extended_cost")) > 0
@@ -333,7 +344,7 @@ def evaluate_job_readiness(
         "labor_coverage",
         "fail" if missing_labor else "pass",
         (
-            "Every active installation material has a positive calculated labor line."
+            "Every active installation material has positive labor evidence in the calculation or accepted proposal."
             if not missing_labor
             else f"{len(missing_labor)} active installation material(s) are missing positive labor cost."
         ),

@@ -1,0 +1,21 @@
+{
+  "status": "PASS",
+  "app": "si-bid-stg-20260714-c0fa",
+  "environment": "staging",
+  "build_commit": "30cb6232f60fb2adcc43a1e49785e7e7249019a3",
+  "build_tag": "v1.5.2",
+  "machine_id": "784443eadd64d8",
+  "job_id": 2,
+  "artifact": "/api/jobs/2/proposal.pdf",
+  "restart_command": "fly machine restart 784443eadd64d8 -a si-bid-stg-20260714-c0fa",
+  "bytes_before": 10162,
+  "bytes_after": 10162,
+  "sha256_before": "1bdd9a8c9340b9de4c7138d9fe5ec80ba71798a416636666ed904f1355a853d7",
+  "sha256_after": "1bdd9a8c9340b9de4c7138d9fe5ec80ba71798a416636666ed904f1355a853d7",
+  "verified": {
+    "machine_restart_succeeded": true,
+    "artifact_downloaded_after_restart": true,
+    "byte_count_unchanged": true,
+    "sha256_unchanged": true
+  }
+}
