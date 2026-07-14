@@ -57,7 +57,7 @@ from rfms_parser import ai_merge_materials, infer_material_type_fallback, parse_
 from quote_parser import MAX_QUOTE_FILE_BYTES, parse_quote_file, set_openai_config
 from dropbox_scanner import match_folder
 from sundry_calc import calculate_sundries_for_materials
-from labor_calc import LABOR_RULES, calculate_labor_for_materials, load_labor_catalog, load_labor_catalog_from_pdf, get_labor_catalog
+from labor_calc import LABOR_RULES, calculate_labor_for_materials, labor_line_values, load_labor_catalog, load_labor_catalog_from_pdf, get_labor_catalog
 from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf, generate_proposal_pdf
 from proposal_bundler import generate_proposal_data
@@ -3635,6 +3635,17 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
         "result": {
             "exact_cent_errors": exact_cent_errors,
             "one_cent_errors": one_cent_errors,
+        },
+    }
+    labor_qty, labor_cost = labor_line_values(1229.704, 3.48)
+    response["labor_line_rounding_contract"] = {
+        "status": "pass" if labor_qty == 1229.70 and labor_cost == 4279.36 else "fail",
+        "result": {
+            "source_quantity": 1229.704,
+            "stored_quantity": labor_qty,
+            "rate": 3.48,
+            "extended_cost": labor_cost,
+            "visible_formula_cost": round(labor_qty * 3.48, 2),
         },
     }
     if field:

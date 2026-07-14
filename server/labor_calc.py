@@ -285,6 +285,12 @@ def _safe_float(val) -> float:
         return 0.0
 
 
+def labor_line_values(quantity: float, rate: float) -> tuple[float, float]:
+    """Return the stored quantity and the cost that its visible formula proves."""
+    stored_quantity = round(_safe_float(quantity), 2)
+    return stored_quantity, round(stored_quantity * _safe_float(rate), 2)
+
+
 _TILE_TYPES = {"floor_tile", "wall_tile", "backsplash", "tub_shower_surround"}
 
 _TILE_DIM_RE = re.compile(r'(\d+(?:\.\d+)?)\s*["\u201d]?\s*x\s*(\d+(?:\.\d+)?)\s*["\u201d]?', re.IGNORECASE)
@@ -526,13 +532,13 @@ def calculate_labor(
     results = []
     for entry in entries:
         rate = entry["cost"]
-        extended_cost = labor_qty * rate
+        stored_qty, extended_cost = labor_line_values(labor_qty, rate)
         item = {
             "labor_description": f"{entry['labor_type']} - {entry['description']}",
-            "qty": round(labor_qty, 2),
+            "qty": stored_qty,
             "unit": entry["unit"],
             "rate": rate,
-            "extended_cost": round(extended_cost, 2),
+            "extended_cost": extended_cost,
         }
         results.append(item)
         if trace:
@@ -649,14 +655,14 @@ def calculate_labor_for_materials(
                 qty = labor_qty
                 line_qty_formula = qty_formula
 
-            extended_cost = qty * rate
+            stored_qty, extended_cost = labor_line_values(qty, rate)
 
             item = {
                 "labor_description": f"{entry['labor_type']} - {entry['description']}",
-                "qty": round(qty, 2),
+                "qty": stored_qty,
                 "unit": entry_unit or entry.get("unit", ""),
                 "rate": rate,
-                "extended_cost": round(extended_cost, 2),
+                "extended_cost": extended_cost,
                 "material_id": material_id,
             }
             results.append(item)

@@ -217,6 +217,30 @@ def validate_proposal_cent_arithmetic_contract(client: "Client") -> Check:
     )
 
 
+def validate_labor_line_rounding_contract(client: "Client") -> Check:
+    try:
+        _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
+    except HarnessError as exc:
+        return Check("labor_line_rounding", "FAIL", f"deployed labor-rounding probe unavailable: {exc}")
+    contract = probe.get("labor_line_rounding_contract") or {}
+    result = contract.get("result") or {}
+    ok = (
+        contract.get("status") == "pass"
+        and result.get("stored_quantity") == 1229.7
+        and result.get("extended_cost") == 4279.36
+        and result.get("visible_formula_cost") == result.get("extended_cost")
+    )
+    return Check(
+        "labor_line_rounding",
+        "PASS" if ok else "FAIL",
+        (
+            "stored labor quantity times stored rate exactly proves stored cost"
+            if ok else "deployed labor lines still depend on hidden quantity precision"
+        ),
+        contract,
+    )
+
+
 def validate_classification_fallback_contract(client: "Client") -> Check:
     try:
         _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
@@ -1823,6 +1847,7 @@ def main() -> int:
         checks.append(validate_quote_price_conflict_contract(client))
         checks.append(validate_transition_pricing_contract(client))
         checks.append(validate_proposal_cent_arithmetic_contract(client))
+        checks.append(validate_labor_line_rounding_contract(client))
         checks.append(validate_classification_fallback_contract(client))
         checks.append(try_rule_registry(client))
         checks.append(try_rule_eval(client, fixture))
