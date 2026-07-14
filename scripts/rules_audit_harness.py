@@ -1328,9 +1328,22 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
     target["price_source"] = "vendor_quote"
     target["quote_source_hash"] = "0" * 64
     target["quote_file_name"] = "missing-harness-quote.eml"
+    cleared_material = {}
     try:
         client.request("PUT", f"/api/jobs/{job_id}/materials", json_body={"materials": mutated})
         _, readiness, _ = client.request("GET", f"/api/jobs/{job_id}/readiness")
+        cleared = copy.deepcopy(mutated)
+        cleared[target_index]["price_source"] = None
+        cleared[target_index]["quote_status"] = "quoted"
+        client.request("PUT", f"/api/jobs/{job_id}/materials", json_body={"materials": cleared})
+        _, cleared_job, _ = client.request("GET", f"/api/jobs/{job_id}")
+        cleared_material = next(
+            (
+                item for item in (cleared_job.get("materials") or [])
+                if str(item.get("id")) == str(target.get("id"))
+            ),
+            {},
+        )
     finally:
         client.request("PUT", f"/api/jobs/{job_id}/materials", json_body={"materials": materials})
 
@@ -1341,6 +1354,12 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
         "intact durable quote file" in str(item)
         for item in (artifact_check.get("affected_items") or [])
     )
+    cleared_receipt = (
+        cleared_material.get("price_source") is None
+        and cleared_material.get("quote_status") is None
+        and cleared_material.get("quote_source_hash") is None
+        and cleared_material.get("quote_file_name") is None
+    )
     ok = (
         readiness.get("status") == "blocked"
         and checks.get("unknown_materials") == "fail"
@@ -1348,6 +1367,7 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
         and checks.get("current_audit") == "fail"
         and checks.get("durable_artifacts") == "fail"
         and exact_source_blocked
+        and cleared_receipt
     )
     return Check(
         "readiness_blockers",
@@ -1358,6 +1378,12 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
             "status": readiness.get("status"),
             "checks": checks,
             "artifact_items": artifact_check.get("affected_items") or [],
+            "clear_price_receipt": {
+                "price_source": cleared_material.get("price_source"),
+                "quote_status": cleared_material.get("quote_status"),
+                "quote_source_hash": cleared_material.get("quote_source_hash"),
+                "quote_file_name": cleared_material.get("quote_file_name"),
+            },
         },
     )
 

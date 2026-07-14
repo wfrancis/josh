@@ -647,6 +647,8 @@ def save_materials(
         }
 
         def material_values(material: dict) -> tuple:
+            price_source = material.get("price_source")
+            is_vendor_quote = str(price_source or "").strip().lower() == "vendor_quote"
             return (
                 material.get("item_code"), material.get("description"),
                 material.get("material_type"), material.get("installed_qty", 0),
@@ -654,8 +656,10 @@ def save_materials(
                 material.get("order_qty", 0), material.get("vendor"),
                 material.get("unit_price", 0), material.get("extended_cost", 0),
                 material.get("ai_confidence"), material.get("quote_status"),
-                material.get("price_source"), material.get("quote_source_hash"),
-                material.get("quote_file_name"), material.get("freight_per_unit"),
+                price_source,
+                material.get("quote_source_hash") if is_vendor_quote else None,
+                material.get("quote_file_name") if is_vendor_quote else None,
+                material.get("freight_per_unit"),
                 material.get("freight_source"), material.get("fixture_count", 0),
                 material.get("labor_rate_lf", 0), material.get("labor_catalog"),
                 material.get("tack_strip_lf", 0), material.get("seam_tape_lf", 0),

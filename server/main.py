@@ -1889,16 +1889,37 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
     conn = _get_conn()
     try:
         all_quotes = conn.execute(
-            "SELECT id, product_name, vendor, unit_price, unit, file_name, source_hash, freight, lead_time, notes FROM job_quotes WHERE job_id=?",
+            """SELECT id, product_name, vendor, unit_price, unit, file_name, source_hash,
+                      freight, lead_time, notes
+               FROM job_quotes
+               WHERE job_id=?
+               ORDER BY CASE WHEN source_hash IS NOT NULL AND source_hash != '' THEN 0 ELSE 1 END,
+                        id DESC""",
             (job_id,),
         ).fetchall()
     finally:
         conn.close()
     all_quote_products = [dict(q) for q in all_quotes] if all_quotes else products
+    verified_quote_hashes = {
+        str(item.get("file_hash") or "").strip()
+        for item in list_imported_files(job_id)
+        if _imported_artifact_is_verified(item, "vendor_quote")
+    }
+    current_quote_hashes = {
+        str(product.get("source_hash") or product.get("_source_hash") or "").strip()
+        for product in products
+        if isinstance(product, dict)
+    }
+    allowed_provenance_hashes = (verified_quote_hashes | current_quote_hashes) - {""}
 
     for mat_idx, mat in enumerate(materials):
-        if mat.get("unit_price") and mat["unit_price"] > 0:
-            continue  # already priced
+        existing_price = _as_number(mat.get("unit_price")) or 0
+        provenance_only = (
+            existing_price > 0
+            and str(mat.get("price_source") or "").strip().lower() == "vendor_quote"
+        )
+        if existing_price > 0 and not provenance_only:
+            continue
         item_code = (mat.get("item_code") or "").strip().lower()
         description = (mat.get("description") or "").strip().lower()
         if not item_code and not description:
@@ -1925,6 +1946,16 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             unit_price = prod.get("unit_price", 0)
             if not unit_price:
                 continue
+            source_hash = prod.get("source_hash") or prod.get("_source_hash")
+            if provenance_only:
+                product_price = _as_number(unit_price)
+                if (
+                    not source_hash
+                    or str(source_hash) not in allowed_provenance_hashes
+                    or product_price is None
+                    or abs(product_price - existing_price) > 0.005
+                ):
+                    continue
             prod_name = (prod.get("product_name") or "").strip().lower()
             prod_desc = (prod.get("description") or "").strip().lower()
             prod_vendor = (prod.get("vendor") or "").strip().lower()
@@ -2004,13 +2035,22 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             if desc_dims and prod_dims and desc_dims & prod_dims:
                 score += 3
 
-            if score > best_score:
+            best_source_hash = (best_prod or {}).get("source_hash") or (best_prod or {}).get("_source_hash")
+            if score > best_score or (score == best_score and source_hash and not best_source_hash):
                 best_score = score
                 best_prod = prod
                 best_prod_idx = prod_idx
 
         # Require a minimum score of 3 to accept a match (prevents single generic word matches)
         if best_score >= 3 and best_prod:
+            if provenance_only:
+                mat["quote_source_hash"] = best_prod.get("source_hash") or best_prod.get("_source_hash")
+                mat["quote_file_name"] = best_prod.get("file_name")
+                mat["quote_status"] = mat.get("quote_status") or "quoted"
+                matched += 1
+                updated = True
+                matched_mat_indices.add(mat_idx)
+                continue
             mat["unit_price"] = best_prod["unit_price"]
             mat["vendor"] = best_prod.get("vendor", "")
             mat["quote_status"] = "quoted"
@@ -2868,6 +2908,8 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
         for material in body.materials:
             base = existing.get(material.get("id"), {})
             merged = {**base, **{key: value for key, value in material.items() if value is not None}}
+            if "price_source" in material:
+                merged["price_source"] = material.get("price_source")
             if material.get("material_type") and base.get("material_type") != material.get("material_type"):
                 merged["ai_confidence"] = 1.0
             if str(merged.get("price_source") or "").strip().lower() != "vendor_quote":
@@ -2877,6 +2919,8 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
             waste_pct = merged.get("waste_pct", 0)
             installed_qty = merged.get("installed_qty", 0)
             unit_price = merged.get("unit_price", 0)
+            if not merged.get("price_source") and (_as_number(unit_price) or 0) <= 0:
+                merged["quote_status"] = None
             order_qty = (
                 material["order_qty"]
                 if "order_qty" in material and material["order_qty"] is not None
