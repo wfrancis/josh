@@ -1579,6 +1579,7 @@ def main() -> int:
     print("JSON_DETAILS_END")
 
     if args.json_output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.json_output)), exist_ok=True)
         with open(args.json_output, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, sort_keys=True, default=str)
             f.write("\n")
