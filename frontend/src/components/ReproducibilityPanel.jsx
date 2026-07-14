@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
   AlertTriangle, CheckCircle2, Database, Loader2, PlayCircle,
   RefreshCw, Save, ShieldCheck, X, XCircle
@@ -285,6 +286,20 @@ export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
     load()
   }, [jobId])
 
+  useEffect(() => {
+    if (!showCapture) return undefined
+    const previousOverflow = document.body.style.overflow
+    const handleKeyDown = event => {
+      if (event.key === 'Escape' && !saving) setShowCapture(false)
+    }
+    document.body.style.overflow = 'hidden'
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [showCapture, saving])
+
   const golden = data?.golden_job
   const activeReplays = data?.active_version_replays || []
   const baselineReplay = data?.baseline_replay || activeReplays.find(replay => replay.mode === 'baseline')
@@ -408,139 +423,210 @@ export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
         </div>
       )}
 
-      {!loading && (!golden || showCapture) && (
-        <div className="mt-4 space-y-4">
-          {golden && (
-            <div className="flex items-center justify-between gap-3 border-t border-white/[0.06] pt-4">
-              <p className="text-sm font-semibold text-gray-200">Capture baseline version {(golden.version_number || 0) + 1}</p>
-              <button onClick={() => setShowCapture(false)} className="btn-ghost px-3 py-1.5 text-xs">Cancel</button>
-            </div>
-          )}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <label className="block">
-              <span className="mb-1 block text-xs text-gray-500">JR Quote ID</span>
-              <input
-                value={form.jr_quote_id}
-                onChange={e => setForm(f => ({ ...f, jr_quote_id: e.target.value }))}
-                className="input w-full text-sm"
-                placeholder="293113"
-              />
-            </label>
-            <label className="block">
-              <span className="mb-1 block text-xs text-gray-500">Reviewed By</span>
-              <input
-                value={form.reviewer_name}
-                onChange={e => setForm(f => ({ ...f, reviewer_name: e.target.value }))}
-                className="input w-full text-sm"
-                placeholder="Estimator name"
-              />
-            </label>
-            {TOTAL_FIELDS.slice(0, 2).map(([key, label]) => (
-              <label key={key} className="block">
-                <span className="mb-1 block text-xs text-gray-500">{label}</span>
-                <input
-                  value={form[key]}
-                  onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
-                  className="input w-full text-sm"
-                  placeholder="$0"
-                />
-              </label>
-            ))}
+      {!loading && !golden && (
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.06] pt-4">
+          <div className="flex items-center gap-2 text-sm text-gray-400">
+            <Database className="h-4 w-4 text-amber-300" />
+            <span>JR baseline not captured</span>
           </div>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            {TOTAL_FIELDS.slice(2).map(([key, label]) => (
-              <label key={key} className="block">
-                <span className="mb-1 block text-xs text-gray-500">{label}</span>
-                <input
-                  value={form[key]}
-                  onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
-                  className="input w-full text-sm"
-                  placeholder="$0"
-                />
-              </label>
-            ))}
-          </div>
-          <label className="block">
-            <span className="mb-1 block text-xs text-gray-500">Notes</span>
-            <input
-              value={form.notes}
-              onChange={e => setForm(f => ({ ...f, notes: e.target.value }))}
-              className="input w-full text-sm"
-              placeholder="Sun Valley accepted baseline"
-            />
-          </label>
-          {acceptedBundles.length > 0 && (
-            <div className="border-t border-white/[0.06] pt-4">
-              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs font-bold uppercase text-gray-400">JR Bundle Breakouts</p>
-                <span className="text-[10px] font-semibold uppercase text-gray-600">
-                  {enteredBundleTargetCount} / {acceptedBundles.length} entered
-                </span>
-              </div>
-              <div className="max-h-96 overflow-y-auto border-y border-white/[0.06] sm:hidden">
-                <div className="divide-y divide-white/[0.04]">
-                  {acceptedBundles.map(bundle => (
-                    <div key={`mobile-${bundle.bundle_name}`} className="py-3">
-                      <p className="break-words text-sm font-medium leading-5 text-gray-300">{bundle.bundle_name}</p>
-                      <div className="mt-2 grid grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)] items-end gap-3">
-                        <div>
-                          <p className="text-[10px] font-semibold uppercase text-gray-600">Accepted</p>
-                          <p className="mt-1 text-sm tabular-nums text-gray-400">{shortMoney(bundle.accepted_total)}</p>
-                        </div>
-                        <label className="block">
-                          <span className="mb-1 block text-[10px] font-semibold uppercase text-gray-600">JR target</span>
-                          <input
-                            value={bundleTargets[bundle.bundle_name] ?? ''}
-                            onChange={event => setBundleTargets(current => ({ ...current, [bundle.bundle_name]: event.target.value }))}
-                            className="input w-full text-right text-sm tabular-nums"
-                            placeholder="$0"
-                            aria-label={`JR target for ${bundle.bundle_name}`}
-                          />
-                        </label>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <div className="hidden max-h-96 overflow-auto border-y border-white/[0.06] sm:block">
-                <table className="w-full min-w-[560px] text-sm">
-                  <thead className="sticky top-0 bg-[#111827] text-[10px] uppercase text-gray-500">
-                    <tr>
-                      <th className="px-3 py-2 text-left font-bold">Accepted bundle</th>
-                      <th className="px-3 py-2 text-right font-bold">Accepted</th>
-                      <th className="w-40 px-3 py-2 text-right font-bold">JR target</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-white/[0.04]">
-                    {acceptedBundles.map(bundle => (
-                      <tr key={bundle.bundle_name}>
-                        <td className="px-3 py-2 text-gray-300">{bundle.bundle_name}</td>
-                        <td className="px-3 py-2 text-right tabular-nums text-gray-500">{shortMoney(bundle.accepted_total)}</td>
-                        <td className="px-3 py-1.5">
-                          <input
-                            value={bundleTargets[bundle.bundle_name] ?? ''}
-                            onChange={event => setBundleTargets(current => ({ ...current, [bundle.bundle_name]: event.target.value }))}
-                            className="input w-full text-right text-sm tabular-nums"
-                            placeholder="$0"
-                            aria-label={`JR target for ${bundle.bundle_name}`}
-                          />
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
           <button
-            onClick={captureBaseline}
-            disabled={saving || !canCapture}
-            className="btn-primary inline-flex items-center gap-2 px-4 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-40"
+            type="button"
+            onClick={startNewVersion}
+            className="btn-primary inline-flex items-center gap-2 px-4 py-2 text-sm"
           >
-            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-            {golden ? 'Capture New Baseline Version' : 'Capture Golden Baseline'}
+            <Save className="h-4 w-4" />
+            Capture Golden Baseline
           </button>
         </div>
+      )}
+
+      {showCapture && createPortal(
+        <div
+          className="fixed inset-0 z-50 overflow-y-auto bg-black/70 px-3 py-4 backdrop-blur-sm sm:px-6 sm:py-8"
+          onClick={() => {
+            if (!saving) setShowCapture(false)
+          }}
+        >
+          <div className="flex min-h-full items-start justify-center">
+            <form
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="golden-baseline-dialog-title"
+              className="flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-lg border border-white/[0.08] bg-[#111827] shadow-2xl sm:max-h-[calc(100vh-4rem)]"
+              onClick={event => event.stopPropagation()}
+              onSubmit={event => {
+                event.preventDefault()
+                if (canCapture && !saving) captureBaseline()
+              }}
+            >
+              <div className="flex flex-shrink-0 items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-4 sm:px-5">
+                <div>
+                  <h2 id="golden-baseline-dialog-title" className="text-base font-bold text-white">
+                    {golden ? `Capture Baseline Version ${(golden.version_number || 0) + 1}` : 'Capture Golden Baseline'}
+                  </h2>
+                  <p className="mt-1 text-xs text-gray-500">Job Runner totals and accepted bundle targets</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowCapture(false)}
+                  disabled={saving}
+                  className="btn-ghost p-2 disabled:cursor-not-allowed disabled:opacity-40"
+                  title="Close baseline dialog"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 sm:px-5">
+                {error && (
+                  <div className="flex items-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+                    <AlertTriangle className="h-4 w-4 flex-shrink-0" />
+                    <span className="flex-1">{error}</span>
+                    <button type="button" onClick={() => setError(null)} className="p-1 text-red-300/60 hover:text-red-200" title="Dismiss error">
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  <label className="block">
+                    <span className="mb-1 block text-xs text-gray-500">JR Quote ID</span>
+                    <input
+                      value={form.jr_quote_id}
+                      onChange={event => setForm(current => ({ ...current, jr_quote_id: event.target.value }))}
+                      className="input w-full text-sm"
+                      placeholder="293113"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="mb-1 block text-xs text-gray-500">Reviewed By</span>
+                    <input
+                      value={form.reviewer_name}
+                      onChange={event => setForm(current => ({ ...current, reviewer_name: event.target.value }))}
+                      className="input w-full text-sm"
+                      placeholder="Estimator name"
+                    />
+                  </label>
+                  {TOTAL_FIELDS.slice(0, 2).map(([key, label]) => (
+                    <label key={key} className="block">
+                      <span className="mb-1 block text-xs text-gray-500">{label}</span>
+                      <input
+                        value={form[key]}
+                        onChange={event => setForm(current => ({ ...current, [key]: event.target.value }))}
+                        className="input w-full text-sm"
+                        placeholder="$0"
+                      />
+                    </label>
+                  ))}
+                </div>
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                  {TOTAL_FIELDS.slice(2).map(([key, label]) => (
+                    <label key={key} className="block">
+                      <span className="mb-1 block text-xs text-gray-500">{label}</span>
+                      <input
+                        value={form[key]}
+                        onChange={event => setForm(current => ({ ...current, [key]: event.target.value }))}
+                        className="input w-full text-sm"
+                        placeholder="$0"
+                      />
+                    </label>
+                  ))}
+                </div>
+                <label className="block">
+                  <span className="mb-1 block text-xs text-gray-500">Notes</span>
+                  <input
+                    value={form.notes}
+                    onChange={event => setForm(current => ({ ...current, notes: event.target.value }))}
+                    className="input w-full text-sm"
+                    placeholder="Sun Valley accepted baseline"
+                  />
+                </label>
+                {acceptedBundles.length > 0 && (
+                  <div className="border-t border-white/[0.06] pt-4">
+                    <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                      <p className="text-xs font-bold uppercase text-gray-400">JR Bundle Breakouts</p>
+                      <span className="text-[10px] font-semibold uppercase text-gray-600">
+                        {enteredBundleTargetCount} / {acceptedBundles.length} entered
+                      </span>
+                    </div>
+                    <div className="max-h-96 overflow-y-auto border-y border-white/[0.06] sm:hidden">
+                      <div className="divide-y divide-white/[0.04]">
+                        {acceptedBundles.map(bundle => (
+                          <div key={`mobile-${bundle.bundle_name}`} className="py-3">
+                            <p className="break-words text-sm font-medium leading-5 text-gray-300">{bundle.bundle_name}</p>
+                            <div className="mt-2 grid grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)] items-end gap-3">
+                              <div>
+                                <p className="text-[10px] font-semibold uppercase text-gray-600">Accepted</p>
+                                <p className="mt-1 text-sm tabular-nums text-gray-400">{shortMoney(bundle.accepted_total)}</p>
+                              </div>
+                              <label className="block">
+                                <span className="mb-1 block text-[10px] font-semibold uppercase text-gray-600">JR target</span>
+                                <input
+                                  value={bundleTargets[bundle.bundle_name] ?? ''}
+                                  onChange={event => setBundleTargets(current => ({ ...current, [bundle.bundle_name]: event.target.value }))}
+                                  className="input w-full text-right text-sm tabular-nums"
+                                  placeholder="$0"
+                                  aria-label={`JR target for ${bundle.bundle_name}`}
+                                />
+                              </label>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="hidden max-h-96 overflow-auto border-y border-white/[0.06] sm:block">
+                      <table className="w-full min-w-[560px] text-sm">
+                        <thead className="sticky top-0 bg-[#111827] text-[10px] uppercase text-gray-500">
+                          <tr>
+                            <th className="px-3 py-2 text-left font-bold">Accepted bundle</th>
+                            <th className="px-3 py-2 text-right font-bold">Accepted</th>
+                            <th className="w-40 px-3 py-2 text-right font-bold">JR target</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/[0.04]">
+                          {acceptedBundles.map(bundle => (
+                            <tr key={bundle.bundle_name}>
+                              <td className="px-3 py-2 text-gray-300">{bundle.bundle_name}</td>
+                              <td className="px-3 py-2 text-right tabular-nums text-gray-500">{shortMoney(bundle.accepted_total)}</td>
+                              <td className="px-3 py-1.5">
+                                <input
+                                  value={bundleTargets[bundle.bundle_name] ?? ''}
+                                  onChange={event => setBundleTargets(current => ({ ...current, [bundle.bundle_name]: event.target.value }))}
+                                  className="input w-full text-right text-sm tabular-nums"
+                                  placeholder="$0"
+                                  aria-label={`JR target for ${bundle.bundle_name}`}
+                                />
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex flex-shrink-0 items-center justify-end gap-2 border-t border-white/[0.06] px-4 py-3 sm:px-5">
+                <button
+                  type="button"
+                  onClick={() => setShowCapture(false)}
+                  disabled={saving}
+                  className="btn-ghost px-4 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={saving || !canCapture}
+                  className="btn-primary inline-flex items-center gap-2 px-4 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                  {golden ? 'Capture New Baseline Version' : 'Capture Golden Baseline'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>,
+        document.body,
       )}
 
       {golden && (
