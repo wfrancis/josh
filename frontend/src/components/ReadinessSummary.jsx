@@ -140,7 +140,30 @@ export default function ReadinessSummary({ readiness, onRefresh, onRecoverEviden
                       {trust.vendor_price_conflict_count || vendorPriceConflicts.length} conflict{(trust.vendor_price_conflict_count || vendorPriceConflicts.length) === 1 ? '' : 's'}
                     </span>
                   </div>
-                  <div className="mt-2 max-h-56 overflow-auto border-y border-white/[0.06]">
+                  <div className="mt-2 max-h-72 overflow-y-auto border-y border-white/[0.06] sm:hidden">
+                    <div className="divide-y divide-white/[0.04]">
+                      {vendorPriceConflicts.map((row, index) => (
+                        <div key={`mobile-${row.material_id}-${row.source_hash}-${index}`} className="py-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <p className="min-w-0 break-words text-sm font-semibold text-gray-200">{row.item_code}</p>
+                            <p className="flex-shrink-0 text-sm font-semibold tabular-nums text-amber-300">{formatMoney(row.delta)}</p>
+                          </div>
+                          <div className="mt-2 grid grid-cols-2 gap-3 text-xs">
+                            <div>
+                              <p className="text-[10px] font-semibold uppercase text-gray-600">Accepted</p>
+                              <p className="mt-0.5 tabular-nums text-gray-300">{formatMoney(row.accepted_price)} / {row.accepted_unit}</p>
+                            </div>
+                            <div>
+                              <p className="text-[10px] font-semibold uppercase text-gray-600">Verified quote</p>
+                              <p className="mt-0.5 tabular-nums text-gray-300">{formatMoney(row.quote_price)} / {row.quote_unit}</p>
+                            </div>
+                          </div>
+                          <p className="mt-2 break-words text-[11px] leading-4 text-gray-500">{row.source_file || 'Verified quote'}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="mt-2 hidden max-h-56 overflow-auto border-y border-white/[0.06] sm:block">
                     <table className="w-full min-w-[580px] text-xs">
                       <thead className="sticky top-0 bg-[#111827] text-[10px] uppercase text-gray-500">
                         <tr>
