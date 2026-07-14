@@ -4,6 +4,7 @@ Uses pdfplumber for PDF text extraction and the model selected in Settings for s
 """
 
 import base64
+from difflib import SequenceMatcher
 import email
 import json
 import math
@@ -17,6 +18,7 @@ from typing import Optional
 import pdfplumber
 
 from ai_client import chat_complete, get_provider_info
+from quote_evidence import normalize_quote_unit
 
 
 MAX_QUOTE_FILE_BYTES = 25 * 1024 * 1024
@@ -99,7 +101,7 @@ def _normalize_products(products) -> list[dict]:
         product = dict(raw)
         product["product_name"] = product_name
         product["vendor"] = str(product.get("vendor") or "").strip()
-        product["unit"] = str(product.get("unit") or "").strip().upper()
+        product["unit"] = normalize_quote_unit(product.get("unit"))
         product["unit_price"] = unit_price
         freight = product.get("freight")
         if isinstance(freight, (int, float)) and not isinstance(freight, bool):
@@ -145,6 +147,83 @@ def _product_identity_key(product: dict) -> tuple[str, str]:
         name = f"name:{re.sub(r'[^a-z0-9]+', '', raw_name)}"
         vendor = re.sub(r"[^a-z0-9]+", "", str(product.get("vendor") or "").lower())
     return name, vendor
+
+
+def _identity_tokens(value: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(value or "").lower())
+
+
+def _vendor_identity_tokens(value: str) -> set[str]:
+    ignored = {"co", "company", "corp", "corporation", "dba", "inc", "llc", "ltd", "the"}
+    return {token for token in _identity_tokens(value) if token not in ignored}
+
+
+def _vendors_compatible(left: dict, right: dict) -> bool:
+    left_tokens = _vendor_identity_tokens(left.get("vendor"))
+    right_tokens = _vendor_identity_tokens(right.get("vendor"))
+    if not left_tokens or not right_tokens:
+        return True
+    overlap = len(left_tokens & right_tokens)
+    return overlap / min(len(left_tokens), len(right_tokens)) >= 0.75
+
+
+def _product_name_similarity(left: dict, right: dict) -> float:
+    """Score only conservative, source-row-like name differences."""
+    left_tokens = _identity_tokens(left.get("product_name"))
+    right_tokens = _identity_tokens(right.get("product_name"))
+    if min(len(left_tokens), len(right_tokens)) < 3:
+        return 0.0
+
+    left_numbers = {token for token in left_tokens if any(char.isdigit() for char in token)}
+    right_numbers = {token for token in right_tokens if any(char.isdigit() for char in token)}
+    if left_numbers != right_numbers:
+        return 0.0
+
+    left_text = " ".join(left_tokens)
+    right_text = " ".join(right_tokens)
+    sequence_score = SequenceMatcher(None, left_text, right_text).ratio()
+    left_set = set(left_tokens)
+    right_set = set(right_tokens)
+    if left_set == right_set and len(left_set) >= 4:
+        return max(sequence_score, 0.99)
+
+    if (
+        min(len(left_set), len(right_set)) >= 4
+        and (left_set <= right_set or right_set <= left_set)
+        and len(left_set ^ right_set) <= 2
+    ):
+        return max(sequence_score, 0.92)
+    return sequence_score
+
+
+def _fuzzy_identity_group(product: dict, groups: list[list[dict]]) -> int | None:
+    """Return one unambiguous high-confidence group or fail closed."""
+    if _explicit_product_code(product):
+        return None
+
+    candidates = []
+    for index, variants in enumerate(groups):
+        compatible = [variant for variant in variants if _vendors_compatible(product, variant)]
+        if not compatible:
+            continue
+        score = max(_product_name_similarity(product, variant) for variant in compatible)
+        if score >= 0.82:
+            candidates.append((score, index))
+
+    strong = [(score, index) for score, index in candidates if score >= 0.90]
+    if len(strong) == 1 and len(candidates) == 1:
+        return strong[0][1]
+    if candidates:
+        label = str(product.get("product_name") or "product")
+        matches = ", ".join(
+            str(groups[index][0].get("product_name") or "product")
+            for _, index in sorted(candidates, reverse=True)
+        )
+        raise ValueError(
+            f"AI quote-reading passes produced an ambiguous product name for {label}: "
+            f"possible match(es): {matches}. Review the source and retry."
+        )
+    return None
 
 
 def _extract_pdf_text(pdf_path: str) -> str:
@@ -269,18 +348,36 @@ def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
     """
     Merge repeated extraction results without inventing source values.
 
-    Punctuation-only name differences are treated as the same row. If passes
-    disagree on the price or unit for that row, parsing fails closed so the
-    caller cannot write an averaged value that never appeared on the quote.
+    Explicit codes, punctuation-only names, and one unambiguous high-similarity
+    name are treated as the same row. Ambiguous names and source-value
+    disagreements fail closed so the caller cannot write duplicate or averaged
+    values that were not proven by the quote.
     """
-    product_map: dict[tuple[str, str], list[dict]] = {}
+    groups: list[list[dict]] = []
+    exact_groups: dict[tuple[str, str], int] = {}
     for pass_result in all_results:
+        prior_group_count = len(groups)
         for product in _normalize_products(pass_result):
-            product_map.setdefault(_product_identity_key(product), []).append(product)
+            identity = _product_identity_key(product)
+            group_index = exact_groups.get(identity)
+            if group_index is None:
+                group_index = _fuzzy_identity_group(product, groups[:prior_group_count])
+            if group_index is None:
+                group_index = len(groups)
+                groups.append([])
+            groups[group_index].append(product)
+            exact_groups[identity] = group_index
 
     merged = []
-    for variants in product_map.values():
-        base = dict(variants[0])
+    for variants in groups:
+        richest = max(
+            variants,
+            key=lambda value: (
+                len(_identity_tokens(value.get("product_name"))),
+                len(str(value.get("product_name") or "")),
+            ),
+        )
+        base = dict(richest)
         label = str(base.get("product_name") or "product")
         prices = sorted({round(float(v["unit_price"]), 4) for v in variants})
         if len(prices) != 1:
@@ -343,6 +440,36 @@ def quote_multipass_audit_contract() -> dict:
     ]
     merged = _merge_multipass_results(duplicate_passes)
 
+    semantic_duplicate_passes = [
+        [{
+            "vendor": "Concept Surfaces",
+            "product_name": "Raw Stone 05 - Ceppo Di Gre 12x24",
+            "unit_price": 5.9,
+            "unit": "SF",
+        }],
+        [{
+            "vendor": "Concept Surfaces LLC",
+            "product_name": "Stone 05 - Ceppo Di Gre 12x24",
+            "unit_price": 5.9,
+            "unit": "SF",
+        }],
+    ]
+    semantic_merged = _merge_multipass_results(semantic_duplicate_passes)
+    piece_unit_merged = _merge_multipass_results([
+        [{
+            "vendor": "Concept Surfaces",
+            "product_name": "Industry Titanium 3x36 Bullnose",
+            "unit_price": 14.45,
+            "unit": "PC",
+        }],
+        [{
+            "vendor": "Concept Surfaces",
+            "product_name": "Industry Titanium 3x36 Bullnose",
+            "unit_price": 14.45,
+            "unit": "EA",
+        }],
+    ])
+
     price_conflict = None
     try:
         _merge_multipass_results([
@@ -361,20 +488,69 @@ def quote_multipass_audit_contract() -> dict:
     except ValueError as exc:
         unit_conflict = str(exc)
 
+    semantic_price_conflict = None
+    try:
+        _merge_multipass_results([
+            semantic_duplicate_passes[0],
+            [{**semantic_duplicate_passes[1][0], "unit_price": 6.25}],
+        ])
+    except ValueError as exc:
+        semantic_price_conflict = str(exc)
+
+    ambiguous_name = None
+    try:
+        _merge_multipass_results([
+            [
+                {
+                    "vendor": "Concept Surfaces",
+                    "product_name": "Pueblo Bianco Matte 12x24",
+                    "unit_price": 5.2,
+                    "unit": "SF",
+                },
+                {
+                    "vendor": "Concept Surfaces",
+                    "product_name": "Pueblo Bianco Satin 12x24",
+                    "unit_price": 5.2,
+                    "unit": "SF",
+                },
+            ],
+            [{
+                "vendor": "Concept Surfaces",
+                "product_name": "Pueblo Bianco 12x24",
+                "unit_price": 5.2,
+                "unit": "SF",
+            }],
+        ])
+    except ValueError as exc:
+        ambiguous_name = str(exc)
+
     passed = (
         len(merged) == 1
         and merged[0].get("unit_price") == 7.25
         and merged[0].get("unit") == "SF"
+        and len(semantic_merged) == 1
+        and semantic_merged[0].get("product_name") == "Raw Stone 05 - Ceppo Di Gre 12x24"
+        and semantic_merged[0].get("unit_price") == 5.9
+        and len(piece_unit_merged) == 1
+        and piece_unit_merged[0].get("unit") == "EA"
         and bool(price_conflict)
         and bool(unit_conflict)
+        and bool(semantic_price_conflict)
+        and bool(ambiguous_name)
     )
     return {
         "status": "pass" if passed else "fail",
         "merged": merged,
+        "semantic_merged": semantic_merged,
+        "piece_unit_merged": piece_unit_merged,
         "price_conflict_rejected": bool(price_conflict),
         "price_conflict_error": price_conflict,
         "unit_conflict_rejected": bool(unit_conflict),
         "unit_conflict_error": unit_conflict,
+        "semantic_price_conflict_rejected": bool(semantic_price_conflict),
+        "semantic_price_conflict_error": semantic_price_conflict,
+        "ambiguous_name_rejected": bool(ambiguous_name),
+        "ambiguous_name_error": ambiguous_name,
     }
 
 

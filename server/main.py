@@ -1081,7 +1081,7 @@ def api_system_vendor_ingestion():
             "model": settings.get("openai_model", "gpt-5-mini"),
             "multi_pass_count": multi_pass_count,
             "multi_pass_disagreement_policy": "reject_without_pricing_writes",
-            "semantic_duplicate_policy": "merge_explicit_item_code_or_punctuation_identity",
+            "semantic_duplicate_policy": "merge_explicit_code_punctuation_or_unambiguous_name_similarity",
             "image_only_pdf_vision": True,
         },
         "email_monitor": {

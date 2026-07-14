@@ -205,7 +205,7 @@ def validate_vendor_ingestion_health(client: "Client") -> Check:
         and (health.get("ai_parser") or {}).get("multi_pass_disagreement_policy")
         == "reject_without_pricing_writes"
         and (health.get("ai_parser") or {}).get("semantic_duplicate_policy")
-        == "merge_explicit_item_code_or_punctuation_identity"
+        == "merge_explicit_code_punctuation_or_unambiguous_name_similarity"
         and bool(health.get("durable_artifact_root"))
     )
     parser_ready = bool((health.get("ai_parser") or {}).get("available"))
@@ -284,19 +284,28 @@ def validate_quote_multipass_contract(client: "Client") -> Check:
         return Check("quote_multipass", "FAIL", f"deployed multi-pass probe unavailable: {exc}")
     contract = probe.get("quote_multipass_contract") or {}
     merged = contract.get("merged") or []
+    semantic_merged = contract.get("semantic_merged") or []
+    piece_unit_merged = contract.get("piece_unit_merged") or []
     ok = (
         contract.get("status") == "pass"
         and len(merged) == 1
         and merged[0].get("unit_price") == 7.25
         and merged[0].get("unit") == "SF"
+        and len(semantic_merged) == 1
+        and semantic_merged[0].get("product_name") == "Raw Stone 05 - Ceppo Di Gre 12x24"
+        and semantic_merged[0].get("unit_price") == 5.9
+        and len(piece_unit_merged) == 1
+        and piece_unit_merged[0].get("unit") == "EA"
         and contract.get("price_conflict_rejected") is True
         and contract.get("unit_conflict_rejected") is True
+        and contract.get("semantic_price_conflict_rejected") is True
+        and contract.get("ambiguous_name_rejected") is True
     )
     return Check(
         "quote_multipass",
         "PASS" if ok else "FAIL",
         (
-            "multi-pass quote parsing merges punctuation drift and rejects source-value disagreements"
+            "multi-pass quote parsing merges unambiguous name drift and rejects ambiguity or source-value disagreements"
             if ok else "deployed multi-pass quote parsing can duplicate or invent source values"
         ),
         contract,
