@@ -1,0 +1,16 @@
+.git
+.claude
+.env
+.env.*
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+frontend/node_modules
+output
+tmp
+tmp-*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+.DS_Store

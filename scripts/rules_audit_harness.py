@@ -114,6 +114,31 @@ def validate_vendor_ingestion_health(client: "Client") -> Check:
     )
 
 
+def validate_quote_receipt_recovery_contract(client: "Client") -> Check:
+    try:
+        _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
+    except HarnessError as exc:
+        return Check("quote_receipt_recovery", "FAIL", f"deployed recovery probe unavailable: {exc}")
+    contract = probe.get("quote_receipt_recovery_contract") or {}
+    result = contract.get("result") or {}
+    ok = (
+        contract.get("status") == "pass"
+        and result.get("provenance_repaired") == 1
+        and result.get("provenance_repaired_items") == ["RECEIPT"]
+        and result.get("quote_price_matched") == 1
+        and result.get("quote_price_matched_items") == ["NEW-PRICE"]
+    )
+    return Check(
+        "quote_receipt_recovery",
+        "PASS" if ok else "FAIL",
+        (
+            "exact-price receipt repair is distinct from new pricing and rejects changed prices"
+            if ok else "deployed quote receipt recovery contract failed"
+        ),
+        contract,
+    )
+
+
 @dataclass
 class Check:
     name: str
@@ -1350,6 +1375,7 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
     readiness_checks = readiness.get("checks") or []
     checks = {item.get("id"): item.get("status") for item in readiness_checks}
     artifact_check = next((item for item in readiness_checks if item.get("id") == "durable_artifacts"), {})
+    trust_summary = readiness.get("trust_summary") or {}
     exact_source_blocked = any(
         "intact durable quote file" in str(item)
         for item in (artifact_check.get("affected_items") or [])
@@ -1367,6 +1393,8 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
         and checks.get("current_audit") == "fail"
         and checks.get("durable_artifacts") == "fail"
         and exact_source_blocked
+        and trust_summary.get("evidence_recovery_needed") is True
+        and int(trust_summary.get("missing_vendor_receipt_count") or 0) >= 1
         and cleared_receipt
     )
     return Check(
@@ -1378,6 +1406,11 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
             "status": readiness.get("status"),
             "checks": checks,
             "artifact_items": artifact_check.get("affected_items") or [],
+            "evidence_recovery": {
+                "needed": trust_summary.get("evidence_recovery_needed"),
+                "missing_vendor_receipt_count": trust_summary.get("missing_vendor_receipt_count"),
+                "quote_source_files_needed": trust_summary.get("quote_source_files_needed") or [],
+            },
             "clear_price_receipt": {
                 "price_source": cleared_material.get("price_source"),
                 "quote_status": cleared_material.get("quote_status"),
@@ -1666,6 +1699,7 @@ def main() -> int:
     try:
         checks.append(validate_build_identity(client, args.expected_commit))
         checks.append(validate_vendor_ingestion_health(client))
+        checks.append(validate_quote_receipt_recovery_contract(client))
         checks.append(try_rule_registry(client))
         checks.append(try_rule_eval(client, fixture))
         checks.append(ensure_fixture_labor_catalog(client, fixture, args.seed_fixture_labor_catalog))

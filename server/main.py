@@ -2,6 +2,7 @@
 FastAPI application for the Standard Interiors Bid Tool.
 """
 
+import copy
 import csv
 import hashlib
 import io
@@ -2618,6 +2619,59 @@ def _link_upload_to_requests(job_id: int, products: list[dict]):
     return matched
 
 
+def _quote_upload_outcomes(
+    before_materials: list[dict],
+    before_verified_vendor_hashes: set[str],
+    after_materials: list[dict],
+    after_verified_vendor_hashes: set[str],
+) -> dict:
+    """Separate exact receipt repairs from newly priced quote matches."""
+    before_by_id = {
+        str(material.get("id")): material
+        for material in before_materials
+        if isinstance(material, dict) and material.get("id") is not None
+    }
+    provenance_repaired_items = []
+    quote_price_matched_items = []
+    for material in after_materials:
+        if not isinstance(material, dict) or material.get("id") is None:
+            continue
+        before = before_by_id.get(str(material.get("id")))
+        if not before:
+            continue
+        before_price = _as_number(before.get("unit_price")) or 0
+        after_price = _as_number(material.get("unit_price")) or 0
+        before_hash = str(before.get("quote_source_hash") or "").strip()
+        after_hash = str(material.get("quote_source_hash") or "").strip()
+        before_vendor_quote = str(before.get("price_source") or "").strip().lower() == "vendor_quote"
+        after_vendor_quote = str(material.get("price_source") or "").strip().lower() == "vendor_quote"
+        before_receipt_verified = bool(before_hash and before_hash in before_verified_vendor_hashes)
+        after_receipt_verified = bool(after_hash and after_hash in after_verified_vendor_hashes)
+        label = material.get("item_code") or material.get("description") or f"Material {material.get('id')}"
+        if (
+            before_vendor_quote
+            and before_price > 0
+            and not before_receipt_verified
+            and after_vendor_quote
+            and after_receipt_verified
+            and abs(after_price - before_price) <= 0.005
+        ):
+            provenance_repaired_items.append(str(label))
+        if (
+            before_price <= 0
+            and after_price > 0
+            and after_vendor_quote
+            and after_receipt_verified
+        ):
+            quote_price_matched_items.append(str(label))
+    return {
+        "quote_price_matched": len(quote_price_matched_items),
+        "quote_price_matched_items": quote_price_matched_items,
+        "provenance_repaired": len(provenance_repaired_items),
+        "provenance_repaired_items": provenance_repaired_items,
+    }
+
+
 @app.post("/api/jobs/{job_id}/upload-quotes")
 async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     """Upload vendor quote files, parse them, return pricing."""
@@ -2625,6 +2679,17 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    before_materials = [
+        copy.deepcopy(material)
+        for material in (job.get("materials") or [])
+        if isinstance(material, dict)
+    ]
+    before_verified_vendor_hashes = {
+        str(item.get("file_hash") or "").strip()
+        for item in list_imported_files(db_id)
+        if _imported_artifact_is_verified(item, "vendor_quote")
+    }
 
     import hashlib as _hashlib
 
@@ -2710,13 +2775,43 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
 
     file_names = [u.filename for u in files if hasattr(u, 'filename')]
     vendors_found = list(set(p.get("vendor", "Unknown") for p in all_products if p.get("vendor")))
-    log_activity(db_id, "quotes_uploaded", f"Uploaded {len(file_names)} quote file(s), {len(all_products)} products, {auto_matched} auto-matched", {"files": file_names, "vendors": vendors_found, "product_count": len(all_products), "auto_matched": auto_matched})
-
     refreshed = load_job(db_id) or {}
+    after_verified_vendor_hashes = {
+        str(item.get("file_hash") or "").strip()
+        for item in list_imported_files(db_id)
+        if _imported_artifact_is_verified(item, "vendor_quote")
+    }
+    upload_outcomes = _quote_upload_outcomes(
+        before_materials,
+        before_verified_vendor_hashes,
+        refreshed.get("materials") or [],
+        after_verified_vendor_hashes,
+    )
+
+    activity_detail = {
+        "files": file_names,
+        "vendors": vendors_found,
+        "product_count": len(all_products),
+        "auto_matched": auto_matched,
+        "provenance_repaired": upload_outcomes["provenance_repaired"],
+        "quote_price_matched": upload_outcomes["quote_price_matched"],
+    }
+    log_activity(
+        db_id,
+        "quotes_uploaded",
+        (
+            f"Uploaded {len(file_names)} quote file(s), {len(all_products)} products, "
+            f"{upload_outcomes['quote_price_matched']} prices matched, "
+            f"{upload_outcomes['provenance_repaired']} receipts repaired"
+        ),
+        activity_detail,
+    )
+
     return {
         "products": refreshed.get("quotes") or [],
         "parsed_products": all_products,
         "auto_matched": auto_matched,
+        **upload_outcomes,
         "linked_requests": linked_requests,
         "skipped_files": skipped_files,
         "file_errors": file_errors,
@@ -3382,6 +3477,30 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
         "rules": rules[:25],
         "note": "Full deployed harness: scripts/rules_audit_harness.py --base-url <fly-url>",
     }
+    recovery_hash = "a" * 64
+    recovery_probe = _quote_upload_outcomes(
+        [
+            {"id": 1, "item_code": "RECEIPT", "unit_price": 5.25, "price_source": "vendor_quote"},
+            {"id": 2, "item_code": "NEW-PRICE", "unit_price": 0, "price_source": None},
+            {"id": 3, "item_code": "PRICE-CHANGED", "unit_price": 5.25, "price_source": "vendor_quote"},
+        ],
+        set(),
+        [
+            {"id": 1, "item_code": "RECEIPT", "unit_price": 5.25, "price_source": "vendor_quote", "quote_source_hash": recovery_hash},
+            {"id": 2, "item_code": "NEW-PRICE", "unit_price": 8.75, "price_source": "vendor_quote", "quote_source_hash": recovery_hash},
+            {"id": 3, "item_code": "PRICE-CHANGED", "unit_price": 5.26, "price_source": "vendor_quote", "quote_source_hash": recovery_hash},
+        ],
+        {recovery_hash},
+    )
+    response["quote_receipt_recovery_contract"] = {
+        "status": "pass" if (
+            recovery_probe["provenance_repaired"] == 1
+            and recovery_probe["provenance_repaired_items"] == ["RECEIPT"]
+            and recovery_probe["quote_price_matched"] == 1
+            and recovery_probe["quote_price_matched_items"] == ["NEW-PRICE"]
+        ) else "fail",
+        "result": recovery_probe,
+    }
     if field:
         response["field"] = field
     if job_ref:
@@ -3606,6 +3725,42 @@ def _readiness_trust_summary(
         )
         manual_override_count += len(bundle.get("deleted_labor_keys") or [])
 
+    imported_receipts = list_imported_files(job["id"])
+    verified_imports = [
+        item for item in imported_receipts
+        if _imported_artifact_is_verified(item)
+    ]
+    verified_vendor_hashes = {
+        str(item.get("file_hash") or "").strip()
+        for item in imported_receipts
+        if _imported_artifact_is_verified(item, "vendor_quote")
+    }
+    vendor_quote_materials = [
+        material for material in active_materials
+        if str(material.get("price_source") or "").strip().lower() == "vendor_quote"
+    ]
+    verified_vendor_quote_materials = [
+        material for material in vendor_quote_materials
+        if str(material.get("quote_source_hash") or "").strip() in verified_vendor_hashes
+    ]
+    referenced_quote_files = {
+        str(quote.get("file_name") or "").strip()
+        for quote in (job.get("quotes") or [])
+        if isinstance(quote, dict) and str(quote.get("file_name") or "").strip()
+    }
+    referenced_quote_files.update(
+        str(material.get("quote_file_name") or "").strip()
+        for material in vendor_quote_materials
+        if str(material.get("quote_file_name") or "").strip()
+    )
+    quote_source_files_needed = sorted({
+        str(item.get("file_name") or "").strip()
+        for item in imported_receipts
+        if str(item.get("file_name") or "").strip() in referenced_quote_files
+        and not _imported_artifact_is_verified(item)
+    })
+    missing_vendor_receipt_count = len(vendor_quote_materials) - len(verified_vendor_quote_materials)
+
     artifact_receipts = list_job_artifacts(job["id"])
     pdf_receipt = next(
         (item for item in artifact_receipts if item.get("artifact_kind") == "proposal_pdf"),
@@ -3647,6 +3802,13 @@ def _readiness_trust_summary(
         "low_confidence_material_count": low_confidence_count,
         "labor_catalog_count": len(get_labor_catalog_entries()),
         "artifact_count": len(artifact_receipts),
+        "verified_source_count": len(verified_imports),
+        "unverified_source_count": len(imported_receipts) - len(verified_imports),
+        "vendor_quote_material_count": len(vendor_quote_materials),
+        "verified_vendor_quote_material_count": len(verified_vendor_quote_materials),
+        "missing_vendor_receipt_count": missing_vendor_receipt_count,
+        "quote_source_files_needed": quote_source_files_needed,
+        "evidence_recovery_needed": bool(missing_vendor_receipt_count or quote_source_files_needed),
         "source_fingerprint": proposal.get("audit_source_fingerprint"),
     }
 

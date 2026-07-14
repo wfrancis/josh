@@ -300,6 +300,12 @@ export default function JobDetail() {
     return saveMaterialsNow({ surfaceError: true })
   }
 
+  const openEvidenceRecovery = () => {
+    setStep('takeoff')
+    setQuotePanel('upload')
+    window.setTimeout(() => quoteSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+  }
+
   const getCompletedSteps = () => {
     const completed = []
     if (job?.materials?.length > 0) completed.push('takeoff')
@@ -557,7 +563,11 @@ export default function JobDetail() {
         )}
       </div>
 
-      <ReadinessSummary readiness={readiness} onRefresh={() => refreshReadiness(job.id)} />
+      <ReadinessSummary
+        readiness={readiness}
+        onRefresh={() => refreshReadiness(job.id)}
+        onRecoverEvidence={openEvidenceRecovery}
+      />
 
       <ReproducibilityPanel jobId={jobId} onConfidenceChange={refreshReadiness} />
 
@@ -711,8 +721,9 @@ export default function JobDetail() {
             {/* Vendor Quotes Section — above materials table for discoverability */}
             {job.materials?.length > 0 && (() => {
               const unpricedCount = job.materials.filter(m => !m.unit_price || m.unit_price === 0).length
-              return unpricedCount > 0 || job.quotes?.length > 0 ? (
-                <div ref={quoteSectionRef} className="glass-card p-4 sm:p-6 animate-slide-up">
+              const evidenceRecoveryNeeded = Boolean(readiness?.trust_summary?.evidence_recovery_needed)
+              return unpricedCount > 0 || job.quotes?.length > 0 || evidenceRecoveryNeeded ? (
+                <div ref={quoteSectionRef} className="glass-card scroll-mt-20 p-4 sm:p-6 animate-slide-up">
                   {/* Unpriced banner */}
                   {unpricedCount > 0 && (
                     <div className="flex items-center gap-3 px-4 py-3 mb-4 bg-amber-500/10 border border-amber-500/20 rounded-xl">
@@ -750,7 +761,14 @@ export default function JobDetail() {
                   {quotePanel === 'upload' && (
                     <div>
                       <div className="flex items-center justify-between mb-3">
-                        <h3 className="text-sm font-bold text-white">Upload Vendor Response</h3>
+                        <div>
+                          <h3 className="text-sm font-bold text-white">
+                            {evidenceRecoveryNeeded ? 'Repair Vendor Quote Receipts' : 'Upload Vendor Response'}
+                          </h3>
+                          {evidenceRecoveryNeeded && (
+                            <p className="mt-1 text-xs text-gray-500">Use the original quote files. Existing accepted prices are relinked only on an exact unit-price match.</p>
+                          )}
+                        </div>
                         <button onClick={() => setQuotePanel(null)}
                           className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
                           Close
@@ -761,6 +779,7 @@ export default function JobDetail() {
                         api={api}
                         existingQuotes={job.quotes || []}
                         beforeMutation={() => isDirty ? saveMaterialsNow({ surfaceError: true }) : true}
+                        evidenceRecoveryMode={evidenceRecoveryNeeded}
                         onQuotesParsed={() => loadJob()}
                         onQuotesCleared={() => loadJob()}
                       />

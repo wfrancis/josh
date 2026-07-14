@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, RefreshCw, ShieldAlert, ShieldCheck, XCircle } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, RefreshCw, ShieldAlert, ShieldCheck, Upload, XCircle } from 'lucide-react'
 import StatusBadge from './StatusBadge'
 
 function CheckIcon({ status }) {
@@ -27,18 +27,19 @@ function Metric({ label, value, title }) {
   return (
     <div className="min-w-0 border-t border-white/[0.06] pt-3" title={title}>
       <p className="text-[10px] font-semibold uppercase text-gray-500">{label}</p>
-      <p className="mt-1 truncate text-sm font-semibold text-gray-200">{value}</p>
+      <p className="mt-1 break-words text-sm font-semibold leading-5 text-gray-200">{value}</p>
     </div>
   )
 }
 
-export default function ReadinessSummary({ readiness, onRefresh }) {
+export default function ReadinessSummary({ readiness, onRefresh, onRecoverEvidence }) {
   if (!readiness) return null
   const failed = (readiness.checks || []).filter(check => check.status === 'fail')
   const warnings = (readiness.checks || []).filter(check => check.status === 'warn')
   const important = [...failed, ...warnings]
   const build = readiness.build || {}
   const trust = readiness.trust_summary || {}
+  const evidenceRecoveryNeeded = Boolean(trust.evidence_recovery_needed)
   const goldenBadgeStatus = readiness.golden_verification_status === 'golden_verified' ? 'golden' : null
   const metadataBadgeStatus = readiness.golden_status === 'metadata_changed'
     || (readiness.current_replay_status === 'warn' && readiness.current_replay_drift_classification === 'metadata_only')
@@ -100,7 +101,10 @@ export default function ReadinessSummary({ readiness, onRefresh }) {
         />
         <Metric label="Rules" value={trust.ruleset_version != null ? `Ruleset v${trust.ruleset_version}` : 'Not recorded'} />
         <Metric label="Golden baseline" value={trust.golden_baseline_version ? `Version ${trust.golden_baseline_version}` : 'Not captured'} />
-        <Metric label="Durable artifacts" value={`${trust.artifact_count || 0} recorded`} />
+        <Metric
+          label="Source evidence"
+          value={`${trust.verified_source_count || 0} verified / ${trust.unverified_source_count || 0} unverified`}
+        />
         <Metric label="JR target" value={formatMoney(trust.jr_target_total)} />
         <Metric label="Accepted proposal" value={formatMoney(trust.accepted_proposal_total)} />
         <Metric
@@ -112,6 +116,31 @@ export default function ReadinessSummary({ readiness, onRefresh }) {
         <Metric label="Unknown materials" value={String(trust.unknown_material_count || 0)} />
         <Metric label="Low confidence" value={String(trust.low_confidence_material_count || 0)} />
       </div>
+
+      {evidenceRecoveryNeeded && (
+        <div className="mt-4 border-t border-amber-500/20 pt-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+            <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-400" />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold text-amber-200">Vendor quote receipts need repair</p>
+              <p className="mt-1 text-xs leading-5 text-gray-400">
+                {trust.missing_vendor_receipt_count || 0} accepted vendor price{trust.missing_vendor_receipt_count === 1 ? '' : 's'} cannot yet prove which intact quote supplied the number. Re-uploading the original files only links an existing price when the quoted unit price matches exactly; mismatches stay blocked.
+              </p>
+              {trust.quote_source_files_needed?.length > 0 && (
+                <p className="mt-2 break-words text-xs leading-5 text-gray-500">
+                  Missing originals: {trust.quote_source_files_needed.join(', ')}
+                </p>
+              )}
+            </div>
+            {onRecoverEvidence && (
+              <button onClick={onRecoverEvidence} className="btn-secondary flex items-center justify-center gap-2 text-sm sm:flex-shrink-0">
+                <Upload className="h-4 w-4" />
+                Repair quote receipts
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {trust.largest_deltas?.length > 0 && (
         <div className="mt-4 border-t border-white/[0.06] pt-3">

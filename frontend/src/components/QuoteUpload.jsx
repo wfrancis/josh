@@ -47,7 +47,7 @@ async function saveBidFolder(handle) {
   }
 }
 
-export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, existingQuotes, api, beforeMutation }) {
+export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, existingQuotes, api, beforeMutation, evidenceRecoveryMode = false }) {
   const [loading, setLoading] = useState(false)
   const [products, setProducts] = useState([])
   const [autoMatched, setAutoMatched] = useState(0)
@@ -60,6 +60,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
   const [linkingId, setLinkingId] = useState(null)
   const [scanning, setScanning] = useState(false)
   const [scanPreview, setScanPreview] = useState(null)
+  const [recoveryResult, setRecoveryResult] = useState(null)
 
   // Populate from existing quotes on load
   useEffect(() => {
@@ -81,6 +82,13 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
       const result = await api.uploadQuotes(jobId, fileList)
       setProducts(result.products || [])
       setAutoMatched(result.auto_matched || 0)
+      setRecoveryResult({
+        attempted: true,
+        receipts: result.provenance_repaired || 0,
+        prices: result.quote_price_matched || 0,
+        receiptItems: result.provenance_repaired_items || [],
+        priceItems: result.quote_price_matched_items || [],
+      })
       setLinkedRequests(result.linked_requests || [])
       if (result.file_errors?.length) {
         setError(result.file_errors.map(item => `${item.file}: ${item.error}`).join(' '))
@@ -124,6 +132,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
           await api.clearQuotes(jobId)
           setProducts([])
           setAutoMatched(0)
+          setRecoveryResult(null)
           onQuotesCleared?.()
         } catch (err) { setError(err.message) }
       }
@@ -261,6 +270,13 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
       const result = await api.uploadQuotes(jobId, scanPreview.fileObjects)
       setProducts(result.products || [])
       setAutoMatched(result.auto_matched || 0)
+      setRecoveryResult({
+        attempted: true,
+        receipts: result.provenance_repaired || 0,
+        prices: result.quote_price_matched || 0,
+        receiptItems: result.provenance_repaired_items || [],
+        priceItems: result.quote_price_matched_items || [],
+      })
       setLinkedRequests(result.linked_requests || [])
       if (result.file_errors?.length) {
         setError(result.file_errors.map(item => `${item.file}: ${item.error}`).join(' '))
@@ -297,8 +313,8 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
       <div className="space-y-3">
           <FileUpload
             accept=".pdf,.eml,.msg,.txt,.csv,.xlsx" multiple
-            label={hasQuotes ? 'Add Vendor Quotes' : 'Upload Vendor Quotes'}
-            description="PDF, email, text, CSV, or XLSX vendor pricing"
+            label={evidenceRecoveryMode ? 'Re-upload Original Quote Files' : hasQuotes ? 'Add Vendor Quotes' : 'Upload Vendor Quotes'}
+            description={evidenceRecoveryMode ? 'Exact original PDF, email, text, CSV, or XLSX files' : 'PDF, email, text, CSV, or XLSX vendor pricing'}
             icon={FileText} onUpload={handleUpload} loading={loading}
           />
           <div className="flex items-center gap-3">
@@ -351,6 +367,27 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
         </div>
       )}
 
+      {recoveryResult?.attempted && (recoveryResult.receipts > 0 || recoveryResult.prices > 0) && (
+        <div className="flex items-start gap-2 border-t border-emerald-500/20 pt-3 text-sm text-emerald-300">
+          <CheckCircle2 className="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <div>
+            {recoveryResult.receipts > 0 && (
+              <p>{recoveryResult.receipts} accepted price receipt{recoveryResult.receipts === 1 ? '' : 's'} repaired without changing the accepted unit price.</p>
+            )}
+            {recoveryResult.prices > 0 && (
+              <p>{recoveryResult.prices} previously unpriced material{recoveryResult.prices === 1 ? '' : 's'} matched to exact quote evidence.</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {evidenceRecoveryMode && recoveryResult?.attempted && recoveryResult.receipts === 0 && recoveryResult.prices === 0 && !error && (
+        <div className="flex items-start gap-2 border-t border-amber-500/20 pt-3 text-sm text-amber-300">
+          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <p>No missing receipt matched exactly. Accepted prices were left unchanged and the evidence blocker remains.</p>
+        </div>
+      )}
+
       {/* Link-to-request confirmation banners */}
       {linkedRequests.length > 0 && (
         <div className="space-y-2">
@@ -396,7 +433,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
               <span className="text-xs font-bold text-gray-400 uppercase">
                 Parsed Products ({validProducts.length})
               </span>
-              {autoMatched > 0 && (
+              {autoMatched > 0 && !evidenceRecoveryMode && (
                 <span className="text-[10px] text-emerald-400/70">· {autoMatched} auto-matched</span>
               )}
             </div>
