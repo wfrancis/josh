@@ -322,8 +322,16 @@ def accepted_overlay_deltas(
         if not isinstance(regenerated_bundle, dict):
             continue
         raw_bundle = _find_matching_bundle(regenerated_bundle, raw_bundles)
-        raw_total = money((raw_bundle or {}).get("total_price"))
-        regenerated_total = money(regenerated_bundle.get("total_price"))
+        raw_total = money(
+            (raw_bundle or {}).get("price_override")
+            if (raw_bundle or {}).get("price_override") is not None
+            else (raw_bundle or {}).get("total_price")
+        )
+        regenerated_total = money(
+            regenerated_bundle.get("price_override")
+            if regenerated_bundle.get("price_override") is not None
+            else regenerated_bundle.get("total_price")
+        )
         row = {
             "bundle_name": regenerated_bundle.get("bundle_name"),
             "matched_raw_bundle": (raw_bundle or {}).get("bundle_name"),
@@ -584,8 +592,22 @@ def main() -> int:
         result["accepted_overlay_unmatched_bundles"] = [
             row["bundle_name"] for row in overlay_deltas if not row["matched"]
         ]
+        raw_textura = money(raw_engine.get("textura_amount"))
+        overlay_textura = money(regenerated.get("textura_amount"))
+        textura_delta = round(overlay_textura - raw_textura, 2)
+        result["accepted_overlay_top_level_deltas"] = {
+            "textura_fee": {
+                "raw_engine": raw_engine.get("textura_fee"),
+                "accepted_overlay": regenerated.get("textura_fee"),
+            },
+            "textura_amount": {
+                "raw_engine": raw_textura,
+                "accepted_overlay": overlay_textura,
+                "delta": textura_delta,
+            },
+        }
         result["accepted_overlay_explained_delta"] = round(
-            sum(row["delta"] for row in overlay_deltas),
+            sum(row["delta"] for row in overlay_deltas) + textura_delta,
             2,
         )
         result["accepted_overlay_unexplained_delta"] = round(
