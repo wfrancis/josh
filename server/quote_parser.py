@@ -110,12 +110,36 @@ def _normalize_products(products) -> list[dict]:
     return normalized
 
 
+def _explicit_product_code(product: dict) -> str:
+    """Find a clearly labeled or hyphenated item code across AI output fields."""
+    direct = str(product.get("item_code") or "").strip()
+    if direct and re.search(r"\d", direct):
+        return re.sub(r"[^a-z0-9]+", "", direct.lower())
+
+    texts = [
+        str(product.get(field) or "")
+        for field in ("product_name", "notes", "description")
+        if product.get(field)
+    ]
+    patterns = (
+        r"\b(?:item|product)\s*code\s*[:#-]?\s*([a-z]{1,10}\s*-?\s*\d{2,}[a-z0-9.-]*)\b",
+        r"\b([a-z]{1,10}\s*-\s*\d{2,}[a-z0-9.-]*)\b",
+        r"^\s*([a-z]{1,10}\d{2,}[a-z0-9.-]*)\b",
+    )
+    for pattern in patterns:
+        for text in texts:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return re.sub(r"[^a-z0-9]+", "", match.group(1).lower())
+    return ""
+
+
 def _product_identity_key(product: dict) -> tuple[str, str]:
     """Return a conservative identity for reconciling repeated AI reads."""
     raw_name = str(product.get("product_name") or "").lower()
-    code_match = re.match(r"^\s*([a-z]{1,10}\s*-?\s*\d{2,}[a-z0-9.-]*)\b", raw_name)
-    if code_match:
-        name = f"code:{re.sub(r'[^a-z0-9]+', '', code_match.group(1))}"
+    item_code = _explicit_product_code(product)
+    if item_code:
+        name = f"code:{item_code}"
         vendor = ""
     else:
         name = f"name:{re.sub(r'[^a-z0-9]+', '', raw_name)}"
@@ -305,15 +329,16 @@ def quote_multipass_audit_contract() -> dict:
     duplicate_passes = [
         [{
             "vendor": "Harness Vision Supply",
-            "product_name": "OCR-100 - Harness Scanned Tile",
+            "product_name": "Harness Scanned Tile (OCR-100)",
             "unit_price": 7.25,
             "unit": "SF",
         }],
         [{
             "vendor": "Harness Vision Supply",
-            "product_name": "OCR-100 / Scanned Tile by Harness",
+            "product_name": "Harness Scanned Tile",
             "unit_price": 7.25,
             "unit": "SF",
+            "notes": "Item Code: OCR-100",
         }],
     ]
     merged = _merge_multipass_results(duplicate_passes)

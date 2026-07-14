@@ -631,11 +631,15 @@ def validate_scanned_pdf_quote(client: Client) -> Check:
         parsed_products = response.get("parsed_products") or []
         identity_products = [
             product for product in parsed_products
-            if "OCR-100" in str(product.get("product_name") or "").upper()
+            if "OCR-100" in " ".join(
+                str(product.get(field) or "").upper()
+                for field in ("product_name", "notes", "description")
+            )
         ]
         matched_product = identity_products[0] if len(identity_products) == 1 else None
         ok = bool(
             matched_product
+            and len(parsed_products) == 1
             and round(float(matched_product.get("unit_price") or 0), 2) == 7.25
             and str(matched_product.get("unit") or "").upper() == "SF"
             and matched_product.get("_source_hash") == source_hash
