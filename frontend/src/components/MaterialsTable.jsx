@@ -22,7 +22,7 @@ const TYPE_LABELS = {
   tub_shower_surround: 'Tub/Shower', rubber_base: 'Rubber Base',
   vct: 'VCT', rubber_tile: 'Rubber Tile', rubber_sheet: 'Rubber Sheet',
   wood: 'Wood', tread_riser: 'Tread/Riser', transitions: 'Transitions',
-  waterproofing: 'Waterproofing', pad: 'Pad',
+  waterproofing: 'Waterproofing', sound_mat: 'Sound Mat', pad: 'Pad',
 }
 
 const TYPE_COLORS = {
@@ -43,7 +43,8 @@ const VALID_TYPES = [
   'unit_carpet_no_pattern', 'unit_carpet_pattern', 'unit_lvt', 'cpt_tile',
   'corridor_broadloom', 'floor_tile', 'wall_tile', 'backsplash',
   'tub_shower_surround', 'rubber_base', 'vct', 'rubber_tile',
-  'rubber_sheet', 'wood', 'tread_riser', 'transitions', 'waterproofing'
+  'rubber_sheet', 'wood', 'tread_riser', 'transitions', 'waterproofing',
+  'sound_mat', 'pad'
 ]
 
 function ConfidenceDot({ confidence }) {
@@ -444,7 +445,14 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
   }
 
   const deleteMaterial = (idx) => {
-    onUpdate?.(materials.filter((_, i) => i !== idx))
+    const material = materials[idx]
+    const reason = window.prompt('Why is this takeoff material being removed?', 'Estimator correction')
+    if (!reason?.trim()) return
+    const materialKey = String(material?.item_code || material?.id || material?.material_id || '')
+    onUpdate?.(
+      materials.filter((_, i) => i !== idx),
+      { deletedMaterial: { key: materialKey, reason: reason.trim() } },
+    )
   }
 
 
@@ -854,12 +862,23 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                 {onRequestQuote && (
                   <td className="hidden lg:table-cell py-3 px-2 sm:px-3 text-right tabular-nums text-xs">
                     {m.known_price ? (
-                      <div>
-                        <span className="text-emerald-300 font-medium">{formatCurrency(m.known_price)}</span>
+                      <button
+                        type="button"
+                        onClick={() => updateMaterial(m._origIdx, {
+                          unit_price: m.known_unit_price,
+                          extended_cost: m.known_price,
+                          price_source: m.known_price_source === 'vendor_history' ? 'vendor_history' : 'price_list',
+                          vendor: m.known_price_vendor || m.vendor,
+                          quote_status: m.known_price_source === 'vendor_history' ? 'historical' : 'quoted',
+                        })}
+                        className="text-right hover:opacity-80 transition-opacity"
+                        title="Use this known price"
+                      >
+                        <span className="block text-emerald-300 font-medium">{formatCurrency(m.known_price)}</span>
                         <span className={`block text-[10px] ${m.known_price_source === 'vendor_history' ? 'text-sky-500/60' : 'text-emerald-500/60'}`}>
                           {m.known_price_source === 'vendor_history' ? m.known_price_vendor || 'Past Quote' : 'In Stock'}
                         </span>
-                      </div>
+                      </button>
                     ) : (
                       <span className="text-gray-700">—</span>
                     )}

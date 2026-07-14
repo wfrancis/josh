@@ -712,7 +712,7 @@ def generate_proposal_pdf(
     for i, bundle in enumerate(bundles):
         bundle_name = bundle.get("bundle_name", "")
         desc_text = bundle.get("description_text", "")
-        total_price = bundle.get("total_price", 0)
+        total_price = bundle.get("price_override") if bundle.get("price_override") is not None else bundle.get("total_price", 0)
 
         # Format description: each line on its own line
         desc_lines = desc_text.strip().split("\n")

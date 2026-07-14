@@ -5,7 +5,7 @@ import {
   Search, FolderOpen, Trash2, Copy
 } from 'lucide-react'
 import { api } from '../api'
-import StatusBadge, { getJobStatus } from './StatusBadge'
+import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
 
 export default function AllJobs() {
@@ -146,6 +146,7 @@ export default function AllJobs() {
         <div className="space-y-2">
           {filtered.map((job, i) => {
             const status = getJobStatus(job)
+            const confidenceStatus = getJobConfidenceStatus(job)
             return (
               <div
                 key={job.id}
@@ -196,6 +197,7 @@ export default function AllJobs() {
                   <Copy className="w-4 h-4" />
                 </button>
                 <StatusBadge status={status} />
+                {confidenceStatus && <span className="hidden sm:inline-flex"><StatusBadge status={confidenceStatus} /></span>}
                 <ChevronRight className="w-4 h-4 text-gray-600 hidden sm:block" />
               </div>
             )

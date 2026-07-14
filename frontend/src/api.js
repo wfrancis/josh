@@ -19,6 +19,7 @@ export const api = {
   getJob: (id) => request(`/jobs/${id}`),
   getJobReadiness: (id) => request(`/jobs/${id}/readiness`),
   getBuildInfo: () => request('/system/build'),
+  getVendorIngestionHealth: () => request('/system/vendor-ingestion'),
   deleteJob: (id) => request(`/jobs/${id}`, { method: 'DELETE' }),
   duplicateJob: (jobId) => request('/jobs/' + jobId + '/duplicate', { method: 'POST' }),
   bulkDeleteJobs: (jobIds) => request('/jobs/bulk-delete', { method: 'POST', body: JSON.stringify({ job_ids: jobIds }) }),
@@ -60,8 +61,15 @@ export const api = {
   },
 
   // Materials
-  updateMaterials: (jobId, materials) =>
-    request(`/jobs/${jobId}/materials`, { method: 'PUT', body: JSON.stringify({ materials }) }),
+  updateMaterials: (jobId, materials, baseSourceFingerprint = null, deletionReasons = {}) =>
+    request(`/jobs/${jobId}/materials`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        materials,
+        base_source_fingerprint: baseSourceFingerprint,
+        deletion_reasons: deletionReasons,
+      }),
+    }),
 
   // Proposal Bundles (auto-save)
   loadProposalBundles: (jobId) => request(`/jobs/${jobId}/proposal/bundles`),
@@ -95,7 +103,7 @@ export const api = {
   archiveRule: (ruleId, data = {}) =>
     request('/rules/' + encodeURIComponent(ruleId) + '/archive', { method: 'POST', body: JSON.stringify(data) }),
   deleteRule: (ruleId) => request('/rules/' + encodeURIComponent(ruleId), { method: 'DELETE' }),
-  getJobAuditTrace: (jobId) => request(`/jobs/${jobId}/audit`),
+  getJobAuditTrace: (jobId) => request(`/jobs/${jobId}/audit?scope=proposal`),
   runRulesAuditHarness: (payload) =>
     request('/rules/audit-harness', { method: 'POST', body: JSON.stringify(payload) }),
   getReproducibility: (jobId) => request(`/jobs/${jobId}/reproducibility`),

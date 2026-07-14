@@ -3,7 +3,51 @@ import { FileText, Package, AlertTriangle, CheckCircle2, Trash2, Search, Link2, 
 import FileUpload from './FileUpload'
 import ConfirmDialog from './ConfirmDialog'
 
-export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, existingQuotes, api }) {
+const DROPBOX_HANDLE_DB = 'si-bid-tool-folders'
+const DROPBOX_HANDLE_STORE = 'directory-handles'
+
+function openFolderDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DROPBOX_HANDLE_DB, 1)
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(DROPBOX_HANDLE_STORE)) {
+        request.result.createObjectStore(DROPBOX_HANDLE_STORE)
+      }
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+}
+
+async function loadSavedBidFolder() {
+  if (!window.indexedDB) return null
+  const db = await openFolderDatabase()
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = db.transaction(DROPBOX_HANDLE_STORE, 'readonly').objectStore(DROPBOX_HANDLE_STORE).get('bid-folder')
+      request.onsuccess = () => resolve(request.result || null)
+      request.onerror = () => reject(request.error)
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function saveBidFolder(handle) {
+  if (!window.indexedDB) return
+  const db = await openFolderDatabase()
+  try {
+    await new Promise((resolve, reject) => {
+      const request = db.transaction(DROPBOX_HANDLE_STORE, 'readwrite').objectStore(DROPBOX_HANDLE_STORE).put(handle, 'bid-folder')
+      request.onsuccess = () => resolve()
+      request.onerror = () => reject(request.error)
+    })
+  } finally {
+    db.close()
+  }
+}
+
+export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, existingQuotes, api, beforeMutation }) {
   const [loading, setLoading] = useState(false)
   const [products, setProducts] = useState([])
   const [autoMatched, setAutoMatched] = useState(0)
@@ -24,14 +68,23 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
     }
   }, [existingQuotes])
 
+  const prepareMutation = async () => {
+    const result = await beforeMutation?.()
+    if (result === false) throw new Error('Save the current material edits before changing vendor pricing.')
+  }
+
   const handleUpload = async (files) => {
     setLoading(true); setError(null)
     try {
+      await prepareMutation()
       const fileList = Array.isArray(files) ? files : [files]
       const result = await api.uploadQuotes(jobId, fileList)
       setProducts(result.products || [])
       setAutoMatched(result.auto_matched || 0)
       setLinkedRequests(result.linked_requests || [])
+      if (result.file_errors?.length) {
+        setError(result.file_errors.map(item => `${item.file}: ${item.error}`).join(' '))
+      }
       onQuotesParsed?.(result.products || [], result.auto_matched || 0)
     } catch (err) { setError(err.message) }
     finally { setLoading(false) }
@@ -67,6 +120,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
       onConfirm: async () => {
         setConfirmDialog(null)
         try {
+          await prepareMutation()
           await api.clearQuotes(jobId)
           setProducts([])
           setAutoMatched(0)
@@ -86,6 +140,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
         clearTimeout(saveTimers.current[product.id])
         saveTimers.current[product.id] = setTimeout(async () => {
           try {
+            await prepareMutation()
             await api.updateQuote(product.id, { [field]: value })
             // Refresh job to pick up re-matched materials
             onQuotesParsed?.()
@@ -98,7 +153,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
     })
   }
 
-  const handleDropboxScan = async () => {
+  const handleDropboxScan = async (forcePicker = false) => {
     // Check browser support
     if (!window.showDirectoryPicker) {
       setError('Your browser does not support folder access. Use Chrome or Edge.')
@@ -110,8 +165,23 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
     setScanPreview(null)
 
     try {
-      // Step 1: User picks the bid folder root
-      const bidFolderHandle = await window.showDirectoryPicker({ mode: 'read' })
+      // Step 1: Reuse the browser-authorized folder when possible.
+      let bidFolderHandle = forcePicker ? null : await loadSavedBidFolder().catch(() => null)
+      if (bidFolderHandle) {
+        try {
+          let permission = await bidFolderHandle.queryPermission({ mode: 'read' })
+          if (permission !== 'granted') {
+            permission = await bidFolderHandle.requestPermission({ mode: 'read' })
+          }
+          if (permission !== 'granted') bidFolderHandle = null
+        } catch {
+          bidFolderHandle = null
+        }
+      }
+      if (!bidFolderHandle) {
+        bidFolderHandle = await window.showDirectoryPicker({ mode: 'read' })
+        await saveBidFolder(bidFolderHandle).catch(() => {})
+      }
 
       // Step 2: List all subdirectories
       const folderNames = []
@@ -143,11 +213,11 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
         corrHandle = projectHandle
       }
 
-      // Step 5: Collect all .eml and .pdf files (recursive)
+      // Step 5: Collect supported vendor email and quote files (recursive)
       const files = []
       async function collectFiles(dirHandle) {
         for await (const entry of dirHandle.values()) {
-          if (entry.kind === 'file' && /\.(eml|pdf)$/i.test(entry.name)) {
+          if (entry.kind === 'file' && /\.(eml|msg|pdf|txt|csv|xlsx)$/i.test(entry.name)) {
             const file = await entry.getFile()
             files.push(file)
           } else if (entry.kind === 'directory') {
@@ -158,7 +228,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
       await collectFiles(corrHandle)
 
       if (files.length === 0) {
-        setError(`Found folder "${matchResult.folder_name}" but no .eml or .pdf files in Correspondence`)
+        setError(`Found folder "${matchResult.folder_name}" but no supported quote files in Correspondence`)
         setScanning(false)
         return
       }
@@ -187,10 +257,14 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
     setLoading(true)
     setError(null)
     try {
+      await prepareMutation()
       const result = await api.uploadQuotes(jobId, scanPreview.fileObjects)
       setProducts(result.products || [])
       setAutoMatched(result.auto_matched || 0)
       setLinkedRequests(result.linked_requests || [])
+      if (result.file_errors?.length) {
+        setError(result.file_errors.map(item => `${item.file}: ${item.error}`).join(' '))
+      }
       setScanPreview(null)
       onQuotesParsed?.(result.products || [], result.auto_matched || 0)
     } catch (err) { setError(err.message) }
@@ -220,26 +294,32 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
 
   return (
     <div className="space-y-4">
-      {!hasQuotes && (
-        <div className="space-y-3">
+      <div className="space-y-3">
           <FileUpload
-            accept=".pdf,.eml,.msg,.txt" multiple
-            label="Upload Vendor Quotes"
-            description="PDF or text files with vendor pricing"
+            accept=".pdf,.eml,.msg,.txt,.csv,.xlsx" multiple
+            label={hasQuotes ? 'Add Vendor Quotes' : 'Upload Vendor Quotes'}
+            description="PDF, email, text, CSV, or XLSX vendor pricing"
             icon={FileText} onUpload={handleUpload} loading={loading}
           />
           <div className="flex items-center gap-3">
             <div className="flex-1 border-t border-gray-700/50" />
-            <span className="text-xs text-gray-500 uppercase tracking-wider">or</span>
+            <span className="text-xs text-gray-500 uppercase">or</span>
             <div className="flex-1 border-t border-gray-700/50" />
           </div>
           <button
-            onClick={handleDropboxScan}
+            onClick={() => handleDropboxScan(false)}
             disabled={scanning || loading}
             className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-500/10 border border-blue-500/20 rounded-xl text-blue-400 hover:bg-blue-500/20 transition-colors disabled:opacity-50"
           >
             {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderSearch className="w-4 h-4" />}
             {scanning ? 'Searching Bid Folder...' : 'Scan Dropbox Bid Folder'}
+          </button>
+          <button
+            onClick={() => handleDropboxScan(true)}
+            disabled={scanning || loading}
+            className="w-full text-xs text-gray-500 transition-colors hover:text-gray-300 disabled:opacity-50"
+          >
+            Choose a different Dropbox folder
           </button>
           {scanPreview && (
             <div className="px-4 py-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl">
@@ -262,8 +342,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
               </button>
             </div>
           )}
-        </div>
-      )}
+      </div>
 
       {error && (
         <div className="flex items-center gap-2 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-400">
@@ -314,7 +393,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-              <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">
+              <span className="text-xs font-bold text-gray-400 uppercase">
                 Parsed Products ({validProducts.length})
               </span>
               {autoMatched > 0 && (

@@ -42,6 +42,8 @@ VALID_MATERIAL_TYPES = [
     "tread_riser",
     "transitions",
     "waterproofing",
+    "sound_mat",
+    "pad",
 ]
 
 # ── Sundry / skip patterns ───────────────────────────────────────────────────
@@ -280,15 +282,16 @@ def _classify_with_ai(material_lines: list[tuple[int, str]],
     """
     try:
         from ai_client import chat_complete, get_provider_info
-        from quote_parser import _openai_config
+        from models import get_settings
 
-        api_key = _openai_config.get("api_key") or os.environ.get("OPENAI_API_KEY")
+        settings = get_settings()
+        api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
         provider = get_provider_info(api_key)
         if not provider["available"]:
             print("[rfms_parser] No AI API key available for classification")
             return {}
 
-        model = _openai_config.get("model", "gpt-5-mini")
+        model = settings.get("openai_model", "gpt-5-mini")
         print(f"[rfms_parser] Classifying {len(material_lines)} materials with provider={provider['provider']}, model={model}")
 
         # Build the user message
@@ -621,15 +624,16 @@ def ai_merge_materials(existing: list[dict], new_parsed: list[dict]) -> list[dic
     """
     try:
         from ai_client import chat_complete, get_provider_info
-        from quote_parser import _openai_config
+        from models import get_settings
 
-        api_key = _openai_config.get("api_key") or os.environ.get("OPENAI_API_KEY")
+        settings = get_settings()
+        api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
         provider = get_provider_info(api_key)
         if not provider["available"]:
             print("[ai_merge] No AI provider available, falling back to append")
             return _fallback_merge(existing, new_parsed)
 
-        model = _openai_config.get("model", "gpt-5-mini")
+        model = settings.get("openai_model", "gpt-5-mini")
 
         # Prepare existing materials for AI (strip DB-only fields)
         existing_for_ai = []

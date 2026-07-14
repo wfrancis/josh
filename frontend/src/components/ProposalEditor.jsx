@@ -137,6 +137,156 @@ function EditableList({ title, items, onChange }) {
 function sumField(arr, key) { return arr.reduce((s, b) => s + (b[key] || 0), 0) }
 function round2(n) { return Math.round(n * 100) / 100 }
 
+function allocateMoney(total, weights) {
+  const totalCents = Math.round(round2(total) * 100)
+  const normalized = weights.map(weight => Math.max(Number(weight) || 0, 0))
+  const weightTotal = normalized.reduce((sum, weight) => sum + weight, 0)
+  if (totalCents <= 0 || weightTotal <= 0) return normalized.map(() => 0)
+
+  const rawCents = normalized.map(weight => totalCents * weight / weightTotal)
+  const allocated = rawCents.map(value => Math.floor(value))
+  const remainder = totalCents - allocated.reduce((sum, cents) => sum + cents, 0)
+  const order = rawCents
+    .map((value, index) => ({ index, fraction: value - allocated[index] }))
+    .sort((a, b) => b.fraction - a.fraction || a.index - b.index)
+  for (let position = 0; position < remainder; position += 1) {
+    allocated[order[position].index] += 1
+  }
+  return allocated.map(cents => cents / 100)
+}
+
+function bundleMaterialCodes(bundle) {
+  return (bundle?.materials || [])
+    .map(material => material.item_code || material.id || material.material_id)
+    .filter(Boolean)
+    .map(String)
+    .sort()
+}
+
+function bundleMaterialSignature(bundle) {
+  return bundleMaterialCodes(bundle)
+    .filter(code => !code.startsWith('synthetic_'))
+    .join('\u001f')
+}
+
+function laborLineKey(labor) {
+  return [
+    labor?.material_id ?? labor?.id ?? '',
+    String(labor?.labor_description || '').trim().toLowerCase(),
+    String(labor?.unit || '').trim().toUpperCase(),
+  ].join('\u001f')
+}
+
+function laborIdentityKey(labor) {
+  return [
+    labor?.material_id ?? labor?.id ?? '',
+    String(labor?.labor_description || '').trim().toLowerCase(),
+  ].join('\u001f')
+}
+
+function realBundleMaterialCodes(bundle) {
+  return bundleMaterialCodes(bundle).filter(code => !code.startsWith('synthetic_'))
+}
+
+function sameCodes(left, right) {
+  return left.length === right.length && left.every((code, index) => code === right[index])
+}
+
+function codesAreSubset(candidate, target) {
+  const remaining = new Map()
+  target.forEach(code => remaining.set(code, (remaining.get(code) || 0) + 1))
+  for (const code of candidate) {
+    const count = remaining.get(code) || 0
+    if (count <= 0) return false
+    remaining.set(code, count - 1)
+  }
+  return true
+}
+
+function combineGeneratedParts(parts, accepted) {
+  const sum = field => round2(parts.reduce((total, part) => total + Number(part?.[field] || 0), 0))
+  return {
+    ...(parts[0] || {}),
+    bundle_name: accepted.bundle_name || parts[0]?.bundle_name || 'Combined Bundle',
+    description_text: parts.map(part => part.description_text).filter(Boolean).join('\n\n'),
+    materials: parts.flatMap(part => part.materials || []),
+    sundry_items: parts.flatMap(part => part.sundry_items || []),
+    labor_items: parts.flatMap(part => part.labor_items || []),
+    material_cost: sum('material_cost'),
+    sundry_cost: sum('sundry_cost'),
+    labor_cost: sum('labor_cost'),
+    freight_cost: sum('freight_cost'),
+    gpm_labor_adder: sum('gpm_labor_adder'),
+    gpm_material_adder: sum('gpm_material_adder'),
+    gpm_adder: sum('gpm_adder'),
+    taxable: sum('taxable'),
+    tax_amount: sum('tax_amount'),
+    total_price: sum('total_price'),
+    installed_qty: sum('installed_qty'),
+    unit: accepted.unit || parts[0]?.unit || 'EA',
+    editable: true,
+  }
+}
+
+function alignGeneratedStructure(acceptedBundles, generatedBundles) {
+  if (!acceptedBundles?.length) return { bundles: generatedBundles, conflicts: [] }
+  const conflicts = new Set()
+  const acceptedCounts = new Map()
+  const usedGenerated = new Set()
+  const aligned = []
+
+  for (const accepted of acceptedBundles) {
+    const codes = realBundleMaterialCodes(accepted)
+    if (!codes.length) continue
+    const signature = codes.join('\u001f')
+    acceptedCounts.set(signature, (acceptedCounts.get(signature) || 0) + 1)
+  }
+  for (const accepted of acceptedBundles) {
+    const codes = realBundleMaterialCodes(accepted)
+    if (codes.length && (acceptedCounts.get(codes.join('\u001f')) || 0) > 1) {
+      conflicts.add(accepted.bundle_name || codes.join(', '))
+    }
+  }
+
+  for (const accepted of acceptedBundles) {
+    const acceptedCodes = realBundleMaterialCodes(accepted)
+    if (!acceptedCodes.length) continue
+    const exact = generatedBundles
+      .map((bundle, index) => ({ bundle, index, codes: realBundleMaterialCodes(bundle) }))
+      .filter(item => !usedGenerated.has(item.index) && sameCodes(item.codes, acceptedCodes))
+    if (exact.length === 1) {
+      usedGenerated.add(exact[0].index)
+      aligned.push(exact[0].bundle)
+      continue
+    }
+    if (exact.length > 1) {
+      conflicts.add(accepted.bundle_name || acceptedCodes.join(', '))
+      continue
+    }
+
+    const parts = generatedBundles
+      .map((bundle, index) => ({ bundle, index, codes: realBundleMaterialCodes(bundle) }))
+      .filter(item => (
+        !usedGenerated.has(item.index)
+        && item.codes.length > 0
+        && codesAreSubset(item.codes, acceptedCodes)
+      ))
+    const combinedCodes = parts.flatMap(item => item.codes).sort()
+    if (parts.length > 1 && sameCodes(combinedCodes, acceptedCodes)) {
+      parts.forEach(item => usedGenerated.add(item.index))
+      aligned.push(combineGeneratedParts(parts.map(item => item.bundle), accepted))
+      continue
+    }
+
+    conflicts.add(accepted.bundle_name || acceptedCodes.join(', '))
+  }
+
+  generatedBundles.forEach((bundle, index) => {
+    if (!usedGenerated.has(index)) aligned.push(bundle)
+  })
+  return { bundles: aligned, conflicts: [...conflicts] }
+}
+
 /* ─── Combine Bundles Dialog ─────────────────────────────────────────── */
 function CombineBundlesDialog({ bundles, selectedIndices, onCombine, onCancel }) {
   const selected = [...selectedIndices].sort((a, b) => a - b).map(i => bundles[i])
@@ -264,10 +414,6 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
   const [laborRateVal, setLaborRateVal] = useState('')
   const [editingSundryPrice, setEditingSundryPrice] = useState(null)
   const [sundryPriceVal, setSundryPriceVal] = useState('')
-  const [editingGpmLabor, setEditingGpmLabor] = useState(false)
-  const [gpmLaborVal, setGpmLaborVal] = useState(String(bundle.gpm_labor_adder || 0))
-  const [editingGpmMaterial, setEditingGpmMaterial] = useState(false)
-  const [gpmMaterialVal, setGpmMaterialVal] = useState(String(bundle.gpm_material_adder || 0))
   const [showStairLabor, setShowStairLabor] = useState(false)
   const [stairLaborOptions, setStairLaborOptions] = useState([])
   const [stairCountVal, setStairCountVal] = useState(String(bundle.stair_count || ''))
@@ -311,56 +457,29 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
     onUpdate(index, { ...bundle, freight_override: num })
   }
 
-  const saveGpmLabor = () => {
-    const num = parseCurrencyInput(gpmLaborVal)
-    setGpmLaborVal(String(num))
-    setEditingGpmLabor(false)
-    const oldAdder = (bundle.gpm_labor_adder || 0) + (bundle.gpm_material_adder || 0)
-    const newAdder = num + (bundle.gpm_material_adder || 0)
-    const diff = newAdder - oldAdder
-    onUpdate(index, {
-      ...bundle,
-      gpm_labor_adder: num,
-      gpm_adder: round2(newAdder),
-      total_price: round2((bundle.total_price || 0) + diff),
-      price_override: undefined,
-    })
-  }
-
-  const saveGpmMaterial = () => {
-    const num = parseCurrencyInput(gpmMaterialVal)
-    setGpmMaterialVal(String(num))
-    setEditingGpmMaterial(false)
-    const oldAdder = (bundle.gpm_labor_adder || 0) + (bundle.gpm_material_adder || 0)
-    const newAdder = (bundle.gpm_labor_adder || 0) + num
-    const diff = newAdder - oldAdder
-    // Recalculate tax since GPM material adder affects taxable base
-    const taxRate = bundle.tax_amount && bundle.taxable ? bundle.tax_amount / bundle.taxable : 0
-    const oldTaxable = bundle.taxable || 0
-    const newTaxable = round2(oldTaxable - (bundle.gpm_material_adder || 0) + num)
-    const newTax = round2(newTaxable * taxRate)
-    const taxDiff = newTax - (bundle.tax_amount || 0)
-    onUpdate(index, {
-      ...bundle,
-      gpm_material_adder: num,
-      gpm_adder: round2(newAdder),
-      taxable: newTaxable,
-      tax_amount: newTax,
-      total_price: round2((bundle.total_price || 0) + diff + taxDiff),
-      price_override: undefined,
-    })
-  }
-
   const deleteLabor = (laborIdx) => {
+    const removed = (bundle.labor_items || [])[laborIdx]
+    const requiresReason = removed && !removed.is_manual && !removed.is_stair_labor
+    const reason = requiresReason
+      ? window.prompt('Why is this labor line being removed?', 'Estimator exclusion')
+      : ''
+    if (requiresReason && !reason?.trim()) return
     const updatedLabor = (bundle.labor_items || []).filter((_, i) => i !== laborIdx)
     const newLaborCost = round2(updatedLabor.reduce((s, l) => s + (l.extended_cost || 0), 0))
     const diff = newLaborCost - (bundle.labor_cost || 0)
+    const deletedKey = removed?.is_manual || removed?.is_stair_labor ? null : laborLineKey(removed)
     onUpdate(index, {
       ...bundle,
       labor_items: updatedLabor,
       labor_cost: newLaborCost,
       total_price: round2((bundle.total_price || 0) + diff),
       price_override: null,
+      deleted_labor_keys: deletedKey
+        ? [...new Set([...(bundle.deleted_labor_keys || []), deletedKey])]
+        : (bundle.deleted_labor_keys || []),
+      deleted_labor_reasons: deletedKey
+        ? { ...(bundle.deleted_labor_reasons || {}), [deletedKey]: reason.trim() }
+        : (bundle.deleted_labor_reasons || {}),
     })
   }
 
@@ -372,7 +491,9 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
     const newItem = {
       labor_description: newLabor.labor_description.trim(),
       qty, unit: newLabor.unit, rate, extended_cost: extCost,
+      is_manual: true,
     }
+    newItem.manual_source_key = laborLineKey(newItem)
     const updatedLabor = [...(bundle.labor_items || []), newItem]
     const newLaborCost = round2(updatedLabor.reduce((s, l) => s + (l.extended_cost || 0), 0))
     const diff = newLaborCost - (bundle.labor_cost || 0)
@@ -393,7 +514,7 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
     const updatedLabor = (bundle.labor_items || []).map((l, i) => {
       if (i !== laborIdx) return l
       const extCost = round2(l.qty * newRate)
-      return { ...l, rate: newRate, extended_cost: extCost }
+      return { ...l, rate: newRate, extended_cost: extCost, is_manual: true, manual_source_key: l.manual_source_key || laborLineKey(l) }
     })
     const newLaborCost = round2(updatedLabor.reduce((s, l) => s + (l.extended_cost || 0), 0))
     const diff = newLaborCost - (bundle.labor_cost || 0)
@@ -413,7 +534,7 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
     const updatedLabor = (bundle.labor_items || []).map((l, i) => {
       if (i !== laborIdx) return l
       const extCost = round2(newQty * l.rate)
-      return { ...l, qty: newQty, extended_cost: extCost }
+      return { ...l, qty: newQty, extended_cost: extCost, is_manual: true, manual_source_key: l.manual_source_key || laborLineKey(l) }
     })
     const newLaborCost = round2(updatedLabor.reduce((s, l) => s + (l.extended_cost || 0), 0))
     const diff = newLaborCost - (bundle.labor_cost || 0)
@@ -433,7 +554,7 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
     const updatedSundries = (bundle.sundry_items || []).map((s, i) => {
       if (i !== sundryIdx) return s
       const extCost = round2(s.qty * newPrice)
-      return { ...s, unit_price: newPrice, extended_cost: extCost }
+      return { ...s, unit_price: newPrice, extended_cost: extCost, is_manual_price: true }
     })
     const newSundryCost = round2(updatedSundries.reduce((s, item) => s + (item.extended_cost || 0), 0))
     const diff = newSundryCost - (bundle.sundry_cost || 0)
@@ -450,12 +571,16 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
   const saveFreightUnit = (matIdx) => {
     const newFreight = parseFloat(freightUnitVal) || 0
     setEditingFreightUnit(null)
+    const originalMaterial = (bundle.materials || [])[matIdx] || {}
+    const originalQty = originalMaterial.order_qty || originalMaterial.installed_qty || 0
+    const oldLineFreight = originalMaterial.freight_cost ?? round2((originalMaterial.freight_per_unit || 0) * originalQty)
     const updatedMaterials = (bundle.materials || []).map((m, i) => {
       if (i !== matIdx) return m
       const freightCost = round2(newFreight * (m.order_qty || m.installed_qty || 0))
-      return { ...m, freight_per_unit: newFreight, freight_cost: freightCost }
+      return { ...m, freight_per_unit: newFreight, freight_cost: freightCost, freight_is_manual: true }
     })
-    const newFreightCost = round2(updatedMaterials.reduce((s, m) => s + (m.freight_cost || 0), 0))
+    const editedLineFreight = updatedMaterials[matIdx]?.freight_cost || 0
+    const newFreightCost = round2((bundle.freight_cost || 0) + editedLineFreight - oldLineFreight)
     const diff = newFreightCost - (bundle.freight_cost || 0)
     onUpdate(index, {
       ...bundle,
@@ -499,7 +624,9 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
       qty: count, unit: 'EA', rate: catalogEntry.cost,
       extended_cost: round2(count * catalogEntry.cost),
       is_stair_labor: true,
+      is_manual: true,
     }
+    laborItem.manual_source_key = laborLineKey(laborItem)
 
     const kitType = (catalogEntry.description || '').toLowerCase().includes('stretch') ? 'stretched' : null
     const kitSundries = (STAIR_KITS[kitType] || []).map(s => {
@@ -848,6 +975,13 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                               className="w-20 bg-white/[0.04] border border-si-accent/50 rounded px-2 py-0.5 text-white text-xs text-right focus:outline-none tabular-nums"
                               autoFocus
                             />
+                          ) : bundle.is_derived ? (
+                            <span
+                              className="text-gray-500 tabular-nums"
+                              title="Derived bundle prices are controlled by the calculator. Use the bundle sell-price override for an accepted adjustment."
+                            >
+                              {s.unit_price != null ? formatCurrency(s.unit_price) : '—'}
+                            </span>
                           ) : (
                             <span
                               onClick={() => { setEditingSundryPrice(si); setSundryPriceVal(String(s.unit_price ?? '')) }}
@@ -969,7 +1103,13 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
                           value={l.unit || 'SY'}
                           onChange={(e) => {
                             const updated = [...(bundle.labor_items || [])]
-                            updated[li] = { ...updated[li], unit: e.target.value }
+                            const original = updated[li]
+                            updated[li] = {
+                              ...original,
+                              unit: e.target.value,
+                              is_manual: true,
+                              manual_source_key: original.manual_source_key || laborLineKey(original),
+                            }
                             const laborCost = round2(updated.reduce((s, item) => s + (item.extended_cost || 0), 0))
                             onUpdate(index, { ...bundle, labor_items: updated, labor_cost: laborCost })
                           }}
@@ -1153,53 +1293,21 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
               ) : null}
               <div className="flex justify-between text-gray-400">
                 <span>GPM Labor</span>
-                {editingGpmLabor ? (
-                  <input
-                    autoFocus
-                    type="text"
-                    value={gpmLaborVal}
-                    onChange={(e) => setGpmLaborVal(e.target.value)}
-                    onBlur={saveGpmLabor}
-                    onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); if (e.key === 'Escape') { setGpmLaborVal(String(bundle.gpm_labor_adder || 0)); setEditingGpmLabor(false) } }}
-                    className="bg-white/[0.06] border border-white/[0.12] rounded px-2 py-0.5 text-emerald-400 text-xs tabular-nums focus:outline-none focus:border-emerald-400/50 w-28 text-right"
-                  />
-                ) : (
-                  <span
-                    className="tabular-nums text-emerald-400 cursor-pointer hover:text-emerald-300 transition-colors"
-                    onClick={() => { setGpmLaborVal(String(bundle.gpm_labor_adder || 0)); setEditingGpmLabor(true) }}
-                    title="Click to edit GPM labor"
-                  >
-                    <span className="inline-flex items-center gap-1">
-                      {formatCurrency(bundle.gpm_labor_adder || 0)}
-                      <AuditTraceButton trace={auditFor('gpm_labor_adder')} label={`${bundle.bundle_name} GPM labor`} />
-                    </span>
+                <span className="tabular-nums text-emerald-400" title="Calculated from the job GPM">
+                  <span className="inline-flex items-center gap-1">
+                    {formatCurrency(bundle.gpm_labor_adder || 0)}
+                    <AuditTraceButton trace={auditFor('gpm_labor_adder')} label={`${bundle.bundle_name} GPM labor`} />
                   </span>
-                )}
+                </span>
               </div>
               <div className="flex justify-between text-gray-400">
                 <span>GPM Material</span>
-                {editingGpmMaterial ? (
-                  <input
-                    autoFocus
-                    type="text"
-                    value={gpmMaterialVal}
-                    onChange={(e) => setGpmMaterialVal(e.target.value)}
-                    onBlur={saveGpmMaterial}
-                    onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); if (e.key === 'Escape') { setGpmMaterialVal(String(bundle.gpm_material_adder || 0)); setEditingGpmMaterial(false) } }}
-                    className="bg-white/[0.06] border border-white/[0.12] rounded px-2 py-0.5 text-emerald-400 text-xs tabular-nums focus:outline-none focus:border-emerald-400/50 w-28 text-right"
-                  />
-                ) : (
-                  <span
-                    className="tabular-nums text-emerald-400 cursor-pointer hover:text-emerald-300 transition-colors"
-                    onClick={() => { setGpmMaterialVal(String(bundle.gpm_material_adder || 0)); setEditingGpmMaterial(true) }}
-                    title="Click to edit GPM material"
-                  >
-                    <span className="inline-flex items-center gap-1">
-                      {formatCurrency(bundle.gpm_material_adder || 0)}
-                      <AuditTraceButton trace={auditFor('gpm_material_adder')} label={`${bundle.bundle_name} GPM material`} />
-                    </span>
+                <span className="tabular-nums text-emerald-400" title="Calculated from the job GPM">
+                  <span className="inline-flex items-center gap-1">
+                    {formatCurrency(bundle.gpm_material_adder || 0)}
+                    <AuditTraceButton trace={auditFor('gpm_material_adder')} label={`${bundle.bundle_name} GPM material`} />
                   </span>
-                )}
+                </span>
               </div>
               {bundleTax > 0 && (
                 <div className="flex justify-between text-gray-400">
@@ -1253,10 +1361,12 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
 }
 
 /* ─── Main Component ──────────────────────────────────────────────────── */
-export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
+export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfidenceChange }) {
   const [bundles, setBundles] = useState([])
   const [deletedBundleNames, setDeletedBundleNames] = useState(new Set())
+  const [deletedBundleReasons, setDeletedBundleReasons] = useState({})
   const [deletedMaterialCodes, setDeletedMaterialCodes] = useState(new Set())
+  const [deletedMaterialReasons, setDeletedMaterialReasons] = useState({})
   const [notes, setNotes] = useState([])
   const [terms, setTerms] = useState([])
   const [exclusions, setExclusions] = useState([])
@@ -1280,6 +1390,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   const [gpmLabor, setGpmLabor] = useState(0)
   const [gpmMaterial, setGpmMaterial] = useState(0)
   const [gpmTotal, setGpmTotal] = useState(0)
+  const [manualAdjustment, setManualAdjustment] = useState(0)
   const [auditTrace, setAuditTrace] = useState(null)
 
   // Auto-save state
@@ -1287,16 +1398,29 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   const [saving, setSaving] = useState(false)
   const [lastSaved, setLastSaved] = useState(null)
   const autoSaveRef = useRef(null)
+  const editVersionRef = useRef(0)
+  const activeSaveCountRef = useRef(0)
+  const saveSequenceRef = useRef(0)
+  const serverRevisionRef = useRef(Number(job?.proposal_data?._server_revision || 0))
+  const saveSessionRef = useRef(
+    globalThis.crypto?.randomUUID?.() || `proposal-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  )
+
+  const markDirty = useCallback(() => {
+    editVersionRef.current += 1
+    setIsDirty(true)
+  }, [])
 
   // Recalculate totals when bundles, GPM, tax, or textura change
   const recalcTotals = useCallback((currentBundles, rate, textura, gpm) => {
     const gpmDecimal = (gpm || 0) / 100
 
     // Sum raw base costs across all bundles
-    const totalBaseCost = currentBundles.reduce((sum, b) => {
-      return sum + (b.material_cost || 0) + (b.sundry_cost || 0) + (b.labor_cost || 0)
-        + (b.freight_override ?? b.freight_cost ?? 0)
-    }, 0)
+    const bundleCosts = currentBundles.map(b => round2(
+      (b.material_cost || 0) + (b.sundry_cost || 0) + (b.labor_cost || 0)
+      + (b.freight_override ?? b.freight_cost ?? 0)
+    ))
+    const totalBaseCost = round2(bundleCosts.reduce((sum, cost) => sum + cost, 0))
 
     // Calculate GPM profit on total cost and distribute to bundles
     let profit = 0, profitLabor = 0, profitMaterial = 0
@@ -1310,46 +1434,41 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     setGpmLabor(profitLabor)
     setGpmMaterial(profitMaterial)
 
-    // Distribute GPM profit proportionally across bundles by cost share
-    if (profit > 0 && totalBaseCost > 0) {
-      for (const b of currentBundles) {
-        const bCost = (b.material_cost || 0) + (b.sundry_cost || 0) + (b.labor_cost || 0) + (b.freight_override ?? b.freight_cost ?? 0)
-        const share = bCost / totalBaseCost
-        b.gpm_labor_adder = round2(profitLabor * share)
-        b.gpm_material_adder = round2(profitMaterial * share)
-        b.gpm_adder = round2(b.gpm_labor_adder + b.gpm_material_adder)
-      }
-    } else {
-      for (const b of currentBundles) {
-        b.gpm_labor_adder = 0
-        b.gpm_material_adder = 0
-        b.gpm_adder = 0
-      }
+    // Allocate exact cents so bundle adders sum to the proposal-level GPM.
+    const laborAllocations = allocateMoney(profitLabor, bundleCosts)
+    const materialAllocations = allocateMoney(profitMaterial, bundleCosts)
+    for (let index = 0; index < currentBundles.length; index += 1) {
+      const b = currentBundles[index]
+      b.gpm_labor_adder = laborAllocations[index]
+      b.gpm_material_adder = materialAllocations[index]
+      b.gpm_adder = round2(b.gpm_labor_adder + b.gpm_material_adder)
     }
 
     // Tax per bundle: (material + sundry + freight + gpm_material_adder) × rate
-    const tax = currentBundles.reduce((sum, b) => {
+    const tax = round2(currentBundles.reduce((sum, b) => {
       const freight = b.freight_override ?? b.freight_cost ?? 0
       const taxable = (b.material_cost || 0) + (b.sundry_cost || 0) + freight + (b.gpm_material_adder || 0)
       const taxAmount = Math.round(taxable * rate * 100) / 100
       const preTax = (b.material_cost || 0) + (b.sundry_cost || 0) + (b.labor_cost || 0) + freight + (b.gpm_adder || 0)
       b.taxable = round2(taxable)
       b.tax_amount = taxAmount
-      if (b.price_override == null) {
-        b.total_price = round2(preTax + taxAmount)
-      }
+      b.total_price = round2(preTax + taxAmount)
       return sum + taxAmount
-    }, 0)
+    }, 0))
 
-    const sellPrice = totalBaseCost + profit
-    const preTotalCalc = sellPrice + tax
-    setSubtotal(sellPrice)
+    const calculatedBundleTotal = round2(currentBundles.reduce((sum, b) => sum + (b.total_price || 0), 0))
+    const acceptedBundleTotal = round2(currentBundles.reduce((sum, b) => sum + (b.price_override ?? b.total_price ?? 0), 0))
+    const adjustment = round2(acceptedBundleTotal - calculatedBundleTotal)
+    const acceptedSubtotal = round2(acceptedBundleTotal - tax)
+    const preTotalCalc = acceptedBundleTotal
+    setManualAdjustment(adjustment)
+    setSubtotal(acceptedSubtotal)
     setTaxAmount(tax)
 
     // Textura fee: 0.22% of total, capped at $5,000
     const txtAmt = textura ? Math.min(Math.round(preTotalCalc * 0.0022 * 100) / 100, 5000) : 0
     setTexturaAmount(txtAmt)
-    setGrandTotal(preTotalCalc + txtAmt)
+    setGrandTotal(round2(preTotalCalc + txtAmt))
   }, [])
 
   useEffect(() => {
@@ -1368,8 +1487,8 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   // Helper: set bundles + mark dirty (must be before generateBundles/doSave)
   const setBundlesAndDirty = useCallback((updater) => {
     setBundles(updater)
-    setIsDirty(true)
-  }, [])
+    markDirty()
+  }, [markDirty])
 
   // Generate proposal bundles from API
   const generateBundles = useCallback(async () => {
@@ -1384,7 +1503,18 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         throw new Error(err.detail || 'Failed to generate proposal')
       }
       const data = await res.json()
-      const freshBundles = data.bundles || []
+      const generatedRevision = Number(data?._server_revision)
+      if (Number.isFinite(generatedRevision)) {
+        serverRevisionRef.current = Math.max(serverRevisionRef.current, generatedRevision)
+      }
+      const rawBundles = data.bundles || []
+      const aligned = alignGeneratedStructure(bundles, rawBundles)
+      const freshBundles = aligned.bundles
+      const conflicts = aligned.conflicts
+      if (conflicts.length > 0) {
+        setError(`Regeneration changed the material grouping for ${conflicts.slice(0, 3).join(', ')}. Your accepted proposal was left unchanged. Review the structural change before replacing those bundles.`)
+        return
+      }
 
       // Merge manual edits from previous bundles into fresh bundles
       setBundlesAndDirty(prevBundles => {
@@ -1402,24 +1532,22 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           if (base && !prevByBaseName[base]) prevByBaseName[base] = b
         })
 
-        // Material overlap match: index previous bundles by material item_codes
-        const prevByMatCode = {}
+        // Numeric/manual edits only follow an exact material-code set. This
+        // prevents a split or combined bundle from receiving an old price twice.
+        const prevBySignature = {}
         prevBundles.forEach(b => {
-          (b.materials || []).forEach(m => {
-            const code = m.item_code || m.id
-            if (code && !prevByMatCode[code]) prevByMatCode[code] = b
-          })
+          const signature = bundleMaterialSignature(b)
+          if (signature && !prevBySignature[signature]) prevBySignature[signature] = b
         })
 
-        // Multi-strategy match: exact name → fuzzy name → material overlap
+        // Code-bearing bundles require an exact structural match. Name matching
+        // is only used for bundles without material identifiers.
         const findPrev = (fresh) => {
+          const signature = bundleMaterialSignature(fresh)
+          if (signature) return prevBySignature[signature] || null
           if (prevByName[fresh.bundle_name]) return prevByName[fresh.bundle_name]
           const baseName = stripSuffix(fresh.bundle_name)
           if (baseName && prevByBaseName[baseName]) return prevByBaseName[baseName]
-          const freshCodes = (fresh.materials || []).map(m => m.item_code || m.id).filter(Boolean)
-          for (const code of freshCodes) {
-            if (prevByMatCode[code]) return prevByMatCode[code]
-          }
           return null
         }
 
@@ -1435,31 +1563,81 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           if (prev.freight_override != null) edits.freight_override = prev.freight_override
           if (prev.description_text && prev.description_text !== fresh.description_text) edits.description_text = prev.description_text
           if (prev.stair_count) { edits.stair_count = prev.stair_count; edits.stair_labor_type = prev.stair_labor_type }
-          if (prev.gpm_labor_adder != null) edits.gpm_labor_adder = prev.gpm_labor_adder
-          if (prev.gpm_material_adder != null) edits.gpm_material_adder = prev.gpm_material_adder
+          const previousMaterials = new Map(
+            (prev.materials || []).map(material => [String(material.item_code || material.id || material.material_id || ''), material])
+          )
+          let adjustedFreightCost = Number(fresh.freight_cost || 0)
+          const mergedMaterials = (fresh.materials || []).map(material => {
+            const prior = previousMaterials.get(String(material.item_code || material.id || material.material_id || ''))
+            const freightChanged = Number(prior?.freight_per_unit || 0) !== Number(material.freight_per_unit || 0)
+              || (prior?.freight_cost != null && Number(prior.freight_cost) !== Number(material.freight_cost || 0))
+            if (!prior || (!prior.freight_is_manual && !freightChanged)) return material
+            const qty = prior.order_qty ?? prior.installed_qty ?? material.order_qty ?? material.installed_qty ?? 0
+            const priorLineFreight = prior.freight_cost ?? round2(Number(prior.freight_per_unit || 0) * Number(qty || 0))
+            adjustedFreightCost += Number(priorLineFreight || 0) - Number(material.freight_cost || 0)
+            return {
+              ...material,
+              freight_per_unit: prior.freight_per_unit,
+              freight_cost: round2(priorLineFreight),
+              freight_is_manual: true,
+            }
+          })
+          if (mergedMaterials.some((material, materialIndex) => material !== (fresh.materials || [])[materialIndex])) {
+            edits.materials = mergedMaterials
+            edits.freight_cost = round2(adjustedFreightCost)
+          }
 
-          // Preserve labor lines explicitly flagged as manually added (stair labor,
-          // or future is_manual lines). Auto-generated labor always comes from fresh
-          // so labor-catalog changes (e.g. Kerdi → Roll On) don't leave stale lines.
-          // Stair labor is ADDITIVE to installed-area labor: keep fresh's base labor
-          // (broadloom/CPT installed area) and re-attach prev's stair/manual lines.
-          const manualLabor = (prev.labor_items || []).filter(l => l.is_manual || l.is_stair_labor)
-          if (manualLabor.length > 0) {
-            edits.labor_items = [...(fresh.labor_items || []), ...manualLabor]
+          // Keep explicit and inferred accepted labor overrides. The raw generated
+          // response still carries today's catalog result for drift evidence; this
+          // merge protects the estimator's accepted line until they replace it.
+          const freshLaborByIdentity = new Map(
+            (fresh.labor_items || []).map(labor => [laborIdentityKey(labor), labor])
+          )
+          const manualLabor = (prev.labor_items || []).flatMap(labor => {
+            const generated = freshLaborByIdentity.get(laborIdentityKey(labor))
+            const acceptedDifference = !generated
+              || Number(labor.qty || 0) !== Number(generated.qty || 0)
+              || Number(labor.rate || 0) !== Number(generated.rate || 0)
+              || String(labor.unit || '') !== String(generated.unit || '')
+            if (!labor.is_manual && !labor.is_stair_labor && !acceptedDifference) return []
+            return [{
+              ...labor,
+              is_manual: true,
+              manual_source_key: labor.manual_source_key || laborLineKey(generated || labor),
+            }]
+          })
+          const manualLaborKeys = new Set(manualLabor.map(labor => labor.manual_source_key || laborLineKey(labor)))
+          const deletedLaborKeys = new Set(prev.deleted_labor_keys || [])
+          const filteredFreshLabor = (fresh.labor_items || []).filter(labor => {
+            const key = laborLineKey(labor)
+            return !manualLaborKeys.has(key) && !deletedLaborKeys.has(key)
+          })
+          if (manualLabor.length > 0 || deletedLaborKeys.size > 0) {
+            edits.labor_items = [...filteredFreshLabor, ...manualLabor]
             edits.labor_cost = round2(edits.labor_items.reduce((s, l) => s + (l.extended_cost || 0), 0))
+            edits.deleted_labor_keys = [...deletedLaborKeys]
+            edits.deleted_labor_reasons = { ...(prev.deleted_labor_reasons || {}) }
           }
 
           // Preserve stair sundries and edited sundry prices
           const stairSundries = (prev.sundry_items || []).filter(s => s.is_stair_sundry)
           const editedPrices = {}
           ;(prev.sundry_items || []).forEach(s => {
-            if (!s.is_stair_sundry && s.unit_price != null) editedPrices[s.sundry_name] = s.unit_price
+            if (!s.is_stair_sundry && s.unit_price != null) {
+              editedPrices[`${s.material_id ?? ''}\u001f${s.sundry_name || ''}`] = {
+                price: s.unit_price,
+                isManual: !!s.is_manual_price,
+              }
+            }
           })
           let sundries = (fresh.sundry_items || []).map(s => {
-            if (editedPrices[s.sundry_name] != null && editedPrices[s.sundry_name] !== s.unit_price) {
-              const price = editedPrices[s.sundry_name]
-              return { ...s, unit_price: price, extended_cost: round2(s.qty * price) }
+            const acceptedKey = `${s.material_id ?? ''}\u001f${s.sundry_name || ''}`
+            const acceptedPrice = editedPrices[acceptedKey]
+            if (acceptedPrice && acceptedPrice.price !== s.unit_price) {
+              const price = acceptedPrice.price
+              return { ...s, unit_price: price, extended_cost: round2(s.qty * price), is_manual_price: true }
             }
+            if (acceptedPrice?.isManual) return { ...s, is_manual_price: true }
             return s
           })
           if (stairSundries.length > 0) sundries = [...sundries, ...stairSundries]
@@ -1516,7 +1694,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         result = result.filter(b => {
           if (deletedBundleNames.has(b.bundle_name)) return false
           const codes = (b.materials || [])
-            .map(m => m.item_code || m.id)
+            .map(m => m.item_code || m.id || m.material_id)
             .filter(Boolean)
             .map(String)
           if (codes.length > 0 && codes.every(c => deletedMaterialCodes.has(c))) return false
@@ -1553,7 +1731,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
     } finally {
       setLoading(false)
     }
-  }, [job, apiProp, setBundlesAndDirty, deletedBundleNames, deletedMaterialCodes])
+  }, [job, apiProp, bundles, setBundlesAndDirty, deletedBundleNames, deletedMaterialCodes])
 
   // Load saved bundles on mount, or auto-generate if none saved
   useEffect(() => {
@@ -1565,6 +1743,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         const saved = await fetch(`/api/jobs/${job.id}/proposal/bundles`).then(r => r.ok ? r.json() : null)
         if (cancelled) return
         if (saved && saved.bundles && saved.bundles.length > 0) {
+          serverRevisionRef.current = Number(saved._server_revision || 0)
           setBundles(saved.bundles)
           setNotes(saved.notes || [])
           setTerms(saved.terms || [])
@@ -1578,7 +1757,9 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           setGpmPct((savedGpm || job?.gpm_pct || 0) * 100)
           if (saved.textura_fee != null) setTexturaEnabled(!!saved.textura_fee)
           if (saved.deleted_bundles?.length) setDeletedBundleNames(new Set(saved.deleted_bundles))
+          if (saved.deleted_bundle_reasons) setDeletedBundleReasons(saved.deleted_bundle_reasons)
           if (saved.deleted_material_codes?.length) setDeletedMaterialCodes(new Set(saved.deleted_material_codes))
+          if (saved.deleted_material_reasons) setDeletedMaterialReasons(saved.deleted_material_reasons)
           setHasGenerated(true)
           setLoading(false)
           return
@@ -1596,6 +1777,9 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   // Save proposal data to backend
   const doSave = useCallback(async ({ throwOnError = false } = {}) => {
     if (!job?.id || bundles.length === 0) return null
+    const saveVersion = editVersionRef.current
+    const saveSequence = ++saveSequenceRef.current
+    activeSaveCountRef.current += 1
     setSaving(true)
     try {
       const res = await fetch(`/api/jobs/${job.id}/proposal/bundles`, {
@@ -1615,9 +1799,16 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
           gpm_profit: gpmTotal,
           gpm_labor: gpmLabor,
           gpm_material: gpmMaterial,
+          manual_adjustment: manualAdjustment,
           textura_amount: texturaAmount,
           deleted_bundles: [...deletedBundleNames],
+          deleted_bundle_reasons: deletedBundleReasons,
           deleted_material_codes: [...deletedMaterialCodes],
+          deleted_material_reasons: deletedMaterialReasons,
+          client_session_id: saveSessionRef.current,
+          client_edit_version: saveVersion,
+          client_save_sequence: saveSequence,
+          base_server_revision: serverRevisionRef.current,
         }),
       })
       if (!res.ok) {
@@ -1625,20 +1816,33 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         throw new Error(err.detail || 'Auto-save failed')
       }
       const saved = await res.json().catch(() => ({}))
-      if (saved.audit_trace || saved.audit || saved.audit_traces) {
-        setAuditTrace(saved.audit_trace || saved.audit || saved.audit_traces)
+      const returnedRevision = Number(saved?.proposal_data?._server_revision)
+      if (Number.isFinite(returnedRevision)) {
+        serverRevisionRef.current = Math.max(serverRevisionRef.current, returnedRevision)
       }
-      setIsDirty(false)
-      setLastSaved(new Date())
+      const isCurrentSave = editVersionRef.current === saveVersion
+      if (!isCurrentSave && throwOnError) {
+        throw new Error('The proposal changed while it was saving. Review the latest totals and generate the PDF again.')
+      }
+      if (isCurrentSave) {
+        if (saved.audit_trace || saved.audit || saved.audit_traces) {
+          setAuditTrace(saved.audit_trace || saved.audit || saved.audit_traces)
+        }
+        setIsDirty(false)
+        setLastSaved(new Date())
+        onConfidenceChange?.()
+      }
       return saved
     } catch (e) {
       console.error('Auto-save failed:', e)
+      setError(e.message || 'The proposal could not be saved.')
       if (throwOnError) throw e
       return null
     } finally {
-      setSaving(false)
+      activeSaveCountRef.current = Math.max(0, activeSaveCountRef.current - 1)
+      if (activeSaveCountRef.current === 0) setSaving(false)
     }
-  }, [bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, deletedBundleNames, deletedMaterialCodes, job?.id])
+  }, [bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, manualAdjustment, texturaAmount, deletedBundleNames, deletedBundleReasons, deletedMaterialCodes, deletedMaterialReasons, job?.id, onConfidenceChange])
 
   // Auto-save: immediate on every dirty change, debounced 500ms to batch rapid edits
   useEffect(() => {
@@ -1649,9 +1853,9 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   }, [isDirty, bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, job?.id, doSave])
 
   // Ref to hold latest state for flush-on-unmount (avoids stale closures)
-  const stateRef = useRef({ bundles: [], notes: [], terms: [], exclusions: [], taxRate: 0, gpmPct: 0, texturaEnabled: false, subtotal: 0, taxAmount: 0, grandTotal: 0, gpmTotal: 0, gpmLabor: 0, gpmMaterial: 0, texturaAmount: 0, auditTrace: null, isDirty: false, deletedBundleNames: new Set(), deletedMaterialCodes: new Set() })
+  const stateRef = useRef({ bundles: [], notes: [], terms: [], exclusions: [], taxRate: 0, gpmPct: 0, texturaEnabled: false, subtotal: 0, taxAmount: 0, grandTotal: 0, gpmTotal: 0, gpmLabor: 0, gpmMaterial: 0, manualAdjustment: 0, texturaAmount: 0, auditTrace: null, isDirty: false, deletedBundleNames: new Set(), deletedBundleReasons: {}, deletedMaterialCodes: new Set(), deletedMaterialReasons: {} })
   useEffect(() => {
-    stateRef.current = { bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, texturaAmount, auditTrace, isDirty, deletedBundleNames, deletedMaterialCodes }
+    stateRef.current = { bundles, notes, terms, exclusions, taxRate, gpmPct, texturaEnabled, subtotal, taxAmount, grandTotal, gpmTotal, gpmLabor, gpmMaterial, manualAdjustment, texturaAmount, auditTrace, isDirty, deletedBundleNames, deletedBundleReasons, deletedMaterialCodes, deletedMaterialReasons }
   })
 
   // Flush pending save immediately on unmount or beforeunload
@@ -1660,14 +1864,22 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
       const s = stateRef.current
       if (!s.isDirty || !job?.id || s.bundles.length === 0) return
       // Use sendBeacon for reliability during unload
+      const saveSequence = ++saveSequenceRef.current
       const payload = JSON.stringify({
         bundles: s.bundles, notes: s.notes, terms: s.terms, exclusions: s.exclusions,
         tax_rate: s.taxRate, gpm_pct: s.gpmPct / 100, textura_fee: s.texturaEnabled ? 1 : 0,
         subtotal: s.subtotal, tax_amount: s.taxAmount, grand_total: s.grandTotal,
         gpm_profit: s.gpmTotal, gpm_labor: s.gpmLabor, gpm_material: s.gpmMaterial,
+        manual_adjustment: s.manualAdjustment,
         textura_amount: s.texturaAmount,
         deleted_bundles: [...(s.deletedBundleNames || [])],
+        deleted_bundle_reasons: s.deletedBundleReasons || {},
         deleted_material_codes: [...(s.deletedMaterialCodes || [])],
+        deleted_material_reasons: s.deletedMaterialReasons || {},
+        client_session_id: saveSessionRef.current,
+        client_edit_version: editVersionRef.current,
+        client_save_sequence: saveSequence,
+        base_server_revision: serverRevisionRef.current,
       })
       navigator.sendBeacon(`/api/jobs/${job.id}/proposal/bundles/save`, new Blob([payload], { type: 'application/json' }))
     }
@@ -1700,21 +1912,49 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
   // Delete a bundle — track name AND material item_codes so Regenerate can't
   // resurrect it under a different (raw vs AI-renamed) bundle name.
   const deleteBundle = useCallback((idx) => {
+    const reason = window.prompt('Why is this bundle being removed from the accepted proposal?', 'Estimator exclusion')
+    if (!reason?.trim()) return
     setBundlesAndDirty(prev => {
       const deleted = prev[idx]
       if (deleted?.bundle_name) {
         setDeletedBundleNames(names => new Set([...names, deleted.bundle_name]))
+        setDeletedBundleReasons(previous => ({
+          ...previous,
+          [deleted.bundle_name]: reason.trim(),
+        }))
       }
       const codes = (deleted?.materials || [])
-        .map(m => m.item_code || m.id)
+        .map(m => m.item_code || m.id || m.material_id)
         .filter(Boolean)
         .map(String)
-      if (codes.length > 0) {
-        setDeletedMaterialCodes(s => new Set([...s, ...codes]))
+      const remainingCodes = new Set(
+        prev
+          .filter((_, bundleIndex) => bundleIndex !== idx)
+          .flatMap(bundle => (bundle.materials || []).map(material => material.item_code || material.id || material.material_id))
+          .filter(Boolean)
+          .map(String)
+      )
+      const uniquelyDeletedCodes = codes.filter(code => !remainingCodes.has(code))
+      if (uniquelyDeletedCodes.length > 0) {
+        setDeletedMaterialCodes(s => new Set([...s, ...uniquelyDeletedCodes]))
+        setDeletedMaterialReasons(previous => ({
+          ...previous,
+          ...Object.fromEntries(uniquelyDeletedCodes.map(code => [String(code), reason.trim()])),
+        }))
       }
       return prev.filter((_, i) => i !== idx)
     })
   }, [setBundlesAndDirty])
+
+  const editDeletedBundleReason = useCallback((bundleName) => {
+    const reason = window.prompt(
+      `Why is ${bundleName} excluded from the accepted proposal?`,
+      deletedBundleReasons[bundleName] || 'Estimator exclusion',
+    )
+    if (!reason?.trim()) return
+    setDeletedBundleReasons(previous => ({ ...previous, [bundleName]: reason.trim() }))
+    markDirty()
+  }, [deletedBundleReasons, markDirty])
 
   // Move a bundle up/down
   const moveBundle = useCallback((idx, direction) => {
@@ -1826,6 +2066,11 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         unit: 'SY',
         rate: 0.27,
         extended_cost: patternCost,
+        is_manual: true,
+        manual_source_key: laborLineKey({
+          labor_description: 'Project Carpet - X ADD for Carpet Tile Pattern',
+          unit: 'SY',
+        }),
       })
       combined.labor_cost = round2(combined.labor_cost + patternCost)
     }
@@ -1858,44 +2103,27 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
       if (!saved?.audit_trace && !saved?.audit) {
         throw new Error('Cannot generate PDF until the proposal has a current audit trace.')
       }
-      const proposalData = {
-        bundles: bundles.map((b, i) => ({
-          ...b,
-          sort_order: i,
-          final_price: b.price_override ?? b.total_price ?? 0,
-        })),
-        notes,
-        terms,
-        exclusions,
-        subtotal,
-        tax_rate: taxRate,
-        tax_amount: taxAmount,
-        gpm_pct: gpmPct / 100,
-        gpm_profit: gpmTotal,
-        gpm_labor: gpmLabor,
-        gpm_material: gpmMaterial,
-        textura_fee: texturaEnabled ? 1 : 0,
-        textura_amount: texturaAmount,
-        grand_total: grandTotal,
-        deleted_bundles: [...deletedBundleNames],
-        deleted_material_codes: [...deletedMaterialCodes],
+      const accepted = saved.proposal_data
+      if (!accepted?.bundles) {
+        throw new Error('The server did not return the saved proposal state.')
       }
       const res = await fetch(`/api/jobs/${job.id}/proposal/pdf`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(proposalData),
+        body: JSON.stringify(accepted),
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }))
         throw new Error(err.detail || 'Failed to generate PDF')
       }
       setPdfReady(true)
+      onConfidenceChange?.()
     } catch (err) {
       setError(err.message)
     } finally {
       setGenerating(false)
     }
-  }, [job, bundles, notes, terms, exclusions, subtotal, taxRate, taxAmount, gpmPct, gpmTotal, gpmLabor, gpmMaterial, texturaEnabled, texturaAmount, grandTotal, deletedBundleNames, deletedMaterialCodes, doSave])
+  }, [job, bundles, notes, terms, exclusions, subtotal, taxRate, taxAmount, gpmPct, gpmTotal, gpmLabor, gpmMaterial, texturaEnabled, texturaAmount, grandTotal, deletedBundleNames, deletedBundleReasons, deletedMaterialCodes, deletedMaterialReasons, doSave, onConfidenceChange])
 
   // Download PDF
   const downloadPdf = useCallback(() => {
@@ -1923,7 +2151,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
             <>
               <button
                 onClick={() => {
-                  if (bundles.length > 0 && !window.confirm('Regenerate bundles from materials? Your manual edits (prices, stair labor, combines) will be preserved.')) return
+                  if (bundles.length > 0 && !window.confirm('Regenerate from current materials? Manual prices, deletions, and clean bundle combinations will be preserved. Ambiguous regrouping will stop for review.')) return
                   generateBundles()
                 }}
                 disabled={loading}
@@ -1989,6 +2217,33 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
         </div>
       )}
 
+      {deletedBundleNames.size > 0 && (
+        <div className="border border-amber-500/20 bg-amber-500/[0.06] rounded-lg px-4 py-3">
+          <div className="flex items-center gap-2 mb-2">
+            <AlertTriangle className="w-4 h-4 text-amber-400" />
+            <h3 className="text-xs font-bold uppercase text-amber-300">Excluded Bundles</h3>
+          </div>
+          <div className="space-y-1.5">
+            {[...deletedBundleNames].map(bundleName => (
+              <div key={bundleName} className="flex items-center gap-2 text-xs">
+                <span className="font-medium text-gray-200">{bundleName}</span>
+                <span className={deletedBundleReasons[bundleName] ? 'text-gray-500' : 'text-red-300'}>
+                  {deletedBundleReasons[bundleName] || 'Reason required'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => editDeletedBundleReason(bundleName)}
+                  className="ml-auto p-1 text-gray-500 hover:text-amber-300 transition-colors"
+                  title="Edit exclusion reason"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Loading state */}
       {loading && (
         <div className="glass-card p-12 flex flex-col items-center justify-center gap-3">
@@ -2036,9 +2291,9 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
       {/* Notes, Terms, Exclusions */}
       {!loading && hasGenerated && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <EditableList title="Notes" items={notes} onChange={v => { setNotes(v); setIsDirty(true) }} />
-          <EditableList title="Terms & Conditions" items={terms} onChange={v => { setTerms(v); setIsDirty(true) }} />
-          <EditableList title="Exclusions" items={exclusions} onChange={v => { setExclusions(v); setIsDirty(true) }} />
+          <EditableList title="Notes" items={notes} onChange={v => { setNotes(v); markDirty() }} />
+          <EditableList title="Terms & Conditions" items={terms} onChange={v => { setTerms(v); markDirty() }} />
+          <EditableList title="Exclusions" items={exclusions} onChange={v => { setExclusions(v); markDirty() }} />
         </div>
       )}
 
@@ -2101,7 +2356,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
                         onChange={(e) => {
                           const val = parseFloat(e.target.value)
                           setGpmPct(isNaN(val) ? 0 : val)
-                          setIsDirty(true)
+                          markDirty()
                         }}
                         className="bg-white/[0.04] border border-white/[0.08] rounded-lg px-2 py-1 text-emerald-400 text-xs tabular-nums w-20 text-center focus:outline-none focus:border-emerald-400/50"
                       />
@@ -2142,6 +2397,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
                       onChange={(e) => {
                         const val = parseFloat(e.target.value)
                         setTaxRate(isNaN(val) ? 0 : val / 100)
+                        markDirty()
                       }}
                       className="bg-white/[0.04] border border-white/[0.08] rounded-lg px-2 py-1 text-white text-xs tabular-nums w-20 text-center focus:outline-none focus:border-si-accent/50"
                     />
@@ -2155,7 +2411,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack }) {
                     <input
                       type="checkbox"
                       checked={texturaEnabled}
-                      onChange={(e) => { setTexturaEnabled(e.target.checked); setIsDirty(true) }}
+                      onChange={(e) => { setTexturaEnabled(e.target.checked); markDirty() }}
                       className="w-3.5 h-3.5 rounded border-white/10 bg-white/[0.04] text-si-accent focus:ring-si-accent/50"
                     />
                     <span>Textura (0.22%)</span>

@@ -83,7 +83,9 @@ def compose_quote_request(
         user_prompt += f"\nSender Name: {sender_name}"
 
     api_key = openai_config.get("api_key")
-    model = openai_config.get("model", "gpt-5-mini")
+    from models import get_settings
+    settings = get_settings()
+    model = settings.get("openai_model", "gpt-5-mini")
 
     body = chat_complete(
         system=system_prompt,

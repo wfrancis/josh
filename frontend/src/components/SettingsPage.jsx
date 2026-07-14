@@ -26,9 +26,6 @@ export default function SettingsPage() {
   const [model, setModel] = useState('gpt-5-mini')
   const [multiPassCount, setMultiPassCount] = useState(2)
 
-  // Bid folder state
-  const [bidFolderPath, setBidFolderPath] = useState('')
-
   // Vendor quote test mode
   const [testMode, setTestMode] = useState(false)
   const [testModeToggling, setTestModeToggling] = useState(false)
@@ -37,6 +34,7 @@ export default function SettingsPage() {
   const [emailEnabled, setEmailEnabled] = useState(false)
   const [emailSaving, setEmailSaving] = useState(false)
   const [emailSaveSuccess, setEmailSaveSuccess] = useState(false)
+  const [vendorHealth, setVendorHealth] = useState(null)
   const [emailConfig, setEmailConfig] = useState({
     smtp_host: '', smtp_port: '587', imap_host: '', imap_port: '993',
     email_address: '', email_password: '', sender_name: '', sender_signature: '',
@@ -54,8 +52,6 @@ export default function SettingsPage() {
         setAiProvider(data.ai_provider || 'none')
         setModel(data.openai_model || 'gpt-5-mini')
         setMultiPassCount(data.multi_pass_count || 2)
-        // Bid folder path
-        if (data.bid_folder_path) setBidFolderPath(data.bid_folder_path)
         // Email automation settings
         if (data.vendor_quote_test_mode === 'true') setTestMode(true)
         if (data.email_automation_enabled === 'true') setEmailEnabled(true)
@@ -67,6 +63,10 @@ export default function SettingsPage() {
       .finally(() => setSettingsLoading(false))
   }, [])
 
+  useEffect(() => {
+    api.getVendorIngestionHealth().then(setVendorHealth).catch(() => setVendorHealth(null))
+  }, [saveSuccess, emailSaveSuccess, testMode])
+
   const handleSaveSettings = async () => {
     setSaving(true)
     setSaveError(null)
@@ -75,7 +75,6 @@ export default function SettingsPage() {
       const payload = {
         openai_model: model,
         multi_pass_count: multiPassCount,
-        bid_folder_path: bidFolderPath,
       }
       // Only send API keys if user actively edited them
       if (editingKey && apiKey) {
@@ -186,7 +185,7 @@ export default function SettingsPage() {
                 <label className="label flex items-center gap-2">
                   <Key className="w-3.5 h-3.5" />
                   Anthropic API Key
-                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-purple-500/15 text-purple-400 uppercase tracking-wider">
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-purple-500/15 text-purple-400 uppercase">
                     Alternative
                   </span>
                 </label>
@@ -281,7 +280,7 @@ export default function SettingsPage() {
                     <div className="flex items-center gap-2 mb-1.5">
                       <div className={`w-3 h-3 rounded-full ${model === 'gpt-5.4' ? 'bg-si-orange' : 'bg-white/10'}`} />
                       <span className="text-sm font-semibold text-white">GPT-5.4</span>
-                      <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-si-orange/15 text-si-orange uppercase tracking-wider">
+                      <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-si-orange/15 text-si-orange uppercase">
                         Flagship
                       </span>
                     </div>
@@ -322,23 +321,6 @@ export default function SettingsPage() {
                   {multiPassCount === 3 && '3 passes — higher accuracy, slower'}
                   {multiPassCount === 4 && '4 passes — high accuracy'}
                   {multiPassCount === 5 && '5 passes — maximum accuracy, slowest'}
-                </div>
-              </div>
-
-              {/* Bid Folder Path */}
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-gray-300 flex items-center gap-2">
-                  Dropbox Bid Folder Path
-                </label>
-                <input
-                  type="text"
-                  value={bidFolderPath}
-                  onChange={(e) => setBidFolderPath(e.target.value)}
-                  placeholder="C:\Users\...\001-Bid Folder"
-                  className="input w-full"
-                />
-                <div className="text-xs text-gray-500">
-                  Local path to your Dropbox bid folder. Used by the Dropbox quote scanner.
                 </div>
               </div>
 
@@ -427,6 +409,31 @@ export default function SettingsPage() {
           </div>
 
           <div className="space-y-5">
+            {vendorHealth && (
+              <div className="grid grid-cols-1 gap-3 border-y border-white/[0.06] py-4 sm:grid-cols-3">
+                <div>
+                  <p className="text-[10px] font-semibold uppercase text-gray-500">AI parser</p>
+                  <p className={vendorHealth.ai_parser?.available ? 'mt-1 text-sm font-semibold text-emerald-300' : 'mt-1 text-sm font-semibold text-red-300'}>
+                    {vendorHealth.ai_parser?.available ? 'Ready' : 'Blocked'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-semibold uppercase text-gray-500">Inbox monitor</p>
+                  <p className={vendorHealth.email_monitor?.running ? 'mt-1 text-sm font-semibold text-emerald-300' : 'mt-1 text-sm font-semibold text-gray-300'}>
+                    {vendorHealth.email_monitor?.running || vendorHealth.email_monitor?.simulator_running
+                      ? 'Running'
+                      : vendorHealth.email_monitor?.enabled || vendorHealth.email_monitor?.test_mode
+                        ? 'Not running'
+                        : 'Off'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-semibold uppercase text-gray-500">Dropbox files</p>
+                  <p className="mt-1 text-sm font-semibold text-gray-300">EML, MSG, PDF, TXT, CSV, XLSX</p>
+                </div>
+              </div>
+            )}
+
             {/* SMTP Settings */}
             <div>
               <label className="label flex items-center gap-2">

@@ -115,6 +115,7 @@ def init_db() -> None:
                 unit TEXT,
                 description TEXT,
                 file_name TEXT,
+                source_hash TEXT,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
 
@@ -179,6 +180,7 @@ def init_db() -> None:
                 file_name TEXT,
                 won_bid INTEGER DEFAULT 0,
                 notes TEXT,
+                source_hash TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (vendor_id) REFERENCES vendors(id) ON DELETE SET NULL,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL,
@@ -462,12 +464,44 @@ def init_db() -> None:
             ("artifact_kind", "ALTER TABLE imported_files ADD COLUMN artifact_kind TEXT DEFAULT 'source'"),
             ("current_version_id", "ALTER TABLE golden_jobs ADD COLUMN current_version_id INTEGER"),
             ("golden_version_id", "ALTER TABLE golden_job_replays ADD COLUMN golden_version_id INTEGER"),
+            ("job_quote_source_hash", "ALTER TABLE job_quotes ADD COLUMN source_hash TEXT"),
+            ("vendor_price_source_hash", "ALTER TABLE vendor_prices ADD COLUMN source_hash TEXT"),
         ]:
             try:
                 conn.execute(sql)
                 conn.commit()
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+        # Exact duplicates from an interrupted pre-index import carry the same
+        # source hash and product identity. Keep the oldest evidence row so the
+        # uniqueness indexes can be established without touching legacy rows
+        # that predate source hashing.
+        conn.execute(
+            """
+            DELETE FROM job_quotes
+            WHERE source_hash IS NOT NULL AND source_hash != ''
+              AND id NOT IN (
+                  SELECT MIN(id) FROM job_quotes
+                  WHERE source_hash IS NOT NULL AND source_hash != ''
+                  GROUP BY job_id, source_hash, COALESCE(product_name, ''),
+                           COALESCE(vendor, ''), COALESCE(unit_price, 0), COALESCE(unit, '')
+              )
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM vendor_prices
+            WHERE source_hash IS NOT NULL AND source_hash != ''
+              AND id NOT IN (
+                  SELECT MIN(id) FROM vendor_prices
+                  WHERE source_hash IS NOT NULL AND source_hash != ''
+                  GROUP BY job_id, source_hash, COALESCE(product_name, ''),
+                           COALESCE(vendor_name, ''), COALESCE(unit_price, 0), COALESCE(unit, '')
+              )
+            """
+        )
+        conn.commit()
 
         # Indexes for vendor_prices
         for idx_sql in [
@@ -486,6 +520,13 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_est_rules_status ON estimating_rules(status)",
             "CREATE INDEX IF NOT EXISTS idx_est_rule_versions_rule ON estimating_rule_versions(rule_id, version DESC)",
             "CREATE INDEX IF NOT EXISTS idx_ruleset_versions_version ON ruleset_versions(version DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_golden_replays_version_mode ON golden_job_replays(source_job_id, golden_version_id, mode, created_at DESC, id DESC)",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_job_quotes_source_product
+               ON job_quotes(job_id, source_hash, COALESCE(product_name, ''), COALESCE(vendor, ''), COALESCE(unit_price, 0), COALESCE(unit, ''))
+               WHERE source_hash IS NOT NULL AND source_hash != ''""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_vendor_prices_source_product
+               ON vendor_prices(job_id, source_hash, COALESCE(product_name, ''), COALESCE(vendor_name, ''), COALESCE(unit_price, 0), COALESCE(unit, ''))
+               WHERE source_hash IS NOT NULL AND source_hash != ''""",
         ]:
             try:
                 conn.execute(idx_sql)
@@ -585,42 +626,93 @@ def save_job(job_data: dict) -> int:
         conn.close()
 
 
-def save_materials(job_id: int, materials: list[dict]) -> list[int]:
-    """Save material lines for a job. Returns list of material ids."""
-    conn = _get_conn()
+def save_materials(
+    job_id: int,
+    materials: list[dict],
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> list[int]:
+    """Save material lines while retaining IDs for rows that still exist."""
+    owns_connection = conn is None
+    conn = conn or _get_conn()
     try:
-        # Clear existing materials for this job
-        conn.execute("DELETE FROM job_materials WHERE job_id=?", (job_id,))
+        existing_ids = {
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM job_materials WHERE job_id=?",
+                (job_id,),
+            ).fetchall()
+        }
+
+        def material_values(material: dict) -> tuple:
+            return (
+                material.get("item_code"), material.get("description"),
+                material.get("material_type"), material.get("installed_qty", 0),
+                material.get("unit"), material.get("waste_pct", 0),
+                material.get("order_qty", 0), material.get("vendor"),
+                material.get("unit_price", 0), material.get("extended_cost", 0),
+                material.get("ai_confidence"), material.get("quote_status"),
+                material.get("price_source"), material.get("freight_per_unit"),
+                material.get("freight_source"), material.get("fixture_count", 0),
+                material.get("labor_rate_lf", 0), material.get("labor_catalog"),
+                material.get("tack_strip_lf", 0), material.get("seam_tape_lf", 0),
+                material.get("pad_sy", 0), material.get("area_type", "unit"),
+                1 if material.get("is_mosaic") else 0,
+                1 if material.get("is_penny_hex") else 0,
+                material.get("crack_isolation_sf", 0),
+                material.get("weld_rod_lf", 0),
+            )
+
         ids = []
+        retained_ids = set()
         for m in materials:
-            cur = conn.execute("""
-                INSERT INTO job_materials
-                    (job_id, item_code, description, material_type, installed_qty,
-                     unit, waste_pct, order_qty, vendor, unit_price, extended_cost, ai_confidence,
-                     quote_status, price_source, freight_per_unit, freight_source,
-                     fixture_count, labor_rate_lf, labor_catalog,
-                     tack_strip_lf, seam_tape_lf, pad_sy, area_type,
-                     is_mosaic, is_penny_hex, crack_isolation_sf, weld_rod_lf)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                job_id, m.get("item_code"), m.get("description"),
-                m.get("material_type"), m.get("installed_qty", 0),
-                m.get("unit"), m.get("waste_pct", 0), m.get("order_qty", 0),
-                m.get("vendor"), m.get("unit_price", 0), m.get("extended_cost", 0),
-                m.get("ai_confidence"), m.get("quote_status"), m.get("price_source"),
-                m.get("freight_per_unit"), m.get("freight_source"), m.get("fixture_count", 0),
-                m.get("labor_rate_lf", 0), m.get("labor_catalog"),
-                m.get("tack_strip_lf", 0), m.get("seam_tape_lf", 0), m.get("pad_sy", 0),
-                m.get("area_type", "unit"),
-                1 if m.get("is_mosaic") else 0, 1 if m.get("is_penny_hex") else 0,
-                m.get("crack_isolation_sf", 0),
-                m.get("weld_rod_lf", 0),
-            ))
-            ids.append(cur.lastrowid)
-        conn.commit()
+            try:
+                requested_id = int(m.get("id")) if m.get("id") is not None else None
+            except (TypeError, ValueError):
+                requested_id = None
+            values = material_values(m)
+            if requested_id in existing_ids and requested_id not in retained_ids:
+                conn.execute("""
+                    UPDATE job_materials SET
+                        item_code=?, description=?, material_type=?, installed_qty=?,
+                        unit=?, waste_pct=?, order_qty=?, vendor=?, unit_price=?,
+                        extended_cost=?, ai_confidence=?, quote_status=?, price_source=?,
+                        freight_per_unit=?, freight_source=?, fixture_count=?, labor_rate_lf=?,
+                        labor_catalog=?, tack_strip_lf=?, seam_tape_lf=?, pad_sy=?,
+                        area_type=?, is_mosaic=?, is_penny_hex=?, crack_isolation_sf=?,
+                        weld_rod_lf=?
+                    WHERE id=? AND job_id=?
+                """, (*values, requested_id, job_id))
+                material_id = requested_id
+            else:
+                cur = conn.execute("""
+                    INSERT INTO job_materials
+                        (job_id, item_code, description, material_type, installed_qty,
+                         unit, waste_pct, order_qty, vendor, unit_price, extended_cost,
+                         ai_confidence, quote_status, price_source, freight_per_unit,
+                         freight_source, fixture_count, labor_rate_lf, labor_catalog,
+                         tack_strip_lf, seam_tape_lf, pad_sy, area_type, is_mosaic,
+                         is_penny_hex, crack_isolation_sf, weld_rod_lf)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (job_id, *values))
+                material_id = int(cur.lastrowid)
+            retained_ids.add(material_id)
+            ids.append(material_id)
+
+        if retained_ids:
+            placeholders = ",".join("?" for _ in retained_ids)
+            conn.execute(
+                f"DELETE FROM job_materials WHERE job_id=? AND id NOT IN ({placeholders})",
+                (job_id, *sorted(retained_ids)),
+            )
+        else:
+            conn.execute("DELETE FROM job_materials WHERE job_id=?", (job_id,))
+        if owns_connection:
+            conn.commit()
         return ids
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
 
 def save_sundries(job_id: int, sundries: list[dict]) -> None:
@@ -821,6 +913,49 @@ def list_calculation_runs(job_id: int, limit: int = 20) -> list[dict]:
         conn.close()
 
 
+def get_latest_completed_calculation_run(
+    job_id: int,
+    run_types: set[str] | list[str] | tuple[str, ...],
+) -> dict | None:
+    """Return the newest completed audit run matching any requested type."""
+    import json as _json
+
+    normalized_types = sorted({str(run_type).strip() for run_type in run_types if str(run_type).strip()})
+    if not normalized_types:
+        return None
+
+    placeholders = ", ".join("?" for _ in normalized_types)
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            f"""
+            SELECT * FROM calculation_runs
+            WHERE job_id=?
+              AND status='completed'
+              AND run_type IN ({placeholders})
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+            """,
+            (job_id, *normalized_types),
+        ).fetchone()
+        if not row:
+            return None
+
+        result = dict(row)
+        for src, dest in (("metadata_json", "metadata"), ("summary_json", "summary")):
+            raw = result.pop(src, None)
+            if raw:
+                try:
+                    result[dest] = _json.loads(raw)
+                except (ValueError, TypeError):
+                    result[dest] = raw
+            else:
+                result[dest] = {}
+        return result
+    finally:
+        conn.close()
+
+
 def get_calculation_traces(
     job_id: int,
     run_id: int = None,
@@ -888,18 +1023,19 @@ def save_quotes(job_id: int, quotes: list[dict]) -> list[int]:
             if q.get("error"):
                 continue  # Skip error entries
             cur = conn.execute("""
-                INSERT INTO job_quotes
+                INSERT OR IGNORE INTO job_quotes
                     (job_id, product_name, vendor, unit_price, unit, description, file_name,
-                     quoted_at, freight, lead_time, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     quoted_at, freight, lead_time, notes, source_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_id, q.get("product_name"), q.get("vendor"),
                 q.get("unit_price", 0), q.get("unit"),
                 q.get("description"), q.get("file_name"),
                 datetime.now().isoformat(),
-                q.get("freight"), q.get("lead_time"), q.get("notes")
+                q.get("freight"), q.get("lead_time"), q.get("notes"), q.get("_source_hash")
             ))
-            ids.append(cur.lastrowid)
+            if cur.rowcount:
+                ids.append(cur.lastrowid)
         conn.commit()
         return ids
     finally:
@@ -1621,11 +1757,12 @@ def get_active_rules(stage: str = None, category: str = None, as_of: str = None)
 
 def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
     """Seed built-in hard rules without overwriting user edits by default."""
-    from rules_registry import DEFAULT_HARD_RULES
+    from rules_registry import BUILTIN_RULE_CORRECTIONS, DEFAULT_HARD_RULES
 
     inserted = 0
     updated = 0
     contract_backfilled = 0
+    corrected = 0
     conn = _get_conn()
     try:
         for rule in DEFAULT_HARD_RULES:
@@ -1644,12 +1781,42 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
                     "SELECT * FROM estimating_rules WHERE rule_id=?",
                     (data["rule_id"],),
                 ).fetchone()
+                correction = BUILTIN_RULE_CORRECTIONS.get(data["rule_id"])
+                correction_applied = False
+                if current and correction:
+                    current_rule = _rule_from_row(current)
+                    expected = correction.get("expected") or {}
+                    matches_legacy_seed = (
+                        int(current_rule.get("version") or 1) == int(correction.get("from_version") or 1)
+                        and all(current_rule.get(field) == value for field, value in expected.items())
+                    )
+                    if matches_legacy_seed:
+                        fields = tuple(correction.get("fields") or ())
+                        assignments = [f"{field}=?" for field in fields]
+                        values = [data[field] for field in fields]
+                        next_version = max(
+                            int(current_rule.get("version") or 1) + 1,
+                            int(data.get("version") or 1),
+                        )
+                        conn.execute(
+                            f"UPDATE estimating_rules SET {', '.join(assignments)}, version=?, updated_at=? WHERE rule_id=?",
+                            (*values, next_version, now, data["rule_id"]),
+                        )
+                        correction_applied = True
+                        corrected += 1
+                        current = conn.execute(
+                            "SELECT * FROM estimating_rules WHERE rule_id=?",
+                            (data["rule_id"],),
+                        ).fetchone()
                 if current and (not str(current["implementation_ref"] or "").strip() or not str(current["test_ref"] or "").strip()):
-                    now = datetime.now().isoformat()
                     conn.execute(
                         "UPDATE estimating_rules SET implementation_ref=?, test_ref=?, updated_at=? WHERE rule_id=?",
                         (data["implementation_ref"], data["test_ref"], now, data["rule_id"]),
                     )
+                    contract_backfilled += 1
+                if correction_applied or (
+                    current and (not str(current["implementation_ref"] or "").strip() or not str(current["test_ref"] or "").strip())
+                ):
                     row = conn.execute(
                         "SELECT * FROM estimating_rules WHERE rule_id=?",
                         (data["rule_id"],),
@@ -1657,11 +1824,10 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
                     _insert_rule_version(
                         conn,
                         _rule_from_row(row),
-                        "contract_backfill",
+                        "builtin_correction" if correction_applied else "contract_backfill",
                         "System",
-                        "Added implementation and test references required by the rules contract.",
+                        correction.get("change_note") if correction_applied else "Added implementation and test references required by the rules contract.",
                     )
-                    contract_backfilled += 1
                 continue
             if existing and overwrite:
                 next_version = max(int(existing["version"] or 1) + 1, int(data.get("version") or 1))
@@ -1720,15 +1886,33 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
                     "Built-in hard rule seeded.",
                 )
                 inserted += 1
-        if inserted or updated or contract_backfilled:
+        if inserted or updated or contract_backfilled or corrected:
+            if corrected:
+                change_type = "builtin_correction"
+                change_note = "Corrected built-in rule metadata that did not match runtime behavior."
+            elif updated:
+                change_type = "seed_overwrite"
+                change_note = "Built-in hard rules overwritten."
+            elif contract_backfilled:
+                change_type = "contract_backfill"
+                change_note = "Backfilled implementation and test references for built-in rules."
+            else:
+                change_type = "seeded"
+                change_note = "Built-in hard rules seeded."
             _insert_ruleset_version(
                 conn,
-                change_type="seed_overwrite" if updated else ("contract_backfill" if contract_backfilled else "seeded"),
+                change_type=change_type,
                 changed_by="System",
-                change_note=("Built-in hard rules seeded." if inserted else "Built-in hard rules overwritten.") if not contract_backfilled else "Backfilled implementation and test references for built-in rules.",
+                change_note=change_note,
             )
         conn.commit()
-        return {"inserted": inserted, "updated": updated, "contract_backfilled": contract_backfilled, "total": len(DEFAULT_HARD_RULES)}
+        return {
+            "inserted": inserted,
+            "updated": updated,
+            "contract_backfilled": contract_backfilled,
+            "corrected": corrected,
+            "total": len(DEFAULT_HARD_RULES),
+        }
     finally:
         conn.close()
 
@@ -2417,6 +2601,50 @@ def list_golden_replays_for_job(source_job_id: int, limit: int = 20) -> list[dic
         conn.close()
 
 
+def list_golden_replays_for_version(
+    source_job_id: int,
+    golden_version_id: int,
+    limit: int = 20,
+) -> list[dict]:
+    """List recent replay reports for one immutable baseline version."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM golden_job_replays
+            WHERE source_job_id=? AND golden_version_id=?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (source_job_id, golden_version_id, limit),
+        ).fetchall()
+        return [_decode_golden_replay_row(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_latest_golden_replay_for_version(
+    source_job_id: int,
+    golden_version_id: int,
+    mode: str,
+) -> dict | None:
+    """Return the newest replay in a mode for one immutable baseline version."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM golden_job_replays
+            WHERE source_job_id=? AND golden_version_id=? AND mode=?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (source_job_id, golden_version_id, mode),
+        ).fetchone()
+        return _decode_golden_replay_row(row) if row else None
+    finally:
+        conn.close()
+
+
 def get_golden_replay(replay_id: int) -> dict | None:
     """Return one replay report."""
     conn = _get_conn()
@@ -2512,18 +2740,18 @@ def save_vendor_prices_from_quotes(job_id: int, products: list[dict]) -> int:
             total = unit_price + freight_num
 
             conn.execute("""
-                INSERT INTO vendor_prices
+                INSERT OR IGNORE INTO vendor_prices
                     (product_name, unit_price, vendor_name, job_id,
                      product_normalized, unit, freight_per_unit, total_per_unit,
-                     quantity, lead_time, quote_date, file_name, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     quantity, lead_time, quote_date, file_name, notes, source_hash, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 product_name, unit_price, vendor_name, job_id,
                 product_normalized, p.get("unit", ""), freight, total,
                 p.get("quantity"), p.get("lead_time"),
-                now, p.get("file_name"), p.get("notes"), now
+                now, p.get("file_name"), p.get("notes"), p.get("_source_hash"), now
             ))
-            count += 1
+            count += int(conn.execute("SELECT changes()").fetchone()[0] or 0)
         conn.commit()
 
         # Now link vendor_ids (separate pass to avoid nested connections)

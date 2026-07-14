@@ -77,17 +77,17 @@ DEFAULT_HARD_RULES: list[dict] = [
     },
     {
         "rule_id": "quote_parser.cpt_tile_unit_sy",
-        "name": "CPT tile always 3.85/SY",
+        "name": "CPT tile quotes use SY",
         "category": "pricing",
         "stage": "quote_parse",
         "status": "active",
         "priority": 80,
         "condition_json": {"material_type": "cpt_tile"},
-        "action_json": {"set": {"unit": "SY", "unit_price": 3.85}},
+        "action_json": {"set": {"unit": "SY"}},
         "source": "server/quote_parser.py",
-        "description": "Carpet tile quote parsing normalizes CPT units to square yards and preserves the known 3.85/SY convention.",
-        "version": 1,
-        "notes": "Registry captures the estimating standard for audit; current parser prompt enforces the SY unit.",
+        "description": "Carpet tile quote parsing normalizes CPT units to square yards while extracting the quoted price from source evidence.",
+        "version": 2,
+        "notes": "Registry metadata documents the parser contract; it does not supply a carpet-tile price.",
     },
     {
         "rule_id": "labor.tile_dimension_tiers",
@@ -183,3 +183,21 @@ DEFAULT_HARD_RULES: list[dict] = [
         "notes": "Startup seeds company_rates.sundry_rules from config only when missing.",
     },
 ]
+
+
+# Startup applies these corrections only when the stored built-in rule still
+# exactly matches the known legacy seed. Estimator-authored changes are left
+# untouched.
+BUILTIN_RULE_CORRECTIONS: dict[str, dict] = {
+    "quote_parser.cpt_tile_unit_sy": {
+        "from_version": 1,
+        "expected": {
+            "name": "CPT tile always 3.85/SY",
+            "action_json": {"set": {"unit": "SY", "unit_price": 3.85}},
+            "description": "Carpet tile quote parsing normalizes CPT units to square yards and preserves the known 3.85/SY convention.",
+            "notes": "Registry captures the estimating standard for audit; current parser prompt enforces the SY unit.",
+        },
+        "fields": ("name", "action_json", "description", "notes"),
+        "change_note": "Removed the unsupported hard-coded 3.85/SY claim; quote prices come from source evidence.",
+    },
+}

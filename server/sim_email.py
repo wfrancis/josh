@@ -151,6 +151,8 @@ class SimFolderWatcher(threading.Thread):
         self._inbox_dir = inbox_dir or BIDTOOL_INBOX
         self._running = False
         self._lock = threading.Lock()
+        self._retry_after = {}
+        self._retry_delay = max(60, poll_interval)
 
     def start(self):
         with self._lock:
@@ -200,11 +202,17 @@ class SimFolderWatcher(threading.Thread):
         print(f"[SimFolderWatcher] Found {len(eml_files)} new .eml file(s)")
 
         for eml_path in eml_files:
+            if time.monotonic() < self._retry_after.get(eml_path, 0):
+                continue
             try:
-                self._process_eml(eml_path)
-                processed.append(eml_path.name)
+                if self._process_eml(eml_path):
+                    processed.append(eml_path.name)
+                    self._retry_after.pop(eml_path, None)
+                else:
+                    self._retry_after[eml_path] = time.monotonic() + self._retry_delay
             except Exception as e:
                 print(f"[SimFolderWatcher] Error processing {eml_path.name}: {e}")
+                self._retry_after[eml_path] = time.monotonic() + self._retry_delay
 
         return processed
 
@@ -220,20 +228,25 @@ class SimFolderWatcher(threading.Thread):
 
         print(f"[SimFolderWatcher] Processing: '{subject}' from {from_addr} (job_id={job_id_header})")
 
-        # Move to processed/
-        dest = self._inbox_dir / "processed" / eml_path.name
-        shutil.move(str(eml_path), str(dest))
-
         # Extract vendor email from From header
         import re
         email_match = re.search(r"[\w.+-]+@[\w.-]+\.\w+", from_addr)
         vendor_email = email_match.group(0) if email_match else from_addr
 
         # Call the callback with the same signature as InboxMonitor
-        self._callback(
+        imported = self._callback(
             job_reference=job_id_header or subject,
-            temp_files=[str(dest)],
+            temp_files=[str(eml_path)],
             vendor_email=vendor_email,
             filenames=[eml_path.name],
             subject=subject,
         )
+        if not imported:
+            print(f"[SimFolderWatcher] Import deferred; leaving for retry: {eml_path.name}")
+            return False
+
+        dest = self._inbox_dir / "processed" / eml_path.name
+        if dest.exists():
+            dest = dest.with_name(f"{dest.stem}_{int(time.time())}{dest.suffix}")
+        shutil.move(str(eml_path), str(dest))
+        return True

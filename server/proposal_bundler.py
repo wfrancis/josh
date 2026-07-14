@@ -195,8 +195,9 @@ def _safe_float(val, default: float = 0.0) -> float:
         return default
 
 
-def _config_freight_rate(material_type: str) -> float:
+def _config_freight_rate(material_type: str, freight_rates: dict | None = None) -> float:
     """Look up freight rate from config FREIGHT_RATES by material type."""
+    freight_rates = freight_rates if isinstance(freight_rates, dict) else FREIGHT_RATES
     _freight_map = {
         "cpt_tile": "cpt_tile",
         "corridor_broadloom": "broadloom",
@@ -206,7 +207,7 @@ def _config_freight_rate(material_type: str) -> float:
     }
     key = _freight_map.get(material_type)
     if key:
-        return FREIGHT_RATES.get(key, 0)
+        return freight_rates.get(key, 0)
     return 0
 
 
@@ -350,6 +351,7 @@ def _sum_material_costs(
     sundries_by_mat: dict,
     labor_by_mat: dict,
     trace=None,
+    freight_rates: dict | None = None,
 ) -> dict:
     """Sum up costs across a group of materials.
 
@@ -387,13 +389,17 @@ def _sum_material_costs(
         freight_source = mat.get("freight_source") or "freight_rates"
         if freight_per_unit <= 0:
             # Fall back to config freight rates by material type
-            freight_per_unit = _config_freight_rate(mat.get("material_type", ""))
+            freight_per_unit = _config_freight_rate(mat.get("material_type", ""), freight_rates)
             freight_source = "freight_rates"
         order_qty = _safe_float(mat.get("order_qty", mat.get("installed_qty", 0)))
         freight_line_cost = 0
         if freight_per_unit > 0:
             freight_line_cost = round(freight_per_unit * order_qty, 2)
             freight_cost += freight_line_cost
+        # Keep the calculated line contribution on the proposal copy. This lets
+        # accepted freight edits apply a delta without dropping sundry freight or
+        # freight from untouched materials.
+        mat["freight_cost"] = freight_line_cost
 
         if trace:
             entity_key = mat.get("item_code") or str(mat_id)
@@ -476,9 +482,16 @@ def _make_bundle(
     template_key: str = "",
     extra_desc_lines: list[str] = None,
     trace=None,
+    freight_rates: dict | None = None,
 ) -> dict:
     """Create a single bundle dict from a group of materials."""
-    costs = _sum_material_costs(materials, sundries_by_mat, labor_by_mat, trace=trace)
+    costs = _sum_material_costs(
+        materials,
+        sundries_by_mat,
+        labor_by_mat,
+        trace=trace,
+        freight_rates=freight_rates,
+    )
 
     description_text = _build_description(
         template_key=template_key,
@@ -764,6 +777,7 @@ def auto_bundle_materials(
     sundries: list[dict] = None,
     labor_items: list[dict] = None,
     trace=None,
+    freight_rates_override: dict | None = None,
 ) -> list[dict]:
     """Group materials into proposal bundles.
 
@@ -934,6 +948,7 @@ def auto_bundle_materials(
             labor_by_mat=labor_by_mat,
             template_key=template_key,
             trace=trace,
+            freight_rates=freight_rates_override,
         )
         bundles.append(bundle)
 
@@ -1168,7 +1183,12 @@ def _generate_derived_bundles(job: dict, materials: list[dict], trace=None) -> l
 
 # ─── Proposal Generator ─────────────────────────────────────────────────────
 
-def generate_proposal_data(job_id: int, job: dict, trace=None) -> dict:
+def generate_proposal_data(
+    job_id: int,
+    job: dict,
+    trace=None,
+    freight_rates_override: dict | None = None,
+) -> dict:
     """Generate full proposal data with bundles, totals, T&C, exclusions.
 
     Args:
@@ -1199,6 +1219,7 @@ def generate_proposal_data(job_id: int, job: dict, trace=None) -> dict:
         sundries=sundries,
         labor_items=labor_items,
         trace=trace,
+        freight_rates_override=freight_rates_override,
     )
 
     # ── Inject Schluter Jolly @ tub/shower surrounds into Unit Transitions ─
@@ -1372,12 +1393,19 @@ def generate_proposal_data(job_id: int, job: dict, trace=None) -> dict:
     deleted_bundle_names = set(existing_pd.get("deleted_bundles") or [])
     deleted_material_codes = set(existing_pd.get("deleted_material_codes") or [])
     if deleted_bundle_names or deleted_material_codes:
+        def material_codes(bundle: dict) -> set[str]:
+            return {
+                str(material.get("item_code") or material.get("id") or material.get("material_id"))
+                for material in (bundle.get("materials") or [])
+                if material.get("item_code") or material.get("id") or material.get("material_id")
+            }
+
         bundles = [
             b for b in bundles
             if b.get("bundle_name") not in deleted_bundle_names
             and not (
-                {m.get("item_code") for m in (b.get("materials") or []) if m.get("item_code")}
-                and {m.get("item_code") for m in (b.get("materials") or []) if m.get("item_code")}.issubset(deleted_material_codes)
+                material_codes(b)
+                and material_codes(b).issubset({str(code) for code in deleted_material_codes})
             )
         ]
 

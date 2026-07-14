@@ -17,7 +17,7 @@ import VendorQuoteFlow from './VendorQuoteFlow'
 import QuoteTracker from './QuoteTracker'
 import ReproducibilityPanel from './ReproducibilityPanel'
 import ReadinessSummary from './ReadinessSummary'
-import StatusBadge, { getJobStatus } from './StatusBadge'
+import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
 import ActivityLog from './ActivityLog'
 
@@ -48,15 +48,34 @@ export default function JobDetail() {
   const [editSaving, setEditSaving] = useState(false)
   const [quoteRequests, setQuoteRequests] = useState([])
   const [readiness, setReadiness] = useState(null)
+  const materialsStateRef = useRef([])
+  const materialsFingerprintRef = useRef('')
+  const materialEditVersionRef = useRef(0)
+  const materialSavePromiseRef = useRef(null)
+  const pendingMaterialDeletionReasonsRef = useRef({})
+
+  const refreshReadiness = useCallback(async (id = jobId) => {
+    try {
+      const result = await api.getJobReadiness(id)
+      setReadiness(result)
+      setJob(current => current ? { ...current, readiness: result } : current)
+      return result
+    } catch {
+      setReadiness(null)
+      return null
+    }
+  }, [jobId])
 
   const loadJob = async () => {
     try {
       const data = await api.getJob(jobId)
+      materialsStateRef.current = data.materials || []
+      materialsFingerprintRef.current = data.materials_source_fingerprint || ''
+      materialEditVersionRef.current = 0
+      pendingMaterialDeletionReasonsRef.current = {}
       setJob(data)
-      api.getJobReadiness(data.id).then(result => {
-        setReadiness(result)
-        setJob(current => current ? { ...current, readiness: result } : current)
-      }).catch(() => setReadiness(null))
+      setIsDirty(false)
+      refreshReadiness(data.id)
       setNotes(data.notes || '')
       setNotesOpen(!!data.notes)
       if (data.materials?.length > 0) setRfmsSuccess(true)
@@ -121,6 +140,7 @@ export default function JobDetail() {
       await api.updateJob(jobId, updates)
       const updated = await api.getJob(jobId)
       setJob(updated)
+      await refreshReadiness(updated.id)
       setEditing(false)
     } catch (err) {
       setError(err.message)
@@ -146,7 +166,13 @@ export default function JobDetail() {
     try {
       await api.uploadRFMS(jobId, fileList)
       const updated = await api.getJob(jobId)
+      materialsStateRef.current = updated.materials || []
+      materialsFingerprintRef.current = updated.materials_source_fingerprint || ''
+      materialEditVersionRef.current = 0
+      pendingMaterialDeletionReasonsRef.current = {}
       setJob(updated)
+      setIsDirty(false)
+      await refreshReadiness(updated.id)
       setRfmsSuccess(true)
       setStagedFiles([])
       // Stay on takeoff step — user reviews materials here
@@ -186,44 +212,92 @@ export default function JobDetail() {
     setStagedFiles(prev => prev.filter((_, i) => i !== idx))
   }
 
-  const handleMaterialsUpdate = (materials) => {
+  const handleMaterialsUpdate = (materials, metadata = {}) => {
+    const deletedMaterial = metadata.deletedMaterial
+    if (deletedMaterial?.key && deletedMaterial?.reason) {
+      pendingMaterialDeletionReasonsRef.current = {
+        ...pendingMaterialDeletionReasonsRef.current,
+        [String(deletedMaterial.key)]: deletedMaterial.reason,
+      }
+    }
+    materialsStateRef.current = materials
+    materialEditVersionRef.current += 1
     setJob(j => ({ ...j, materials }))
     setIsDirty(true)
   }
 
-  // Auto-save: debounce 1.5s after any material edit
+  // Serialize material saves and keep looping when an edit lands mid-request.
   const autoSaveRef = useRef(null)
-  useEffect(() => {
-    if (!isDirty || !job?.materials?.length) return
-    clearTimeout(autoSaveRef.current)
-    autoSaveRef.current = setTimeout(async () => {
-      try {
+  const saveMaterialsNow = useCallback(async ({ surfaceError = false } = {}) => {
+    let task = materialSavePromiseRef.current
+    const ownsTask = !task
+    if (!task) {
+      task = (async () => {
         setSaving(true)
-        const result = await api.updateMaterials(jobId, job.materials)
-        setJob(j => ({ ...j, materials: result.materials }))
-        setIsDirty(false)
-      } catch (err) {
-        console.error('Auto-save failed:', err)
-      } finally {
+        while (true) {
+          const saveVersion = materialEditVersionRef.current
+          const snapshot = materialsStateRef.current.map(material => ({ ...material }))
+          const deletionReasons = { ...pendingMaterialDeletionReasonsRef.current }
+          const result = await api.updateMaterials(
+            jobId,
+            snapshot,
+            materialsFingerprintRef.current || null,
+            deletionReasons,
+          )
+          materialsFingerprintRef.current = result.materials_source_fingerprint || ''
+          if (materialEditVersionRef.current !== saveVersion) continue
+
+          const persisted = result.materials || []
+          for (const [key, reason] of Object.entries(deletionReasons)) {
+            if (pendingMaterialDeletionReasonsRef.current[key] === reason) {
+              delete pendingMaterialDeletionReasonsRef.current[key]
+            }
+          }
+          materialsStateRef.current = persisted
+          setJob(current => current ? {
+            ...current,
+            materials: persisted,
+            materials_source_fingerprint: materialsFingerprintRef.current,
+          } : current)
+          setIsDirty(false)
+          return true
+        }
+      })()
+      materialSavePromiseRef.current = task
+    }
+
+    try {
+      const saved = await task
+      if (ownsTask && materialSavePromiseRef.current === task) {
+        materialSavePromiseRef.current = null
         setSaving(false)
       }
-    }, 1500)
+      if (ownsTask) await refreshReadiness(jobId)
+      return saved
+    } catch (err) {
+      console.error('Material save failed:', err)
+      if (surfaceError) setError(err.message || 'Material pricing could not be saved.')
+      return false
+    } finally {
+      if (ownsTask && materialSavePromiseRef.current === task) {
+        materialSavePromiseRef.current = null
+        setSaving(false)
+      }
+    }
+  }, [jobId, refreshReadiness])
+
+  // Auto-save: debounce 1.5s after any material edit.
+  useEffect(() => {
+    if (!isDirty) return
+    clearTimeout(autoSaveRef.current)
+    autoSaveRef.current = setTimeout(() => { saveMaterialsNow() }, 1500)
     return () => clearTimeout(autoSaveRef.current)
-  }, [isDirty, job?.materials])
+  }, [isDirty, job?.materials, saveMaterialsNow])
 
   const handleSavePricing = async () => {
     clearTimeout(autoSaveRef.current)
-    setSaving(true)
     setError(null)
-    try {
-      const result = await api.updateMaterials(jobId, job.materials)
-      setJob(j => ({ ...j, materials: result.materials }))
-      setIsDirty(false)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setSaving(false)
-    }
+    return saveMaterialsNow({ surfaceError: true })
   }
 
   const getCompletedSteps = () => {
@@ -261,7 +335,7 @@ export default function JobDetail() {
           {editing ? (
             /* ── Edit Mode ── */
             <div className="space-y-4">
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <input
                   type="text"
                   value={editForm.project_name}
@@ -271,6 +345,7 @@ export default function JobDetail() {
                   autoFocus
                 />
                 <StatusBadge status={getJobStatus(job)} />
+                {getJobConfidenceStatus(job) && <StatusBadge status={getJobConfidenceStatus(job)} />}
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                 <label className="block">
@@ -365,9 +440,10 @@ export default function JobDetail() {
           ) : (
             /* ── Display Mode ── */
             <>
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <h1 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight">{job.project_name}</h1>
                 <StatusBadge status={getJobStatus(job)} />
+                {getJobConfidenceStatus(job) && <StatusBadge status={getJobConfidenceStatus(job)} />}
               </div>
               <div className="flex flex-wrap items-center gap-4 mt-2 text-sm text-gray-500">
                 {job.gc_name && (
@@ -481,9 +557,9 @@ export default function JobDetail() {
         )}
       </div>
 
-      <ReadinessSummary readiness={readiness} onRefresh={() => api.getJobReadiness(job.id).then(result => { setReadiness(result); setJob(current => ({ ...current, readiness: result })) }).catch(err => setError(err.message))} />
+      <ReadinessSummary readiness={readiness} onRefresh={() => refreshReadiness(job.id)} />
 
-      <ReproducibilityPanel jobId={jobId} />
+      <ReproducibilityPanel jobId={jobId} onConfidenceChange={refreshReadiness} />
 
       {/* Stepper */}
       <div className="glass-card px-3 sm:px-6 py-3 sm:py-4 mb-6 sm:mb-8">
@@ -500,7 +576,9 @@ export default function JobDetail() {
         <div className="flex items-center gap-2 px-4 py-3 mb-6 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-400">
           <AlertTriangle className="w-4 h-4 flex-shrink-0" />
           {error}
-          <button onClick={() => setError(null)} className="ml-auto text-red-500/60 hover:text-red-400">dismiss</button>
+          <button onClick={() => setError(null)} className="ml-auto p-1 text-red-500/60 hover:text-red-400" title="Dismiss error">
+            <X className="h-4 w-4" />
+          </button>
         </div>
       )}
 
@@ -617,6 +695,7 @@ export default function JobDetail() {
                       await api.updateMaterials(jobId, [])
                       const updated = await api.getJob(jobId)
                       setJob(updated)
+                      await refreshReadiness(updated.id)
                       setRfmsSuccess(false)
                       setStagedFiles([])
                     }
@@ -681,6 +760,7 @@ export default function JobDetail() {
                         jobId={job.id}
                         api={api}
                         existingQuotes={job.quotes || []}
+                        beforeMutation={() => isDirty ? saveMaterialsNow({ surfaceError: true }) : true}
                         onQuotesParsed={() => loadJob()}
                         onQuotesCleared={() => loadJob()}
                       />
@@ -731,7 +811,8 @@ export default function JobDetail() {
                     }}
                     onAiEstimate={async (materialIdx) => {
                       try {
-                        const result = await api.estimatePrice(job.id, materialIdx)
+                        if (isDirty && !(await saveMaterialsNow({ surfaceError: true }))) return
+                        await api.estimatePrice(job.id, materialIdx)
                         await loadJob()
                       } catch (err) {
                         console.error('AI estimate failed:', err)
@@ -754,7 +835,10 @@ export default function JobDetail() {
                     </p>
                   )}
                   <button
-                    onClick={async () => { if (isDirty) await handleSavePricing(); setStep('bid') }}
+                    onClick={async () => {
+                      if (isDirty && !(await handleSavePricing())) return
+                      setStep('bid')
+                    }}
                     className="btn-primary"
                     disabled={unpricedCount > 0}
                   >
@@ -768,7 +852,7 @@ export default function JobDetail() {
 
         {step === 'bid' && (
           <div className="glass-card p-4 sm:p-8">
-            <ProposalEditor job={job} api={api} onGoBack={() => setStep('takeoff')} />
+            <ProposalEditor job={job} api={api} onGoBack={() => setStep('takeoff')} onConfidenceChange={refreshReadiness} />
           </div>
         )}
       </div>

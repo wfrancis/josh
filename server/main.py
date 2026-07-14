@@ -6,17 +6,20 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import shutil
 import sqlite3
 import tempfile
+from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from models import (
     init_db, save_job, load_job, list_jobs, delete_job,
@@ -44,26 +47,28 @@ from models import (
     list_ruleset_versions, get_ruleset_version, rollback_ruleset_version,
     get_active_rules, seed_rules_registry_defaults,
     create_calculation_run, save_calculation_traces, complete_calculation_run,
-    list_calculation_runs, get_calculation_traces,
+    list_calculation_runs, get_latest_completed_calculation_run, get_calculation_traces,
     upsert_golden_job, get_golden_job_for_source, get_golden_replay,
-    save_golden_replay, list_golden_replays_for_job,
+    save_golden_replay, list_golden_replays_for_job, list_golden_replays_for_version,
+    get_latest_golden_replay_for_version,
 )
 from rfms_parser import parse_rfms, ai_merge_materials
-from quote_parser import parse_quote_file, set_openai_config
+from quote_parser import MAX_QUOTE_FILE_BYTES, parse_quote_file, set_openai_config
 from dropbox_scanner import match_folder
 from sundry_calc import calculate_sundries_for_materials
 from labor_calc import calculate_labor_for_materials, load_labor_catalog, load_labor_catalog_from_pdf, get_labor_catalog
 from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf, generate_proposal_pdf
 from proposal_bundler import generate_proposal_data
-from reproducibility import DEFAULT_TOLERANCE, make_golden_snapshot, replay_golden_job
+from proposal_totals import effective_bundle_total, normalize_proposal_totals
+from reproducibility import DEFAULT_TOLERANCE, apply_accepted_numeric_edits, make_golden_snapshot, replay_golden_job
 from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE, STAIR_SUNDRY_KITS
 from email_agent import compose_quote_request, send_email, generate_quote_request_text
 from ai_client import chat_complete, get_provider_info
 from inbox_monitor import InboxMonitor
 from audit_engine import AuditTraceBuilder
 from build_info import build_manifest_for_snapshot, get_build_info
-from readiness import evaluate_job_readiness
+from readiness import evaluate_job_readiness, is_valid_material_classification, proposal_math_errors
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="SI Bid Tool", version="1.0.0")
@@ -176,6 +181,7 @@ def _match_price_list(material: dict, price_list: list[dict]) -> dict | None:
 
 _artifact_default = "/data/artifacts" if os.path.isdir("/data") else os.path.join(os.path.dirname(__file__), "artifacts")
 ARTIFACT_ROOT = os.environ.get("ARTIFACT_ROOT", _artifact_default)
+MAX_RFMS_FILE_BYTES = 50 * 1024 * 1024
 UPLOAD_DIR = os.path.join(ARTIFACT_ROOT, "shared", "uploads")
 PDF_DIR = os.path.join(ARTIFACT_ROOT, "shared", "pdfs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -203,7 +209,13 @@ def _job_pdf_path(job_id: int, kind: str) -> str:
     return os.path.join(_job_artifact_dir(job_id, "pdfs"), f"{kind}_{job_id}.pdf")
 
 
-def _file_hash(path: str) -> str | None:
+@lru_cache(maxsize=512)
+def _file_hash_for_stat(
+    path: str,
+    size: int,
+    modified_ns: int,
+    changed_ns: int,
+) -> str | None:
     try:
         digest = hashlib.sha256()
         with open(path, "rb") as handle:
@@ -212,6 +224,19 @@ def _file_hash(path: str) -> str | None:
         return digest.hexdigest()
     except OSError:
         return None
+
+
+def _file_hash(path: str) -> str | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return _file_hash_for_stat(
+        os.path.realpath(path),
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
 
 
 def _record_artifact(job_id: int, path: str, artifact_kind: str) -> None:
@@ -230,6 +255,59 @@ def _record_artifact(job_id: int, path: str, artifact_kind: str) -> None:
         digest,
         size,
     )
+
+
+def _require_artifact_receipt(job_id: int, path: str, artifact_kind: str) -> None:
+    """Reject a download when its durable receipt is missing or no longer matches."""
+    expected_path = os.path.relpath(path, ARTIFACT_ROOT)
+    receipt = next(
+        (
+            item for item in list_job_artifacts(job_id)
+            if item.get("artifact_kind") == artifact_kind
+            and item.get("artifact_path") == expected_path
+        ),
+        None,
+    )
+    if not receipt:
+        raise HTTPException(
+            status_code=409,
+            detail="This PDF has no durable storage receipt. Generate it again before downloading.",
+        )
+    if _file_hash(path) != receipt.get("file_hash"):
+        raise HTTPException(
+            status_code=409,
+            detail="This PDF no longer matches its recorded hash. Generate it again before downloading.",
+        )
+
+
+def _persist_automated_quote_evidence(
+    job_id: int,
+    temp_files: list[str],
+    filenames: list[str],
+    parsed_indexes: set[int],
+    source: str,
+) -> None:
+    """Copy temporary inbox artifacts to durable job storage before cleanup."""
+    for index, temp_path in enumerate(temp_files):
+        digest = _file_hash(temp_path)
+        if not digest:
+            continue
+        original_name = filenames[index] if index < len(filenames) else os.path.basename(temp_path)
+        durable_name = f"{digest[:12]}_{original_name or 'vendor_quote'}"
+        durable_path = _job_upload_path(job_id, durable_name, "quote")
+        if not os.path.exists(durable_path):
+            shutil.copy2(temp_path, durable_path)
+        _record_artifact(job_id, durable_path, "vendor_quote")
+        if index in parsed_indexes and not is_file_imported(job_id, digest):
+            record_imported_file(
+                job_id,
+                original_name or "vendor_quote",
+                digest,
+                os.path.getsize(durable_path),
+                source=source,
+                artifact_path=os.path.relpath(durable_path, ARTIFACT_ROOT),
+                artifact_kind="vendor_quote",
+            )
 
 
 def _job_artifact_manifest(job_id: int) -> list[dict]:
@@ -263,6 +341,217 @@ def _job_artifact_manifest(job_id: int) -> list[dict]:
     return manifest
 
 
+def _artifact_readiness(
+    job_id: int,
+    proposal_pdf_path: str,
+    materials: list[dict] | None = None,
+) -> tuple[str, str, list[str]]:
+    """Verify durable source and PDF receipts without changing the job."""
+    failures = []
+    warnings = []
+    artifact_root = os.path.realpath(ARTIFACT_ROOT)
+
+    def checked_path(relative_path: str) -> str | None:
+        if not relative_path:
+            return None
+        candidate = os.path.realpath(os.path.join(artifact_root, relative_path))
+        try:
+            if os.path.commonpath([artifact_root, candidate]) != artifact_root:
+                return None
+        except ValueError:
+            return None
+        return candidate
+
+    def add_failure(message: str) -> None:
+        if message not in failures:
+            failures.append(message)
+
+    imported_files = list_imported_files(job_id)
+    for imported in imported_files:
+        label = imported.get("file_name") or "source file"
+        relative_path = imported.get("artifact_path") or ""
+        if not relative_path:
+            warnings.append(f"{label} is a legacy import without a durable path")
+            continue
+        path = checked_path(relative_path)
+        if not path or not os.path.isfile(path):
+            add_failure(f"{label} is missing from durable storage")
+            continue
+        expected_hash = imported.get("file_hash")
+        if expected_hash and _file_hash(path) != expected_hash:
+            add_failure(f"{label} no longer matches its recorded hash")
+
+    artifact_receipts = list_job_artifacts(job_id)
+    for receipt in artifact_receipts:
+        relative_path = receipt.get("artifact_path") or ""
+        label = receipt.get("artifact_kind") or relative_path or "artifact"
+        path = checked_path(relative_path)
+        if not path or not os.path.isfile(path):
+            add_failure(f"Recorded {label} artifact is missing from durable storage")
+            continue
+        expected_hash = receipt.get("file_hash")
+        if expected_hash and _file_hash(path) != expected_hash:
+            add_failure(f"Recorded {label} artifact no longer matches its hash")
+
+    has_rfms_evidence = any(
+        item.get("artifact_kind") == "rfms"
+        for item in (*imported_files, *artifact_receipts)
+    )
+    if materials and not has_rfms_evidence:
+        warnings.append("No durable RFMS source workbook is recorded for this structured job")
+
+    vendor_priced = [
+        material.get("item_code") or material.get("description") or "material"
+        for material in (materials or [])
+        if isinstance(material, dict)
+        and str(material.get("price_source") or "").strip().lower() == "vendor_quote"
+    ]
+    has_vendor_evidence = any(
+        item.get("artifact_kind") == "vendor_quote"
+        for item in (*imported_files, *artifact_receipts)
+    )
+    if vendor_priced and not has_vendor_evidence:
+        add_failure(
+            f"{len(vendor_priced)} material(s) use vendor-quote pricing without a durable quote file"
+        )
+
+    expected_pdf_rel = os.path.relpath(proposal_pdf_path, ARTIFACT_ROOT)
+    pdf_receipt = next(
+        (
+            item for item in artifact_receipts
+            if item.get("artifact_kind") == "proposal_pdf"
+            and item.get("artifact_path") == expected_pdf_rel
+        ),
+        None,
+    )
+    if not os.path.isfile(proposal_pdf_path):
+        add_failure("The proposal PDF is missing from durable storage")
+    elif not pdf_receipt:
+        add_failure("The proposal PDF does not have a durable artifact receipt")
+    elif _file_hash(proposal_pdf_path) != pdf_receipt.get("file_hash"):
+        add_failure("The proposal PDF no longer matches its recorded hash")
+
+    if failures:
+        return "fail", "Durable artifact verification failed.", failures
+    if warnings:
+        return "warn", "Current artifacts are intact, but some historical imports predate durable storage.", warnings
+    return "pass", "Recorded source files, vendor evidence, and the proposal PDF pass their hash checks.", []
+
+
+def _find_incoming_quote_job(job_reference, subject: str) -> int | None:
+    reference = str(job_reference or "").strip()
+    if reference:
+        direct = load_job(reference)
+        if direct:
+            return direct["id"]
+    search_term = reference or str(subject or "")[:80]
+    if not search_term:
+        return None
+    results = search_all(search_term)
+    jobs = results.get("jobs") or []
+    normalized = "".join(character.lower() for character in search_term if character.isalnum())
+    exact = [
+        item for item in jobs
+        if normalized and normalized in {
+            "".join(character.lower() for character in str(item.get("project_name") or "") if character.isalnum()),
+            "".join(character.lower() for character in str(item.get("slug") or "") if character.isalnum()),
+        }
+    ]
+    if len(exact) == 1:
+        return exact[0]["id"]
+    if len(jobs) == 1 and len(normalized) >= 6:
+        return jobs[0]["id"]
+    if jobs:
+        print(f"[InboxMonitor] Ambiguous job match for '{search_term}'; leaving the email unread")
+    return None
+
+
+def _ingest_automated_quote(
+    *,
+    job_reference=None,
+    temp_files=None,
+    vendor_email=None,
+    filenames=None,
+    subject="",
+    source: str,
+    simulated: bool = False,
+) -> bool:
+    """Persist, parse, and import one automated vendor response idempotently."""
+    temp_files = temp_files or []
+    filenames = filenames or []
+    job_id = _find_incoming_quote_job(job_reference, subject)
+    log_prefix = "SimWatcher" if simulated else "InboxMonitor"
+    if not job_id:
+        print(f"[{log_prefix}] No matching job for: {job_reference or subject}")
+        return False
+
+    # Preserve the original evidence before any AI call. A failed parse stays
+    # unread/retryable, while the estimator still has the source artifact.
+    _persist_automated_quote_evidence(
+        job_id,
+        temp_files,
+        filenames,
+        set(),
+        source=source,
+    )
+
+    all_products = []
+    parsed_indexes = set()
+    already_imported = set()
+    for index, file_path in enumerate(temp_files):
+        digest = _file_hash(file_path)
+        if digest and is_file_imported(job_id, digest):
+            already_imported.add(index)
+            continue
+        try:
+            products = parse_quote_file(file_path)
+            if products:
+                filename = filenames[index] if index < len(filenames) else os.path.basename(file_path)
+                for product in products:
+                    product["file_name"] = filename
+                    product["_source_hash"] = digest
+                all_products.extend(products)
+                parsed_indexes.add(index)
+        except Exception as exc:
+            print(f"[{log_prefix}] Error parsing {file_path}: {exc}")
+
+    if not all_products:
+        if temp_files and len(already_imported) == len(temp_files):
+            return True
+        print(f"[{log_prefix}] No products extracted from: {str(subject)[:60]}")
+        return False
+
+    save_quotes(job_id, all_products)
+    matched = _auto_match_quotes(job_id, all_products)
+    save_vendor_prices_from_quotes(job_id, all_products)
+    _link_upload_to_requests(job_id, all_products)
+    _persist_automated_quote_evidence(
+        job_id,
+        temp_files,
+        filenames,
+        parsed_indexes,
+        source=source,
+    )
+
+    vendor_name = all_products[0].get("vendor", vendor_email or "Unknown")
+    file_names_str = ", ".join(filenames[:3]) if filenames else "email"
+    sim_prefix = "[SIM] " if simulated else ""
+    create_notification(
+        job_id,
+        "quote_received",
+        f"{sim_prefix}Quote received from {vendor_name} - {len(all_products)} products parsed, "
+        f"{matched} auto-matched ({file_names_str})",
+    )
+    log_activity(
+        job_id,
+        "agent_quote_imported",
+        f"{sim_prefix}Auto-imported quote from {vendor_name} via {'test mode' if simulated else 'email monitor'}",
+        {"vendor": vendor_name, "products": len(all_products), "matched": matched, "sim": simulated},
+    )
+    print(f"[{log_prefix}] Imported {len(all_products)} products for job #{job_id} from {vendor_name}")
+    return True
+
+
 _inbox_monitor: InboxMonitor | None = None
 _sim_watcher = None  # SimFolderWatcher instance (lazy import to avoid circular)
 
@@ -286,55 +575,15 @@ def _start_sim_watcher():
     def on_sim_quote_received(*, job_reference=None, temp_files=None, vendor_email=None,
                               filenames=None, subject=""):
         """Callback for sim watcher — same pipeline as InboxMonitor."""
-        temp_files = temp_files or []
-        filenames = filenames or []
-        all_products = []
-
-        for fpath in temp_files:
-            try:
-                products = parse_quote_file(fpath)
-                if products:
-                    all_products.extend(products)
-            except Exception as e:
-                print(f"[SimWatcher] Error parsing {fpath}: {e}")
-
-        if not all_products:
-            print(f"[SimWatcher] No products extracted from: {subject[:60]}")
-            return
-
-        # Try X-SI-Job-Id header first (numeric), then fuzzy search
-        job_id = None
-        if job_reference and job_reference.isdigit():
-            job = load_job(int(job_reference))
-            if job:
-                job_id = job["id"]
-
-        if not job_id:
-            search_term = job_reference or subject[:80]
-            results = search_all(search_term)
-            if results.get("jobs"):
-                job_id = results["jobs"][0]["id"]
-
-        if not job_id:
-            print(f"[SimWatcher] No matching job for: {job_reference or subject}")
-            return
-
-        save_quotes(job_id, all_products)
-        matched = _auto_match_quotes(job_id, all_products)
-        save_vendor_prices_from_quotes(job_id, all_products)
-        _link_upload_to_requests(job_id, all_products)
-
-        vendor_name = all_products[0].get("vendor", vendor_email or "Unknown")
-        file_names_str = ", ".join(filenames[:3]) if filenames else "email"
-        create_notification(
-            job_id, "quote_received",
-            f"[SIM] Quote received from {vendor_name} — {len(all_products)} products parsed, "
-            f"{matched} auto-matched ({file_names_str})"
+        return _ingest_automated_quote(
+            job_reference=job_reference,
+            temp_files=temp_files,
+            vendor_email=vendor_email,
+            filenames=filenames,
+            subject=subject,
+            source="simulator",
+            simulated=True,
         )
-        log_activity(job_id, "agent_quote_imported",
-                     f"[SIM] Auto-imported quote from {vendor_name} via test mode",
-                     {"vendor": vendor_name, "products": len(all_products), "matched": matched, "sim": True})
-        print(f"[SimWatcher] Imported {len(all_products)} products for job #{job_id} from {vendor_name}")
 
     _sim_watcher = SimFolderWatcher(on_quote_received=on_sim_quote_received)
     _sim_watcher.start()
@@ -349,71 +598,42 @@ def _start_inbox_monitor():
     if str(settings.get("vendor_quote_test_mode", "false")).lower() == "true":
         if _inbox_monitor and _inbox_monitor.is_running:
             _inbox_monitor.stop()
+        _inbox_monitor = None
         return
     if settings.get("email_automation_enabled") != "true":
+        if _inbox_monitor and _inbox_monitor.is_running:
+            _inbox_monitor.stop()
+        _inbox_monitor = None
         return
     try:
         config = _json.loads(settings.get("email_config", "{}"))
     except Exception:
+        if _inbox_monitor and _inbox_monitor.is_running:
+            _inbox_monitor.stop()
+        _inbox_monitor = None
         return
     imap_host = config.get("imap_host")
     imap_port = int(config.get("imap_port", 993))
     email_addr = config.get("email_address")
     email_pass = config.get("email_password")
     if not all([imap_host, email_addr, email_pass]):
+        if _inbox_monitor and _inbox_monitor.is_running:
+            _inbox_monitor.stop()
+        _inbox_monitor = None
         return
 
     def on_quote_received(*, job_reference=None, temp_files=None, vendor_email=None,
                           filenames=None, subject=""):
         """Callback when inbox monitor detects a vendor response.
         Signature matches InboxMonitor._process_email kwargs."""
-        temp_files = temp_files or []
-        filenames = filenames or []
-        all_products = []
-
-        for fpath in temp_files:
-            try:
-                products = parse_quote_file(fpath)
-                if products:
-                    all_products.extend(products)
-            except Exception as e:
-                print(f"[InboxMonitor] Error parsing {fpath}: {e}")
-
-        if not all_products:
-            print(f"[InboxMonitor] No products extracted from: {subject[:60]}")
-            return
-
-        # Find the matching job — use job_reference first, fall back to subject search
-        job_id = None
-        search_term = job_reference or subject[:80]
-        results = search_all(search_term)
-        if results.get("jobs"):
-            job_id = results["jobs"][0]["id"]
-
-        if not job_id:
-            print(f"[InboxMonitor] No matching job for: {search_term}")
-            return
-
-        # Save quotes and auto-match
-        save_quotes(job_id, all_products)
-        matched = _auto_match_quotes(job_id, all_products)
-        save_vendor_prices_from_quotes(job_id, all_products)
-
-        # Auto-link to open quote requests
-        _link_upload_to_requests(job_id, all_products)
-
-        vendor_name = all_products[0].get("vendor", vendor_email or "Unknown")
-        file_names_str = ", ".join(filenames[:3]) if filenames else "email"
-        create_notification(
-            job_id, "quote_received",
-            f"Quote received from {vendor_name} — {len(all_products)} products parsed, "
-            f"{matched} auto-matched ({file_names_str})"
+        return _ingest_automated_quote(
+            job_reference=job_reference,
+            temp_files=temp_files,
+            vendor_email=vendor_email,
+            filenames=filenames,
+            subject=subject,
+            source="email_monitor",
         )
-        job = load_job(job_id)
-        log_activity(job_id, "agent_quote_imported",
-                     f"Auto-imported quote from {vendor_name} via email monitor",
-                     {"vendor": vendor_name, "products": len(all_products), "matched": matched})
-        print(f"[InboxMonitor] Imported {len(all_products)} products for job #{job_id} from {vendor_name}")
 
     if _inbox_monitor and _inbox_monitor.is_running:
         _inbox_monitor.stop()
@@ -487,6 +707,8 @@ class JobCreate(BaseModel):
 
 class MaterialUpdate(BaseModel):
     materials: list[dict]
+    base_source_fingerprint: Optional[str] = None
+    deletion_reasons: dict[str, str] = Field(default_factory=dict)
 
 
 class NotesUpdate(BaseModel):
@@ -578,23 +800,148 @@ class GoldenReplayRequest(BaseModel):
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+def _rule_with_engine_contract(rule: dict, build: dict | None = None) -> dict:
+    build = build or get_build_info()
+    item = dict(rule or {})
+    implementation_ref = str(item.get("implementation_ref") or item.get("source") or "").strip()
+    implementation_path = implementation_ref.split("#", 1)[0].split(":", 1)[0]
+    implementation_file = os.path.basename(implementation_path)
+    implementation_hash = (build.get("engine_files") or {}).get(implementation_file)
+    contribution_payload = {
+        "rule_id": item.get("rule_id"),
+        "rule_version": item.get("version"),
+        "implementation_ref": implementation_ref,
+        "test_ref": item.get("test_ref"),
+        "implementation_hash": implementation_hash,
+        "config_fingerprint": build.get("config_fingerprint"),
+    }
+    item["rule_version"] = item.get("version")
+    item["engine_config_fingerprint_contribution"] = hashlib.sha256(
+        json.dumps(contribution_payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    runtime_reference_verified = bool(implementation_ref and implementation_hash)
+    item["calculation_contract"] = "implemented" if runtime_reference_verified else "metadata_only"
+    item["runtime_implementation_referenced"] = runtime_reference_verified
+    item["registry_effect"] = "metadata_only"
+    return item
+
+
+def _ruleset_with_engine_contract(ruleset: dict | None) -> dict | None:
+    if not ruleset:
+        return ruleset
+    result = dict(ruleset)
+    snapshot = dict(result.get("snapshot") or {})
+    build = get_build_info()
+    snapshot["rules"] = [_rule_with_engine_contract(rule, build) for rule in (snapshot.get("rules") or [])]
+    snapshot["engine_fingerprint"] = build.get("engine_fingerprint")
+    snapshot["config_fingerprint"] = build.get("config_fingerprint")
+    result["snapshot"] = snapshot
+    result["engine_fingerprint"] = build.get("engine_fingerprint")
+    result["config_fingerprint"] = build.get("config_fingerprint")
+    return result
+
 @app.get("/api/system/build")
 def api_system_build():
     """Return the deployed build and engine identity used for trust checks."""
     return get_build_info()
 
+
+def _vendor_import_idempotency_status() -> dict:
+    required_columns = {
+        "job_quotes": "source_hash",
+        "vendor_prices": "source_hash",
+    }
+    required_indexes = {
+        "idx_job_quotes_source_product",
+        "idx_vendor_prices_source_product",
+    }
+    missing = []
+    conn = _get_conn()
+    try:
+        for table, column in required_columns.items():
+            columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in columns:
+                missing.append(f"{table}.{column}")
+        indexes = set()
+        for table in required_columns:
+            for row in conn.execute(f"PRAGMA index_list({table})").fetchall():
+                if int(row["unique"] or 0):
+                    indexes.add(row["name"])
+        missing.extend(sorted(required_indexes - indexes))
+    finally:
+        conn.close()
+    return {
+        "verified": not missing,
+        "mechanism": "source_hash_database_uniqueness",
+        "missing": missing,
+    }
+
+
+@app.get("/api/system/vendor-ingestion")
+def api_system_vendor_ingestion():
+    """Return non-secret health evidence for vendor-pricing ingestion."""
+    settings = get_settings()
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+    provider = get_provider_info(api_key)
+    test_mode = str(settings.get("vendor_quote_test_mode", "false")).lower() == "true"
+    automation_enabled = str(settings.get("email_automation_enabled", "false")).lower() == "true"
+    monitor_running = bool(_inbox_monitor and _inbox_monitor.is_running)
+    simulator_running = bool(_sim_watcher and _sim_watcher.is_running)
+    idempotency = _vendor_import_idempotency_status()
+    if not idempotency["verified"] or not provider.get("available"):
+        status = "blocked"
+    elif test_mode and not simulator_running:
+        status = "warning"
+    elif automation_enabled and not test_mode and not monitor_running:
+        status = "warning"
+    else:
+        status = "ready"
+    try:
+        multi_pass_count = max(1, min(5, int(settings.get("multi_pass_count", "2"))))
+    except (TypeError, ValueError):
+        multi_pass_count = 2
+    return {
+        "status": status,
+        "ai_parser": {
+            "available": bool(provider.get("available")),
+            "provider": provider.get("provider"),
+            "model": settings.get("openai_model", "gpt-5-mini"),
+            "multi_pass_count": multi_pass_count,
+        },
+        "email_monitor": {
+            "enabled": automation_enabled,
+            "running": monitor_running,
+            "simulator_running": simulator_running,
+            "test_mode": test_mode,
+            "retry_failed_unread": True,
+            "idempotency": idempotency["mechanism"],
+            "idempotency_verified": idempotency["verified"],
+            "idempotency_missing": idempotency["missing"],
+            "job_match": "stable_subject_tag_then_unambiguous_project_match",
+        },
+        "dropbox_import": {
+            "mode": "browser_folder_picker",
+            "requires_user_action": True,
+            "supported_extensions": [".eml", ".msg", ".pdf", ".txt", ".csv", ".xlsx"],
+            "max_file_mb": MAX_QUOTE_FILE_BYTES // (1024 * 1024),
+        },
+        "durable_artifact_root": ARTIFACT_ROOT,
+    }
+
 @app.get("/api/rules")
 def api_list_rules(category: str = None, stage: str = None, status: str = None):
     """List hard estimating rules with optional category/stage/status filters."""
     rules = list_rules(category=category, stage=stage, status=status)
-    return {"rules": rules, "count": len(rules)}
+    build = get_build_info()
+    return {"rules": [_rule_with_engine_contract(rule, build) for rule in rules], "count": len(rules)}
 
 
 @app.get("/api/rules/active")
 def api_get_active_rules(stage: str = None, category: str = None, as_of: str = None):
     """List currently active estimating rules for audit/calculation consumers."""
     rules = get_active_rules(stage=stage, category=category, as_of=as_of)
-    return {"rules": rules, "count": len(rules)}
+    build = get_build_info()
+    return {"rules": [_rule_with_engine_contract(rule, build) for rule in rules], "count": len(rules)}
 
 
 def _rules_registry_contract() -> dict:
@@ -612,7 +959,7 @@ def _rules_registry_contract() -> dict:
         "active_rule_count": len(active),
         "calculation_behavior": "engine_code_and_config",
         "registry_changes_are_metadata_only": True,
-        "behavior_change_signal": "engine_fingerprint",
+        "behavior_change_signal": "engine_and_config_fingerprints",
     }
 
 
@@ -642,7 +989,7 @@ def api_get_ruleset(version: int):
     ruleset = get_ruleset_version(version)
     if not ruleset:
         raise HTTPException(status_code=404, detail="Ruleset version not found")
-    return ruleset
+    return _ruleset_with_engine_contract(ruleset)
 
 
 @app.post("/api/rulesets/{version}/rollback")
@@ -784,7 +1131,13 @@ def api_get_rule_versions(rule_id: str):
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
     versions = list_rule_versions(rule_id)
-    return {"rule": rule, "versions": versions, "count": len(versions)}
+    build = get_build_info()
+    contracted_versions = []
+    for version in versions:
+        item = dict(version)
+        item["snapshot"] = _rule_with_engine_contract(item.get("snapshot") or {}, build)
+        contracted_versions.append(item)
+    return {"rule": _rule_with_engine_contract(rule, build), "versions": contracted_versions, "count": len(versions)}
 
 
 @app.get("/api/rules/{rule_id}")
@@ -793,7 +1146,7 @@ def api_get_rule(rule_id: str):
     rule = get_rule(rule_id)
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
-    return rule
+    return _rule_with_engine_contract(rule)
 
 
 @app.post("/api/rules")
@@ -808,7 +1161,7 @@ def api_create_rule(body: RuleCreate):
         raise HTTPException(status_code=400, detail=str(e))
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Rule already exists")
-    return get_rule(rule_id)
+    return _rule_with_engine_contract(get_rule(rule_id))
 
 
 @app.put("/api/rules/{rule_id}")
@@ -839,7 +1192,7 @@ def api_update_rule(rule_id: str, body: RuleUpdate):
         raise HTTPException(status_code=400, detail=str(e))
     if not updated:
         raise HTTPException(status_code=404, detail="Rule not found")
-    return get_rule(rule_id)
+    return _rule_with_engine_contract(get_rule(rule_id))
 
 
 @app.post("/api/rules/{rule_id}/archive")
@@ -853,7 +1206,7 @@ def api_archive_rule(rule_id: str, body: Optional[RuleChangeMeta] = None):
     )
     if not archived:
         raise HTTPException(status_code=404, detail="Rule not found")
-    return get_rule(rule_id)
+    return _rule_with_engine_contract(get_rule(rule_id))
 
 
 @app.delete("/api/rules/{rule_id}")
@@ -861,7 +1214,7 @@ def api_delete_rule(rule_id: str):
     """Archive a hard estimating rule. History is preserved for old bids."""
     if not delete_rule(rule_id):
         raise HTTPException(status_code=404, detail="Rule not found")
-    return {"message": "Rule archived", "rule": get_rule(rule_id)}
+    return {"message": "Rule archived", "rule": _rule_with_engine_contract(get_rule(rule_id))}
 
 
 @app.get("/api/jobs")
@@ -946,19 +1299,19 @@ def _resolve_job_id(job_id: str) -> int:
 @app.get("/api/jobs/{job_id}")
 def api_get_job(job_id: str):
     """Get job details by ID or slug."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Enrich materials with known prices from price list and vendor history
-    applied = _enrich_known_prices(job)
-    if applied:
-        save_materials(job["id"], job["materials"])
+    job["materials_source_fingerprint"] = _materials_source_fingerprint(job.get("materials") or [])
+    # Known prices are read-only suggestions. Opening a job must never change
+    # accepted source data or stale an existing proposal audit.
+    _enrich_known_prices(job)
     return job
 
 
 def _enrich_known_prices(job: dict):
-    """Add known_price field to each material from price list and vendor price history.
-    Auto-applies prices to unpriced materials. Returns count of newly applied prices."""
+    """Add transient price suggestions without mutating persisted job inputs."""
     materials = job.get("materials", [])
     applied_count = 0
     if not materials:
@@ -969,12 +1322,19 @@ def _enrich_known_prices(job: dict):
     conn = _get_conn()
     try:
         rows = conn.execute("""
-            SELECT product_normalized, unit_price, vendor_name, unit,
-                   MAX(created_at) as latest_date
-            FROM vendor_prices
-            WHERE unit_price > 0
-            GROUP BY product_normalized
-            ORDER BY latest_date DESC
+            SELECT vp.product_normalized, vp.unit_price, vp.vendor_name, vp.unit,
+                   vp.created_at AS latest_date
+            FROM vendor_prices vp
+            WHERE vp.unit_price > 0
+              AND vp.id = (
+                  SELECT newest.id
+                  FROM vendor_prices newest
+                  WHERE newest.product_normalized = vp.product_normalized
+                    AND newest.unit_price > 0
+                  ORDER BY newest.created_at DESC, newest.id DESC
+                  LIMIT 1
+              )
+            ORDER BY vp.created_at DESC
         """).fetchall()
         vendor_map = {r["product_normalized"]: dict(r) for r in rows}
     finally:
@@ -992,14 +1352,9 @@ def _enrich_known_prices(job: dict):
         if pl_match and pl_match.get("unit_price"):
             order_qty = mat.get("order_qty") or mat.get("installed_qty") or 1
             mat["known_price"] = round(pl_match["unit_price"] * order_qty, 2)
+            mat["known_unit_price"] = pl_match["unit_price"]
             mat["known_price_source"] = "price_list"
             mat["known_price_vendor"] = pl_match.get("vendor", "")
-            # Auto-apply known price to material
-            mat["unit_price"] = pl_match["unit_price"]
-            mat["extended_cost"] = mat["known_price"]
-            mat["price_source"] = "price_list"
-            mat["vendor"] = pl_match.get("vendor", mat.get("vendor", ""))
-            mat["quote_status"] = "quoted"
             applied_count += 1
             continue
 
@@ -1010,16 +1365,9 @@ def _enrich_known_prices(job: dict):
                 if normalized in key or key in normalized:
                     order_qty = mat.get("order_qty") or mat.get("installed_qty") or 1
                     mat["known_price"] = round(vp["unit_price"] * order_qty, 2)
+                    mat["known_unit_price"] = vp["unit_price"]
                     mat["known_price_source"] = "vendor_history"
                     mat["known_price_vendor"] = vp.get("vendor_name", "")
-                    # Auto-apply known price to material
-                    mat["unit_price"] = vp["unit_price"]
-                    mat["extended_cost"] = mat["known_price"]
-                    mat["price_source"] = "vendor_quote"
-                    # Only set vendor from price match if material doesn't already have one
-                    if not mat.get("vendor"):
-                        mat["vendor"] = vp.get("vendor_name", "")
-                    mat["quote_status"] = "quoted"
                     applied_count += 1
                     break
 
@@ -1039,7 +1387,8 @@ def api_bulk_delete(body: BulkDeleteRequest):
 @app.delete("/api/jobs/{job_id}")
 def api_delete_job(job_id: str):
     """Delete a job by ID or slug and all related data."""
-    if not delete_job(job_id):
+    db_id = _resolve_job_id(job_id)
+    if not delete_job(db_id):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"message": "Job deleted"}
 
@@ -1047,7 +1396,8 @@ def api_delete_job(job_id: str):
 @app.post("/api/jobs/{job_id}/duplicate")
 def api_duplicate_job(job_id: str):
     """Duplicate a job and all its materials."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -1090,7 +1440,8 @@ def api_duplicate_job(job_id: str):
 @app.put("/api/jobs/{job_id}/notes")
 def api_update_notes(job_id: str, body: NotesUpdate):
     """Update job notes."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     job["notes"] = body.notes
@@ -1120,7 +1471,8 @@ class JobUpdate(BaseModel):
 @app.put("/api/jobs/{job_id}")
 def api_update_job(job_id: str, body: JobUpdate):
     """Update job fields."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     updates = body.model_dump(exclude_none=True)
@@ -1155,35 +1507,33 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         if not files:
             raise HTTPException(status_code=422, detail=f"No files received. Form keys: {list(form.keys())}")
 
-    job = load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    db_id = job["id"]
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
 
     all_materials_raw = []
     rfms_job_info = {}
+    imported_uploads = []
 
     for file in files:
-        # Save uploaded file
-        file_path = _job_upload_path(db_id, file.filename, "rfms")
-        content = await file.read()
+        if os.path.splitext(file.filename or "")[1].lower() != ".xlsx":
+            raise HTTPException(status_code=400, detail=f"RFMS file '{file.filename}' must be an .xlsx workbook.")
+        content = await file.read(MAX_RFMS_FILE_BYTES + 1)
+        if len(content) > MAX_RFMS_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"RFMS file '{file.filename}' exceeds the {MAX_RFMS_FILE_BYTES // (1024 * 1024)} MB limit.",
+            )
+        file_hash = hashlib.sha256(content).hexdigest()
+        file_path = _job_upload_path(db_id, f"{file_hash[:12]}_{file.filename}", "rfms")
         with open(file_path, "wb") as f:
             f.write(content)
         _record_artifact(db_id, file_path, "rfms")
-        record_imported_file(
-            db_id,
-            file.filename,
-            hashlib.sha256(content).hexdigest(),
-            len(content),
-            source="rfms",
-            artifact_path=os.path.relpath(file_path, ARTIFACT_ROOT),
-            artifact_kind="rfms",
-        )
 
         try:
             result = parse_rfms(file_path)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to parse RFMS file '{file.filename}': {e}")
+        imported_uploads.append((file.filename, file_hash, len(content), file_path))
 
         # Use job info from first file that has it
         file_job_info = result.get("job_info", {})
@@ -1196,6 +1546,17 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         for mat in result.get("materials", []):
             mat["area_type"] = area_type
         all_materials_raw.extend(result.get("materials", []))
+
+    for filename, file_hash, file_size, file_path in imported_uploads:
+        record_imported_file(
+            db_id,
+            filename,
+            file_hash,
+            file_size,
+            source="rfms",
+            artifact_path=os.path.relpath(file_path, ARTIFACT_ROOT),
+            artifact_kind="rfms",
+        )
 
     # Update job info from RFMS if available
     job_update = {
@@ -1343,7 +1704,7 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
     return {"job_info": rfms_job_info, "materials": materials}
 
 
-def _apply_fob_freight(mat: dict, prod: dict):
+def _apply_fob_freight(mat: dict, prod: dict, freight_rates: dict | None = None):
     """When vendor freight is FOB (we pay shipping), apply internal freight rates
     based on material type. CPT/carpet tile uses cpt_tile rate, LVT uses lvt rate."""
     freight_val = prod.get("freight") or ""
@@ -1354,18 +1715,20 @@ def _apply_fob_freight(mat: dict, prod: dict):
     unit = (mat.get("unit") or "").upper()
     description = (mat.get("description") or "").lower()
 
-    # Determine freight rate from internal config based on material type
+    # Determine freight rate from the editable company table, with config as the
+    # startup fallback. This same table is snapshotted for golden replay.
+    freight_rates = freight_rates if isinstance(freight_rates, dict) else FREIGHT_RATES
     rate = None
     if mat_type in ("carpet_tile", "cpt", "cpt_tile") or "carpet tile" in description or "cpt" in (mat.get("item_code") or "").lower():
-        rate = FREIGHT_RATES.get("cpt_tile", 1.25)  # per SY
+        rate = freight_rates.get("cpt_tile", 1.25)  # per SY
     elif mat_type in ("lvt", "unit_lvt") or "lvt" in description or "lvt" in (mat.get("item_code") or "").lower() or "vinyl plank" in description:
         # Determine LVT thickness from description
         if "5mm" in description or "4.5mm" in description or "5.0mm" in description:
-            rate = FREIGHT_RATES.get("lvt_5mm", 0.25)  # per SF
+            rate = freight_rates.get("lvt_5mm", 0.25)  # per SF
         else:
-            rate = FREIGHT_RATES.get("lvt_2mm", 0.11)  # per SF
+            rate = freight_rates.get("lvt_2mm", 0.11)  # per SF
     elif mat_type in ("broadloom",) or "broadloom" in description:
-        rate = FREIGHT_RATES.get("broadloom", 0.65)  # per SY
+        rate = freight_rates.get("broadloom", 0.65)  # per SY
 
     if rate is not None:
         mat["freight_per_unit"] = rate
@@ -1388,7 +1751,7 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
     updated = False
     matched_mat_indices = set()
     matched_prod_indices = set()
-    conn = _get_conn()
+    freight_rates = (get_all_company_rates().get("freight_rates") or FREIGHT_RATES)
 
     # Phase 1: Fast matching — item_code AND description-based product identifiers
     # Extract searchable identifiers from material descriptions.
@@ -1450,10 +1813,14 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
 
     # Also collect ALL quote products across the DB for this job (not just current upload)
     # so we can score against the full universe of quotes
-    all_quotes = conn.execute(
-        "SELECT id, product_name, vendor, unit_price, unit, file_name FROM job_quotes WHERE job_id=?",
-        (job_id,)
-    ).fetchall() if conn else []
+    conn = _get_conn()
+    try:
+        all_quotes = conn.execute(
+            "SELECT id, product_name, vendor, unit_price, unit, file_name, freight, lead_time, notes FROM job_quotes WHERE job_id=?",
+            (job_id,),
+        ).fetchall()
+    finally:
+        conn.close()
     all_quote_products = [dict(q) for q in all_quotes] if all_quotes else products
 
     for mat_idx, mat in enumerate(materials):
@@ -1495,7 +1862,7 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             # quotes, never Metropolitan Floors or anyone else.
             # Vendor aliases: parent companies own subsidiaries (Daltile=Marazzi, etc.)
             _VENDOR_ALIASES = {
-                "marazzi": ["daltile"], "daltile": ["marazzi"],
+                "marazzi": ["daltile"],
                 "flor": ["interface"], "interface": ["flor"],
                 "mohawk": ["daltile", "marazzi"], "daltile": ["marazzi", "mohawk"],
             }
@@ -1576,7 +1943,7 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             mat["quote_status"] = "quoted"
             mat["price_source"] = "vendor_quote"
             # If freight is FOB, apply internal freight rates by material type
-            _apply_fob_freight(mat, best_prod)
+            _apply_fob_freight(mat, best_prod, freight_rates)
             order_qty = mat.get("order_qty", 0)
             mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
             matched += 1
@@ -1596,7 +1963,7 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             mat["vendor"] = prod.get("vendor", "")
             mat["quote_status"] = "quoted"
             mat["price_source"] = "vendor_quote"
-            _apply_fob_freight(mat, prod)
+            _apply_fob_freight(mat, prod, freight_rates)
             order_qty = mat.get("order_qty", 0)
             mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
             matched += 1
@@ -2137,10 +2504,10 @@ def _link_upload_to_requests(job_id: int, products: list[dict]):
 @app.post("/api/jobs/{job_id}/upload-quotes")
 async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     """Upload vendor quote files, parse them, return pricing."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    db_id = job["id"]
 
     import hashlib as _hashlib
 
@@ -2149,8 +2516,15 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
 
     all_products = []
     skipped_files = []
+    file_errors = []
     for upload in files:
-        content = await upload.read()
+        content = await upload.read(MAX_QUOTE_FILE_BYTES + 1)
+        if len(content) > MAX_QUOTE_FILE_BYTES:
+            file_errors.append({
+                "file": upload.filename,
+                "error": f"File exceeds the {MAX_QUOTE_FILE_BYTES // (1024 * 1024)} MB limit.",
+            })
+            continue
 
         # Dedup: check file hash before parsing
         file_hash = _hashlib.sha256(content).hexdigest()
@@ -2158,7 +2532,7 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
             skipped_files.append(upload.filename)
             continue
 
-        file_path = _job_upload_path(db_id, upload.filename, "quote")
+        file_path = _job_upload_path(db_id, f"{file_hash[:12]}_{upload.filename}", "quote")
         with open(file_path, "wb") as f:
             f.write(content)
         _record_artifact(db_id, file_path, "vendor_quote")
@@ -2167,7 +2541,10 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
             products = parse_quote_file(file_path)
             for p in products:
                 p["file_name"] = upload.filename
+                p["_source_hash"] = file_hash
             all_products.extend(products)
+            if not products:
+                file_errors.append({"file": upload.filename, "error": "No pricing products were extracted."})
             # Only record as imported if we actually extracted products
             if products:
                 record_imported_file(
@@ -2180,7 +2557,11 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
                     artifact_kind="vendor_quote",
                 )
         except Exception as e:
-            all_products.append({"error": str(e), "file": upload.filename})
+            file_errors.append({"error": str(e), "file": upload.filename})
+
+    if not all_products and file_errors:
+        detail = "; ".join(f"{item['file']}: {item['error']}" for item in file_errors[:5])
+        raise HTTPException(status_code=422, detail=f"No vendor pricing was imported. {detail}")
 
     # Persist quotes to DB
     save_quotes(db_id, all_products)
@@ -2198,13 +2579,22 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     vendors_found = list(set(p.get("vendor", "Unknown") for p in all_products if p.get("vendor")))
     log_activity(db_id, "quotes_uploaded", f"Uploaded {len(file_names)} quote file(s), {len(all_products)} products, {auto_matched} auto-matched", {"files": file_names, "vendors": vendors_found, "product_count": len(all_products), "auto_matched": auto_matched})
 
-    return {"products": all_products, "auto_matched": auto_matched, "linked_requests": linked_requests, "skipped_files": skipped_files}
+    refreshed = load_job(db_id) or {}
+    return {
+        "products": refreshed.get("quotes") or [],
+        "parsed_products": all_products,
+        "auto_matched": auto_matched,
+        "linked_requests": linked_requests,
+        "skipped_files": skipped_files,
+        "file_errors": file_errors,
+    }
 
 
 @app.get("/api/jobs/{job_id}/imported-files")
 def api_imported_files(job_id: str):
     """List all files that have been imported for this job (for dedup)."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return list_imported_files(job["id"])
@@ -2213,7 +2603,8 @@ def api_imported_files(job_id: str):
 @app.delete("/api/jobs/{job_id}/quotes")
 def api_clear_quotes(job_id: str):
     """Clear all parsed quotes for a job."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     delete_quotes(job["id"])
@@ -2244,7 +2635,8 @@ def api_match_dropbox_folder(job_id: str, body: dict = Body(...)):
     """Fuzzy-match job project name against a list of folder names from the browser.
     The browser reads the local Dropbox folder via File System Access API and sends folder names here.
     """
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -2267,7 +2659,8 @@ def api_match_dropbox_folder(job_id: str, body: dict = Body(...)):
 @app.post("/api/jobs/{job_id}/calculate")
 def api_calculate(job_id: str):
     """Run sundry + labor calculators, return results."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -2318,71 +2711,158 @@ def api_calculate(job_id: str):
 @app.put("/api/jobs/{job_id}/materials")
 def api_update_materials(job_id: str, body: MaterialUpdate):
     """Update materials (edited pricing, waste, etc.)."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    deletion_reasons = {
+        str(key): str(value or "").strip()
+        for key, value in (body.deletion_reasons or {}).items()
+    }
 
-    # Build lookup of existing materials by id
-    existing = {m["id"]: m for m in job.get("materials", [])}
+    def deletion_key(material: dict) -> str:
+        return str(material.get("item_code") or material.get("id") or "")
 
-    # Merge incoming updates with existing data
-    updated = []
-    for m in body.materials:
-        base = existing.get(m.get("id"), {})
-        merged = {**base, **{k: v for k, v in m.items() if v is not None}}
+    conn = _get_conn()
+    deleted_materials = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current_materials = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM job_materials WHERE job_id=? ORDER BY id",
+                (job["id"],),
+            ).fetchall()
+        ]
+        current_fingerprint = _materials_source_fingerprint(current_materials)
+        if (
+            body.base_source_fingerprint
+            and body.base_source_fingerprint != current_fingerprint
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "These materials changed in another tab or workflow. Your stale pricing copy "
+                    "was not saved. Reload the job and review the newer values before editing again."
+                ),
+            )
 
-        # If user changed the type, mark as human-verified
-        if m.get("material_type") and base.get("material_type") != m.get("material_type"):
-            merged["ai_confidence"] = 1.0
+        existing = {material["id"]: material for material in current_materials}
+        incoming_ids = {
+            str(material.get("id"))
+            for material in body.materials
+            if material.get("id") is not None
+        }
+        deleted_materials = [
+            material for material in existing.values()
+            if str(material.get("id")) not in incoming_ids
+        ]
+        missing_deletion_reasons = [
+            deletion_key(material)
+            for material in deleted_materials
+            if not deletion_reasons.get(deletion_key(material))
+        ]
+        if missing_deletion_reasons:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "A reason is required before removing takeoff materials: "
+                    f"{', '.join(missing_deletion_reasons[:5])}."
+                ),
+            )
 
-        waste_pct = merged.get("waste_pct", 0)
-        installed_qty = merged.get("installed_qty", 0)
-        unit_price = merged.get("unit_price", 0)
+        updated = []
+        for material in body.materials:
+            base = existing.get(material.get("id"), {})
+            merged = {**base, **{key: value for key, value in material.items() if value is not None}}
+            if material.get("material_type") and base.get("material_type") != material.get("material_type"):
+                merged["ai_confidence"] = 1.0
 
-        # Recompute order_qty unless user explicitly set it
-        if "order_qty" in m and m["order_qty"] is not None:
-            order_qty = m["order_qty"]
-        else:
-            order_qty = installed_qty * (1 + waste_pct)
+            waste_pct = merged.get("waste_pct", 0)
+            installed_qty = merged.get("installed_qty", 0)
+            unit_price = merged.get("unit_price", 0)
+            order_qty = (
+                material["order_qty"]
+                if "order_qty" in material and material["order_qty"] is not None
+                else installed_qty * (1 + waste_pct)
+            )
 
-        # If user entered a manual total, preserve it exactly
-        if m.get("price_source") == "manual" and "extended_cost" in m and m["extended_cost"] is not None:
-            extended_cost = m["extended_cost"]
-        elif merged.get("price_source") in ("price_book", "default_rule") and (merged.get("material_type") or "").lower() == "transitions":
-            # Transitions: recalculate piece-based pricing
-            import math
-            vendor = (merged.get("vendor") or "").lower()
-            # Determine stick length based on vendor/product
-            if "silver pin" in vendor:
-                stick_lf = 12.0  # Silver Pin Metal = 12' sticks
+            if material.get("price_source") == "manual" and material.get("extended_cost") is not None:
+                extended_cost = material["extended_cost"]
+            elif (
+                merged.get("price_source") in ("price_book", "default_rule")
+                and (merged.get("material_type") or "").lower() == "transitions"
+            ):
+                import math
+                vendor = (merged.get("vendor") or "").lower()
+                stick_lf = 12.0 if "silver pin" in vendor else 8.0 + 2.0 / 12.0
+                fixture_count = merged.get("fixture_count", 0) or 0
+                pieces = (
+                    _calc_schluter_pieces(order_qty, fixture_count, stick_lf)
+                    if vendor == "schluter"
+                    else math.ceil(order_qty / stick_lf) if order_qty > 0 else 0
+                )
+                extended_cost = pieces * unit_price
             else:
-                stick_lf = 8.0 + 2.0 / 12.0  # Schluter = 8'-2"
-            fixture_count = merged.get("fixture_count", 0) or 0
-            if vendor == "schluter":
-                pieces = _calc_schluter_pieces(order_qty, fixture_count, stick_lf)
-            else:
-                pieces = math.ceil(order_qty / stick_lf) if order_qty > 0 else 0
-            extended_cost = pieces * unit_price
-        else:
-            extended_cost = order_qty * unit_price
+                extended_cost = order_qty * unit_price
 
-        merged["order_qty"] = round(order_qty, 2)
-        merged["extended_cost"] = round(extended_cost, 2)
-        updated.append(merged)
+            merged["order_qty"] = round(order_qty, 2)
+            merged["extended_cost"] = round(extended_cost, 2)
+            updated.append(merged)
 
-    material_ids = save_materials(job["id"], updated)
-    for mat, mid in zip(updated, material_ids):
-        mat["id"] = mid
+        material_ids = save_materials(job["id"], updated, conn=conn)
+        for material, material_id in zip(updated, material_ids):
+            material["id"] = material_id
+        persisted_materials = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM job_materials WHERE job_id=? ORDER BY id",
+                (job["id"],),
+            ).fetchall()
+        ]
+        source_fingerprint = _materials_source_fingerprint(persisted_materials)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
+    # Keep read-only price suggestions visible after an autosave without
+    # including them in the durable source fingerprint.
+    response_job = {"materials": persisted_materials}
+    _enrich_known_prices(response_job)
+    response_materials = response_job["materials"]
+
+    if deleted_materials:
+        log_activity(
+            job["id"],
+            "materials_deleted",
+            f"Removed {len(deleted_materials)} takeoff material(s) with estimator reasons",
+            {
+                "deletions": [
+                    {
+                        "material_key": deletion_key(material),
+                        "description": material.get("description"),
+                        "reason": deletion_reasons.get(deletion_key(material)),
+                    }
+                    for material in deleted_materials
+                ],
+            },
+        )
     log_activity(job["id"], "materials_updated", f"Updated pricing for {len(body.materials)} materials")
 
-    return {"materials": updated}
+    return {
+        "materials": response_materials,
+        "materials_source_fingerprint": source_fingerprint,
+    }
 
 
 @app.post("/api/jobs/{job_id}/materials/{material_idx}/estimate-price")
 def api_estimate_price(job_id: str, material_idx: int):
     """Use AI to estimate a material's unit price based on its description."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -2480,7 +2960,8 @@ The price should be per {m.get('unit', 'unit')}. Be conservative — estimate on
 @app.post("/api/jobs/{job_id}/generate-bid")
 def api_generate_bid(job_id: str):
     """Assemble bid + generate PDF, return bid data."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _validate_bid_job_ready(job)
@@ -2571,7 +3052,8 @@ def api_generate_bid(job_id: str):
 @app.delete("/api/jobs/{job_id}/bid")
 def api_clear_bid(job_id: str):
     """Clear saved bid data for a job."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     job["bid_data"] = None
@@ -2585,13 +3067,15 @@ def api_clear_bid(job_id: str):
 @app.get("/api/jobs/{job_id}/bid.pdf")
 def api_download_bid_pdf(job_id: str):
     """Download the generated bid PDF."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _validate_bid_pdf_download_ready(job)
     pdf_path = _job_pdf_path(job["id"], "bid")
     if not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="PDF not found. Generate bid first.")
+    _require_artifact_receipt(job["id"], pdf_path, "bid_pdf")
     return FileResponse(
         pdf_path,
         media_type="application/pdf",
@@ -2606,7 +3090,8 @@ async def api_rewrite_descriptions(job_id: str, request: Request):
     """Use AI to rewrite bundle descriptions in professional proposal style."""
     from description_agent import rewrite_bundle_descriptions
 
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -2622,7 +3107,8 @@ async def api_rewrite_descriptions(job_id: str, request: Request):
 @app.get("/api/jobs/{job_id}/proposal/bundles")
 def api_get_proposal_bundles(job_id: str):
     """Load saved proposal editor state (bundles, notes, terms, etc.)."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     pd = job.get("proposal_data")
@@ -2641,18 +3127,26 @@ def api_get_calculation_runs(job_id: str, limit: int = 20):
 
 
 @app.get("/api/jobs/{job_id}/audit")
-def api_get_latest_calculation_audit(job_id: str, limit: int = 1000):
-    """Fetch the latest calculation run and trace rows for the job."""
+def api_get_latest_calculation_audit(job_id: str, limit: int = 1000, scope: Optional[str] = None):
+    """Fetch the latest audit, optionally limited to accepted-proposal work."""
     db_id = _resolve_job_id(job_id)
-    runs = list_calculation_runs(db_id, limit=50)
-    run = runs[0] if runs else None
+    if scope not in (None, "", "proposal"):
+        raise HTTPException(status_code=400, detail="Unsupported audit scope")
+    if scope == "proposal":
+        run = get_latest_completed_calculation_run(
+            db_id,
+            {"proposal_editor_save", "proposal_generation", "bid_calculation"},
+        )
+    else:
+        runs = list_calculation_runs(db_id, limit=1)
+        run = runs[0] if runs else None
     traces = []
     if run:
         traces = get_calculation_traces(db_id, run_id=run["id"], limit=limit)
         if run.get("run_type") in ("proposal_manual_save", "proposal_editor_save"):
-            prior = next(
-                (r for r in runs[1:] if r.get("run_type") in ("proposal_generation", "bid_calculation")),
-                None,
+            prior = get_latest_completed_calculation_run(
+                db_id,
+                {"proposal_generation", "bid_calculation"},
             )
             if prior:
                 remaining = max(limit - len(traces), 0)
@@ -2699,9 +3193,9 @@ def api_get_calculation_trace(
             limit=limit,
         )
         if run and run.get("run_type") in ("proposal_manual_save", "proposal_editor_save") and not any([run_id, entity_type, entity_id, entity_key]):
-            prior = next(
-                (r for r in list_calculation_runs(db_id, limit=10)[1:] if r.get("run_type") in ("proposal_generation", "bid_calculation")),
-                None,
+            prior = get_latest_completed_calculation_run(
+                db_id,
+                {"proposal_generation", "bid_calculation"},
             )
             if prior:
                 remaining = max(limit - len(traces), 0)
@@ -2821,20 +3315,199 @@ def _public_replay(replay: dict | None, include_generated: bool = False) -> dict
     return result
 
 
-def _golden_readiness_status(job_id: int) -> str | None:
+def _golden_replay_statuses(
+    job_id: int,
+    current_source_fingerprint: str | None = None,
+    current_engine_fingerprint: str | None = None,
+) -> dict:
     golden = get_golden_job_for_source(job_id)
     if not golden:
-        return None
-    replays = list_golden_replays_for_job(job_id, limit=50)
-    baseline = next((item for item in replays if item.get("mode") == "baseline"), None)
+        return {
+            "overall": None,
+            "verification": None,
+            "current": None,
+            "current_drift_classification": None,
+            "source_matches": None,
+        }
+    active_version_id = golden.get("version_id")
+    baseline = get_latest_golden_replay_for_version(job_id, active_version_id, "baseline") if active_version_id else None
+    current = get_latest_golden_replay_for_version(job_id, active_version_id, "current") if active_version_id else None
     if not baseline:
-        return None
-    summary = baseline.get("summary") or {}
-    if baseline.get("status") == "pass" and summary.get("raw_engine_status", summary.get("engine_status")) == "pass":
-        return "golden_verified"
-    if baseline.get("status") == "incomparable" or summary.get("status") == "incomparable":
-        return "incomparable"
-    return "fail"
+        verification = "not_replayed"
+    else:
+        summary = baseline.get("summary") or {}
+        if baseline.get("status") == "pass" and summary.get("raw_engine_status", summary.get("engine_status")) == "pass":
+            verification = "golden_verified"
+        elif baseline.get("status") == "incomparable" or summary.get("status") == "incomparable":
+            verification = "incomparable"
+        else:
+            verification = "fail"
+
+    baseline_source_fingerprint = ((golden.get("snapshot") or {}).get("proposal_source_fingerprint") or "").strip()
+    baseline_engine_fingerprint = (
+        golden.get("engine_fingerprint")
+        or ((golden.get("snapshot") or {}).get("build") or {}).get("engine_fingerprint")
+        or ""
+    ).strip()
+    source_matches = None
+    if baseline_source_fingerprint and current_source_fingerprint:
+        source_matches = baseline_source_fingerprint == current_source_fingerprint
+        if not source_matches:
+            verification = "stale"
+    engine_incomparable = (
+        not baseline_engine_fingerprint
+        or (current_engine_fingerprint and baseline_engine_fingerprint != current_engine_fingerprint)
+    )
+    if verification in ("golden_verified", "stale") and engine_incomparable:
+        verification = "incomparable"
+    elif verification == "golden_verified" and not baseline_source_fingerprint:
+        verification = "incomparable"
+
+    current_status = current.get("status") if current else None
+    current_drift_classification = ((current or {}).get("summary") or {}).get("drift_classification")
+    if verification == "stale":
+        overall = "drift"
+    elif verification != "golden_verified":
+        overall = verification
+    elif current_status == "warn" and current_drift_classification == "metadata_only":
+        overall = "metadata_changed"
+    elif current_status in ("warn", "fail", "incomparable"):
+        overall = "drift"
+    else:
+        overall = "golden_verified"
+    return {
+        "overall": overall,
+        "verification": verification,
+        "current": current_status,
+        "current_drift_classification": current_drift_classification,
+        "source_matches": source_matches,
+    }
+
+
+def _golden_readiness_status(job_id: int) -> str | None:
+    """Backward-compatible combined golden status for job list consumers."""
+    job = load_job(job_id)
+    proposal = (job or {}).get("proposal_data") if isinstance((job or {}).get("proposal_data"), dict) else {}
+    fingerprint = _proposal_source_fingerprint(job, proposal) if job else None
+    return _golden_replay_statuses(job_id, fingerprint, get_build_info().get("engine_fingerprint"))["overall"]
+
+
+def _active_golden_replays(job_id: int, golden: dict | None, limit: int = 50) -> list[dict]:
+    """Return replay evidence only for the currently active immutable version."""
+    if not golden:
+        return []
+    active_version_id = golden.get("version_id")
+    if not active_version_id:
+        return []
+    return list_golden_replays_for_version(job_id, active_version_id, limit=limit)
+
+
+def _readiness_trust_summary(
+    job: dict,
+    *,
+    proposal: dict,
+    latest_run: dict | None,
+    build: dict,
+    ruleset_version: int | None,
+) -> dict:
+    golden = get_golden_job_for_source(job["id"])
+    replays = _active_golden_replays(job["id"], golden, limit=50)
+    active_version_id = (golden or {}).get("version_id")
+    current_replay = get_latest_golden_replay_for_version(job["id"], active_version_id, "current") if active_version_id else None
+    latest_replay = current_replay or (replays[0] if replays else None)
+
+    deleted_reasons = proposal.get("deleted_material_reasons")
+    if not isinstance(deleted_reasons, dict):
+        deleted_reasons = {}
+    deleted_codes = {
+        str(code)
+        for code in (proposal.get("deleted_material_codes") or [])
+        if code and str(deleted_reasons.get(str(code)) or "").strip()
+    }
+    active_materials = [
+        material for material in (job.get("materials") or [])
+        if isinstance(material, dict) and _job_material_key(material) not in deleted_codes
+    ]
+    unknown_count = sum(
+        1 for material in active_materials
+        if not is_valid_material_classification(material.get("material_type"))
+    )
+    low_confidence_count = 0
+    for material in active_materials:
+        confidence = _as_number(material.get("ai_confidence"))
+        price_source = str(material.get("price_source") or "").strip().lower()
+        if (
+            (confidence is not None and confidence < 0.75)
+            or price_source in {"ai_estimate", "vendor_history"}
+            or (_as_number(material.get("unit_price")) or 0) > 0 and not price_source
+        ):
+            low_confidence_count += 1
+
+    manual_override_count = sum(
+        1 for material in active_materials
+        if str(material.get("price_source") or "").strip().lower() == "manual"
+    )
+    for bundle in (proposal.get("bundles") or []):
+        if not isinstance(bundle, dict):
+            continue
+        manual_override_count += int(bundle.get("price_override") is not None)
+        manual_override_count += int(bundle.get("freight_override") is not None)
+        manual_override_count += sum(
+            1 for material in (bundle.get("materials") or [])
+            if isinstance(material, dict) and material.get("freight_is_manual")
+        )
+        manual_override_count += sum(
+            1 for sundry in (bundle.get("sundry_items") or [])
+            if isinstance(sundry, dict) and sundry.get("is_manual_price")
+        )
+        manual_override_count += sum(
+            1 for labor in (bundle.get("labor_items") or [])
+            if isinstance(labor, dict) and (labor.get("is_manual") or labor.get("is_stair_labor"))
+        )
+        manual_override_count += len(bundle.get("deleted_labor_keys") or [])
+
+    artifact_receipts = list_job_artifacts(job["id"])
+    pdf_receipt = next(
+        (item for item in artifact_receipts if item.get("artifact_kind") == "proposal_pdf"),
+        None,
+    )
+    replay_summary = (latest_replay or {}).get("summary") or {}
+    replay_diff = (latest_replay or {}).get("diff") or {}
+    largest_deltas = [
+        {
+            "bundle_name": row.get("bundle_name"),
+            "delta": row.get("delta"),
+            "status": row.get("status"),
+        }
+        for row in sorted(
+            [row for row in (replay_diff.get("bundles") or []) if isinstance(row, dict)],
+            key=lambda row: abs(_as_number(row.get("delta")) or 0),
+            reverse=True,
+        )[:3]
+    ]
+    target_totals = ((golden or {}).get("snapshot") or {}).get("target_totals") or (golden or {}).get("target_totals") or {}
+
+    return {
+        "last_audit_at": (latest_run or {}).get("completed_at") or (latest_run or {}).get("started_at"),
+        "last_pdf_at": proposal.get("pdf_generated_at") or (pdf_receipt or {}).get("created_at"),
+        "ruleset_version": ruleset_version,
+        "build_commit": build.get("commit"),
+        "build_tag": build.get("tag"),
+        "engine_fingerprint": build.get("engine_fingerprint"),
+        "config_fingerprint": build.get("config_fingerprint"),
+        "golden_baseline_version": (golden or {}).get("version_number"),
+        "jr_target_total": _as_money_number(target_totals.get("grand_total")),
+        "accepted_proposal_total": _as_money_number(proposal.get("grand_total")),
+        "replay_total": _as_money_number((replay_summary.get("generated_totals") or {}).get("grand_total")),
+        "replay_mode": (latest_replay or {}).get("mode"),
+        "replay_status": (latest_replay or {}).get("status"),
+        "largest_deltas": largest_deltas,
+        "manual_override_count": manual_override_count,
+        "unknown_material_count": unknown_count,
+        "low_confidence_material_count": low_confidence_count,
+        "artifact_count": len(artifact_receipts),
+        "source_fingerprint": proposal.get("audit_source_fingerprint"),
+    }
 
 
 def _evaluate_job_readiness(job: dict) -> dict:
@@ -2852,16 +3525,54 @@ def _evaluate_job_readiness(job: dict) -> dict:
         except HTTPException as exc:
             pdf_message = str(exc.detail)
 
+    artifact_status, artifact_message, artifact_items = _artifact_readiness(
+        job["id"],
+        pdf_path,
+        job.get("materials") or [],
+    )
+    proposal_source_ok = bool(proposal.get("bundles"))
+    proposal_source_message = None
+    if proposal_source_ok:
+        try:
+            _validate_proposal_body_matches_job_source(job, proposal)
+        except HTTPException as exc:
+            proposal_source_ok = False
+            proposal_source_message = str(exc.detail)
+    else:
+        proposal_source_message = "No saved proposal exists to compare with the current material source."
+
     proposal_fingerprint = _proposal_source_fingerprint(job, proposal)
+    build = get_build_info()
+    ruleset_version = _current_ruleset_version()
+    golden_statuses = _golden_replay_statuses(
+        job["id"],
+        proposal_fingerprint,
+        build.get("engine_fingerprint"),
+    )
     return evaluate_job_readiness(
         job,
         latest_run=latest_run,
-        current_ruleset_version=_current_ruleset_version(),
+        current_ruleset_version=ruleset_version,
         pdf_ready=pdf_ready,
         pdf_message=pdf_message,
         proposal_source_fingerprint=proposal_fingerprint,
-        golden_status=_golden_readiness_status(job["id"]),
-        build=get_build_info(),
+        proposal_source_ok=proposal_source_ok,
+        proposal_source_message=proposal_source_message,
+        artifact_status=artifact_status,
+        artifact_message=artifact_message,
+        artifact_items=artifact_items,
+        golden_status=golden_statuses["overall"],
+        golden_verification_status=golden_statuses["verification"],
+        current_replay_status=golden_statuses["current"],
+        current_replay_drift_classification=golden_statuses["current_drift_classification"],
+        build=build,
+        trust_summary=_readiness_trust_summary(
+            job,
+            proposal=proposal,
+            latest_run=latest_run,
+            build=build,
+            ruleset_version=ruleset_version,
+        ),
     )
 
 
@@ -2880,11 +3591,30 @@ def api_get_job_reproducibility(job_id: str):
     """Return golden baseline and recent replay status for a job."""
     db_id = _resolve_job_id(job_id)
     golden = get_golden_job_for_source(db_id)
-    replays = list_golden_replays_for_job(db_id, limit=10)
+    replays = list_golden_replays_for_job(db_id, limit=50)
+    active_replays = _active_golden_replays(db_id, golden, limit=50)
+    latest_active = active_replays[0] if active_replays else None
+    active_version_id = (golden or {}).get("version_id")
+    baseline_replay = get_latest_golden_replay_for_version(db_id, active_version_id, "baseline") if active_version_id else None
+    current_replay = get_latest_golden_replay_for_version(db_id, active_version_id, "current") if active_version_id else None
+    job = load_job(db_id)
+    proposal = (job or {}).get("proposal_data") if isinstance((job or {}).get("proposal_data"), dict) else {}
+    source_fingerprint = _proposal_source_fingerprint(job, proposal) if job else None
+    statuses = _golden_replay_statuses(
+        db_id,
+        source_fingerprint,
+        get_build_info().get("engine_fingerprint"),
+    )
     return {
         "golden_job": _public_golden_job(golden),
-        "latest_replay": _public_replay(replays[0]) if replays else None,
-        "replays": [_public_replay(replay) for replay in replays],
+        "latest_replay": _public_replay(latest_active),
+        "baseline_replay": _public_replay(baseline_replay),
+        "current_replay": _public_replay(current_replay),
+        "comparison_status": statuses["overall"] or ("not_replayed" if golden else "not_captured"),
+        "current_drift_classification": statuses["current_drift_classification"],
+        "live_source_matches_baseline": statuses["source_matches"],
+        "replays": [_public_replay(replay) for replay in replays[:10]],
+        "active_version_replays": [_public_replay(replay) for replay in active_replays[:10]],
         "default_tolerance": DEFAULT_TOLERANCE,
     }
 
@@ -2896,6 +3626,10 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if not str(body.jr_quote_id or "").strip():
+        raise HTTPException(status_code=400, detail="Enter the Job Runner quote ID before capturing the golden baseline.")
+    if not str(body.reviewer_name or "").strip():
+        raise HTTPException(status_code=400, detail="Enter the reviewer name before capturing the golden baseline.")
 
     missing = _required_job_field_gaps(job)
     if missing:
@@ -2907,14 +3641,104 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     proposal_data = job.get("proposal_data")
     if not isinstance(proposal_data, dict) or not proposal_data.get("bundles"):
         raise HTTPException(status_code=409, detail="Cannot capture golden baseline until the proposal has saved bundles.")
+    nonpositive_bundles = [
+        bundle.get("bundle_name") or "bundle"
+        for bundle in proposal_data.get("bundles") or []
+        if isinstance(bundle, dict) and (effective_bundle_total(bundle) <= 0)
+    ]
+    if nonpositive_bundles:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot capture golden baseline until every bundle has a positive accepted price: {', '.join(nonpositive_bundles[:5])}.",
+        )
+    arithmetic_errors = proposal_math_errors(proposal_data)
+    if arithmetic_errors:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot capture golden baseline because proposal arithmetic is invalid: {' '.join(arithmetic_errors[:3])}",
+        )
+    try:
+        _validate_proposal_body_matches_job_source(job, proposal_data)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot capture golden baseline because the accepted proposal is stale. {exc.detail}",
+        ) from exc
 
     current_proposal_fingerprint = _proposal_source_fingerprint(job, proposal_data)
     if proposal_data.get("audit_source_fingerprint") != current_proposal_fingerprint:
         raise HTTPException(status_code=409, detail="Cannot capture golden baseline until the saved proposal audit matches the current job source. Save or regenerate the proposal first.")
 
-    deleted_codes = {str(code) for code in (proposal_data.get("deleted_material_codes") or []) if code}
-    active_materials = [m for m in (job.get("materials") or []) if str(m.get("item_code") or "") not in deleted_codes]
-    unknown = [m.get("item_code") or m.get("description") or "material" for m in active_materials if str(m.get("material_type") or "").lower() in ("", "unknown")]
+    raw_deleted_codes = {str(code) for code in (proposal_data.get("deleted_material_codes") or []) if code}
+    deleted_reasons = proposal_data.get("deleted_material_reasons")
+    if not isinstance(deleted_reasons, dict):
+        deleted_reasons = {}
+    deleted_codes = {
+        code for code in raw_deleted_codes
+        if str(deleted_reasons.get(code) or "").strip()
+    }
+    missing_deletion_reasons = sorted(raw_deleted_codes - deleted_codes)
+    if missing_deletion_reasons:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot capture golden baseline until every deleted material has an explicit estimator reason.",
+        )
+    deleted_bundle_names = {str(name) for name in (proposal_data.get("deleted_bundles") or []) if name}
+    deleted_bundle_reasons = proposal_data.get("deleted_bundle_reasons")
+    if not isinstance(deleted_bundle_reasons, dict):
+        deleted_bundle_reasons = {}
+    if any(not str(deleted_bundle_reasons.get(name) or "").strip() for name in deleted_bundle_names):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot capture golden baseline until every deleted bundle has an explicit estimator reason.",
+        )
+    accepted_material_codes = {
+        _job_material_key(material)
+        for bundle in (proposal_data.get("bundles") or [])
+        if isinstance(bundle, dict)
+        for material in (bundle.get("materials") or [])
+        if isinstance(material, dict) and _job_material_key(material)
+    }
+    contradictory_deleted_codes = sorted(raw_deleted_codes & accepted_material_codes)
+    if contradictory_deleted_codes:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot capture golden baseline because a material is both deleted and still present in an accepted bundle.",
+        )
+    for bundle in proposal_data.get("bundles") or []:
+        if not isinstance(bundle, dict):
+            continue
+        deleted_labor_reasons = bundle.get("deleted_labor_reasons")
+        if not isinstance(deleted_labor_reasons, dict):
+            deleted_labor_reasons = {}
+        if any(not str(deleted_labor_reasons.get(key) or "").strip() for key in (bundle.get("deleted_labor_keys") or [])):
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot capture golden baseline until every deleted labor line has an explicit estimator reason.",
+            )
+    active_materials = [
+        material for material in (job.get("materials") or [])
+        if isinstance(material, dict) and _job_material_key(material) not in deleted_codes
+    ]
+    missing_from_proposal = [
+        material.get("item_code") or material.get("description") or "material"
+        for material in active_materials
+        if not _job_material_key(material)
+        or _job_material_key(material) not in accepted_material_codes
+    ]
+    if missing_from_proposal:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot capture golden baseline until every active material is represented "
+                f"in the accepted proposal: {', '.join(str(item) for item in missing_from_proposal[:5])}."
+            ),
+        )
+    unknown = [
+        m.get("item_code") or m.get("description") or "material"
+        for m in active_materials
+        if not is_valid_material_classification(m.get("material_type"))
+    ]
     unpriced = [m.get("item_code") or m.get("description") or "material" for m in active_materials if _as_number(m.get("unit_price")) is None or _as_number(m.get("unit_price")) <= 0]
     if unknown or unpriced:
         details = []
@@ -2927,19 +3751,50 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     run = _latest_completed_run(job["id"], {"proposal_manual_save", "proposal_editor_save", "proposal_generation"})
     if not run:
         raise HTTPException(status_code=409, detail="Cannot capture golden baseline until this proposal has a current audit trace. Save or regenerate first.")
-    _ensure_audit_ruleset_current(run, label="Golden baseline")
+    proposal_audit = proposal_data.get("audit") if isinstance(proposal_data.get("audit"), dict) else {}
+    try:
+        audit_receipt_matches = int(proposal_audit.get("run_id")) == int(run["id"])
+    except (TypeError, ValueError):
+        audit_receipt_matches = False
+    if not audit_receipt_matches:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot capture golden baseline because the proposal audit receipt is stale. Save or regenerate the proposal first.",
+        )
+    _ensure_audit_calculator_current(run, label="Golden baseline")
 
     target_totals = {}
     for key, value in (body.target_totals or {}).items():
         if value in (None, ""):
             continue
         number = _as_money_number(value)
-        if number is not None:
-            target_totals[key] = number
-    if target_totals.get("grand_total") is None:
-        raise HTTPException(status_code=400, detail="Enter the Job Runner grand total before capturing the golden baseline.")
+        if number is None or number < 0:
+            raise HTTPException(status_code=400, detail=f"Job Runner total '{key}' must be a non-negative number.")
+        target_totals[key] = number
+    if target_totals.get("grand_total") is None or target_totals["grand_total"] <= 0:
+        raise HTTPException(status_code=400, detail="Enter a positive Job Runner grand total before capturing the golden baseline.")
 
-    ruleset = get_ruleset_version()
+    raw_tolerance = body.tolerance or {}
+    unknown_tolerance_fields = sorted(set(raw_tolerance) - set(DEFAULT_TOLERANCE))
+    if unknown_tolerance_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown tolerance field(s): {', '.join(unknown_tolerance_fields)}.",
+        )
+    tolerance = dict(DEFAULT_TOLERANCE)
+    for key, value in raw_tolerance.items():
+        number = _as_number(value)
+        if number is None or number < 0:
+            raise HTTPException(status_code=400, detail=f"Tolerance '{key}' must be a non-negative number.")
+        tolerance[key] = number
+    for scope in ("proposal", "bundle"):
+        if tolerance[f"{scope}_warn_abs"] < tolerance[f"{scope}_pass_abs"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{scope.title()} warning tolerance must be at least its pass tolerance.",
+            )
+
+    ruleset = _ruleset_with_engine_contract(get_ruleset_version())
     config_snapshot = {
         "waste_factors": WASTE_FACTORS,
         "sundry_rules": SUNDRY_RULES,
@@ -2953,10 +3808,11 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
         labor_catalog=get_labor_catalog_entries(),
         ruleset=ruleset,
         target_totals=target_totals,
-        tolerance=body.tolerance or DEFAULT_TOLERANCE,
+        tolerance=tolerance,
         build=build_manifest_for_snapshot(),
         artifact_manifest=_job_artifact_manifest(job["id"]),
         config_snapshot=config_snapshot,
+        proposal_source_fingerprint=current_proposal_fingerprint,
     )
     golden = upsert_golden_job(
         source_job_id=job["id"],
@@ -2984,7 +3840,12 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     return {
         "golden_job": _public_golden_job(golden),
         "latest_replay": None,
+        "baseline_replay": None,
+        "current_replay": None,
+        "comparison_status": "not_replayed",
+        "current_drift_classification": None,
         "replays": [],
+        "active_version_replays": [],
         "default_tolerance": DEFAULT_TOLERANCE,
     }
 
@@ -3006,7 +3867,7 @@ def api_replay_golden_job(job_id: str, body: GoldenReplayRequest):
         mode=mode,
         current_company_rates=get_all_company_rates(),
         current_labor_catalog=get_labor_catalog_entries(),
-        current_ruleset=get_ruleset_version(),
+        current_ruleset=_ruleset_with_engine_contract(get_ruleset_version()),
         current_config_snapshot={
             "waste_factors": WASTE_FACTORS,
             "sundry_rules": SUNDRY_RULES,
@@ -3068,7 +3929,10 @@ def _as_number(value):
     try:
         if value is None or value == "":
             return None
-        return round(float(value), 4)
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        return round(number, 4)
     except (TypeError, ValueError):
         return None
 
@@ -3079,9 +3943,24 @@ def _as_money_number(value):
     return _as_number(value)
 
 
+def _job_material_key(material: dict) -> str:
+    return str(
+        material.get("item_code")
+        or material.get("id")
+        or material.get("material_id")
+        or ""
+    )
+
+
 def _audit_metadata(extra: dict = None) -> dict:
-    """Attach the current whole-ruleset version to every audit run."""
+    """Attach visible rules metadata and the calculator identity to an audit."""
     metadata = dict(extra or {})
+    build = get_build_info()
+    metadata.update({
+        "engine_fingerprint": build.get("engine_fingerprint"),
+        "config_fingerprint": build.get("config_fingerprint"),
+        **_calculator_data_fingerprints(),
+    })
     ruleset = get_ruleset_version()
     if ruleset:
         metadata.update({
@@ -3098,19 +3977,54 @@ def _current_ruleset_version() -> int | None:
     return ruleset.get("version") if ruleset else None
 
 
-def _ensure_audit_ruleset_current(run: dict | None, *, label: str) -> None:
-    current_version = _current_ruleset_version()
-    run_version = (run.get("metadata") or {}).get("ruleset_version") if run else None
-    if current_version is not None and run_version is not None and int(run_version) != int(current_version):
+def _ensure_audit_calculator_current(run: dict | None, *, label: str) -> None:
+    """Require proof from the running calculator, not a metadata-only rules edit."""
+    build = get_build_info()
+    metadata = (run or {}).get("metadata") or {}
+    expected_engine = build.get("engine_fingerprint")
+    expected_config = build.get("config_fingerprint")
+    run_engine = metadata.get("engine_fingerprint")
+    run_config = metadata.get("config_fingerprint")
+    if not run_engine or not run_config:
         raise HTTPException(
             status_code=409,
-            detail=f"{label} audit was created under ruleset v{run_version}; current ruleset is v{current_version}. Regenerate first.",
+            detail=f"{label} audit predates calculator fingerprint evidence. Recalculate or save the proposal first.",
+        )
+    if run_engine != expected_engine or run_config != expected_config:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{label} audit was created by a different calculator build or config. Recalculate or save the proposal first.",
         )
 
 
 def _fingerprint_payload(payload) -> str:
     raw = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _materials_source_fingerprint(materials: list[dict]) -> str:
+    """Fingerprint only durable material fields used by pricing and calculation."""
+    fields = (
+        "id", "item_code", "description", "material_type", "installed_qty", "unit",
+        "waste_pct", "order_qty", "vendor", "unit_price", "extended_cost",
+        "ai_confidence", "quote_status", "price_source", "freight_per_unit",
+        "freight_source", "fixture_count", "labor_rate_lf", "labor_catalog",
+        "tack_strip_lf", "seam_tape_lf", "pad_sy", "area_type", "is_mosaic",
+        "is_penny_hex", "crack_isolation_sf", "weld_rod_lf",
+    )
+    return _fingerprint_payload([
+        {field: material.get(field) for field in fields}
+        for material in materials
+        if isinstance(material, dict)
+    ])
+
+
+def _calculator_data_fingerprints() -> dict:
+    """Fingerprint mutable rate inputs that live outside the source job."""
+    return {
+        "company_rates_fingerprint": _fingerprint_payload(get_all_company_rates()),
+        "labor_catalog_fingerprint": _fingerprint_payload(get_labor_catalog_entries()),
+    }
 
 
 def _job_source_snapshot(job: dict) -> dict:
@@ -3141,11 +4055,15 @@ def _line_snapshot(items: list[dict], fields: tuple[str, ...]) -> list[dict]:
 
 
 def _bid_source_fingerprint(job: dict) -> str:
+    build = get_build_info()
+    data_fingerprints = _calculator_data_fingerprints()
     return _fingerprint_payload({
+        "fingerprint_schema": 2,
         "job": _job_source_snapshot(job),
         "materials": _line_snapshot(job.get("materials", []), (
             "id", "item_code", "description", "material_type", "installed_qty",
             "unit", "waste_pct", "order_qty", "unit_price", "extended_cost",
+            "vendor", "price_source", "quote_status", "ai_confidence",
             "freight_per_unit", "freight_source", "fixture_count", "labor_rate_lf",
             "labor_catalog", "tack_strip_lf", "seam_tape_lf", "pad_sy", "area_type",
             "is_mosaic", "is_penny_hex", "crack_isolation_sf", "weld_rod_lf",
@@ -3157,17 +4075,23 @@ def _bid_source_fingerprint(job: dict) -> str:
         "labor": _line_snapshot(job.get("labor", []), (
             "id", "material_id", "labor_description", "qty", "unit", "rate", "extended_cost",
         )),
-        "ruleset_version": _current_ruleset_version(),
+        "engine_fingerprint": build.get("engine_fingerprint"),
+        "config_fingerprint": build.get("config_fingerprint"),
+        **data_fingerprints,
     })
 
 
 def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -> str:
     proposal_data = proposal_data if isinstance(proposal_data, dict) else (job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {})
+    build = get_build_info()
+    data_fingerprints = _calculator_data_fingerprints()
     return _fingerprint_payload({
+        "fingerprint_schema": 2,
         "job": _job_source_snapshot(job),
         "materials": _line_snapshot(job.get("materials", []), (
             "id", "item_code", "description", "material_type", "installed_qty",
             "unit", "waste_pct", "order_qty", "unit_price", "extended_cost",
+            "vendor", "price_source", "quote_status", "ai_confidence",
             "freight_per_unit", "freight_source", "fixture_count", "labor_rate_lf",
             "labor_catalog", "tack_strip_lf", "seam_tape_lf", "pad_sy", "area_type",
             "is_mosaic", "is_penny_hex", "crack_isolation_sf", "weld_rod_lf",
@@ -3186,9 +4110,12 @@ def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -
             "gpm_profit": proposal_data.get("gpm_profit", 0),
             "gpm_labor": proposal_data.get("gpm_labor", 0),
             "gpm_material": proposal_data.get("gpm_material", 0),
+            "manual_adjustment": proposal_data.get("manual_adjustment", 0),
             "textura_amount": proposal_data.get("textura_amount", 0),
             "deleted_bundles": proposal_data.get("deleted_bundles", []),
+            "deleted_bundle_reasons": proposal_data.get("deleted_bundle_reasons", {}),
             "deleted_material_codes": proposal_data.get("deleted_material_codes", []),
+            "deleted_material_reasons": proposal_data.get("deleted_material_reasons", {}),
         },
         "sundries": _line_snapshot(job.get("sundries", []), (
             "id", "material_id", "sundry_name", "qty", "unit", "unit_price",
@@ -3197,16 +4124,14 @@ def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -
         "labor": _line_snapshot(job.get("labor", []), (
             "id", "material_id", "labor_description", "qty", "unit", "rate", "extended_cost",
         )),
-        "ruleset_version": _current_ruleset_version(),
+        "engine_fingerprint": build.get("engine_fingerprint"),
+        "config_fingerprint": build.get("config_fingerprint"),
+        **data_fingerprints,
     })
 
 
 def _latest_completed_run(job_id: int, run_types: set[str]) -> dict | None:
-    runs = list_calculation_runs(job_id, limit=50)
-    for run in runs:
-        if run.get("status") == "completed" and run.get("run_type") in run_types:
-            return run
-    return None
+    return get_latest_completed_calculation_run(job_id, run_types)
 
 
 def _required_job_field_gaps(job: dict) -> list[str]:
@@ -3246,7 +4171,7 @@ def _validate_bid_job_ready(job: dict) -> None:
     unknown = [
         m.get("item_code") or m.get("description") or f"material {index + 1}"
         for index, m in enumerate(materials)
-        if not str(m.get("material_type") or "").strip() or str(m.get("material_type") or "").lower() == "unknown"
+        if not is_valid_material_classification(m.get("material_type"))
     ]
     if unknown:
         sample = ", ".join(str(item) for item in unknown[:5])
@@ -3266,7 +4191,7 @@ def _validate_bid_pdf_download_ready(job: dict) -> None:
     latest = _latest_completed_run(job["id"], {"bid_pdf_generation"})
     if not latest or int(latest["id"]) != int(bid_data.get("pdf_audit_run_id")):
         raise HTTPException(status_code=409, detail="Bid PDF is stale. Regenerate the bid before downloading.")
-    _ensure_audit_ruleset_current(latest, label="Bid PDF")
+    _ensure_audit_calculator_current(latest, label="Bid PDF")
     if bid_data.get("pdf_source_fingerprint") != _bid_source_fingerprint(job):
         raise HTTPException(status_code=409, detail="Bid PDF is stale because the job source changed. Regenerate the bid before downloading.")
     traces = get_calculation_traces(job["id"], run_id=latest["id"], entity_type="bid", entity_key="bid", limit=200)
@@ -3451,6 +4376,7 @@ def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) ->
             "gpm_adder": _money(bundle.get("gpm_adder")),
             "taxable": _money(bundle.get("taxable")),
             "tax_amount": _money(bundle.get("tax_amount")),
+            "calculated_total": _money(bundle.get("total_price")),
             "total_price": _money(bundle.get("price_override") if bundle.get("price_override") is not None else bundle.get("total_price")),
             "price_override": bundle.get("price_override"),
         })
@@ -3462,6 +4388,7 @@ def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) ->
         "gpm_profit": _money(current.get("gpm_profit")),
         "gpm_labor": _money(current.get("gpm_labor")),
         "gpm_material": _money(current.get("gpm_material")),
+        "manual_adjustment": _money(current.get("manual_adjustment")),
         "subtotal": _money(current.get("subtotal")),
         "tax_amount": _money(current.get("tax_amount")),
         "textura_amount": _money(current.get("textura_amount")),
@@ -3495,9 +4422,15 @@ def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) ->
             "gpm_profit": totals["gpm_profit"],
             "gpm_labor": totals["gpm_labor"],
         }),
-        ("subtotal", "total_cost + gpm_profit", {
-            "total_cost": totals["total_cost"],
-            "gpm_profit": totals["gpm_profit"],
+        ("manual_adjustment", "sum(effective bundle total - calculated bundle total)", {
+            "bundles": [
+                {"bundle_name": bundle["bundle_name"], "calculated": bundle["calculated_total"], "effective": bundle["total_price"]}
+                for bundle in bundle_components
+            ],
+        }),
+        ("subtotal", "sum(effective bundle totals) - tax_amount", {
+            "manual_adjustment": totals["manual_adjustment"],
+            "tax_amount": totals["tax_amount"],
         }),
         ("tax_amount", "sum(bundle.tax_amount)", {
             "tax_rate": current.get("tax_rate", 0),
@@ -3661,11 +4594,7 @@ def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) ->
             )
 
     manual_trace_count = 0
-    proposal_fields = [
-        "tax_rate", "gpm_pct", "textura_fee", "subtotal", "tax_amount",
-        "grand_total", "gpm_profit", "gpm_labor", "gpm_material", "textura_amount",
-    ]
-    for field in proposal_fields:
+    for field in ("tax_rate", "gpm_pct", "textura_fee"):
         old = _as_number(previous.get(field))
         new = _as_number(current.get(field))
         if old != new:
@@ -3676,15 +4605,10 @@ def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) ->
                 output_field=field,
                 prior_value=previous.get(field),
                 value=current.get(field),
-                note="Proposal editor save changed a proposal-level numeric field.",
+                note="Estimator changed a proposal calculation input.",
             )
             manual_trace_count += 1
 
-    bundle_fields = [
-        "material_cost", "sundry_cost", "labor_cost", "freight_cost",
-        "gpm_labor_adder", "gpm_material_adder", "gpm_adder",
-        "taxable", "tax_amount", "total_price", "price_override",
-    ]
     previous_bundles = previous.get("bundles") or []
     previous_by_name = {
         b.get("bundle_name"): b for b in previous_bundles
@@ -3698,19 +4622,92 @@ def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) ->
         if prior is None and index < len(previous_bundles):
             prior = previous_bundles[index] if isinstance(previous_bundles[index], dict) else {}
         prior = prior or {}
-        for field in bundle_fields:
-            old = _as_number(prior.get(field))
-            new = _as_number(bundle.get(field))
-            if old != new:
+
+        for field in ("price_override", "freight_override"):
+            prior_value = prior.get(field)
+            value = bundle.get(field)
+            if value is not None or prior_value is not None:
                 trace.manual_override(
                     entity_type="bundle",
                     entity_key=bundle_name,
                     output_field=field,
-                    prior_value=prior.get(field),
-                    value=bundle.get(field),
-                    note="Proposal editor save changed a bundle numeric field.",
+                    prior_value=prior_value,
+                    value=value,
+                    note="Accepted bundle override is active." if value is not None else "Estimator cleared the accepted bundle override.",
                 )
                 manual_trace_count += 1
+
+        prior_materials = {
+            str(item.get("item_code") or item.get("id") or item.get("material_id") or ""): item
+            for item in (prior.get("materials") or []) if isinstance(item, dict)
+        }
+        for material in (bundle.get("materials") or []):
+            if not isinstance(material, dict) or not material.get("freight_is_manual"):
+                continue
+            material_key = str(material.get("item_code") or material.get("id") or material.get("material_id") or "")
+            prior_material = prior_materials.get(material_key) or {}
+            trace.manual_override(
+                entity_type="material",
+                entity_id=material.get("id") or material.get("material_id"),
+                entity_key=material.get("item_code") or material.get("description"),
+                output_field="freight_per_unit",
+                prior_value=prior_material.get("freight_per_unit"),
+                value=material.get("freight_per_unit"),
+                note="Accepted material freight override is active.",
+            )
+            manual_trace_count += 1
+
+        prior_sundries = {
+            f"{item.get('material_id')}:{item.get('sundry_name') or 'sundry'}": item
+            for item in (prior.get("sundry_items") or []) if isinstance(item, dict)
+        }
+        for sundry in (bundle.get("sundry_items") or []):
+            if not isinstance(sundry, dict) or not sundry.get("is_manual_price"):
+                continue
+            sundry_key = f"{sundry.get('material_id')}:{sundry.get('sundry_name') or 'sundry'}"
+            prior_sundry = prior_sundries.get(sundry_key) or {}
+            trace.manual_override(
+                entity_type="sundry",
+                entity_id=sundry.get("material_id"),
+                entity_key=sundry_key,
+                output_field="extended_cost",
+                prior_value=prior_sundry.get("extended_cost"),
+                value=sundry.get("extended_cost"),
+                note="Accepted sundry price override is active.",
+            )
+            manual_trace_count += 1
+
+        prior_labor = {
+            str(item.get("manual_source_key") or f"{item.get('material_id')}:{item.get('labor_description') or 'labor'}"): item
+            for item in (prior.get("labor_items") or []) if isinstance(item, dict)
+        }
+        for labor in (bundle.get("labor_items") or []):
+            if not isinstance(labor, dict) or not (labor.get("is_manual") or labor.get("is_stair_labor")):
+                continue
+            source_key = str(labor.get("manual_source_key") or f"{labor.get('material_id')}:{labor.get('labor_description') or 'labor'}")
+            prior_line = prior_labor.get(source_key) or {}
+            labor_description = labor.get("labor_description") or "labor"
+            trace.manual_override(
+                entity_type="labor",
+                entity_id=labor.get("material_id"),
+                entity_key=f"{labor.get('material_id')}:{labor_description}",
+                output_field="extended_cost",
+                prior_value=prior_line.get("extended_cost"),
+                value=labor.get("extended_cost"),
+                note="Accepted manual labor line is active.",
+            )
+            manual_trace_count += 1
+
+        for deleted_key in (bundle.get("deleted_labor_keys") or []):
+            trace.manual_override(
+                entity_type="bundle",
+                entity_key=bundle_name,
+                output_field="deleted_labor",
+                prior_value=(prior.get("deleted_labor_reasons") or {}).get(deleted_key),
+                value=(bundle.get("deleted_labor_reasons") or {}).get(deleted_key),
+                note=f"Generated labor line remains deleted: {deleted_key}",
+            )
+            manual_trace_count += 1
 
     if not trace.records:
         return {"trace_count": 0, "manual_trace_count": 0, "audit_trace": None}
@@ -3735,7 +4732,11 @@ def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) ->
 
 def _append_proposal_totals_snapshot(trace: AuditTraceBuilder, job_id: int, proposal: dict) -> None:
     """Append final editor-style proposal totals to a generation audit run."""
-    if not trace or not isinstance(proposal, dict):
+    if not isinstance(proposal, dict):
+        return
+
+    normalize_proposal_totals(proposal)
+    if not trace:
         return
 
     def _money(value) -> float:
@@ -3763,33 +4764,14 @@ def _append_proposal_totals_snapshot(trace: AuditTraceBuilder, job_id: int, prop
     freight_total = _money(sum(_freight(b) for b in bundles))
     total_cost = _money(material_total + sundry_total + labor_total + freight_total)
 
-    if 0 < gpm_pct < 1 and total_cost > 0:
-        gpm_profit = _money(total_cost / (1 - gpm_pct) - total_cost)
-        gpm_labor = _money(gpm_profit * 0.9793)
-        gpm_material = _money(gpm_profit - gpm_labor)
-    else:
-        gpm_profit = gpm_labor = gpm_material = 0.0
+    gpm_profit = _money(proposal.get("gpm_profit"))
+    gpm_labor = _money(proposal.get("gpm_labor"))
+    gpm_material = _money(proposal.get("gpm_material"))
 
     bundle_rows = []
     for index, bundle in enumerate(bundles):
         bundle_name = bundle.get("bundle_name") or f"bundle:{index}"
         freight = _freight(bundle)
-        bundle_cost = _money(
-            _money(bundle.get("material_cost"))
-            + _money(bundle.get("sundry_cost"))
-            + _money(bundle.get("labor_cost"))
-            + freight
-        )
-        share = bundle_cost / total_cost if total_cost > 0 else 0
-        bundle["gpm_labor_adder"] = _money(gpm_labor * share) if gpm_profit else 0.0
-        bundle["gpm_material_adder"] = _money(gpm_material * share) if gpm_profit else 0.0
-        bundle["gpm_adder"] = _money(bundle["gpm_labor_adder"] + bundle["gpm_material_adder"])
-        bundle["taxable"] = _money(_money(bundle.get("material_cost")) + _money(bundle.get("sundry_cost")) + freight + bundle["gpm_material_adder"])
-        bundle["tax_amount"] = _money(bundle["taxable"] * tax_rate)
-        computed_total = _money(bundle_cost + bundle["gpm_adder"] + bundle["tax_amount"])
-        display_total = _money(bundle.get("price_override") if bundle.get("price_override") is not None else computed_total)
-        if bundle.get("price_override") is None:
-            bundle["total_price"] = display_total
         row = {
             "bundle_name": bundle_name,
             "bundle_index": index,
@@ -3802,25 +4784,18 @@ def _append_proposal_totals_snapshot(trace: AuditTraceBuilder, job_id: int, prop
             "gpm_adder": bundle["gpm_adder"],
             "taxable": bundle["taxable"],
             "tax_amount": bundle["tax_amount"],
-            "total_price": display_total,
+            "calculated_total": _money(bundle.get("total_price")),
+            "total_price": effective_bundle_total(bundle),
             "price_override": bundle.get("price_override"),
         }
         bundle_rows.append(row)
 
-    tax_amount = _money(sum(row["tax_amount"] for row in bundle_rows))
-    subtotal = _money(total_cost + gpm_profit)
-    textura_enabled = int(proposal.get("textura_fee") or 0)
-    textura_amount = _money(min(round((subtotal + tax_amount) * 0.0022, 2), 5000.0) if textura_enabled else 0)
-    grand_total = _money(subtotal + tax_amount + textura_amount)
-    proposal.update({
-        "gpm_profit": gpm_profit,
-        "gpm_labor": gpm_labor,
-        "gpm_material": gpm_material,
-        "subtotal": subtotal,
-        "tax_amount": tax_amount,
-        "textura_amount": textura_amount,
-        "grand_total": grand_total,
-    })
+    tax_amount = _money(proposal.get("tax_amount"))
+    subtotal = _money(proposal.get("subtotal"))
+    manual_adjustment = _money(proposal.get("manual_adjustment"))
+    textura_enabled = 1 if proposal.get("textura_fee") else 0
+    textura_amount = _money(proposal.get("textura_amount"))
+    grand_total = _money(proposal.get("grand_total"))
 
     def _bundle_values(field: str) -> list[dict]:
         return [{"bundle_name": row["bundle_name"], "value": row[field]} for row in bundle_rows]
@@ -3839,7 +4814,13 @@ def _append_proposal_totals_snapshot(trace: AuditTraceBuilder, job_id: int, prop
         ("gpm_profit", "total_cost / (1 - gpm_pct) - total_cost", {"total_cost": total_cost, "gpm_pct": gpm_pct}, gpm_profit),
         ("gpm_labor", "gpm_profit * 0.9793", {"gpm_profit": gpm_profit, "split_pct": 0.9793}, gpm_labor),
         ("gpm_material", "gpm_profit - gpm_labor", {"gpm_profit": gpm_profit, "gpm_labor": gpm_labor}, gpm_material),
-        ("subtotal", "total_cost + gpm_profit", {"total_cost": total_cost, "gpm_profit": gpm_profit}, subtotal),
+        ("manual_adjustment", "sum(effective bundle total - calculated bundle total)", {
+            "bundles": [
+                {"bundle_name": row["bundle_name"], "calculated": row["calculated_total"], "effective": row["total_price"]}
+                for row in bundle_rows
+            ],
+        }, manual_adjustment),
+        ("subtotal", "sum(effective bundle totals) - tax_amount", {"manual_adjustment": manual_adjustment, "tax_amount": tax_amount}, subtotal),
         ("tax_amount", "sum(bundle.tax_amount)", {"tax_rate": tax_rate, "bundles": _bundle_values("tax_amount")}, tax_amount),
         ("textura_amount", "min((subtotal + tax_amount) * 0.0022, 5000) when enabled else 0", {
             "textura_fee": textura_enabled,
@@ -3902,11 +4883,69 @@ def _append_proposal_totals_snapshot(trace: AuditTraceBuilder, job_id: int, prop
 async def api_save_proposal_bundles(job_id: str, request: Request):
     """Auto-save proposal editor state (bundles, notes, terms, GPM, etc.)."""
     import json as _json
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     body = await request.json()
     previous_proposal_data = job.get("proposal_data") or {}
+    incoming_session_id = str(body.get("client_session_id") or "").strip()
+    try:
+        incoming_edit_version = max(0, int(body.get("client_edit_version") or 0))
+    except (TypeError, ValueError):
+        incoming_edit_version = 0
+    try:
+        incoming_save_sequence = max(0, int(body.get("client_save_sequence") or 0))
+    except (TypeError, ValueError):
+        incoming_save_sequence = 0
+    stored_session_id = str(previous_proposal_data.get("_client_session_id") or "").strip()
+    try:
+        stored_edit_version = max(0, int(previous_proposal_data.get("_client_edit_version") or 0))
+    except (TypeError, ValueError):
+        stored_edit_version = 0
+    try:
+        stored_save_sequence = max(0, int(previous_proposal_data.get("_client_save_sequence") or 0))
+    except (TypeError, ValueError):
+        stored_save_sequence = 0
+    try:
+        stored_server_revision = max(0, int(previous_proposal_data.get("_server_revision") or 0))
+    except (TypeError, ValueError):
+        stored_server_revision = 0
+    incoming_base_revision_present = "base_server_revision" in body
+    try:
+        incoming_base_revision = max(0, int(body.get("base_server_revision") or 0))
+    except (TypeError, ValueError):
+        incoming_base_revision = -1
+    same_client_session = bool(incoming_session_id and incoming_session_id == stored_session_id)
+    if (
+        same_client_session
+        and (
+            incoming_save_sequence < stored_save_sequence
+            or incoming_edit_version < stored_edit_version
+        )
+    ):
+        return {
+            "status": "stale_ignored",
+            "stale_save_ignored": True,
+            "manual_trace_count": 0,
+            "trace_count": 0,
+            "audit_trace": None,
+            "audit": None,
+            "proposal_data": previous_proposal_data,
+        }
+    if (
+        incoming_session_id
+        and not same_client_session
+        and incoming_base_revision_present
+        and incoming_base_revision != stored_server_revision
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This proposal changed in another tab or session. Your stale copy was not saved. "
+                "Reload the job and review the newer accepted proposal before editing again."
+            ),
+        )
     proposal_data = {
         "bundles": body.get("bundles", []),
         "notes": body.get("notes", []),
@@ -3921,11 +4960,19 @@ async def api_save_proposal_bundles(job_id: str, request: Request):
         "gpm_profit": body.get("gpm_profit", 0),
         "gpm_labor": body.get("gpm_labor", 0),
         "gpm_material": body.get("gpm_material", 0),
+        "manual_adjustment": body.get("manual_adjustment", 0),
         "textura_amount": body.get("textura_amount", 0),
         "deleted_bundles": body.get("deleted_bundles", []),
+        "deleted_bundle_reasons": body.get("deleted_bundle_reasons", {}),
         "deleted_material_codes": body.get("deleted_material_codes", []),
+        "deleted_material_reasons": body.get("deleted_material_reasons", {}),
         "audit": body.get("audit", {}),
+        "_client_session_id": incoming_session_id,
+        "_client_edit_version": incoming_edit_version,
+        "_client_save_sequence": incoming_save_sequence,
+        "_server_revision": stored_server_revision + 1,
     }
+    normalize_proposal_totals(proposal_data)
     proposal_data["audit_source_fingerprint"] = _proposal_source_fingerprint(job, proposal_data)
     audit_result = _record_proposal_editor_audit(job["id"], previous_proposal_data, proposal_data)
     if audit_result.get("audit_trace"):
@@ -3942,6 +4989,7 @@ async def api_save_proposal_bundles(job_id: str, request: Request):
         "trace_count": audit_result.get("trace_count", 0),
         "audit_trace": audit_result.get("audit_trace"),
         "audit": audit_result.get("audit_trace"),
+        "proposal_data": proposal_data,
     }
 
 
@@ -3954,10 +5002,84 @@ def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
             detail=f"Cannot generate PDF until required job fields are filled: {', '.join(missing)}.",
         )
 
+    saved_proposal = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
+    body_fingerprint = _proposal_source_fingerprint(job, body)
+    if not saved_proposal.get("audit_source_fingerprint") or saved_proposal.get("audit_source_fingerprint") != body_fingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot generate PDF because this is not the exact saved and audited proposal. Save it and try again.",
+        )
+
+    raw_deleted_codes = {str(code) for code in (body.get("deleted_material_codes") or []) if code}
+    deleted_material_reasons = body.get("deleted_material_reasons")
+    if not isinstance(deleted_material_reasons, dict):
+        deleted_material_reasons = {}
+    missing_material_reasons = [
+        code for code in sorted(raw_deleted_codes)
+        if not str(deleted_material_reasons.get(code) or "").strip()
+    ]
+    if missing_material_reasons:
+        raise HTTPException(status_code=409, detail="Cannot generate PDF until every deleted material has an estimator reason.")
+
+    deleted_bundle_names = {str(name) for name in (body.get("deleted_bundles") or []) if name}
+    deleted_bundle_reasons = body.get("deleted_bundle_reasons")
+    if not isinstance(deleted_bundle_reasons, dict):
+        deleted_bundle_reasons = {}
+    if any(not str(deleted_bundle_reasons.get(name) or "").strip() for name in deleted_bundle_names):
+        raise HTTPException(status_code=409, detail="Cannot generate PDF until every deleted bundle has an estimator reason.")
+
+    accepted_codes = {
+        _job_material_key(material)
+        for bundle in (body.get("bundles") or [])
+        if isinstance(bundle, dict)
+        for material in (bundle.get("materials") or [])
+        if isinstance(material, dict) and _job_material_key(material)
+    }
+    if raw_deleted_codes & accepted_codes:
+        raise HTTPException(status_code=409, detail="Cannot generate PDF because a material is both deleted and present in an accepted bundle.")
+
+    for bundle in body.get("bundles") or []:
+        if not isinstance(bundle, dict):
+            continue
+        reasons = bundle.get("deleted_labor_reasons")
+        if not isinstance(reasons, dict):
+            reasons = {}
+        if any(not str(reasons.get(key) or "").strip() for key in (bundle.get("deleted_labor_keys") or [])):
+            raise HTTPException(status_code=409, detail="Cannot generate PDF until every deleted labor line has an estimator reason.")
+
+    active_materials = [
+        material for material in (job.get("materials") or [])
+        if isinstance(material, dict) and _job_material_key(material) not in raw_deleted_codes
+    ]
+    unknown = [
+        material.get("item_code") or material.get("description") or "material"
+        for material in active_materials
+        if not is_valid_material_classification(material.get("material_type"))
+    ]
+    unpriced = [
+        material.get("item_code") or material.get("description") or "material"
+        for material in active_materials
+        if _as_number(material.get("unit_price")) is None or _as_number(material.get("unit_price")) <= 0
+    ]
+    if unknown or unpriced:
+        issues = []
+        if unknown:
+            issues.append(f"classify {', '.join(str(item) for item in unknown[:5])}")
+        if unpriced:
+            issues.append(f"price {', '.join(str(item) for item in unpriced[:5])}")
+        raise HTTPException(status_code=409, detail=f"Cannot generate PDF until active materials are ready: {'; '.join(issues)}.")
+
+    arithmetic_errors = proposal_math_errors(body)
+    if arithmetic_errors:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot generate PDF because proposal arithmetic is invalid: {' '.join(arithmetic_errors[:3])}",
+        )
+
     run = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
     if not run:
         raise HTTPException(status_code=409, detail="Cannot generate PDF until this proposal has a current audit trace. Save or regenerate first.")
-    _ensure_audit_ruleset_current(run, label="Proposal PDF")
+    _ensure_audit_calculator_current(run, label="Proposal PDF")
     _validate_proposal_body_matches_job_source(job, body)
     traces = get_calculation_traces(job["id"], run_id=run["id"], limit=5000)
     proposal_traces = [
@@ -3967,7 +5089,7 @@ def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
     by_field = {}
     for trace in proposal_traces:
         by_field[trace.get("output_field")] = trace
-    required = ["subtotal", "tax_amount", "grand_total", "gpm_profit", "gpm_labor", "gpm_material", "textura_amount"]
+    required = ["subtotal", "tax_amount", "grand_total", "gpm_profit", "gpm_labor", "gpm_material", "manual_adjustment", "textura_amount"]
     missing_traces = [field for field in required if field not in by_field]
     if missing_traces:
         raise HTTPException(
@@ -3975,17 +5097,7 @@ def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
             detail=f"Cannot generate PDF because audit is missing: {', '.join(missing_traces)}.",
         )
     for field in required:
-        body_value = _as_number(body.get(field))
-        trace_value = _as_number(by_field[field].get("result_value"))
-        if body_value is None:
-            body_value = 0
-        if trace_value is None:
-            trace_value = 0
-        if abs(body_value - trace_value) > 0.02:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Cannot generate PDF because audit is stale for {field}. Save the proposal and try again.",
-            )
+        _trace_result_matches(by_field[field], body.get(field), label=f"proposal {field}")
     _validate_proposal_body_against_trace(body, traces)
 
 
@@ -3995,9 +5107,9 @@ def _trace_result_matches(trace: dict | None, expected, *, label: str) -> None:
     expected_value = _as_number(expected)
     trace_value = _as_number(trace.get("result_value"))
     if expected_value is None:
-        expected_value = 0
+        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because {label} is not a finite number.")
     if trace_value is None:
-        trace_value = 0
+        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because audit has no numeric result for {label}.")
     if abs(expected_value - trace_value) > 0.02:
         raise HTTPException(status_code=409, detail=f"Cannot generate PDF because audit is stale for {label}.")
 
@@ -4017,21 +5129,23 @@ def _find_trace(
         if trace.get("entity_type") == entity_type and trace.get("output_field") == output_field
     ]
     if entity_key is not None:
-        keyed = [trace for trace in matches if str(trace.get("entity_key") or "") == str(entity_key)]
-        if keyed:
-            matches = keyed
+        matches = [trace for trace in matches if str(trace.get("entity_key") or "") == str(entity_key)]
     if entity_id is not None:
-        identified = [trace for trace in matches if str(trace.get("entity_id") or "") == str(entity_id)]
-        if identified:
-            matches = identified
+        matches = [trace for trace in matches if str(trace.get("entity_id") or "") == str(entity_id)]
     if bundle_index is not None:
-        indexed = [trace for trace in matches if (trace.get("inputs") or {}).get("bundle_index") == bundle_index]
-        if indexed:
-            matches = indexed
+        traces_with_index = [trace for trace in matches if "bundle_index" in (trace.get("inputs") or {})]
+        if traces_with_index:
+            matches = [
+                trace for trace in traces_with_index
+                if (trace.get("inputs") or {}).get("bundle_index") == bundle_index
+            ]
     if line_index is not None:
-        indexed = [trace for trace in matches if (trace.get("inputs") or {}).get("line_index") == line_index]
-        if indexed:
-            matches = indexed
+        traces_with_index = [trace for trace in matches if "line_index" in (trace.get("inputs") or {})]
+        if traces_with_index:
+            matches = [
+                trace for trace in traces_with_index
+                if (trace.get("inputs") or {}).get("line_index") == line_index
+            ]
     return matches[-1] if matches else None
 
 
@@ -4134,11 +5248,17 @@ def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
 
     seen = set()
     compare_fields = (
-        "material_type", "installed_qty", "waste_pct", "order_qty",
-        "unit_price", "extended_cost", "freight_per_unit",
-        "fixture_count", "labor_rate_lf", "tack_strip_lf", "seam_tape_lf",
-        "pad_sy", "crack_isolation_sf", "weld_rod_lf",
+        "item_code", "description", "material_type", "installed_qty", "unit", "waste_pct", "order_qty",
+        "vendor", "unit_price", "extended_cost", "price_source", "quote_status",
+        "ai_confidence", "freight_per_unit", "freight_source", "fixture_count",
+        "labor_rate_lf", "labor_catalog", "tack_strip_lf", "seam_tape_lf",
+        "pad_sy", "area_type", "is_mosaic", "is_penny_hex",
+        "crack_isolation_sf", "weld_rod_lf",
     )
+    text_fields = {
+        "item_code", "description", "material_type", "unit", "vendor",
+        "price_source", "quote_status", "freight_source", "labor_catalog", "area_type",
+    }
 
     for bundle in body.get("bundles") or []:
         if not isinstance(bundle, dict):
@@ -4162,8 +5282,18 @@ def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
             seen.add(str(current.get("id")))
             label = item_code or current.get("description") or f"material {current.get('id')}"
             for field in compare_fields:
+                # Per-material freight may be an accepted proposal edit. It is
+                # fingerprinted and audited with the proposal, so comparing it
+                # to the raw job-material value would incorrectly block a valid
+                # PDF after the estimator explicitly changed freight.
+                if field == "freight_per_unit" and material.get("freight_is_manual"):
+                    continue
                 current_value = current.get(field)
                 body_value = material.get(field)
+                if field in text_fields:
+                    if str(current_value or "") != str(body_value or ""):
+                        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because proposal material {label} is stale for {field}. Regenerate the proposal.")
+                    continue
                 current_number = _as_number(current_value)
                 body_number = _as_number(body_value)
                 if current_number is not None or body_number is not None:
@@ -4179,7 +5309,7 @@ def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
         if _is_synthetic_material(material):
             continue
         item_code = str(material.get("item_code") or "")
-        if item_code in deleted_codes:
+        if _job_material_key(material) in deleted_codes:
             continue
         material_id = str(material.get("id"))
         if material_id and material_id not in seen:
@@ -4204,7 +5334,7 @@ def _validate_proposal_pdf_download_ready(job: dict) -> None:
     latest = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
     if not latest or int(latest["id"]) != int(proposal_data.get("pdf_audit_run_id")):
         raise HTTPException(status_code=409, detail="Proposal PDF is stale. Regenerate the proposal PDF before downloading.")
-    _ensure_audit_ruleset_current(latest, label="Proposal PDF")
+    _ensure_audit_calculator_current(latest, label="Proposal PDF")
     if proposal_data.get("pdf_source_fingerprint") != _proposal_source_fingerprint(job, proposal_data):
         raise HTTPException(status_code=409, detail="Proposal PDF is stale because the job or proposal source changed. Regenerate the proposal PDF before downloading.")
     traces = get_calculation_traces(
@@ -4216,7 +5346,7 @@ def _validate_proposal_pdf_download_ready(job: dict) -> None:
     )
     by_field = {trace.get("output_field"): trace for trace in traces}
     totals = proposal_data.get("pdf_totals") or {}
-    for field in ("subtotal", "tax_amount", "grand_total", "gpm_profit", "gpm_labor", "gpm_material", "textura_amount"):
+    for field in ("subtotal", "tax_amount", "grand_total", "gpm_profit", "gpm_labor", "gpm_material", "manual_adjustment", "textura_amount"):
         _trace_result_matches(by_field.get(field), totals.get(field), label=f"proposal {field}")
 
 
@@ -4228,7 +5358,8 @@ def api_generate_proposal(job_id: str):
     by snapshotting them keyed on material item_code before regeneration,
     then re-applying after.
     """
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     trace = AuditTraceBuilder(job["id"])
@@ -4236,12 +5367,21 @@ def api_generate_proposal(job_id: str):
     # ── Snapshot existing rewrites so Regenerate doesn't destroy them ──────
     # Key by the first material's item_code per bundle.
     existing_rewrites: dict[str, dict] = {}
+    existing_by_codes: dict[tuple[str, ...], list[dict]] = {}
     existing_pd = job.get("proposal_data") or {}
+    has_saved_accepted_proposal = bool(existing_pd.get("bundles"))
     for b in (existing_pd.get("bundles") or []):
         mats = b.get("materials") or []
         if not mats:
             continue
-        key = (mats[0].get("item_code") or "").strip()
+        codes = tuple(sorted(
+            str(m.get("item_code") or m.get("id") or m.get("material_id"))
+            for m in mats
+            if m.get("item_code") or m.get("id") or m.get("material_id")
+        ))
+        if codes:
+            existing_by_codes.setdefault(codes, []).append(b)
+        key = str(mats[0].get("item_code") or mats[0].get("id") or mats[0].get("material_id") or "").strip()
         if not key:
             continue
         existing_rewrites[key] = {
@@ -4252,7 +5392,11 @@ def api_generate_proposal(job_id: str):
     # ── Carry forward deleted-bundle / deleted-material-code flags ─────────
     # Users mark these via the UI's delete action; they must survive regenerate.
     deleted_bundle_names = set(existing_pd.get("deleted_bundles") or [])
+    raw_deleted_bundle_reasons = existing_pd.get("deleted_bundle_reasons")
+    deleted_bundle_reasons = dict(raw_deleted_bundle_reasons) if isinstance(raw_deleted_bundle_reasons, dict) else {}
     deleted_material_codes = set(existing_pd.get("deleted_material_codes") or [])
+    raw_deleted_reasons = existing_pd.get("deleted_material_reasons")
+    deleted_material_reasons = dict(raw_deleted_reasons) if isinstance(raw_deleted_reasons, dict) else {}
 
     # Always recalculate sundries and labor to reflect latest rules/flags
     materials = job.get("materials", [])
@@ -4320,29 +5464,49 @@ def api_generate_proposal(job_id: str):
         labor_items = calculate_labor_for_materials(materials, trace=trace)
         save_labor(job["id"], labor_items)
         # Reload job with freshly calculated sundries/labor
-        job = load_job(job_id)
+        job = load_job(db_id)
 
-    proposal = generate_proposal_data(job["id"], job, trace=trace)
+    current_company_rates = get_all_company_rates()
+    proposal = generate_proposal_data(
+        job["id"],
+        job,
+        trace=trace,
+        freight_rates_override=current_company_rates.get("freight_rates") or FREIGHT_RATES,
+    )
 
     # ── Re-apply snapshotted rewrites where item_codes match ───────────────
     for b in proposal.get("bundles", []):
         mats = b.get("materials") or []
         if not mats:
             continue
-        key = (mats[0].get("item_code") or "").strip()
-        rw = existing_rewrites.get(key)
+        codes = tuple(sorted(
+            str(m.get("item_code") or m.get("id") or m.get("material_id"))
+            for m in mats
+            if m.get("item_code") or m.get("id") or m.get("material_id")
+        ))
+        candidates = existing_by_codes.get(codes, [])
+        named_candidates = [candidate for candidate in candidates if candidate.get("bundle_name") == b.get("bundle_name")]
+        exact = named_candidates[0] if len(named_candidates) == 1 else (candidates[0] if len(candidates) == 1 else None)
+        key = str(mats[0].get("item_code") or mats[0].get("id") or mats[0].get("material_id") or "").strip()
+        rw = exact if codes else existing_rewrites.get(key)
         if rw:
             if rw.get("bundle_name"):
                 b["bundle_name"] = rw["bundle_name"]
             if rw.get("description_text"):
                 b["description_text"] = rw["description_text"]
+        if exact:
+            for field in ("price_override", "freight_override", "stair_count", "stair_labor_type"):
+                if exact.get(field) is not None:
+                    b[field] = exact[field]
 
     # Carry deletion lists back so the FE save can persist them.
-    # The bundler already filtered the bundles + recomputed totals consistently,
-    # so we don't recompute totals here (doing so caused a double-tax bug).
+    # The shared normalizer below recalculates totals once after these flags and
+    # any exact-match accepted overrides have been restored.
     if deleted_bundle_names or deleted_material_codes:
         proposal["deleted_bundles"] = sorted(deleted_bundle_names)
+        proposal["deleted_bundle_reasons"] = deleted_bundle_reasons
         proposal["deleted_material_codes"] = sorted(deleted_material_codes)
+        proposal["deleted_material_reasons"] = deleted_material_reasons
         trace.record(
             entity_type="proposal",
             entity_id=job["id"],
@@ -4356,6 +5520,23 @@ def api_generate_proposal(job_id: str):
             result=len(proposal.get("bundles") or []),
             rule_id="proposal:deleted_bundle_filter",
             source="proposal_bundler",
+        )
+
+    for field in ("notes", "terms", "exclusions"):
+        if field in existing_pd:
+            proposal[field] = list(existing_pd.get(field) or [])
+    accepted_edit_count = apply_accepted_numeric_edits(proposal, existing_pd) if has_saved_accepted_proposal else 0
+    if accepted_edit_count:
+        trace.record(
+            entity_type="proposal",
+            entity_id=job["id"],
+            entity_key="proposal",
+            output_field="accepted_numeric_edits",
+            formula="reapply explicit estimator inputs and overrides after raw bundle generation",
+            inputs={"accepted_proposal_present": True},
+            result=accepted_edit_count,
+            rule_id="proposal:accepted_numeric_edits",
+            source="proposal_regeneration",
         )
 
     _append_proposal_totals_snapshot(trace, job["id"], proposal)
@@ -4374,9 +5555,18 @@ def api_generate_proposal(job_id: str):
         "summary": summary,
     }
     proposal["audit_source_fingerprint"] = _proposal_source_fingerprint(job, proposal)
-    saved_job = load_job(job_id) or job
-    saved_job["proposal_data"] = proposal
-    save_job(saved_job)
+    # A regenerate must never overwrite the accepted proposal before the UI has
+    # merged its full manual structure and saved it. Initial generation is safe
+    # to persist immediately because there is no accepted proposal yet.
+    if not has_saved_accepted_proposal:
+        try:
+            prior_revision = max(0, int(existing_pd.get("_server_revision") or 0))
+        except (TypeError, ValueError):
+            prior_revision = 0
+        proposal["_server_revision"] = prior_revision + 1
+        saved_job = load_job(db_id) or job
+        saved_job["proposal_data"] = proposal
+        save_job(saved_job)
     return proposal
 
 
@@ -4384,7 +5574,8 @@ def api_generate_proposal(job_id: str):
 async def api_generate_proposal_pdf(job_id: str, request: Request):
     """Generate proposal PDF from edited bundle data."""
     import json as _json
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -4415,14 +5606,22 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
         "gpm_profit": body.get("gpm_profit", 0),
         "gpm_labor": body.get("gpm_labor", 0),
         "gpm_material": body.get("gpm_material", 0),
+        "manual_adjustment": body.get("manual_adjustment", 0),
         "textura_fee": body.get("textura_fee", 0),
         "textura_amount": body.get("textura_amount", 0),
         "notes": body.get("notes", []),
         "terms": body.get("terms", []),
         "exclusions": body.get("exclusions", []),
         "deleted_bundles": body.get("deleted_bundles", []),
+        "deleted_bundle_reasons": body.get("deleted_bundle_reasons", {}),
         "deleted_material_codes": body.get("deleted_material_codes", []),
+        "deleted_material_reasons": body.get("deleted_material_reasons", {}),
         "audit": body.get("audit", (job.get("proposal_data") or {}).get("audit", {})),
+        "_client_session_id": body.get("_client_session_id") or (job.get("proposal_data") or {}).get("_client_session_id", ""),
+        "_client_edit_version": body.get("_client_edit_version") or (job.get("proposal_data") or {}).get("_client_edit_version", 0),
+        "_client_save_sequence": body.get("_client_save_sequence") or (job.get("proposal_data") or {}).get("_client_save_sequence", 0),
+        "_server_revision": (job.get("proposal_data") or {}).get("_server_revision", 0),
+        "pdf_generated_at": datetime.now(timezone.utc).isoformat(),
     }
     proposal_data["audit_source_fingerprint"] = _proposal_source_fingerprint(job, proposal_data)
     pdf_run = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
@@ -4437,6 +5636,7 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
             "gpm_profit": body.get("gpm_profit", 0),
             "gpm_labor": body.get("gpm_labor", 0),
             "gpm_material": body.get("gpm_material", 0),
+            "manual_adjustment": body.get("manual_adjustment", 0),
             "textura_amount": body.get("textura_amount", 0),
         }
 
@@ -4458,13 +5658,15 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
 @app.get("/api/jobs/{job_id}/proposal.pdf")
 def api_download_proposal_pdf(job_id: str):
     """Download the generated proposal PDF."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _validate_proposal_pdf_download_ready(job)
     pdf_path = _job_pdf_path(job["id"], "proposal")
     if not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="PDF not found. Generate proposal first.")
+    _require_artifact_receipt(job["id"], pdf_path, "proposal_pdf")
     return FileResponse(
         pdf_path,
         media_type="application/pdf",
@@ -4509,7 +5711,8 @@ class ExclusionsUpdate(BaseModel):
 def api_update_exclusions(job_id: str, body: ExclusionsUpdate):
     """Update job-specific exclusions list."""
     import json as _json
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     job["exclusions"] = _json.dumps(body.exclusions)
@@ -4523,7 +5726,8 @@ def api_update_exclusions(job_id: str, body: ExclusionsUpdate):
 def api_get_exclusions(job_id: str):
     """Get job exclusions (custom or defaults)."""
     import json as _json
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     raw = job.get("exclusions")
@@ -4540,7 +5744,8 @@ def api_get_exclusions(job_id: str):
 @app.get("/api/jobs/{job_id}/materials/export")
 def api_export_materials(job_id: str):
     """Export materials as CSV download."""
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -4801,8 +6006,11 @@ async def api_upload_price_list(file: UploadFile = File(...)):
     return {"message": "Price list uploaded", "count": len(entries)}
 
 
-def _parse_price_list_pdf(file_path: str, api_key: str = None, model: str = "gpt-5-mini") -> list[dict]:
+def _parse_price_list_pdf(file_path: str, api_key: str = None, model: str = None) -> list[dict]:
     """Parse a price list PDF using AI."""
+    if model is None:
+        settings = get_settings()
+        model = settings.get("openai_model", "gpt-5-mini")
     import pdfplumber
 
     text_parts = []
@@ -5726,7 +6934,8 @@ async def api_mark_notification_read(notification_id: int):
 
 @app.get("/api/jobs/{job_id}/activity")
 def api_get_activity(job_id: str):
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return get_activity(job["id"])
@@ -5734,7 +6943,8 @@ def api_get_activity(job_id: str):
 
 @app.get("/api/jobs/{job_id}/comments")
 def api_get_comments(job_id: str):
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return get_comments(job["id"])
@@ -5745,7 +6955,8 @@ class CommentCreate(BaseModel):
 
 @app.post("/api/jobs/{job_id}/comments")
 def api_add_comment(job_id: str, body: CommentCreate):
-    job = load_job(job_id)
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     comment = add_comment(job["id"], body.text)
@@ -5836,6 +7047,9 @@ async def api_send_quote_email(job_id: str, request: Request):
     if not subject:
         job = load_job(db_id)
         subject = f"Request for Pricing — {job.get('project_name', 'Project')}"
+    job_tag = f"[SI Job {db_id}]"
+    if job_tag.lower() not in subject.lower():
+        subject = f"{subject} {job_tag}"
 
     # Get SMTP config based on test mode
     settings = get_settings()

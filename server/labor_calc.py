@@ -13,7 +13,7 @@ import pdfplumber
 
 from ai_client import chat_complete, get_provider_info
 from config import LABOR_QTY_RULES, WASTE_FACTORS
-from models import save_labor_catalog_entries, get_labor_catalog_entries
+from models import get_settings, save_labor_catalog_entries, get_labor_catalog_entries
 
 LABOR_CATALOG_PROMPT = """You are parsing a labor rate catalog for a flooring/interiors contractor.
 Extract every labor line item from this document into a JSON array.
@@ -227,10 +227,14 @@ def load_labor_catalog(file_path: str) -> list[dict]:
     return catalog
 
 
-def load_labor_catalog_from_pdf(file_path: str, api_key: str = None, model: str = "gpt-5-mini") -> list[dict]:
+def load_labor_catalog_from_pdf(file_path: str, api_key: str = None, model: str = None) -> list[dict]:
     """
     Parse a Labor Catalog PDF using pdfplumber + OpenAI and persist to database.
     """
+    if model is None:
+        settings = get_settings()
+        model = settings.get("openai_model", "gpt-5-mini")
+
     # Extract text from PDF
     text_parts = []
     with pdfplumber.open(file_path) as pdf:
@@ -461,16 +465,17 @@ def _find_labor_entries(
     return results
 
 
-def _get_labor_qty_rule(material_type: str) -> str:
+def _get_labor_qty_rule(material_type: str, labor_qty_rules: dict | None = None) -> str:
     """Get the labor quantity rule for a material type.
     Matches longest key first so 'corridor_broadloom' beats 'broadloom'.
     """
-    for key in sorted(LABOR_QTY_RULES.keys(), key=len, reverse=True):
+    labor_qty_rules = labor_qty_rules if isinstance(labor_qty_rules, dict) else LABOR_QTY_RULES
+    for key in sorted(labor_qty_rules.keys(), key=len, reverse=True):
         if key == "default":
             continue
         if key in material_type:
-            return LABOR_QTY_RULES[key]
-    return LABOR_QTY_RULES["default"]
+            return labor_qty_rules[key]
+    return labor_qty_rules.get("default", "no_waste")
 
 
 def calculate_labor(
@@ -480,6 +485,8 @@ def calculate_labor(
     measure_qty: Optional[float] = None,
     material: dict = None,
     trace=None,
+    labor_qty_rules_override: dict | None = None,
+    waste_factors_override: dict | None = None,
 ) -> list[dict]:
     """
     Calculate labor for a single material line item.
@@ -499,9 +506,10 @@ def calculate_labor(
         return []
 
     if waste_pct is None:
-        waste_pct = WASTE_FACTORS.get(material_type, 0)
+        waste_factors = waste_factors_override if isinstance(waste_factors_override, dict) else WASTE_FACTORS
+        waste_pct = waste_factors.get(material_type, 0)
 
-    rule = _get_labor_qty_rule(material_type)
+    rule = _get_labor_qty_rule(material_type, labor_qty_rules_override)
     if rule == "with_waste":
         labor_qty = installed_qty * (1 + waste_pct)
         qty_formula = "installed_qty * (1 + waste_pct)"
@@ -561,7 +569,13 @@ def calculate_labor(
     return results
 
 
-def calculate_labor_for_materials(materials: list[dict], trace=None, labor_catalog_override: list[dict] | None = None) -> list[dict]:
+def calculate_labor_for_materials(
+    materials: list[dict],
+    trace=None,
+    labor_catalog_override: list[dict] | None = None,
+    labor_qty_rules_override: dict | None = None,
+    waste_factors_override: dict | None = None,
+) -> list[dict]:
     """
     Calculate labor for a list of material line items.
     Loads labor catalog from DB once for efficiency.
@@ -598,9 +612,10 @@ def calculate_labor_for_materials(materials: list[dict], trace=None, labor_catal
             continue
 
         if waste_pct is None:
-            waste_pct = WASTE_FACTORS.get(material_type, 0)
+            waste_factors = waste_factors_override if isinstance(waste_factors_override, dict) else WASTE_FACTORS
+            waste_pct = waste_factors.get(material_type, 0)
 
-        rule = _get_labor_qty_rule(material_type)
+        rule = _get_labor_qty_rule(material_type, labor_qty_rules_override)
         if rule == "with_waste":
             labor_qty = installed_qty * (1 + waste_pct)
             qty_formula = "installed_qty * (1 + waste_pct)"

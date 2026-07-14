@@ -31,7 +31,7 @@ def chat_complete(
     system: str,
     user: str,
     api_key: str = None,
-    model: str = "gpt-5-mini",
+    model: str = None,
     json_mode: bool = False,
 ) -> str:
     """
@@ -45,6 +45,10 @@ def chat_complete(
         model: Model name (OpenAI naming; auto-mapped for Anthropic)
         json_mode: If True, request JSON output format
     """
+    if model is None:
+        from models import get_settings
+        settings = get_settings()
+        model = settings.get("openai_model", "gpt-5-mini")
     provider = _detect_provider(api_key)
 
     if provider == "openai":

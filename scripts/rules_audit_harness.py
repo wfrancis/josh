@@ -57,6 +57,59 @@ AUDIT_ENDPOINTS = [
 ]
 
 
+def validate_build_identity(client: "Client", expected_commit: str | None) -> Check:
+    try:
+        _, build, _ = client.request("GET", "/api/system/build")
+    except HarnessError as exc:
+        return Check("build_identity", "FAIL", f"build manifest unavailable: {exc}")
+    required = ["commit", "tag", "built_at", "environment", "engine_fingerprint", "config_fingerprint", "frontend_asset"]
+    missing = [
+        field
+        for field in required
+        if str(build.get(field) or "").strip().lower() in {"", "unknown"}
+    ]
+    commit_matches = not expected_commit or build.get("commit") == expected_commit
+    ok = not missing and commit_matches
+    return Check(
+        "build_identity",
+        "PASS" if ok else "FAIL",
+        "deployed build matches the intended source" if ok else "deployed build identity is incomplete or mismatched",
+        {"expected_commit": expected_commit, "actual": build, "missing_fields": missing},
+    )
+
+
+def validate_vendor_ingestion_health(client: "Client") -> Check:
+    try:
+        _, health, _ = client.request("GET", "/api/system/vendor-ingestion")
+    except HarnessError as exc:
+        return Check("vendor_ingestion", "FAIL", f"vendor ingestion health unavailable: {exc}")
+    extensions = set((health.get("dropbox_import") or {}).get("supported_extensions") or [])
+    contract_ok = (
+        {".eml", ".msg", ".pdf", ".txt", ".csv", ".xlsx"}.issubset(extensions)
+        and (health.get("email_monitor") or {}).get("retry_failed_unread") is True
+        and (health.get("email_monitor") or {}).get("idempotency") == "source_hash_database_uniqueness"
+        and (health.get("email_monitor") or {}).get("idempotency_verified") is True
+        and (health.get("email_monitor") or {}).get("job_match") == "stable_subject_tag_then_unambiguous_project_match"
+        and bool(health.get("durable_artifact_root"))
+    )
+    parser_ready = bool((health.get("ai_parser") or {}).get("available"))
+    if not contract_ok:
+        status = "FAIL"
+    elif not parser_ready:
+        status = "WARN"
+    else:
+        status = "PASS"
+    return Check(
+        "vendor_ingestion",
+        status,
+        "vendor quote ingestion contract is ready" if status == "PASS" else (
+            "vendor ingestion contract is present but its AI provider is unavailable" if status == "WARN"
+            else "vendor ingestion contract is incomplete"
+        ),
+        health,
+    )
+
+
 @dataclass
 class Check:
     name: str
@@ -376,6 +429,48 @@ def try_rule_registry(client: Client) -> Check:
     formal_hits = []
     legacy_hits = []
 
+    active_status, active_payload, _ = client.get_optional("/api/rules/active")
+    ruleset_status, ruleset_payload, _ = client.get_optional("/api/rulesets")
+    if active_status == 200 and isinstance(active_payload, dict) and ruleset_status == 200 and isinstance(ruleset_payload, dict):
+        rules = active_payload.get("rules") or []
+        gaps = []
+        for rule in rules:
+            missing = [
+                field for field in (
+                    "implementation_ref", "test_ref", "rule_version",
+                    "engine_config_fingerprint_contribution",
+                )
+                if not rule.get(field)
+            ]
+            if rule.get("calculation_contract") != "implemented":
+                missing.append("implemented calculation contract")
+            if rule.get("runtime_implementation_referenced") is not True:
+                missing.append("verified runtime implementation reference")
+            if rule.get("registry_effect") != "metadata_only":
+                missing.append("explicit metadata-only registry effect")
+            if missing:
+                gaps.append({"rule_id": rule.get("rule_id"), "missing": missing})
+        contract = ruleset_payload.get("contract") or {}
+        contract_ok = (
+            contract.get("status") == "pass"
+            and not contract.get("implementation_gaps")
+            and contract.get("registry_changes_are_metadata_only") is True
+            and contract.get("calculation_behavior") == "engine_code_and_config"
+        )
+        if gaps or not contract_ok:
+            return Check(
+                "rule_registry",
+                "FAIL",
+                "active rules are missing implementation/test/fingerprint evidence",
+                {"gaps": gaps, "contract": contract},
+            )
+        return Check(
+            "rule_registry",
+            "PASS",
+            f"{len(rules)} active rules have implementation, test, version, and fingerprint evidence",
+            {"active_count": len(rules), "contract": contract},
+        )
+
     for path in FORMAL_REGISTRY_ENDPOINTS:
         status, parsed, _ = client.get_optional(path)
         if status == 200 and parsed is not None:
@@ -554,6 +649,8 @@ def upload_rfms_fixture(client: Client, job_id: str, fixture: dict[str, Any]) ->
 def price_materials(client: Client, job_id: str, fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], Check]:
     _, job, _ = client.request("GET", f"/api/jobs/{job_id}")
     materials = job.get("materials") or []
+    original_ids = [material.get("id") for material in materials]
+    base_fingerprint = job.get("materials_source_fingerprint")
     pricing = fixture.get("pricing", {})
     default_price = float(pricing.get("default_unit_price", 10))
     by_code = {k.upper(): float(v) for k, v in (pricing.get("by_item_code") or {}).items()}
@@ -565,13 +662,49 @@ def price_materials(client: Client, job_id: str, fixture: dict[str, Any]) -> tup
         mat["price_source"] = "rules_audit_harness"
         mat["quote_status"] = "quoted"
         priced.append(mat)
-    _, parsed, _ = client.request("PUT", f"/api/jobs/{job_id}/materials", json_body={"materials": priced})
+    _, parsed, _ = client.request(
+        "PUT",
+        f"/api/jobs/{job_id}/materials",
+        json_body={
+            "materials": priced,
+            "base_source_fingerprint": base_fingerprint,
+        },
+    )
     updated = parsed.get("materials") or []
+    updated_fingerprint = parsed.get("materials_source_fingerprint")
+    stale_status, stale_payload, _ = client.request(
+        "PUT",
+        f"/api/jobs/{job_id}/materials",
+        json_body={
+            "materials": updated,
+            "base_source_fingerprint": base_fingerprint,
+        },
+        ok_statuses=(409,),
+    )
+    stable_ids = original_ids == [material.get("id") for material in updated]
+    contract_ok = bool(
+        base_fingerprint
+        and updated_fingerprint
+        and updated_fingerprint != base_fingerprint
+        and stable_ids
+        and stale_status == 409
+    )
     return updated, Check(
         "material_pricing",
-        "PASS",
-        f"set deterministic unit pricing on {len(updated)} materials",
-        {"priced_codes": {m.get("item_code"): m.get("unit_price") for m in updated}},
+        "PASS" if contract_ok else "FAIL",
+        (
+            f"set deterministic pricing on {len(updated)} stable material rows and rejected a stale save"
+            if contract_ok
+            else "material identity or stale-save protection failed"
+        ),
+        {
+            "priced_codes": {m.get("item_code"): m.get("unit_price") for m in updated},
+            "stable_ids": stable_ids,
+            "base_fingerprint": base_fingerprint,
+            "updated_fingerprint": updated_fingerprint,
+            "stale_status": stale_status,
+            "stale_response": stale_payload,
+        },
     )
 
 
@@ -749,6 +882,7 @@ def summarize_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
         "gpm_profit": proposal.get("gpm_profit"),
         "gpm_labor": proposal.get("gpm_labor"),
         "gpm_material": proposal.get("gpm_material"),
+        "manual_adjustment": proposal.get("manual_adjustment"),
     }
 
 
@@ -781,6 +915,14 @@ def validate_totals(proposal: dict[str, Any]) -> Check:
     expected_gpm_labor = round(expected_gpm * 0.9793, 2)
     expected_gpm_material = round(expected_gpm - expected_gpm_labor, 2)
     labor_included_tax = round((expected_taxable + labor_total) * tax_rate, 2)
+    calculated_bundle_total = round(sum(float(b.get("total_price") or 0) for b in bundles), 2)
+    accepted_bundle_total = round(sum(
+        float(b.get("price_override") if b.get("price_override") is not None else b.get("total_price") or 0)
+        for b in bundles
+    ), 2)
+    expected_adjustment = round(accepted_bundle_total - calculated_bundle_total, 2)
+    expected_subtotal = round(accepted_bundle_total - actual_tax, 2)
+    expected_grand_total = round(expected_subtotal + actual_tax + float(proposal.get("textura_amount") or 0), 2)
 
     checks = [
         {"name": "material_total_positive", "ok": material_total > 0, "actual": material_total},
@@ -791,6 +933,9 @@ def validate_totals(proposal: dict[str, Any]) -> Check:
         {"name": "gpm_material_split", "ok": almost_equal(gpm_material_total, expected_gpm_material, 0.05), "expected": expected_gpm_material, "actual": gpm_material_total},
         {"name": "taxable_excludes_labor", "ok": almost_equal(actual_taxable, expected_taxable), "expected": expected_taxable, "actual": actual_taxable},
         {"name": "tax_amount_excludes_labor", "ok": almost_equal(actual_tax, expected_tax), "expected": expected_tax, "actual": actual_tax},
+        {"name": "accepted_bundle_rollup", "ok": almost_equal(float(proposal.get("subtotal") or 0), expected_subtotal), "expected": expected_subtotal, "actual": proposal.get("subtotal")},
+        {"name": "manual_adjustment", "ok": almost_equal(float(proposal.get("manual_adjustment") or 0), expected_adjustment), "expected": expected_adjustment, "actual": proposal.get("manual_adjustment")},
+        {"name": "grand_total", "ok": almost_equal(float(proposal.get("grand_total") or 0), expected_grand_total), "expected": expected_grand_total, "actual": proposal.get("grand_total")},
         {
             "name": "tax_not_calculated_on_labor",
             "ok": not almost_equal(actual_tax, labor_included_tax) if labor_total > 0 else True,
@@ -822,9 +967,12 @@ def proposal_save_payload(proposal: dict[str, Any]) -> dict[str, Any]:
         "gpm_profit": proposal.get("gpm_profit", 0),
         "gpm_labor": proposal.get("gpm_labor", 0),
         "gpm_material": proposal.get("gpm_material", 0),
+        "manual_adjustment": proposal.get("manual_adjustment", 0),
         "textura_amount": proposal.get("textura_amount", 0),
         "deleted_bundles": proposal.get("deleted_bundles", []),
+        "deleted_bundle_reasons": proposal.get("deleted_bundle_reasons", {}),
         "deleted_material_codes": proposal.get("deleted_material_codes", []),
+        "deleted_material_reasons": proposal.get("deleted_material_reasons", {}),
         "audit": proposal.get("audit", {}),
     }
 
@@ -835,16 +983,62 @@ def validate_manual_override_audit(client: Client, job_id: str, proposal: dict[s
         return Check("manual_override_audit", "WARN", "no proposal bundle available for manual override audit")
 
     baseline = copy.deepcopy(proposal)
-    client.request("PUT", f"/api/jobs/{job_id}/proposal/bundles", json_body=proposal_save_payload(baseline))
+    _, baseline_result, _ = client.request(
+        "PUT",
+        f"/api/jobs/{job_id}/proposal/bundles",
+        json_body=proposal_save_payload(baseline),
+    )
+    baseline = baseline_result.get("proposal_data") or baseline
 
-    edited = copy.deepcopy(proposal)
+    edited = copy.deepcopy(baseline)
     target = edited["bundles"][0]
     old_price = float(target.get("price_override") if target.get("price_override") is not None else target.get("total_price") or 0)
     new_price = round(old_price + 12.34, 2)
     target["price_override"] = new_price
-    _, save_result, _ = client.request("PUT", f"/api/jobs/{job_id}/proposal/bundles", json_body=proposal_save_payload(edited))
-    _, audit, _ = client.request("GET", f"/api/jobs/{job_id}/audit")
-    client.request("PUT", f"/api/jobs/{job_id}/proposal/bundles", json_body=proposal_save_payload(baseline))
+    restoration_error = None
+    try:
+        save_session = f"harness-autosave-{job_id}"
+        edited_payload = proposal_save_payload(edited)
+        edited_payload.update({
+            "client_session_id": save_session,
+            "client_edit_version": 2,
+            "client_save_sequence": 2,
+        })
+        _, save_result, _ = client.request("PUT", f"/api/jobs/{job_id}/proposal/bundles", json_body=edited_payload)
+        saved_edited = save_result.get("proposal_data") or {}
+        stale_payload = proposal_save_payload(baseline)
+        stale_payload.update({
+            "client_session_id": save_session,
+            "client_edit_version": 1,
+            "client_save_sequence": 1,
+        })
+        _, stale_result, _ = client.request("PUT", f"/api/jobs/{job_id}/proposal/bundles", json_body=stale_payload)
+        cross_session_payload = proposal_save_payload(baseline)
+        cross_session_payload.update({
+            "client_session_id": f"harness-stale-tab-{job_id}",
+            "client_edit_version": 99,
+            "client_save_sequence": 99,
+            "base_server_revision": baseline.get("_server_revision", 0),
+        })
+        cross_session_status, cross_session_result, _ = client.request(
+            "PUT",
+            f"/api/jobs/{job_id}/proposal/bundles",
+            json_body=cross_session_payload,
+            ok_statuses=(409,),
+        )
+        _, live_after_stale_save, _ = client.request("GET", f"/api/jobs/{job_id}")
+        _, audit, _ = client.request("GET", f"/api/jobs/{job_id}/audit")
+        _, regenerated, _ = client.request("POST", f"/api/jobs/{job_id}/proposal/generate")
+        _, live_after_regenerate, _ = client.request("GET", f"/api/jobs/{job_id}")
+        _, stale_readiness, _ = client.request("GET", f"/api/jobs/{job_id}/readiness")
+        regenerated_target = next((b for b in (regenerated.get("bundles") or []) if b.get("bundle_name") == target.get("bundle_name")), None)
+        stale_save_target = next((b for b in ((live_after_stale_save.get("proposal_data") or {}).get("bundles") or []) if b.get("bundle_name") == target.get("bundle_name")), None)
+        live_target = next((b for b in ((live_after_regenerate.get("proposal_data") or {}).get("bundles") or []) if b.get("bundle_name") == target.get("bundle_name")), None)
+    finally:
+        try:
+            client.request("PUT", f"/api/jobs/{job_id}/proposal/bundles", json_body=proposal_save_payload(baseline))
+        except HarnessError as exc:
+            restoration_error = str(exc)
     traces = audit.get("traces") or []
     target_name = target.get("bundle_name")
     hit = next(
@@ -856,17 +1050,46 @@ def validate_manual_override_audit(client: Client, job_id: str, proposal: dict[s
         ),
         None,
     )
-    ok = bool(hit) and int(save_result.get("manual_trace_count") or 0) > 0
+    expected_grand_delta = round(new_price - old_price, 2)
+    actual_grand_delta = round(float(saved_edited.get("grand_total") or 0) - float(baseline.get("grand_total") or 0), 2)
+    ok = (
+        bool(hit)
+        and int(save_result.get("manual_trace_count") or 0) > 0
+        and almost_equal(actual_grand_delta, expected_grand_delta)
+        and stale_result.get("stale_save_ignored") is True
+        and cross_session_status == 409
+        and "stale copy was not saved" in str(cross_session_result.get("detail") or "")
+        and stale_save_target is not None
+        and almost_equal(float(stale_save_target.get("price_override") or 0), new_price)
+        and regenerated_target is not None
+        and almost_equal(float(regenerated_target.get("price_override") or 0), new_price)
+        and live_target is not None
+        and almost_equal(float(live_target.get("price_override") or 0), new_price)
+        and stale_readiness.get("golden_verification_status") == "stale"
+        and stale_readiness.get("golden_status") == "drift"
+        and restoration_error is None
+    )
     return Check(
         "manual_override_audit",
         "PASS" if ok else "FAIL",
-        "manual proposal edit created a manual_override audit row" if ok else "manual proposal edit did not create an audit row",
+        "manual price changed totals, produced an audit row, and survived regenerate" if ok else "manual price was not fully preserved and audited",
         {
             "bundle_name": target_name,
             "old_price": old_price,
             "new_price": new_price,
             "save_result": save_result,
             "trace": hit,
+            "expected_grand_delta": expected_grand_delta,
+            "actual_grand_delta": actual_grand_delta,
+            "stale_save_ignored": stale_result.get("stale_save_ignored"),
+            "cross_session_stale_status": cross_session_status,
+            "cross_session_stale_result": cross_session_result,
+            "live_override_after_stale_save": (stale_save_target or {}).get("price_override"),
+            "regenerated_override": (regenerated_target or {}).get("price_override"),
+            "live_override_after_regenerate": (live_target or {}).get("price_override"),
+            "golden_status_after_edit": stale_readiness.get("golden_status"),
+            "golden_verification_after_edit": stale_readiness.get("golden_verification_status"),
+            "restoration_error": restoration_error,
         },
     )
 
@@ -891,7 +1114,9 @@ def validate_deleted_bundle(client: Client, job_id: str, proposal: dict[str, Any
     save_payload.update({
         "bundles": kept,
         "deleted_bundles": [target_name],
+        "deleted_bundle_reasons": {target_name: "Harness test deletion"},
         "deleted_material_codes": target_codes,
+        "deleted_material_reasons": {str(code): "Harness test deletion" for code in target_codes},
     })
     client.request("PUT", f"/api/jobs/{job_id}/proposal/bundles", json_body=save_payload)
     _, regenerated, _ = client.request("POST", f"/api/jobs/{job_id}/proposal/generate")
@@ -911,8 +1136,130 @@ def validate_deleted_bundle(client: Client, job_id: str, proposal: dict[str, Any
     )
 
 
+def validate_readiness_blockers(client: Client, job_id: str) -> Check:
+    _, job, _ = client.request("GET", f"/api/jobs/{job_id}")
+    materials = copy.deepcopy(job.get("materials") or [])
+    proposal = job.get("proposal_data") or {}
+    deleted = {str(code) for code in (proposal.get("deleted_material_codes") or [])}
+    target_index = next(
+        (index for index, material in enumerate(materials) if str(material.get("item_code") or "") not in deleted),
+        None,
+    )
+    if target_index is None:
+        return Check("readiness_blockers", "WARN", "no active material available for readiness mutation")
+
+    mutated = copy.deepcopy(materials)
+    target = mutated[target_index]
+    target["material_type"] = "unknown"
+    target["unit_price"] = 0
+    target["extended_cost"] = 0
+    try:
+        client.request("PUT", f"/api/jobs/{job_id}/materials", json_body={"materials": mutated})
+        _, readiness, _ = client.request("GET", f"/api/jobs/{job_id}/readiness")
+    finally:
+        client.request("PUT", f"/api/jobs/{job_id}/materials", json_body={"materials": materials})
+
+    checks = {item.get("id"): item.get("status") for item in (readiness.get("checks") or [])}
+    ok = (
+        readiness.get("status") == "blocked"
+        and checks.get("unknown_materials") == "fail"
+        and checks.get("unpriced_materials") == "fail"
+        and checks.get("current_audit") == "fail"
+    )
+    return Check(
+        "readiness_blockers",
+        "PASS" if ok else "FAIL",
+        "unknown, unpriced, and stale-audit defects block the bid" if ok else "readiness did not block every staged defect",
+        {"material": target.get("item_code"), "status": readiness.get("status"), "checks": checks},
+    )
+
+
 def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[str, Any]) -> Check:
-    totals = summarize_proposal(proposal)
+    accepted = copy.deepcopy(proposal)
+    accepted_bundles = accepted.get("bundles") or []
+    combined_name = None
+    code_sets = [
+        {
+            str(item.get("item_code") or item.get("id") or item.get("material_id"))
+            for item in (bundle.get("materials") or [])
+            if item.get("item_code") or item.get("id") or item.get("material_id")
+        }
+        for bundle in accepted_bundles
+    ]
+    selected_indexes = None
+    for left_index, left_codes in enumerate(code_sets):
+        if not left_codes:
+            continue
+        right_index = next(
+            (
+                index for index in range(left_index + 1, len(code_sets))
+                if code_sets[index] and code_sets[index].isdisjoint(left_codes)
+            ),
+            None,
+        )
+        if right_index is not None:
+            selected_indexes = (left_index, right_index)
+            break
+    if selected_indexes:
+        selected = [accepted_bundles[index] for index in selected_indexes]
+        combined_name = "Harness Accepted Combined Bundle"
+        combined = {
+            "bundle_name": combined_name,
+            "description_text": "\n\n".join(
+                str(bundle.get("description_text") or "") for bundle in selected
+                if bundle.get("description_text")
+            ),
+            "materials": [copy.deepcopy(item) for bundle in selected for item in (bundle.get("materials") or [])],
+            "sundry_items": [copy.deepcopy(item) for bundle in selected for item in (bundle.get("sundry_items") or [])],
+            "labor_items": [copy.deepcopy(item) for bundle in selected for item in (bundle.get("labor_items") or [])],
+            "material_cost": round(sum(float(bundle.get("material_cost") or 0) for bundle in selected), 2),
+            "sundry_cost": round(sum(float(bundle.get("sundry_cost") or 0) for bundle in selected), 2),
+            "labor_cost": round(sum(float(bundle.get("labor_cost") or 0) for bundle in selected), 2),
+            "freight_cost": round(sum(float(bundle.get("freight_cost") or 0) for bundle in selected), 2),
+            "installed_qty": round(sum(float(bundle.get("installed_qty") or 0) for bundle in selected), 2),
+            "unit": selected[0].get("unit") or "",
+            "editable": True,
+        }
+        selected_index_set = set(selected_indexes)
+        rebuilt_bundles = []
+        for index, bundle in enumerate(accepted_bundles):
+            if index == selected_indexes[0]:
+                rebuilt_bundles.append(combined)
+            elif index not in selected_index_set:
+                rebuilt_bundles.append(bundle)
+        accepted_bundles = rebuilt_bundles
+
+    custom_name = "Harness Accepted Manual Allowance"
+    accepted_bundles.append({
+        "bundle_name": custom_name,
+        "description_text": "Estimator-approved allowance used to prove accepted structure replay.",
+        "materials": [],
+        "sundry_items": [],
+        "labor_items": [],
+        "material_cost": 0,
+        "sundry_cost": 0,
+        "labor_cost": 0,
+        "freight_cost": 0,
+        "total_price": 0,
+        "price_override": 123.45,
+        "installed_qty": 0,
+        "unit": "EA",
+        "editable": True,
+    })
+    accepted["bundles"] = accepted_bundles
+
+    try:
+        _, saved, _ = client.request(
+            "PUT",
+            f"/api/jobs/{job_id}/proposal/bundles",
+            json_body=proposal_save_payload(accepted),
+        )
+        accepted = saved.get("proposal_data") or accepted
+        artifact_check = generate_proposal_pdf(client, job_id, accepted)
+    except HarnessError as exc:
+        return Check("golden_reproducibility", "FAIL", f"accepted structure setup failed: {exc}")
+
+    totals = summarize_proposal(accepted)
     target_totals = {
         key: totals.get(key)
         for key in ("grand_total", "subtotal", "tax_amount", "gpm_profit", "gpm_labor", "gpm_material")
@@ -959,27 +1306,47 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
     baseline_summary = baseline_replay.get("summary") or {}
     baseline_engine_status = baseline_summary.get("raw_engine_status", baseline_summary.get("engine_status"))
     baseline_accepted_status = baseline_summary.get("accepted_proposal_status")
+    baseline_jr_status = baseline_summary.get("jr_target_status")
+    structural_edit_count = int(baseline_summary.get("accepted_structural_edit_count") or 0)
     current_status = current_replay.get("status")
+    trust_summary = readiness.get("trust_summary") or {}
+    required_trust_fields = {
+        "last_audit_at", "last_pdf_at", "ruleset_version", "build_commit",
+        "engine_fingerprint", "config_fingerprint", "golden_baseline_version",
+        "jr_target_total", "accepted_proposal_total", "replay_total",
+        "manual_override_count", "unknown_material_count", "low_confidence_material_count",
+    }
+    missing_trust_fields = sorted(required_trust_fields - set(trust_summary))
     ok = (
         baseline.get("golden_job")
         and baseline_status == "pass"
         and baseline_engine_status == "pass"
-        and baseline_accepted_status in {"pass", "warn"}
+        and baseline_accepted_status == "pass"
+        and baseline_jr_status == "pass"
+        and structural_edit_count >= (2 if combined_name else 1)
         and current_status in {"pass", "warn", "fail"}
         and state.get("golden_job")
+        and artifact_check.status == "PASS"
         and readiness.get("blocking_count") == 0
+        and not missing_trust_fields
         and mutable_state(before_job) == mutable_state(after_job)
     )
     return Check(
         "golden_reproducibility",
         "PASS" if ok else "FAIL",
-        "captured synthetic golden baseline and replayed it" if ok else "baseline golden replay did not pass",
+        "combined bundles and a manual allowance reproduced without changing the live bid" if ok else "accepted structural golden replay did not pass",
         {
             "baseline_status": baseline_status,
             "baseline_engine_status": baseline_engine_status,
             "baseline_accepted_status": baseline_accepted_status,
+            "baseline_jr_status": baseline_jr_status,
+            "accepted_structural_edit_count": structural_edit_count,
             "current_status": current_status,
+            "combined_bundle": combined_name,
+            "custom_bundle": custom_name,
+            "artifact_check": artifact_check.__dict__,
             "readiness": readiness,
+            "missing_trust_fields": missing_trust_fields,
             "live_state_unchanged": mutable_state(before_job) == mutable_state(after_job),
             "golden_job": baseline.get("golden_job"),
             "latest_replay": state.get("latest_replay"),
@@ -1064,6 +1431,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=180.0, help="HTTP timeout in seconds")
     parser.add_argument("--header", action="append", default=[], help="Extra HTTP header, e.g. 'Authorization: Bearer ...'")
     parser.add_argument("--json-output", help="Optional path for JSON detail output")
+    parser.add_argument("--expected-commit", help="Require /api/system/build to report this exact Git commit")
     parser.add_argument("--allow-missing-audit", action="store_true", help="Downgrade missing audit trace checks to WARN")
     args = parser.parse_args()
 
@@ -1074,6 +1442,8 @@ def main() -> int:
     created_job = False
 
     try:
+        checks.append(validate_build_identity(client, args.expected_commit))
+        checks.append(validate_vendor_ingestion_health(client))
         checks.append(try_rule_registry(client))
         checks.append(try_rule_eval(client, fixture))
 
@@ -1101,6 +1471,7 @@ def main() -> int:
         checks.append(validate_manual_override_audit(client, job_id, proposal))
         checks.append(validate_deleted_bundle(client, job_id, proposal, fixture))
         checks.append(validate_audit_trace(client, job_id, proposal, fixture, args.allow_missing_audit))
+        checks.append(validate_readiness_blockers(client, job_id))
         final_proposal, final_proposal_check = generate_proposal(client, job_id)
         checks.append(Check(
             "final_proposal_artifact",

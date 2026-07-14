@@ -8,7 +8,8 @@ const VALID_TYPES = [
   'unit_carpet_no_pattern', 'unit_carpet_pattern', 'unit_lvt', 'cpt_tile',
   'corridor_broadloom', 'floor_tile', 'wall_tile', 'backsplash',
   'tub_shower_surround', 'rubber_base', 'vct', 'rubber_tile',
-  'rubber_sheet', 'wood', 'tread_riser', 'transitions', 'waterproofing'
+  'rubber_sheet', 'wood', 'tread_riser', 'transitions', 'waterproofing',
+  'sound_mat', 'pad'
 ]
 
 const TYPE_LABELS = {
@@ -18,6 +19,7 @@ const TYPE_LABELS = {
   tub_shower_surround: 'Tub/Shower', rubber_base: 'Rubber Base', vct: 'VCT',
   rubber_tile: 'Rubber Tile', rubber_sheet: 'Rubber Sheet', wood: 'Wood',
   tread_riser: 'Tread & Riser', transitions: 'Transitions', waterproofing: 'Waterproofing',
+  sound_mat: 'Sound Mat', pad: 'Pad',
 }
 
 function formatCurrency(val) {

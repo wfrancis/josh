@@ -6,4 +6,5 @@ reportlab==4.2.0
 openai>=1.60.0
 python-multipart==0.0.9
 aiofiles==24.1.0
-# email parsing uses stdlib email module - no extra package needed
+extract-msg==0.55.0
+# .eml parsing uses stdlib email; extract-msg handles Outlook .msg files.

@@ -5,7 +5,7 @@ import {
   ChevronRight, Building2, User, Loader2
 } from 'lucide-react'
 import { api } from '../api'
-import StatusBadge, { getJobStatus } from './StatusBadge'
+import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
 
 /* ── Stat Card ─────────────────────────────────────────── */
 function StatCard({ icon: Icon, label, value, gradient }) {
@@ -242,6 +242,7 @@ export default function Dashboard() {
           <div className="space-y-2">
             {jobs.map((job, i) => {
               const status = getJobStatus(job)
+              const confidenceStatus = getJobConfidenceStatus(job)
               return (
                 <div
                   key={job.id}
@@ -272,6 +273,7 @@ export default function Dashboard() {
                     </div>
                   </div>
                   <StatusBadge status={status} />
+                  {confidenceStatus && <span className="hidden sm:inline-flex"><StatusBadge status={confidenceStatus} /></span>}
                   <ChevronRight className="w-4 h-4 text-gray-600" />
                 </div>
               )

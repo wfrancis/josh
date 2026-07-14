@@ -138,7 +138,9 @@ class InboxMonitor:
     def _process_email(self, conn, msg_id: bytes):
         """Process a single email to see if it's a quote response."""
         # Fetch the email
-        status, data = conn.fetch(msg_id, "(RFC822)")
+        # PEEK keeps the message unread until the entire import succeeds. This
+        # lets a quote retry after a temporary AI/API or job-matching failure.
+        status, data = conn.fetch(msg_id, "(BODY.PEEK[])")
         if status != "OK" or not data or not data[0]:
             return
 
@@ -160,31 +162,20 @@ class InboxMonitor:
         # Extract job reference from subject
         job_reference = self._extract_job_reference(subject)
 
-        # Extract attachments
-        attachments = self._extract_attachments(msg)
         temp_files = []
         filenames = []
 
         try:
-            if attachments:
-                # Save attachments to temp files for parsing
-                for filename, file_data in attachments:
-                    ext = os.path.splitext(filename)[1].lower() if filename else ".bin"
-                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                        tmp.write(file_data)
-                        temp_files.append(tmp.name)
-                        filenames.append(filename)
-                    print(f"[InboxMonitor] Saved attachment: {filename}")
-            else:
-                # No attachments — save email body as .eml for parsing
-                with tempfile.NamedTemporaryFile(suffix=".eml", delete=False) as tmp:
-                    tmp.write(raw_email)
-                    temp_files.append(tmp.name)
-                    filenames.append("email_body.eml")
-                print("[InboxMonitor] No attachments, saved email body for parsing")
+            # Preserve the complete RFC822 message. The quote parser reads the
+            # body and supported attachments together, so no pricing context is
+            # lost when a vendor puts numbers in the body and also attaches a file.
+            with tempfile.NamedTemporaryFile(suffix=".eml", delete=False) as tmp:
+                tmp.write(raw_email)
+                temp_files.append(tmp.name)
+                filenames.append("vendor_response.eml")
 
             # Call the callback with temp file paths and metadata
-            self._callback(
+            imported = self._callback(
                 job_reference=job_reference,
                 temp_files=temp_files,
                 vendor_email=vendor_email,
@@ -192,9 +183,10 @@ class InboxMonitor:
                 subject=subject,
             )
 
-            # Mark as SEEN (it was fetched as UNSEEN, IMAP auto-marks on fetch
-            # but we explicitly flag it to be safe)
-            conn.store(msg_id, "+FLAGS", "\\Seen")
+            if imported:
+                conn.store(msg_id, "+FLAGS", "\\Seen")
+            else:
+                print(f"[InboxMonitor] Import deferred; leaving unread for retry: '{subject}'")
 
         finally:
             # Clean up temp files
@@ -215,7 +207,7 @@ class InboxMonitor:
     def _extract_attachments(self, msg) -> list[tuple[str, bytes]]:
         """Extract PDF/document attachments from email."""
         attachments = []
-        supported_extensions = {".pdf", ".xlsx", ".xls", ".csv", ".txt", ".eml"}
+        supported_extensions = {".pdf", ".xlsx", ".csv", ".txt", ".eml", ".msg"}
 
         for part in msg.walk():
             if part.get_content_maintype() == "multipart":
@@ -239,6 +231,10 @@ class InboxMonitor:
           - "Re: [SI] Project Name - Quote Request"
           - "Pricing for Project Name"
         """
+        stable_tag = re.search(r"\[SI(?:\s+Job)?\s*#?(\d+)\]", subject, flags=re.IGNORECASE)
+        if stable_tag:
+            return stable_tag.group(1)
+
         # Strip common prefixes
         cleaned = subject.strip()
         # Remove Re:/Fwd: prefixes

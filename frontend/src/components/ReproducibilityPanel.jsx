@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle, CheckCircle2, Database, Loader2, PlayCircle,
-  RefreshCw, Save, ShieldCheck, XCircle
+  RefreshCw, Save, ShieldCheck, X, XCircle
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -37,8 +37,9 @@ function parseMoney(value) {
 
 function statusClass(status) {
   const key = String(status || '').toLowerCase()
-  if (key === 'pass') return 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
-  if (key === 'warn') return 'bg-amber-500/10 text-amber-300 border-amber-500/20'
+  if (key === 'pass' || key === 'golden_verified') return 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
+  if (key === 'metadata_changed' || key === 'metadata_only') return 'bg-blue-500/10 text-blue-300 border-blue-500/20'
+  if (key === 'warn' || key === 'stale' || key === 'drift') return 'bg-amber-500/10 text-amber-300 border-amber-500/20'
   if (key === 'fail') return 'bg-red-500/10 text-red-300 border-red-500/20'
   if (key === 'incomparable') return 'bg-purple-500/10 text-purple-300 border-purple-500/20'
   return 'bg-white/[0.04] text-gray-400 border-white/[0.08]'
@@ -46,27 +47,34 @@ function statusClass(status) {
 
 function StatusIcon({ status }) {
   const key = String(status || '').toLowerCase()
-  if (key === 'pass') return <CheckCircle2 className="w-4 h-4" />
+  if (key === 'pass' || key === 'golden_verified') return <CheckCircle2 className="w-4 h-4" />
   if (key === 'fail') return <XCircle className="w-4 h-4" />
   return <AlertTriangle className="w-4 h-4" />
 }
 
 function StatusBadge({ status }) {
+  const label = status === 'not_replayed'
+    ? 'not replayed'
+    : status === 'metadata_only'
+      ? 'metadata only'
+      : String(status || 'not replayed').replaceAll('_', ' ')
   return (
-    <span className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10px] font-bold uppercase tracking-wider ${statusClass(status)}`}>
+    <span className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10px] font-bold uppercase ${statusClass(status)}`}>
       <StatusIcon status={status} />
-      {status || 'ready'}
+      {label}
     </span>
   )
 }
 
-function TotalsTable({ replay }) {
-  const rows = replay?.diff?.totals || []
+function TotalsTable({ replay, rowsKey = 'totals', title = 'Accepted Proposal Comparison' }) {
+  const rows = replay?.diff?.[rowsKey] || []
   if (!rows.length) return null
   return (
-    <div className="overflow-x-auto rounded-lg border border-white/[0.06]">
-      <table className="w-full text-sm">
-        <thead className="bg-white/[0.03] text-[10px] uppercase tracking-wider text-gray-500">
+    <div>
+      <h3 className="mb-2 text-xs font-bold uppercase text-gray-500">{title}</h3>
+      <div className="overflow-x-auto rounded-lg border border-white/[0.06]">
+        <table className="w-full text-sm">
+        <thead className="bg-white/[0.03] text-[10px] uppercase text-gray-500">
           <tr>
             <th className="px-3 py-2 text-left font-bold">Total</th>
             <th className="px-3 py-2 text-right font-bold">Target</th>
@@ -92,7 +100,8 @@ function TotalsTable({ replay }) {
             </tr>
           ))}
         </tbody>
-      </table>
+        </table>
+      </div>
     </div>
   )
 }
@@ -103,7 +112,7 @@ function BundleDeltas({ replay }) {
   return (
     <div className="rounded-lg border border-white/[0.06] p-3">
       <div className="mb-2 flex items-center justify-between">
-        <h3 className="text-xs font-bold uppercase tracking-wider text-gray-500">Bundle Deltas</h3>
+        <h3 className="text-xs font-bold uppercase text-gray-500">Bundle Deltas</h3>
         <span className="text-[10px] text-gray-600">largest first</span>
       </div>
       <div className="space-y-2">
@@ -129,7 +138,7 @@ function StructuralIssues({ replay }) {
   if (!rows.length) return null
   return (
     <div className="rounded-lg border border-red-500/20 bg-red-500/[0.04] p-3">
-      <h3 className="mb-2 text-xs font-bold uppercase tracking-wider text-red-300">Structural Issues</h3>
+      <h3 className="mb-2 text-xs font-bold uppercase text-red-300">Structural Issues</h3>
       <div className="space-y-1.5">
         {rows.slice(0, 5).map((row, idx) => (
           <p key={`${row.check}-${idx}`} className="text-sm text-red-200">{row.message || row.check}</p>
@@ -144,10 +153,15 @@ function DriftRows({ replay }) {
   if (!rows.length) return null
   return (
     <div className="rounded-lg border border-amber-500/20 bg-amber-500/[0.04] p-3">
-      <h3 className="mb-2 text-xs font-bold uppercase tracking-wider text-amber-300">Rule / Rate Drift</h3>
+      <h3 className="mb-2 text-xs font-bold uppercase text-amber-300">Rule / Rate Drift</h3>
       <div className="space-y-1.5">
         {rows.map(row => (
-          <p key={row.check} className="text-sm text-amber-100">{row.message || row.check}</p>
+          <p key={row.check} className="text-sm text-amber-100">
+            <span className="font-semibold">
+              {row.classification === 'metadata_only' ? 'Metadata only: ' : 'Calculation behavior: '}
+            </span>
+            {row.message || row.check}
+          </p>
         ))}
       </div>
     </div>
@@ -163,7 +177,7 @@ function EngineReplayNotice({ replay }) {
   return (
     <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3">
       <div className="mb-2 flex items-center justify-between gap-3">
-        <h3 className="text-xs font-bold uppercase tracking-wider text-blue-300">Engine Replay Before Accepted Edits</h3>
+        <h3 className="text-xs font-bold uppercase text-blue-300">Engine Replay Before Accepted Edits</h3>
         <span className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase ${statusClass(engine.status)}`}>
           {engine.status}
         </span>
@@ -183,12 +197,14 @@ function EngineReplayNotice({ replay }) {
   )
 }
 
-export default function ReproducibilityPanel({ jobId }) {
+export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [saving, setSaving] = useState(false)
   const [runningMode, setRunningMode] = useState(null)
+  const [selectedMode, setSelectedMode] = useState('baseline')
+  const [showCapture, setShowCapture] = useState(false)
   const [form, setForm] = useState({
     jr_quote_id: '',
     reviewer_name: '',
@@ -216,8 +232,31 @@ export default function ReproducibilityPanel({ jobId }) {
   useEffect(() => { load() }, [jobId])
 
   const golden = data?.golden_job
-  const latest = data?.latest_replay
-  const hasTarget = useMemo(() => TOTAL_FIELDS.some(([key]) => parseMoney(form[key]) != null), [form])
+  const activeReplays = data?.active_version_replays || []
+  const baselineReplay = data?.baseline_replay || activeReplays.find(replay => replay.mode === 'baseline')
+  const currentReplay = data?.current_replay || activeReplays.find(replay => replay.mode === 'current')
+  const latest = (selectedMode === 'baseline' ? baselineReplay : currentReplay) || data?.latest_replay
+  const canCapture = useMemo(() => (
+    (parseMoney(form.grand_total) || 0) > 0
+    && form.jr_quote_id.trim().length > 0
+    && form.reviewer_name.trim().length > 0
+  ), [form.grand_total, form.jr_quote_id, form.reviewer_name])
+
+  function startNewVersion() {
+    const targets = golden?.target_totals || {}
+    setForm({
+      jr_quote_id: golden?.jr_quote_id || '',
+      reviewer_name: golden?.reviewer_name || '',
+      grand_total: targets.grand_total ?? '',
+      subtotal: targets.subtotal ?? '',
+      tax_amount: targets.tax_amount ?? '',
+      gpm_profit: targets.gpm_profit ?? '',
+      gpm_labor: targets.gpm_labor ?? '',
+      gpm_material: targets.gpm_material ?? '',
+      notes: '',
+    })
+    setShowCapture(true)
+  }
 
   async function captureBaseline() {
     const target_totals = {}
@@ -234,6 +273,8 @@ export default function ReproducibilityPanel({ jobId }) {
         target_totals,
         notes: form.notes,
       }))
+      setShowCapture(false)
+      onConfidenceChange?.()
     } catch (err) {
       setError(err.message)
     } finally {
@@ -243,10 +284,12 @@ export default function ReproducibilityPanel({ jobId }) {
 
   async function runReplay(mode) {
     setRunningMode(mode)
+    setSelectedMode(mode)
     setError(null)
     try {
       await api.runGoldenReplay(jobId, mode)
       await load()
+      onConfidenceChange?.()
     } catch (err) {
       setError(err.message)
     } finally {
@@ -263,8 +306,8 @@ export default function ReproducibilityPanel({ jobId }) {
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-sm font-bold text-white">Reproducibility</h2>
-            {golden ? <StatusBadge status={latest?.status || 'ready'} /> : (
-              <span className="rounded-md border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-amber-300">
+            {golden ? <StatusBadge status={data?.comparison_status || latest?.status || 'not_replayed'} /> : (
+              <span className="rounded-md border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-[10px] font-bold uppercase text-amber-300">
                 No baseline
               </span>
             )}
@@ -278,6 +321,11 @@ export default function ReproducibilityPanel({ jobId }) {
               <span className="font-mono">{String(golden.source_fingerprint || '').slice(0, 10)}</span>
             </div>
           )}
+          {golden && data?.live_source_matches_baseline === false && (
+            <p className="mt-2 text-xs font-medium text-amber-300">
+              The live job changed after this baseline was captured. Capture a new version after the estimator accepts the changes.
+            </p>
+          )}
         </div>
         <button onClick={load} disabled={loading} className="btn-ghost p-2" title="Refresh reproducibility">
           {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
@@ -288,12 +336,20 @@ export default function ReproducibilityPanel({ jobId }) {
         <div className="mt-4 flex items-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-300">
           <AlertTriangle className="h-4 w-4 flex-shrink-0" />
           <span className="flex-1">{error}</span>
-          <button onClick={() => setError(null)} className="text-red-300/60 hover:text-red-200">dismiss</button>
+          <button onClick={() => setError(null)} className="p-1 text-red-300/60 hover:text-red-200" title="Dismiss error">
+            <X className="h-4 w-4" />
+          </button>
         </div>
       )}
 
-      {!loading && !golden && (
+      {!loading && (!golden || showCapture) && (
         <div className="mt-4 space-y-4">
+          {golden && (
+            <div className="flex items-center justify-between gap-3 border-t border-white/[0.06] pt-4">
+              <p className="text-sm font-semibold text-gray-200">Capture baseline version {(golden.version_number || 0) + 1}</p>
+              <button onClick={() => setShowCapture(false)} className="btn-ghost px-3 py-1.5 text-xs">Cancel</button>
+            </div>
+          )}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <label className="block">
               <span className="mb-1 block text-xs text-gray-500">JR Quote ID</span>
@@ -349,11 +405,11 @@ export default function ReproducibilityPanel({ jobId }) {
           </label>
           <button
             onClick={captureBaseline}
-            disabled={saving || !hasTarget}
+            disabled={saving || !canCapture}
             className="btn-primary inline-flex items-center gap-2 px-4 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-40"
           >
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-            Capture Golden Baseline
+            {golden ? 'Capture New Baseline Version' : 'Capture Golden Baseline'}
           </button>
         </div>
       )}
@@ -395,7 +451,46 @@ export default function ReproducibilityPanel({ jobId }) {
               {runningMode === 'current' ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlayCircle className="h-4 w-4" />}
               Replay Current
             </button>
+            <button
+              onClick={startNewVersion}
+              disabled={!!runningMode || showCapture}
+              className="btn-ghost inline-flex items-center gap-2 px-4 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Save className="h-4 w-4" />
+              Capture New Version
+            </button>
           </div>
+
+          {(baselineReplay || currentReplay) && (
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <button
+                type="button"
+                onClick={() => setSelectedMode('baseline')}
+                className={`flex items-center gap-3 rounded-lg border px-3 py-2 text-left transition-colors ${selectedMode === 'baseline' ? 'border-cyan-500/30 bg-cyan-500/[0.08]' : 'border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04]'}`}
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block text-xs font-bold uppercase text-gray-300">Baseline proof</span>
+                  <span className="mt-0.5 block text-[11px] text-gray-500">
+                    Raw {baselineReplay?.summary?.raw_engine_status || 'not replayed'} / accepted {baselineReplay?.summary?.accepted_proposal_status || 'not replayed'}
+                  </span>
+                </span>
+                <StatusBadge status={baselineReplay?.status || 'not_replayed'} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedMode('current')}
+                className={`flex items-center gap-3 rounded-lg border px-3 py-2 text-left transition-colors ${selectedMode === 'current' ? 'border-cyan-500/30 bg-cyan-500/[0.08]' : 'border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04]'}`}
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block text-xs font-bold uppercase text-gray-300">Current drift</span>
+                  <span className="mt-0.5 block text-[11px] text-gray-500">
+                    Raw {currentReplay?.summary?.raw_engine_status || 'not replayed'} / accepted {currentReplay?.summary?.accepted_proposal_status || 'not replayed'}
+                  </span>
+                </span>
+                <StatusBadge status={currentReplay?.summary?.drift_classification === 'metadata_only' ? 'metadata_only' : currentReplay?.status || 'not_replayed'} />
+              </button>
+            </div>
+          )}
 
           {latest && (
             <div className="space-y-3">
@@ -406,8 +501,10 @@ export default function ReproducibilityPanel({ jobId }) {
                 <span>audit #{latest.audit_run_id || '-'}</span>
                 <span>engine {latest.summary?.raw_engine_status || latest.summary?.engine_status || '-'}</span>
                 <span>accepted {latest.summary?.accepted_proposal_status || '-'}</span>
+                <span>JR target {latest.summary?.jr_target_status || '-'}</span>
               </div>
               <TotalsTable replay={latest} />
+              <TotalsTable replay={latest} rowsKey="jr_totals" title="Job Runner Target Delta" />
               <StructuralIssues replay={latest} />
               <BundleDeltas replay={latest} />
               <DriftRows replay={latest} />

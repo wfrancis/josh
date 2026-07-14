@@ -66,6 +66,7 @@
   .badge-draft     { @apply badge bg-gray-500/10 text-gray-400 border border-gray-500/10; }
   .badge-progress  { @apply badge bg-si-bright/10 text-blue-400 border border-si-bright/10; }
   .badge-priced    { @apply badge bg-amber-500/10 text-amber-400 border border-amber-500/10; }
+  .badge-blocked   { @apply badge bg-red-500/10 text-red-400 border border-red-500/10; }
   .badge-complete  { @apply badge bg-emerald-500/10 text-emerald-400 border border-emerald-500/10; }
 }
 
