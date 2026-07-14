@@ -1275,6 +1275,7 @@ def replay_golden_job(
     summary = {
         "mode": mode,
         "status": diff["status"],
+        "overall_status": diff["status"],
         "engine_status": engine_diff["status"],
         "raw_engine_status": engine_diff["status"],
         "accepted_proposal_status": accepted_proposal_status,

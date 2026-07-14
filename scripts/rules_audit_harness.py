@@ -1153,6 +1153,7 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
     target["material_type"] = "unknown"
     target["unit_price"] = 0
     target["extended_cost"] = 0
+    target["price_source"] = "vendor_quote"
     try:
         client.request("PUT", f"/api/jobs/{job_id}/materials", json_body={"materials": mutated})
         _, readiness, _ = client.request("GET", f"/api/jobs/{job_id}/readiness")
@@ -1165,11 +1166,12 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
         and checks.get("unknown_materials") == "fail"
         and checks.get("unpriced_materials") == "fail"
         and checks.get("current_audit") == "fail"
+        and checks.get("durable_artifacts") == "fail"
     )
     return Check(
         "readiness_blockers",
         "PASS" if ok else "FAIL",
-        "unknown, unpriced, and stale-audit defects block the bid" if ok else "readiness did not block every staged defect",
+        "unknown, unpriced, stale-audit, and missing vendor-evidence defects block the bid" if ok else "readiness did not block every staged defect",
         {"material": target.get("item_code"), "status": readiness.get("status"), "checks": checks},
     )
 
@@ -1306,6 +1308,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
     baseline_summary = baseline_replay.get("summary") or {}
     baseline_engine_status = baseline_summary.get("raw_engine_status", baseline_summary.get("engine_status"))
     baseline_accepted_status = baseline_summary.get("accepted_proposal_status")
+    baseline_overall_status = baseline_summary.get("overall_status")
     baseline_jr_status = baseline_summary.get("jr_target_status")
     structural_edit_count = int(baseline_summary.get("accepted_structural_edit_count") or 0)
     current_status = current_replay.get("status")
@@ -1322,6 +1325,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
         and baseline_status == "pass"
         and baseline_engine_status == "pass"
         and baseline_accepted_status == "pass"
+        and baseline_overall_status == "pass"
         and baseline_jr_status == "pass"
         and structural_edit_count >= (2 if combined_name else 1)
         and current_status in {"pass", "warn", "fail"}
@@ -1339,6 +1343,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
             "baseline_status": baseline_status,
             "baseline_engine_status": baseline_engine_status,
             "baseline_accepted_status": baseline_accepted_status,
+            "baseline_overall_status": baseline_overall_status,
             "baseline_jr_status": baseline_jr_status,
             "accepted_structural_edit_count": structural_edit_count,
             "current_status": current_status,

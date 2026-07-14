@@ -3119,13 +3119,19 @@ def record_imported_file(job_id: int, file_name: str, file_hash: str,
                          file_size: int = 0, source: str = "manual",
                          artifact_path: str | None = None,
                          artifact_kind: str = "source"):
-    """Record that a file has been imported for a job."""
+    """Record an import and repair legacy rows when durable evidence is re-uploaded."""
     conn = _get_conn()
     try:
         conn.execute(
-            "INSERT OR IGNORE INTO imported_files "
+            "INSERT INTO imported_files "
             "(job_id, file_name, file_hash, file_size, source, artifact_path, artifact_kind, imported_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(job_id, file_hash) DO UPDATE SET "
+            "file_name=excluded.file_name, file_size=excluded.file_size, source=excluded.source, "
+            "artifact_path=COALESCE(excluded.artifact_path, imported_files.artifact_path), "
+            "artifact_kind=CASE WHEN excluded.artifact_path IS NOT NULL "
+            "THEN excluded.artifact_kind ELSE imported_files.artifact_kind END, "
+            "imported_at=excluded.imported_at",
             (job_id, file_name, file_hash, file_size, source, artifact_path, artifact_kind, datetime.now().isoformat())
         )
         conn.commit()

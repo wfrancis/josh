@@ -37,7 +37,7 @@ from models import (
     create_vendor, delete_vendor,
     get_price_history, import_vendor_prices_csv,
     create_notification, get_notifications, mark_notification_read,
-    is_file_imported, record_imported_file, list_imported_files, record_job_artifact, list_job_artifacts,
+    record_imported_file, list_imported_files, record_job_artifact, list_job_artifacts,
     log_activity, get_activity, add_comment, get_comments,
     create_quote_request, list_quote_requests, update_quote_request, delete_quote_request,
     _normalize_product, _get_conn,
@@ -280,6 +280,42 @@ def _require_artifact_receipt(job_id: int, path: str, artifact_kind: str) -> Non
         )
 
 
+def _checked_artifact_path(relative_path: str) -> str | None:
+    """Resolve a recorded relative path only when it stays inside artifact storage."""
+    if not relative_path:
+        return None
+    artifact_root = os.path.realpath(ARTIFACT_ROOT)
+    candidate = os.path.realpath(os.path.join(artifact_root, relative_path))
+    try:
+        if os.path.commonpath([artifact_root, candidate]) != artifact_root:
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
+def _imported_artifact_is_verified(imported: dict, artifact_kind: str | None = None) -> bool:
+    """Only successfully parsed imports with intact durable bytes qualify as evidence."""
+    if artifact_kind and imported.get("artifact_kind") != artifact_kind:
+        return False
+    path = _checked_artifact_path(imported.get("artifact_path") or "")
+    expected_hash = str(imported.get("file_hash") or "").strip()
+    return bool(
+        path
+        and expected_hash
+        and os.path.isfile(path)
+        and _file_hash(path) == expected_hash
+    )
+
+
+def _file_is_durably_imported(job_id: int, file_hash: str) -> bool:
+    """Deduplicate only when the successful import still has verified source bytes."""
+    return any(
+        item.get("file_hash") == file_hash and _imported_artifact_is_verified(item)
+        for item in list_imported_files(job_id)
+    )
+
+
 def _persist_automated_quote_evidence(
     job_id: int,
     temp_files: list[str],
@@ -298,7 +334,7 @@ def _persist_automated_quote_evidence(
         if not os.path.exists(durable_path):
             shutil.copy2(temp_path, durable_path)
         _record_artifact(job_id, durable_path, "vendor_quote")
-        if index in parsed_indexes and not is_file_imported(job_id, digest):
+        if index in parsed_indexes:
             record_imported_file(
                 job_id,
                 original_name or "vendor_quote",
@@ -349,19 +385,6 @@ def _artifact_readiness(
     """Verify durable source and PDF receipts without changing the job."""
     failures = []
     warnings = []
-    artifact_root = os.path.realpath(ARTIFACT_ROOT)
-
-    def checked_path(relative_path: str) -> str | None:
-        if not relative_path:
-            return None
-        candidate = os.path.realpath(os.path.join(artifact_root, relative_path))
-        try:
-            if os.path.commonpath([artifact_root, candidate]) != artifact_root:
-                return None
-        except ValueError:
-            return None
-        return candidate
-
     def add_failure(message: str) -> None:
         if message not in failures:
             failures.append(message)
@@ -373,7 +396,7 @@ def _artifact_readiness(
         if not relative_path:
             warnings.append(f"{label} is a legacy import without a durable path")
             continue
-        path = checked_path(relative_path)
+        path = _checked_artifact_path(relative_path)
         if not path or not os.path.isfile(path):
             add_failure(f"{label} is missing from durable storage")
             continue
@@ -385,7 +408,7 @@ def _artifact_readiness(
     for receipt in artifact_receipts:
         relative_path = receipt.get("artifact_path") or ""
         label = receipt.get("artifact_kind") or relative_path or "artifact"
-        path = checked_path(relative_path)
+        path = _checked_artifact_path(relative_path)
         if not path or not os.path.isfile(path):
             add_failure(f"Recorded {label} artifact is missing from durable storage")
             continue
@@ -394,8 +417,8 @@ def _artifact_readiness(
             add_failure(f"Recorded {label} artifact no longer matches its hash")
 
     has_rfms_evidence = any(
-        item.get("artifact_kind") == "rfms"
-        for item in (*imported_files, *artifact_receipts)
+        _imported_artifact_is_verified(item, "rfms")
+        for item in imported_files
     )
     if materials and not has_rfms_evidence:
         warnings.append("No durable RFMS source workbook is recorded for this structured job")
@@ -407,8 +430,8 @@ def _artifact_readiness(
         and str(material.get("price_source") or "").strip().lower() == "vendor_quote"
     ]
     has_vendor_evidence = any(
-        item.get("artifact_kind") == "vendor_quote"
-        for item in (*imported_files, *artifact_receipts)
+        _imported_artifact_is_verified(item, "vendor_quote")
+        for item in imported_files
     )
     if vendor_priced and not has_vendor_evidence:
         add_failure(
@@ -500,7 +523,7 @@ def _ingest_automated_quote(
     already_imported = set()
     for index, file_path in enumerate(temp_files):
         digest = _file_hash(file_path)
-        if digest and is_file_imported(job_id, digest):
+        if digest and _file_is_durably_imported(job_id, digest):
             already_imported.add(index)
             continue
         try:
@@ -2528,7 +2551,7 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
 
         # Dedup: check file hash before parsing
         file_hash = _hashlib.sha256(content).hexdigest()
-        if is_file_imported(db_id, file_hash):
+        if _file_is_durably_imported(db_id, file_hash):
             skipped_files.append(upload.filename)
             continue
 
