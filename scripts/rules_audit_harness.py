@@ -193,6 +193,30 @@ def validate_transition_pricing_contract(client: "Client") -> Check:
     )
 
 
+def validate_proposal_cent_arithmetic_contract(client: "Client") -> Check:
+    try:
+        _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
+    except HarnessError as exc:
+        return Check("proposal_cent_arithmetic", "FAIL", f"deployed exact-cent probe unavailable: {exc}")
+    contract = probe.get("proposal_cent_arithmetic_contract") or {}
+    result = contract.get("result") or {}
+    expected_error = "Proposal grand total does not equal subtotal plus tax and Textura."
+    ok = (
+        contract.get("status") == "pass"
+        and result.get("exact_cent_errors") == []
+        and expected_error in (result.get("one_cent_errors") or [])
+    )
+    return Check(
+        "proposal_cent_arithmetic",
+        "PASS" if ok else "FAIL",
+        (
+            "proposal arithmetic is exact to the cent and one-cent drift stays blocked"
+            if ok else "deployed proposal arithmetic did not enforce exact cents"
+        ),
+        contract,
+    )
+
+
 def validate_classification_fallback_contract(client: "Client") -> Check:
     try:
         _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
@@ -1798,6 +1822,7 @@ def main() -> int:
         checks.append(validate_quote_receipt_recovery_contract(client))
         checks.append(validate_quote_price_conflict_contract(client))
         checks.append(validate_transition_pricing_contract(client))
+        checks.append(validate_proposal_cent_arithmetic_contract(client))
         checks.append(validate_classification_fallback_contract(client))
         checks.append(try_rule_registry(client))
         checks.append(try_rule_eval(client, fixture))

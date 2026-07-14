@@ -34,6 +34,11 @@ def _finite_number(value) -> float | None:
         return None
 
 
+def _money_differs(left, right) -> bool:
+    """Compare currency as integer cents so one-cent drift is never hidden."""
+    return int(round(_number(left) * 100)) != int(round(_number(right) * 100))
+
+
 def _check(check_id: str, status: str, message: str, affected_items=None) -> dict:
     return {
         "id": check_id,
@@ -97,12 +102,12 @@ def proposal_math_errors(proposal: dict) -> list[str]:
         if not bundle.get("is_derived"):
             material_line_total = round(sum(_number(line.get("extended_cost")) for line in material_lines), 2)
             sundry_line_total = round(sum(_number(line.get("extended_cost")) for line in sundry_lines), 2)
-            if abs(material_line_total - material) > 0.02:
+            if _money_differs(material_line_total, material):
                 errors.append(f"{name} material lines do not equal its material cost.")
-            if abs(sundry_line_total - sundry) > 0.02:
+            if _money_differs(sundry_line_total, sundry):
                 errors.append(f"{name} sundry lines do not equal its sundry cost.")
         labor_line_total = round(sum(_number(line.get("extended_cost")) for line in labor_lines), 2)
-        if abs(labor_line_total - labor) > 0.02:
+        if _money_differs(labor_line_total, labor):
             errors.append(f"{name} labor lines do not equal its labor cost.")
 
         for line_index, line in enumerate(material_lines):
@@ -115,7 +120,7 @@ def proposal_math_errors(proposal: dict) -> list[str]:
                     errors.append(f"{name} material line {line_index + 1} {field} cannot be negative.")
             pricing = material_pricing_context(line)
             expected_line = pricing["expected_cost"]
-            if abs(expected_line - _number(line.get("extended_cost"))) > 0.02:
+            if _money_differs(expected_line, line.get("extended_cost")):
                 errors.append(
                     f"{name} material line {line_index + 1} does not equal its "
                     f"{pricing['basis'].replace('_', ' ')} pricing formula."
@@ -128,7 +133,7 @@ def proposal_math_errors(proposal: dict) -> list[str]:
                 elif number < 0:
                     errors.append(f"{name} sundry line {line_index + 1} {field} cannot be negative.")
             expected_line = round(_number(line.get("qty")) * _number(line.get("unit_price")), 2)
-            if abs(expected_line - _number(line.get("extended_cost"))) > 0.02:
+            if _money_differs(expected_line, line.get("extended_cost")):
                 errors.append(f"{name} sundry line {line_index + 1} does not equal quantity times unit price.")
         for line_index, line in enumerate(labor_lines):
             for field, value in (("quantity", line.get("qty")), ("rate", line.get("rate")), ("extended cost", line.get("extended_cost"))):
@@ -138,16 +143,16 @@ def proposal_math_errors(proposal: dict) -> list[str]:
                 elif number < 0:
                     errors.append(f"{name} labor line {line_index + 1} {field} cannot be negative.")
             expected_line = round(_number(line.get("qty")) * _number(line.get("rate")), 2)
-            if abs(expected_line - _number(line.get("extended_cost"))) > 0.02:
+            if _money_differs(expected_line, line.get("extended_cost")):
                 errors.append(f"{name} labor line {line_index + 1} does not equal quantity times rate.")
 
-        if abs(expected_gpm - _number(bundle.get("gpm_adder"))) > 0.02:
+        if _money_differs(expected_gpm, bundle.get("gpm_adder")):
             errors.append(f"{name} GPM split does not equal its GPM adder.")
-        if abs(expected_taxable - _number(bundle.get("taxable"))) > 0.02:
+        if _money_differs(expected_taxable, bundle.get("taxable")):
             errors.append(f"{name} taxable amount does not equal its taxable cost components.")
-        if abs(expected_tax - _number(bundle.get("tax_amount"))) > 0.02:
+        if _money_differs(expected_tax, bundle.get("tax_amount")):
             errors.append(f"{name} tax does not equal taxable amount times the proposal tax rate.")
-        if abs(expected_total - _number(bundle.get("total_price"))) > 0.02:
+        if _money_differs(expected_total, bundle.get("total_price")):
             errors.append(f"{name} calculated sell price does not equal its cost, GPM, and tax components.")
         accepted_total = bundle.get("price_override") if bundle.get("price_override") is not None else bundle.get("total_price")
         if _finite_number(accepted_total) is None or _number(accepted_total) <= 0:
@@ -159,35 +164,35 @@ def proposal_math_errors(proposal: dict) -> list[str]:
     ), 2)
 
     bundle_tax = round(sum(_number(b.get("tax_amount")) for b in bundles), 2)
-    if abs(bundle_tax - _number(proposal.get("tax_amount"))) > 0.02:
+    if _money_differs(bundle_tax, proposal.get("tax_amount")):
         errors.append("Proposal tax does not equal the sum of bundle tax.")
 
     expected_before_textura = round(_number(proposal.get("subtotal")) + bundle_tax, 2)
-    if abs(bundle_total - expected_before_textura) > 0.02:
+    if _money_differs(bundle_total, expected_before_textura):
         errors.append("Accepted bundle totals do not equal subtotal plus tax.")
 
     calculated_bundle_total = round(sum(_number(b.get("total_price")) for b in bundles), 2)
     expected_adjustment = round(bundle_total - calculated_bundle_total, 2)
-    if abs(expected_adjustment - _number(proposal.get("manual_adjustment"))) > 0.02:
+    if _money_differs(expected_adjustment, proposal.get("manual_adjustment")):
         errors.append("Manual bundle adjustments do not match the accepted bundle prices.")
 
     expected_grand = round(_number(proposal.get("subtotal")) + bundle_tax + _number(proposal.get("textura_amount")), 2)
-    if abs(expected_grand - _number(proposal.get("grand_total"))) > 0.02:
+    if _money_differs(expected_grand, proposal.get("grand_total")):
         errors.append("Proposal grand total does not equal subtotal plus tax and Textura.")
 
     expected_gpm = round(_number(proposal.get("gpm_labor")) + _number(proposal.get("gpm_material")), 2)
-    if abs(expected_gpm - _number(proposal.get("gpm_profit"))) > 0.02:
+    if _money_differs(expected_gpm, proposal.get("gpm_profit")):
         errors.append("GPM labor and material splits do not equal GPM profit.")
     bundle_gpm_labor = round(sum(_number(bundle.get("gpm_labor_adder")) for bundle in bundles), 2)
     bundle_gpm_material = round(sum(_number(bundle.get("gpm_material_adder")) for bundle in bundles), 2)
-    if abs(bundle_gpm_labor - _number(proposal.get("gpm_labor"))) > 0.02:
+    if _money_differs(bundle_gpm_labor, proposal.get("gpm_labor")):
         errors.append("Bundle labor GPM adders do not equal proposal labor GPM.")
-    if abs(bundle_gpm_material - _number(proposal.get("gpm_material"))) > 0.02:
+    if _money_differs(bundle_gpm_material, proposal.get("gpm_material")):
         errors.append("Bundle material GPM adders do not equal proposal material GPM.")
 
     accepted_before_textura = round(_number(proposal.get("subtotal")) + bundle_tax, 2)
     expected_textura = round(min(accepted_before_textura * 0.0022, 5000), 2) if _number(proposal.get("textura_fee")) else 0.0
-    if abs(expected_textura - _number(proposal.get("textura_amount"))) > 0.02:
+    if _money_differs(expected_textura, proposal.get("textura_amount")):
         errors.append("Textura amount does not match the accepted proposal total and cap.")
     return errors
 

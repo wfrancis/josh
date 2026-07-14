@@ -3595,6 +3595,48 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
         ) else "fail",
         "result": classification_results,
     }
+    exact_cent_proposal = {
+        "tax_rate": 0.10,
+        "gpm_pct": 0,
+        "subtotal": 100.0,
+        "tax_amount": 10.0,
+        "grand_total": 110.0,
+        "gpm_profit": 0,
+        "gpm_labor": 0,
+        "gpm_material": 0,
+        "manual_adjustment": 0,
+        "textura_fee": 0,
+        "textura_amount": 0,
+        "bundles": [{
+            "bundle_name": "Exact-cent contract",
+            "is_derived": True,
+            "material_cost": 100.0,
+            "sundry_cost": 0,
+            "labor_cost": 0,
+            "freight_cost": 0,
+            "gpm_labor_adder": 0,
+            "gpm_material_adder": 0,
+            "gpm_adder": 0,
+            "taxable": 100.0,
+            "tax_amount": 10.0,
+            "total_price": 110.0,
+            "materials": [],
+            "sundry_items": [],
+            "labor_items": [],
+        }],
+    }
+    exact_cent_errors = proposal_math_errors(exact_cent_proposal)
+    one_cent_drift = copy.deepcopy(exact_cent_proposal)
+    one_cent_drift["grand_total"] = 110.01
+    one_cent_errors = proposal_math_errors(one_cent_drift)
+    expected_cent_error = "Proposal grand total does not equal subtotal plus tax and Textura."
+    response["proposal_cent_arithmetic_contract"] = {
+        "status": "pass" if not exact_cent_errors and expected_cent_error in one_cent_errors else "fail",
+        "result": {
+            "exact_cent_errors": exact_cent_errors,
+            "one_cent_errors": one_cent_errors,
+        },
+    }
     if field:
         response["field"] = field
     if job_ref:
