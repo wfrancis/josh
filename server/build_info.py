@@ -15,6 +15,7 @@ ENGINE_FILES = (
     "main.py",
     "config.py",
     "labor_calc.py",
+    "material_pricing.py",
     "models.py",
     "pdf_generator.py",
     "sundry_calc.py",

@@ -62,6 +62,7 @@ from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf, generate_proposal_pdf
 from proposal_bundler import generate_proposal_data
 from proposal_totals import effective_bundle_total, normalize_proposal_totals
+from material_pricing import material_pricing_context
 from reproducibility import DEFAULT_TOLERANCE, apply_accepted_numeric_edits, make_golden_snapshot, replay_golden_job
 from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE, STAIR_SUNDRY_KITS
 from email_agent import compose_quote_request, send_email, generate_quote_request_text
@@ -3501,6 +3502,40 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
         ) else "fail",
         "result": recovery_probe,
     }
+    transition_cases = {
+        "lf_to_sticks": {
+            "material_type": "transitions", "price_source": "price_book",
+            "vendor": "Schluter", "unit": "EA", "order_qty": 212,
+            "fixture_count": 0, "unit_price": 7.94, "extended_cost": 206.44,
+        },
+        "stored_pieces": {
+            "material_type": "transitions", "price_source": "price_book",
+            "vendor": "Schluter", "unit": "EA", "order_qty": 5,
+            "fixture_count": 0, "unit_price": 9.78, "extended_cost": 48.90,
+        },
+        "corrupted": {
+            "material_type": "transitions", "price_source": "price_book",
+            "vendor": "Schluter", "unit": "EA", "order_qty": 34,
+            "fixture_count": 0, "unit_price": 9.78, "extended_cost": 40.00,
+        },
+    }
+    transition_results = {
+        name: material_pricing_context(case)
+        for name, case in transition_cases.items()
+    }
+    transition_ok = (
+        transition_results["lf_to_sticks"]["basis"] == "transition_sticks"
+        and transition_results["lf_to_sticks"]["expected_cost"] == 206.44
+        and transition_results["stored_pieces"]["basis"] == "stored_transition_pieces"
+        and transition_results["stored_pieces"]["expected_cost"] == 48.90
+        and transition_results["corrupted"]["expected_cost"] == 48.90
+        and transition_results["corrupted"]["expected_cost"]
+        != transition_cases["corrupted"]["extended_cost"]
+    )
+    response["transition_pricing_contract"] = {
+        "status": "pass" if transition_ok else "fail",
+        "result": transition_results,
+    }
     if field:
         response["field"] = field
     if job_ref:
@@ -4829,20 +4864,21 @@ def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) ->
         for material_index, material in enumerate(bundle.get("materials") or []):
             if not isinstance(material, dict):
                 continue
-            order_qty = _money(material.get("order_qty") or material.get("installed_qty"))
-            unit_price = _money(material.get("unit_price"))
+            pricing = material_pricing_context(material)
             trace.record(
                 entity_type="material",
                 entity_id=material.get("id") or material.get("material_id"),
                 entity_key=material.get("item_code") or material.get("description"),
                 output_field="extended_cost",
-                formula="order_qty * unit_price",
+                formula=pricing["formula"],
                 inputs={
                     "bundle_name": bundle_name,
                     "bundle_index": index,
                     "line_index": material_index,
-                    "order_qty": order_qty,
-                    "unit_price": unit_price,
+                    **pricing["inputs"],
+                    "pricing_basis": pricing["basis"],
+                    "pricing_quantity": pricing["pricing_quantity"],
+                    "pricing_unit": pricing["pricing_unit"],
                 },
                 result=_money(material.get("extended_cost")),
                 rule_id=f"proposal_editor:material:{material.get('material_type', '')}:extended_cost",

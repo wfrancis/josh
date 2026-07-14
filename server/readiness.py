@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 
+from material_pricing import material_pricing_context
 from rfms_parser import VALID_MATERIAL_TYPES
 
 
@@ -112,13 +113,13 @@ def proposal_math_errors(proposal: dict) -> list[str]:
                     errors.append(f"{name} material line {line_index + 1} {field} must be a finite number.")
                 elif number < 0:
                     errors.append(f"{name} material line {line_index + 1} {field} cannot be negative.")
-            expected_line = round(
-                _number(quantity_value)
-                * _number(line.get("unit_price")),
-                2,
-            )
+            pricing = material_pricing_context(line)
+            expected_line = pricing["expected_cost"]
             if abs(expected_line - _number(line.get("extended_cost"))) > 0.02:
-                errors.append(f"{name} material line {line_index + 1} does not equal quantity times unit price.")
+                errors.append(
+                    f"{name} material line {line_index + 1} does not equal its "
+                    f"{pricing['basis'].replace('_', ' ')} pricing formula."
+                )
         for line_index, line in enumerate(sundry_lines):
             for field, value in (("quantity", line.get("qty")), ("unit price", line.get("unit_price")), ("extended cost", line.get("extended_cost"))):
                 number = _finite_number(value)

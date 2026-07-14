@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import Optional
 
 from config import BID_TEMPLATES, FREIGHT_RATES, DERIVED_BUNDLE_RULES
+from material_pricing import material_pricing_context
 
 
 # ─── Terms & Conditions (full 17-item list from reference proposal) ──────────
@@ -429,15 +430,18 @@ def _sum_material_costs(
                     note="Material total preserved from manual price_source.",
                 )
             else:
+                pricing = material_pricing_context(mat)
                 trace.record(
                     entity_type="material",
                     entity_id=mat_id,
                     entity_key=entity_key,
                     output_field="extended_cost",
-                    formula="order_qty * unit_price",
+                    formula=pricing["formula"],
                     inputs={
-                        "order_qty": round(order_qty, 2),
-                        "unit_price": mat.get("unit_price", 0),
+                        **pricing["inputs"],
+                        "pricing_basis": pricing["basis"],
+                        "pricing_quantity": pricing["pricing_quantity"],
+                        "pricing_unit": pricing["pricing_unit"],
                         "quote_source_hash": mat.get("quote_source_hash"),
                         "quote_file_name": mat.get("quote_file_name"),
                     },

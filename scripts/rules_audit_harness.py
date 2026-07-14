@@ -139,6 +139,35 @@ def validate_quote_receipt_recovery_contract(client: "Client") -> Check:
     )
 
 
+def validate_transition_pricing_contract(client: "Client") -> Check:
+    try:
+        _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
+    except HarnessError as exc:
+        return Check("transition_pricing", "FAIL", f"deployed transition pricing probe unavailable: {exc}")
+    contract = probe.get("transition_pricing_contract") or {}
+    result = contract.get("result") or {}
+    lf_case = result.get("lf_to_sticks") or {}
+    stored_case = result.get("stored_pieces") or {}
+    corrupt_case = result.get("corrupted") or {}
+    ok = (
+        contract.get("status") == "pass"
+        and lf_case.get("basis") == "transition_sticks"
+        and lf_case.get("expected_cost") == 206.44
+        and stored_case.get("basis") == "stored_transition_pieces"
+        and stored_case.get("expected_cost") == 48.9
+        and corrupt_case.get("expected_cost") == 48.9
+    )
+    return Check(
+        "transition_pricing",
+        "PASS" if ok else "FAIL",
+        (
+            "per-stick transition arithmetic is explicit and corrupted totals stay blocked"
+            if ok else "deployed transition pricing contract failed"
+        ),
+        contract,
+    )
+
+
 @dataclass
 class Check:
     name: str
@@ -1700,6 +1729,7 @@ def main() -> int:
         checks.append(validate_build_identity(client, args.expected_commit))
         checks.append(validate_vendor_ingestion_health(client))
         checks.append(validate_quote_receipt_recovery_contract(client))
+        checks.append(validate_transition_pricing_contract(client))
         checks.append(try_rule_registry(client))
         checks.append(try_rule_eval(client, fixture))
         checks.append(ensure_fixture_labor_catalog(client, fixture, args.seed_fixture_labor_catalog))
