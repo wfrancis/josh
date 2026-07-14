@@ -424,18 +424,38 @@ def _artifact_readiness(
         warnings.append("No durable RFMS source workbook is recorded for this structured job")
 
     vendor_priced = [
-        material.get("item_code") or material.get("description") or "material"
+        material
         for material in (materials or [])
         if isinstance(material, dict)
         and str(material.get("price_source") or "").strip().lower() == "vendor_quote"
     ]
-    has_vendor_evidence = any(
-        _imported_artifact_is_verified(item, "vendor_quote")
+    verified_vendor_hashes = {
+        str(item.get("file_hash") or "").strip()
         for item in imported_files
-    )
-    if vendor_priced and not has_vendor_evidence:
+        if _imported_artifact_is_verified(item, "vendor_quote")
+    }
+    missing_quote_source = []
+    missing_quote_artifact = []
+    for material in vendor_priced:
+        label = material.get("item_code") or material.get("description") or "material"
+        source_hash = str(material.get("quote_source_hash") or "").strip()
+        if not source_hash:
+            missing_quote_source.append(str(label))
+        elif source_hash not in verified_vendor_hashes:
+            missing_quote_artifact.append(str(label))
+    if missing_quote_source:
+        labels = ", ".join(missing_quote_source[:5])
+        suffix = "..." if len(missing_quote_source) > 5 else ""
         add_failure(
-            f"{len(vendor_priced)} material(s) use vendor-quote pricing without a durable quote file"
+            f"{len(missing_quote_source)} vendor-quote material(s) do not identify their exact quote source: "
+            f"{labels}{suffix}"
+        )
+    if missing_quote_artifact:
+        labels = ", ".join(missing_quote_artifact[:5])
+        suffix = "..." if len(missing_quote_artifact) > 5 else ""
+        add_failure(
+            f"{len(missing_quote_artifact)} vendor-quote material(s) do not match an intact durable quote file: "
+            f"{labels}{suffix}"
         )
 
     expected_pdf_rel = os.path.relpath(proposal_pdf_path, ARTIFACT_ROOT)
@@ -521,13 +541,14 @@ def _ingest_automated_quote(
     all_products = []
     parsed_indexes = set()
     already_imported = set()
+    parse_failures = []
     for index, file_path in enumerate(temp_files):
         digest = _file_hash(file_path)
         if digest and _file_is_durably_imported(job_id, digest):
             already_imported.add(index)
             continue
         try:
-            products = parse_quote_file(file_path)
+            products = parse_quote_file(file_path, strict=True)
             if products:
                 filename = filenames[index] if index < len(filenames) else os.path.basename(file_path)
                 for product in products:
@@ -535,8 +556,18 @@ def _ingest_automated_quote(
                     product["_source_hash"] = digest
                 all_products.extend(products)
                 parsed_indexes.add(index)
+            else:
+                parse_failures.append(file_path)
         except Exception as exc:
+            parse_failures.append(file_path)
             print(f"[{log_prefix}] Error parsing {file_path}: {exc}")
+
+    if parse_failures:
+        print(
+            f"[{log_prefix}] {len(parse_failures)} quote source(s) did not parse; "
+            "no pricing changes were saved and the message will remain unread"
+        )
+        return False
 
     if not all_products:
         if temp_files and len(already_imported) == len(temp_files):
@@ -900,6 +931,17 @@ def _vendor_import_idempotency_status() -> dict:
     }
 
 
+def _vendor_price_provenance_status() -> dict:
+    required = {"quote_source_hash", "quote_file_name"}
+    conn = _get_conn()
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(job_materials)").fetchall()}
+    finally:
+        conn.close()
+    missing = sorted(required - columns)
+    return {"verified": not missing, "missing": missing}
+
+
 @app.get("/api/system/vendor-ingestion")
 def api_system_vendor_ingestion():
     """Return non-secret health evidence for vendor-pricing ingestion."""
@@ -911,7 +953,8 @@ def api_system_vendor_ingestion():
     monitor_running = bool(_inbox_monitor and _inbox_monitor.is_running)
     simulator_running = bool(_sim_watcher and _sim_watcher.is_running)
     idempotency = _vendor_import_idempotency_status()
-    if not idempotency["verified"] or not provider.get("available"):
+    provenance = _vendor_price_provenance_status()
+    if not idempotency["verified"] or not provenance["verified"] or not provider.get("available"):
         status = "blocked"
     elif test_mode and not simulator_running:
         status = "warning"
@@ -941,6 +984,7 @@ def api_system_vendor_ingestion():
             "idempotency_verified": idempotency["verified"],
             "idempotency_missing": idempotency["missing"],
             "job_match": "stable_subject_tag_then_unambiguous_project_match",
+            "parse_failure_policy": "no_pricing_writes_until_every_selected_source_parses",
         },
         "dropbox_import": {
             "mode": "browser_folder_picker",
@@ -949,6 +993,12 @@ def api_system_vendor_ingestion():
             "max_file_mb": MAX_QUOTE_FILE_BYTES // (1024 * 1024),
         },
         "durable_artifact_root": ARTIFACT_ROOT,
+        "pricing_evidence": {
+            "per_material_source_receipts": provenance["verified"],
+            "source_fields": ["quote_source_hash", "quote_file_name"],
+            "readiness_requires_exact_hash": True,
+            "missing_fields": provenance["missing"],
+        },
     }
 
 @app.get("/api/rules")
@@ -1839,7 +1889,7 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
     conn = _get_conn()
     try:
         all_quotes = conn.execute(
-            "SELECT id, product_name, vendor, unit_price, unit, file_name, freight, lead_time, notes FROM job_quotes WHERE job_id=?",
+            "SELECT id, product_name, vendor, unit_price, unit, file_name, source_hash, freight, lead_time, notes FROM job_quotes WHERE job_id=?",
             (job_id,),
         ).fetchall()
     finally:
@@ -1965,6 +2015,8 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             mat["vendor"] = best_prod.get("vendor", "")
             mat["quote_status"] = "quoted"
             mat["price_source"] = "vendor_quote"
+            mat["quote_source_hash"] = best_prod.get("source_hash") or best_prod.get("_source_hash")
+            mat["quote_file_name"] = best_prod.get("file_name")
             # If freight is FOB, apply internal freight rates by material type
             _apply_fob_freight(mat, best_prod, freight_rates)
             order_qty = mat.get("order_qty", 0)
@@ -1986,6 +2038,8 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             mat["vendor"] = prod.get("vendor", "")
             mat["quote_status"] = "quoted"
             mat["price_source"] = "vendor_quote"
+            mat["quote_source_hash"] = prod.get("source_hash") or prod.get("_source_hash")
+            mat["quote_file_name"] = prod.get("file_name")
             _apply_fob_freight(mat, prod, freight_rates)
             order_qty = mat.get("order_qty", 0)
             mat["extended_cost"] = round(order_qty * mat["unit_price"], 2)
@@ -2540,6 +2594,7 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     all_products = []
     skipped_files = []
     file_errors = []
+    parsed_files = []
     for upload in files:
         content = await upload.read(MAX_QUOTE_FILE_BYTES + 1)
         if len(content) > MAX_QUOTE_FILE_BYTES:
@@ -2561,30 +2616,32 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
         _record_artifact(db_id, file_path, "vendor_quote")
 
         try:
-            products = parse_quote_file(file_path)
+            products = parse_quote_file(file_path, strict=True)
             for p in products:
                 p["file_name"] = upload.filename
                 p["_source_hash"] = file_hash
             all_products.extend(products)
             if not products:
                 file_errors.append({"file": upload.filename, "error": "No pricing products were extracted."})
-            # Only record as imported if we actually extracted products
             if products:
-                record_imported_file(
-                    db_id,
-                    upload.filename,
-                    file_hash,
-                    len(content),
-                    source="manual",
-                    artifact_path=os.path.relpath(file_path, ARTIFACT_ROOT),
-                    artifact_kind="vendor_quote",
-                )
+                parsed_files.append({
+                    "file_name": upload.filename,
+                    "file_hash": file_hash,
+                    "file_size": len(content),
+                    "artifact_path": os.path.relpath(file_path, ARTIFACT_ROOT),
+                })
         except Exception as e:
             file_errors.append({"error": str(e), "file": upload.filename})
 
-    if not all_products and file_errors:
+    if file_errors:
         detail = "; ".join(f"{item['file']}: {item['error']}" for item in file_errors[:5])
-        raise HTTPException(status_code=422, detail=f"No vendor pricing was imported. {detail}")
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No vendor pricing was changed because every selected source must parse successfully. "
+                f"{detail}"
+            ),
+        )
 
     # Persist quotes to DB
     save_quotes(db_id, all_products)
@@ -2597,6 +2654,19 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
 
     # Detect matching quote requests (don't auto-link — frontend will confirm)
     linked_requests = _link_upload_to_requests(db_id, all_products)
+
+    # Mark source files imported only after every selected source parsed and all
+    # downstream pricing writes completed.
+    for parsed_file in parsed_files:
+        record_imported_file(
+            db_id,
+            parsed_file["file_name"],
+            parsed_file["file_hash"],
+            parsed_file["file_size"],
+            source="manual",
+            artifact_path=parsed_file["artifact_path"],
+            artifact_kind="vendor_quote",
+        )
 
     file_names = [u.filename for u in files if hasattr(u, 'filename')]
     vendors_found = list(set(p.get("vendor", "Unknown") for p in all_products if p.get("vendor")))
@@ -2800,6 +2870,9 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
             merged = {**base, **{key: value for key, value in material.items() if value is not None}}
             if material.get("material_type") and base.get("material_type") != material.get("material_type"):
                 merged["ai_confidence"] = 1.0
+            if str(merged.get("price_source") or "").strip().lower() != "vendor_quote":
+                merged["quote_source_hash"] = None
+                merged["quote_file_name"] = None
 
             waste_pct = merged.get("waste_pct", 0)
             installed_qty = merged.get("installed_qty", 0)
@@ -4033,8 +4106,9 @@ def _materials_source_fingerprint(materials: list[dict]) -> str:
     fields = (
         "id", "item_code", "description", "material_type", "installed_qty", "unit",
         "waste_pct", "order_qty", "vendor", "unit_price", "extended_cost",
-        "ai_confidence", "quote_status", "price_source", "freight_per_unit",
-        "freight_source", "fixture_count", "labor_rate_lf", "labor_catalog",
+        "ai_confidence", "quote_status", "price_source", "quote_source_hash",
+        "quote_file_name", "freight_per_unit", "freight_source", "fixture_count",
+        "labor_rate_lf", "labor_catalog",
         "tack_strip_lf", "seam_tape_lf", "pad_sy", "area_type", "is_mosaic",
         "is_penny_hex", "crack_isolation_sf", "weld_rod_lf",
     )
@@ -4084,14 +4158,15 @@ def _bid_source_fingerprint(job: dict) -> str:
     build = get_build_info()
     data_fingerprints = _calculator_data_fingerprints()
     return _fingerprint_payload({
-        "fingerprint_schema": 2,
+        "fingerprint_schema": 3,
         "job": _job_source_snapshot(job),
         "materials": _line_snapshot(job.get("materials", []), (
             "id", "item_code", "description", "material_type", "installed_qty",
             "unit", "waste_pct", "order_qty", "unit_price", "extended_cost",
             "vendor", "price_source", "quote_status", "ai_confidence",
-            "freight_per_unit", "freight_source", "fixture_count", "labor_rate_lf",
-            "labor_catalog", "tack_strip_lf", "seam_tape_lf", "pad_sy", "area_type",
+            "quote_source_hash", "quote_file_name", "freight_per_unit", "freight_source",
+            "fixture_count", "labor_rate_lf", "labor_catalog", "tack_strip_lf",
+            "seam_tape_lf", "pad_sy", "area_type",
             "is_mosaic", "is_penny_hex", "crack_isolation_sf", "weld_rod_lf",
         )),
         "sundries": _line_snapshot(job.get("sundries", []), (
@@ -4112,14 +4187,15 @@ def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -
     build = get_build_info()
     data_fingerprints = _calculator_data_fingerprints()
     return _fingerprint_payload({
-        "fingerprint_schema": 2,
+        "fingerprint_schema": 3,
         "job": _job_source_snapshot(job),
         "materials": _line_snapshot(job.get("materials", []), (
             "id", "item_code", "description", "material_type", "installed_qty",
             "unit", "waste_pct", "order_qty", "unit_price", "extended_cost",
             "vendor", "price_source", "quote_status", "ai_confidence",
-            "freight_per_unit", "freight_source", "fixture_count", "labor_rate_lf",
-            "labor_catalog", "tack_strip_lf", "seam_tape_lf", "pad_sy", "area_type",
+            "quote_source_hash", "quote_file_name", "freight_per_unit", "freight_source",
+            "fixture_count", "labor_rate_lf", "labor_catalog", "tack_strip_lf",
+            "seam_tape_lf", "pad_sy", "area_type",
             "is_mosaic", "is_penny_hex", "crack_isolation_sf", "weld_rod_lf",
         )),
         "proposal": {
@@ -5276,14 +5352,16 @@ def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
     compare_fields = (
         "item_code", "description", "material_type", "installed_qty", "unit", "waste_pct", "order_qty",
         "vendor", "unit_price", "extended_cost", "price_source", "quote_status",
-        "ai_confidence", "freight_per_unit", "freight_source", "fixture_count",
-        "labor_rate_lf", "labor_catalog", "tack_strip_lf", "seam_tape_lf",
+        "ai_confidence", "quote_source_hash", "quote_file_name", "freight_per_unit",
+        "freight_source", "fixture_count", "labor_rate_lf", "labor_catalog",
+        "tack_strip_lf", "seam_tape_lf",
         "pad_sy", "area_type", "is_mosaic", "is_penny_hex",
         "crack_isolation_sf", "weld_rod_lf",
     )
     text_fields = {
         "item_code", "description", "material_type", "unit", "vendor",
-        "price_source", "quote_status", "freight_source", "labor_catalog", "area_type",
+        "price_source", "quote_status", "quote_source_hash", "quote_file_name",
+        "freight_source", "labor_catalog", "area_type",
     }
 
     for bundle in body.get("bundles") or []:

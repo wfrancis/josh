@@ -90,6 +90,10 @@ def validate_vendor_ingestion_health(client: "Client") -> Check:
         and (health.get("email_monitor") or {}).get("idempotency") == "source_hash_database_uniqueness"
         and (health.get("email_monitor") or {}).get("idempotency_verified") is True
         and (health.get("email_monitor") or {}).get("job_match") == "stable_subject_tag_then_unambiguous_project_match"
+        and (health.get("email_monitor") or {}).get("parse_failure_policy")
+        == "no_pricing_writes_until_every_selected_source_parses"
+        and (health.get("pricing_evidence") or {}).get("per_material_source_receipts") is True
+        and (health.get("pricing_evidence") or {}).get("readiness_requires_exact_hash") is True
         and bool(health.get("durable_artifact_root"))
     )
     parser_ready = bool((health.get("ai_parser") or {}).get("available"))
@@ -1322,25 +1326,39 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
     target["unit_price"] = 0
     target["extended_cost"] = 0
     target["price_source"] = "vendor_quote"
+    target["quote_source_hash"] = "0" * 64
+    target["quote_file_name"] = "missing-harness-quote.eml"
     try:
         client.request("PUT", f"/api/jobs/{job_id}/materials", json_body={"materials": mutated})
         _, readiness, _ = client.request("GET", f"/api/jobs/{job_id}/readiness")
     finally:
         client.request("PUT", f"/api/jobs/{job_id}/materials", json_body={"materials": materials})
 
-    checks = {item.get("id"): item.get("status") for item in (readiness.get("checks") or [])}
+    readiness_checks = readiness.get("checks") or []
+    checks = {item.get("id"): item.get("status") for item in readiness_checks}
+    artifact_check = next((item for item in readiness_checks if item.get("id") == "durable_artifacts"), {})
+    exact_source_blocked = any(
+        "intact durable quote file" in str(item)
+        for item in (artifact_check.get("affected_items") or [])
+    )
     ok = (
         readiness.get("status") == "blocked"
         and checks.get("unknown_materials") == "fail"
         and checks.get("unpriced_materials") == "fail"
         and checks.get("current_audit") == "fail"
         and checks.get("durable_artifacts") == "fail"
+        and exact_source_blocked
     )
     return Check(
         "readiness_blockers",
         "PASS" if ok else "FAIL",
         "unknown, unpriced, stale-audit, and missing vendor-evidence defects block the bid" if ok else "readiness did not block every staged defect",
-        {"material": target.get("item_code"), "status": readiness.get("status"), "checks": checks},
+        {
+            "material": target.get("item_code"),
+            "status": readiness.get("status"),
+            "checks": checks,
+            "artifact_items": artifact_check.get("affected_items") or [],
+        },
     )
 
 

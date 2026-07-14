@@ -74,6 +74,8 @@ MATERIAL_FIELDS_FOR_FINGERPRINT = (
     "vendor",
     "price_source",
     "quote_status",
+    "quote_source_hash",
+    "quote_file_name",
     "ai_confidence",
     "freight_per_unit",
     "freight_source",

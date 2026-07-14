@@ -347,6 +347,25 @@ function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimat
             <Sparkles className="w-3.5 h-3.5 text-violet-400" />
             AI Estimate Price
           </button>
+          {priceSource === 'vendor_quote' && (
+            <div className="border-t border-white/[0.06] mt-1 px-3 py-2 flex items-start gap-2">
+              {material.quote_source_hash ? (
+                <Check className="w-3.5 h-3.5 mt-0.5 text-emerald-400 shrink-0" />
+              ) : (
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 text-amber-400 shrink-0" />
+              )}
+              <div className="min-w-0">
+                <div className="text-xs text-gray-300 truncate" title={material.quote_file_name || ''}>
+                  {material.quote_file_name || 'Vendor quote source'}
+                </div>
+                <div className={`text-[10px] ${material.quote_source_hash ? 'text-gray-500' : 'text-amber-400'}`}>
+                  {material.quote_source_hash
+                    ? `SHA-256 ${material.quote_source_hash.slice(0, 12)}...`
+                    : 'Source receipt missing'}
+                </div>
+              </div>
+            </div>
+          )}
           {hasPrice && (
             <>
               <div className="border-t border-white/[0.06] my-1" />

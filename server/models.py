@@ -439,6 +439,8 @@ def init_db() -> None:
             ("jq_lead_time", "ALTER TABLE job_quotes ADD COLUMN lead_time TEXT"),
             ("jq_notes", "ALTER TABLE job_quotes ADD COLUMN notes TEXT"),
             ("price_source", "ALTER TABLE job_materials ADD COLUMN price_source TEXT"),
+            ("quote_source_hash", "ALTER TABLE job_materials ADD COLUMN quote_source_hash TEXT"),
+            ("quote_file_name", "ALTER TABLE job_materials ADD COLUMN quote_file_name TEXT"),
             ("activity_user", "ALTER TABLE job_activity ADD COLUMN user TEXT DEFAULT 'System'"),
             ("comment_user", "ALTER TABLE job_comments ADD COLUMN user TEXT DEFAULT 'System'"),
             ("qr_response_file", "ALTER TABLE quote_requests ADD COLUMN response_file TEXT"),
@@ -652,7 +654,8 @@ def save_materials(
                 material.get("order_qty", 0), material.get("vendor"),
                 material.get("unit_price", 0), material.get("extended_cost", 0),
                 material.get("ai_confidence"), material.get("quote_status"),
-                material.get("price_source"), material.get("freight_per_unit"),
+                material.get("price_source"), material.get("quote_source_hash"),
+                material.get("quote_file_name"), material.get("freight_per_unit"),
                 material.get("freight_source"), material.get("fixture_count", 0),
                 material.get("labor_rate_lf", 0), material.get("labor_catalog"),
                 material.get("tack_strip_lf", 0), material.get("seam_tape_lf", 0),
@@ -677,7 +680,8 @@ def save_materials(
                         item_code=?, description=?, material_type=?, installed_qty=?,
                         unit=?, waste_pct=?, order_qty=?, vendor=?, unit_price=?,
                         extended_cost=?, ai_confidence=?, quote_status=?, price_source=?,
-                        freight_per_unit=?, freight_source=?, fixture_count=?, labor_rate_lf=?,
+                        quote_source_hash=?, quote_file_name=?, freight_per_unit=?,
+                        freight_source=?, fixture_count=?, labor_rate_lf=?,
                         labor_catalog=?, tack_strip_lf=?, seam_tape_lf=?, pad_sy=?,
                         area_type=?, is_mosaic=?, is_penny_hex=?, crack_isolation_sf=?,
                         weld_rod_lf=?
@@ -689,11 +693,12 @@ def save_materials(
                     INSERT INTO job_materials
                         (job_id, item_code, description, material_type, installed_qty,
                          unit, waste_pct, order_qty, vendor, unit_price, extended_cost,
-                         ai_confidence, quote_status, price_source, freight_per_unit,
-                         freight_source, fixture_count, labor_rate_lf, labor_catalog,
+                         ai_confidence, quote_status, price_source, quote_source_hash,
+                         quote_file_name, freight_per_unit, freight_source, fixture_count,
+                         labor_rate_lf, labor_catalog,
                          tack_strip_lf, seam_tape_lf, pad_sy, area_type, is_mosaic,
                          is_penny_hex, crack_isolation_sf, weld_rod_lf)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (job_id, *values))
                 material_id = int(cur.lastrowid)
             retained_ids.add(material_id)

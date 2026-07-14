@@ -438,6 +438,8 @@ def _sum_material_costs(
                     inputs={
                         "order_qty": round(order_qty, 2),
                         "unit_price": mat.get("unit_price", 0),
+                        "quote_source_hash": mat.get("quote_source_hash"),
+                        "quote_file_name": mat.get("quote_file_name"),
                     },
                     result=mat_ext,
                     rule_id=f"material:{mat.get('material_type', '')}:extended_cost",

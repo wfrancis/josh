@@ -237,7 +237,7 @@ def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
     return merged
 
 
-def _call_openai(quote_text: str) -> list[dict]:
+def _call_openai(quote_text: str, *, strict: bool = False) -> list[dict]:
     """Multi-pass AI call: runs N passes and merges results for accuracy."""
     quote_text = _bounded_quote_text(quote_text)
     from models import get_settings
@@ -262,7 +262,7 @@ def _call_openai(quote_text: str) -> list[dict]:
             result = _call_ai_single(quote_text, api_key, model)
             all_results.append(result)
         except Exception:
-            if i == 0:
+            if strict or i == 0:
                 raise
             # If later passes fail, just skip
 
@@ -272,12 +272,12 @@ def _call_openai(quote_text: str) -> list[dict]:
     return _merge_multipass_results(all_results)
 
 
-def parse_quote_pdf(pdf_path: str) -> list[dict]:
+def parse_quote_pdf(pdf_path: str, *, strict: bool = False) -> list[dict]:
     """Parse a vendor quote from a PDF file."""
     text = _extract_pdf_text(pdf_path)
     if not text.strip():
         return []
-    return _call_openai(text)
+    return _call_openai(text, strict=strict)
 
 
 def _deduplicate_products(products: list[dict]) -> list[dict]:
@@ -313,7 +313,7 @@ def _rows_to_quote_text(rows, *, max_rows: int = 5000, max_columns: int = 100) -
     return "\n".join(lines)
 
 
-def parse_quote_spreadsheet(file_path: str) -> list[dict]:
+def parse_quote_spreadsheet(file_path: str, *, strict: bool = False) -> list[dict]:
     """Convert CSV/XLSX cells to stable text and parse vendor pricing."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".csv":
@@ -334,10 +334,10 @@ def parse_quote_spreadsheet(file_path: str) -> list[dict]:
             workbook.close()
     else:
         raise ValueError(f"Unsupported spreadsheet type: {ext}")
-    return _call_openai(text) if text.strip() else []
+    return _call_openai(text, strict=strict) if text.strip() else []
 
 
-def parse_quote_eml(eml_path: str, *, depth: int = 0) -> list[dict]:
+def parse_quote_eml(eml_path: str, *, depth: int = 0, strict: bool = False) -> list[dict]:
     """Parse a vendor quote from an .eml file. Processes body + PDF attachments."""
     eml_data = _extract_eml(eml_path)
     all_products = []
@@ -351,9 +351,11 @@ def parse_quote_eml(eml_path: str, *, depth: int = 0) -> list[dict]:
             f"{eml_data['body']}"
         )
         try:
-            products = _call_openai(context)
+            products = _call_openai(context, strict=strict)
             all_products.extend(products)
         except Exception as e:
+            if strict:
+                raise RuntimeError("Vendor email body parsing failed") from e
             print(f"[quote_parser] Error parsing email body: {e}")
             import traceback; traceback.print_exc()
 
@@ -362,19 +364,31 @@ def parse_quote_eml(eml_path: str, *, depth: int = 0) -> list[dict]:
         filename = att.get("filename") or "attachment"
         ext = os.path.splitext(filename)[1].lower()
         data = att.get("data")
-        if (
-            ext not in {".pdf", ".txt", ".csv", ".xlsx", ".eml", ".msg"}
-            or not data
-            or len(data) > MAX_QUOTE_FILE_BYTES
-            or (ext in {".eml", ".msg"} and depth >= MAX_NESTED_EMAIL_DEPTH)
-        ):
+        if ext not in {".pdf", ".txt", ".csv", ".xlsx", ".eml", ".msg"}:
+            continue
+        if not data:
+            if strict:
+                raise ValueError(f"Vendor email attachment {filename} is empty")
+            continue
+        if len(data) > MAX_QUOTE_FILE_BYTES:
+            if strict:
+                raise ValueError(
+                    f"Vendor email attachment {filename} exceeds the "
+                    f"{MAX_QUOTE_FILE_BYTES // (1024 * 1024)} MB limit"
+                )
+            continue
+        if ext in {".eml", ".msg"} and depth >= MAX_NESTED_EMAIL_DEPTH:
+            if strict:
+                raise ValueError(f"Nested vendor email attachment {filename} exceeds the supported depth")
             continue
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
             tmp.write(data)
             tmp_path = tmp.name
         try:
-            all_products.extend(parse_quote_file(tmp_path, _depth=depth + 1))
+            all_products.extend(parse_quote_file(tmp_path, _depth=depth + 1, strict=strict))
         except Exception as exc:
+            if strict:
+                raise RuntimeError(f"Vendor email attachment {filename} could not be parsed") from exc
             print(f"[quote_parser] Error parsing attachment {filename}: {exc}")
         finally:
             os.unlink(tmp_path)
@@ -382,7 +396,7 @@ def parse_quote_eml(eml_path: str, *, depth: int = 0) -> list[dict]:
     return _deduplicate_products(all_products)
 
 
-def parse_quote_msg(msg_path: str, *, depth: int = 0) -> list[dict]:
+def parse_quote_msg(msg_path: str, *, depth: int = 0, strict: bool = False) -> list[dict]:
     """Parse an Outlook .msg email body and any attached PDFs."""
     import extract_msg
 
@@ -394,7 +408,7 @@ def parse_quote_msg(msg_path: str, *, depth: int = 0) -> list[dict]:
             f"Date: {getattr(message, 'date', '') or ''}\n\n"
             f"{getattr(message, 'body', '') or ''}"
         )
-        all_products = _call_openai(context) if context.strip() else []
+        all_products = _call_openai(context, strict=strict) if context.strip() else []
 
         for attachment in getattr(message, "attachments", []) or []:
             filename = (
@@ -405,19 +419,31 @@ def parse_quote_msg(msg_path: str, *, depth: int = 0) -> list[dict]:
             )
             data = getattr(attachment, "data", None)
             ext = os.path.splitext(str(filename))[1].lower()
-            if (
-                ext not in {".pdf", ".txt", ".csv", ".xlsx", ".eml", ".msg"}
-                or not isinstance(data, (bytes, bytearray))
-                or len(data) > MAX_QUOTE_FILE_BYTES
-                or (ext in {".eml", ".msg"} and depth >= MAX_NESTED_EMAIL_DEPTH)
-            ):
+            if ext not in {".pdf", ".txt", ".csv", ".xlsx", ".eml", ".msg"}:
+                continue
+            if not isinstance(data, (bytes, bytearray)) or not data:
+                if strict:
+                    raise ValueError(f"Outlook attachment {filename} is empty")
+                continue
+            if len(data) > MAX_QUOTE_FILE_BYTES:
+                if strict:
+                    raise ValueError(
+                        f"Outlook attachment {filename} exceeds the "
+                        f"{MAX_QUOTE_FILE_BYTES // (1024 * 1024)} MB limit"
+                    )
+                continue
+            if ext in {".eml", ".msg"} and depth >= MAX_NESTED_EMAIL_DEPTH:
+                if strict:
+                    raise ValueError(f"Nested Outlook attachment {filename} exceeds the supported depth")
                 continue
             with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
                 tmp.write(data)
                 tmp_path = tmp.name
             try:
-                all_products.extend(parse_quote_file(tmp_path, _depth=depth + 1))
+                all_products.extend(parse_quote_file(tmp_path, _depth=depth + 1, strict=strict))
             except Exception as exc:
+                if strict:
+                    raise RuntimeError(f"Outlook attachment {filename} could not be parsed") from exc
                 print(f"[quote_parser] Error parsing .msg attachment {filename}: {exc}")
             finally:
                 os.unlink(tmp_path)
@@ -426,14 +452,14 @@ def parse_quote_msg(msg_path: str, *, depth: int = 0) -> list[dict]:
         message.close()
 
 
-def parse_quote_text(text_path: str) -> list[dict]:
+def parse_quote_text(text_path: str, *, strict: bool = False) -> list[dict]:
     """Parse a plain-text vendor response."""
     with open(text_path, "r", encoding="utf-8", errors="replace") as handle:
         content = handle.read(MAX_AI_TEXT_CHARS + 1)
-    return _call_openai(content) if content.strip() else []
+    return _call_openai(content, strict=strict) if content.strip() else []
 
 
-def parse_quote_file(file_path: str, *, _depth: int = 0) -> list[dict]:
+def parse_quote_file(file_path: str, *, _depth: int = 0, strict: bool = False) -> list[dict]:
     """Auto-detect file type and parse accordingly."""
     try:
         file_size = os.path.getsize(file_path)
@@ -445,13 +471,13 @@ def parse_quote_file(file_path: str, *, _depth: int = 0) -> list[dict]:
         raise ValueError("Nested vendor email depth exceeds the supported limit")
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".eml":
-        return parse_quote_eml(file_path, depth=_depth)
+        return parse_quote_eml(file_path, depth=_depth, strict=strict)
     if ext == ".msg":
-        return parse_quote_msg(file_path, depth=_depth)
+        return parse_quote_msg(file_path, depth=_depth, strict=strict)
     if ext == ".pdf":
-        return parse_quote_pdf(file_path)
+        return parse_quote_pdf(file_path, strict=strict)
     if ext == ".txt":
-        return parse_quote_text(file_path)
+        return parse_quote_text(file_path, strict=strict)
     if ext in (".csv", ".xlsx"):
-        return parse_quote_spreadsheet(file_path)
+        return parse_quote_spreadsheet(file_path, strict=strict)
     raise ValueError(f"Unsupported file type: {ext}. Expected .eml, .msg, .pdf, .txt, .csv, or .xlsx")
