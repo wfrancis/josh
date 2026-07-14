@@ -242,6 +242,15 @@ def explicit_manual_contract(proposal: dict[str, Any]) -> list[dict[str, Any]]:
 def money_deltas(accepted: dict[str, Any], regenerated: dict[str, Any]) -> list[dict[str, Any]]:
     accepted_bundles = accepted.get("bundles") or []
     regenerated_bundles = regenerated.get("bundles") or []
+    component_fields = (
+        "material_cost",
+        "sundry_cost",
+        "labor_cost",
+        "freight_cost",
+        "gpm_labor_adder",
+        "gpm_material_adder",
+        "tax_amount",
+    )
     rows = []
     for index, accepted_bundle in enumerate(accepted_bundles):
         regenerated_bundle = regenerated_bundles[index] if index < len(regenerated_bundles) else {}
@@ -255,12 +264,21 @@ def money_deltas(accepted: dict[str, Any], regenerated: dict[str, Any]) -> list[
             if regenerated_bundle.get("price_override") is not None
             else regenerated_bundle.get("total_price")
         )
-        rows.append({
+        row = {
             "bundle_name": accepted_bundle.get("bundle_name"),
             "accepted_total": accepted_total,
             "regenerated_total": regenerated_total,
             "delta": round(regenerated_total - accepted_total, 2),
-        })
+        }
+        for field in component_fields:
+            accepted_value = money(accepted_bundle.get(field))
+            regenerated_value = money(regenerated_bundle.get(field))
+            row[field] = {
+                "accepted": accepted_value,
+                "regenerated": regenerated_value,
+                "delta": round(regenerated_value - accepted_value, 2),
+            }
+        rows.append(row)
     return sorted(rows, key=lambda row: abs(row["delta"]), reverse=True)
 
 
@@ -352,6 +370,10 @@ def main() -> int:
         if unmapped:
             raise HarnessError(f"could not remap {len(unmapped)} accepted proposal row(s) to the clone")
 
+        _, raw_engine, _ = client.request("POST", f"/api/jobs/{clone_id}/proposal/generate")
+        result["raw_engine_totals"] = summarize_proposal(raw_engine)
+        result["raw_engine_bundle_count"] = len(raw_engine.get("bundles") or [])
+
         _, seeded, _ = client.request(
             "PUT",
             f"/api/jobs/{clone_id}/proposal/bundles",
@@ -386,6 +408,14 @@ def main() -> int:
         result["regenerated_totals"] = summarize_proposal(regenerated)
         result["total_delta"] = round(
             money(regenerated.get("grand_total")) - money(accepted.get("grand_total")),
+            2,
+        )
+        result["raw_engine_to_accepted_delta"] = round(
+            money(accepted.get("grand_total")) - money(raw_engine.get("grand_total")),
+            2,
+        )
+        result["accepted_overlay_to_raw_engine_delta"] = round(
+            money(regenerated.get("grand_total")) - money(raw_engine.get("grand_total")),
             2,
         )
         result["bundle_money_deltas"] = money_deltas(accepted, regenerated)
