@@ -168,6 +168,29 @@ def validate_transition_pricing_contract(client: "Client") -> Check:
     )
 
 
+def validate_classification_fallback_contract(client: "Client") -> Check:
+    try:
+        _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
+    except HarnessError as exc:
+        return Check("classification_fallback", "FAIL", f"deployed classification probe unavailable: {exc}")
+    contract = probe.get("classification_fallback_contract") or {}
+    result = contract.get("result") or {}
+    ok = (
+        contract.get("status") == "pass"
+        and len(result) == 5
+        and all(item.get("actual") == item.get("expected") for item in result.values())
+    )
+    return Check(
+        "classification_fallback",
+        "PASS" if ok else "FAIL",
+        (
+            "explicit carpet-tile, wall-tile, and transition descriptions classify deterministically"
+            if ok else "deployed deterministic classification contract failed"
+        ),
+        contract,
+    )
+
+
 @dataclass
 class Check:
     name: str
@@ -1730,6 +1753,7 @@ def main() -> int:
         checks.append(validate_vendor_ingestion_health(client))
         checks.append(validate_quote_receipt_recovery_contract(client))
         checks.append(validate_transition_pricing_contract(client))
+        checks.append(validate_classification_fallback_contract(client))
         checks.append(try_rule_registry(client))
         checks.append(try_rule_eval(client, fixture))
         checks.append(ensure_fixture_labor_catalog(client, fixture, args.seed_fixture_labor_catalog))

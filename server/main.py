@@ -53,7 +53,7 @@ from models import (
     save_golden_replay, list_golden_replays_for_job, list_golden_replays_for_version,
     get_latest_golden_replay_for_version,
 )
-from rfms_parser import parse_rfms, ai_merge_materials
+from rfms_parser import ai_merge_materials, infer_material_type_fallback, parse_rfms
 from quote_parser import MAX_QUOTE_FILE_BYTES, parse_quote_file, set_openai_config
 from dropbox_scanner import match_folder
 from sundry_calc import calculate_sundries_for_materials
@@ -3535,6 +3535,42 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
     response["transition_pricing_contract"] = {
         "status": "pass" if transition_ok else "fail",
         "result": transition_results,
+    }
+    classification_cases = {
+        "CPT-110": (
+            "CPT-110 - 1'7.75\" - 1'7.75\" - Carpet Tile",
+            "cpt_tile",
+        ),
+        "T-111": (
+            "T-111 - Marazzi - Moroccan Concrete - 12x24 - Wall Tile",
+            "wall_tile",
+        ),
+        "T-112": (
+            "T-112 - Jamie Beckwith - Trowel - 3x9 - Porcelain Wall Tile",
+            "wall_tile",
+        ),
+        "Transition (LVT to Tile)": (
+            "Transition (LVT to Tile)",
+            "transitions",
+        ),
+        "Vertical Exposed Edge Trim": (
+            "Vertical Exposed Edge Trim @L-5 RR",
+            "transitions",
+        ),
+    }
+    classification_results = {
+        item_code: {
+            "expected": expected,
+            "actual": infer_material_type_fallback(item_code, description),
+        }
+        for item_code, (description, expected) in classification_cases.items()
+    }
+    response["classification_fallback_contract"] = {
+        "status": "pass" if all(
+            item["actual"] == item["expected"]
+            for item in classification_results.values()
+        ) else "fail",
+        "result": classification_results,
     }
     if field:
         response["field"] = field

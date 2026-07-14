@@ -319,7 +319,15 @@ def _infer_material_type_fallback(item_code: str, description: str) -> str:
     if "sound mat" in desc or "acoustical underlayment" in desc:
         return "sound_mat"
 
-    return "unknown"
+    # Reuse the conservative description rules used for RFMS install lines.
+    # Material descriptions such as "Carpet Tile", "Wall Tile", and
+    # "Transition" are equally explicit and should not depend on an AI pass.
+    return _infer_material_type_from_install(description)
+
+
+def infer_material_type_fallback(item_code: str, description: str) -> str:
+    """Public deterministic classifier used by deployed contract checks."""
+    return _infer_material_type_fallback(item_code, description)
 
 
 def _classify_with_ai(material_lines: list[tuple[int, str]],
