@@ -221,6 +221,61 @@ def load_fixture(path: str) -> dict[str, Any]:
         return json.load(f)
 
 
+def ensure_fixture_labor_catalog(client: Client, fixture: dict[str, Any], seed_missing: bool) -> Check:
+    """Verify the deployed calculator has the exact small catalog used by the fixture."""
+    expected = [entry for entry in (fixture.get("labor_catalog") or []) if isinstance(entry, dict)]
+    if not expected:
+        return Check("labor_catalog_fixture", "FAIL", "fixture has no deterministic labor catalog")
+
+    def key(entry: dict[str, Any]) -> tuple[str, str, str]:
+        normalize = lambda value: " ".join(str(value or "").lower().split())
+        return normalize(entry.get("labor_type")), normalize(entry.get("description")), normalize(entry.get("unit"))
+
+    def read_entries() -> list[dict[str, Any]]:
+        _, payload, _ = client.request("GET", "/api/labor-catalog")
+        return [entry for entry in (payload.get("entries") or []) if isinstance(entry, dict)]
+
+    existing = read_entries()
+    by_key = {key(entry): entry for entry in existing}
+    missing = [entry for entry in expected if key(entry) not in by_key]
+    seeded = 0
+    if missing and seed_missing:
+        for entry in missing:
+            client.request("POST", "/api/labor-catalog/entry", json_body=entry)
+            seeded += 1
+        existing = read_entries()
+        by_key = {key(entry): entry for entry in existing}
+        missing = [entry for entry in expected if key(entry) not in by_key]
+
+    mismatched = []
+    for entry in expected:
+        actual = by_key.get(key(entry))
+        if actual is None:
+            continue
+        if abs(float(actual.get("cost") or 0) - float(entry.get("cost") or 0)) > 0.001:
+            mismatched.append(entry.get("description") or entry.get("labor_type"))
+
+    ok = not missing and not mismatched
+    missing_labels = [entry.get("description") or entry.get("labor_type") for entry in missing]
+    return Check(
+        "labor_catalog_fixture",
+        "PASS" if ok else "FAIL",
+        (
+            f"verified {len(expected)} deterministic labor rows ({seeded} seeded)"
+            if ok
+            else "deployed labor catalog does not match the deterministic fixture"
+        ),
+        {
+            "expected_count": len(expected),
+            "deployed_count": len(existing),
+            "seeded_count": seeded,
+            "missing": missing_labels,
+            "cost_mismatches": mismatched,
+            "seed_missing_enabled": seed_missing,
+        },
+    )
+
+
 def make_cell(ref: str, value: Any) -> str:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return f'<c r="{ref}"><v>{value}</v></c>'
@@ -843,10 +898,16 @@ def generate_proposal(client: Client, job_id: str) -> tuple[dict[str, Any], Chec
 def generate_proposal_pdf(client: Client, job_id: str, proposal: dict[str, Any]) -> Check:
     """Generate and download the proposal artifact so readiness can verify it."""
     try:
+        _, saved, _ = client.request(
+            "PUT",
+            f"/api/jobs/{job_id}/proposal/bundles",
+            json_body=proposal_save_payload(proposal),
+        )
+        saved_proposal = saved.get("proposal_data") or proposal
         _, generated, _ = client.request(
             "POST",
             f"/api/jobs/{job_id}/proposal/pdf",
-            json_body=proposal_save_payload(proposal),
+            json_body=proposal_save_payload(saved_proposal),
         )
         status, _, raw = client.request(
             "GET",
@@ -1438,6 +1499,11 @@ def main() -> int:
     parser.add_argument("--json-output", help="Optional path for JSON detail output")
     parser.add_argument("--expected-commit", help="Require /api/system/build to report this exact Git commit")
     parser.add_argument("--allow-missing-audit", action="store_true", help="Downgrade missing audit trace checks to WARN")
+    parser.add_argument(
+        "--seed-fixture-labor-catalog",
+        action="store_true",
+        help="Insert only missing labor rows declared by the fixture (use on disposable staging only)",
+    )
     args = parser.parse_args()
 
     fixture = load_fixture(args.fixture)
@@ -1451,6 +1517,7 @@ def main() -> int:
         checks.append(validate_vendor_ingestion_health(client))
         checks.append(try_rule_registry(client))
         checks.append(try_rule_eval(client, fixture))
+        checks.append(ensure_fixture_labor_catalog(client, fixture, args.seed_fixture_labor_catalog))
 
         job_id, created_job, job_check = create_or_use_job(client, fixture, args.job_id)
         checks.append(job_check)

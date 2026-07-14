@@ -207,6 +207,8 @@ def evaluate_job_readiness(
     golden_verification_status: str | None = None,
     current_replay_status: str | None = None,
     current_replay_drift_classification: str | None = None,
+    labor_catalog_count: int = 0,
+    labor_required_types: set[str] | frozenset[str] | None = None,
     build: dict | None = None,
     trust_summary: dict | None = None,
 ) -> dict:
@@ -280,6 +282,62 @@ def evaluate_job_readiness(
         "fail" if unpriced else "pass",
         "All active materials have prices." if not unpriced else f"{len(unpriced)} active material(s) need pricing.",
         unpriced,
+    ))
+
+    required_labor_types = {
+        str(value or "").strip().lower()
+        for value in (labor_required_types or set())
+        if str(value or "").strip()
+    }
+
+    def expects_labor(material: dict) -> bool:
+        material_type = str(material.get("material_type") or "").strip().lower()
+        if material_type not in required_labor_types:
+            return False
+        if material_type != "transitions":
+            return True
+        description = str(material.get("description") or "").lower()
+        return any(term in description for term in ("schluter", "jolly", "exposed edge trim", "metal trim"))
+
+    labor_expected = [material for material in active_materials if expects_labor(material)]
+    catalog_missing = [
+        material.get("item_code") or material.get("description") or "material"
+        for material in labor_expected
+    ] if labor_expected and labor_catalog_count <= 0 else []
+    checks.append(_check(
+        "labor_catalog",
+        "fail" if catalog_missing else "pass",
+        (
+            "The labor catalog is loaded for active installation materials."
+            if not catalog_missing
+            else "The labor catalog is empty, so installation cost cannot be trusted."
+        ),
+        catalog_missing,
+    ))
+
+    valid_labor_material_ids = {
+        str(item.get("material_id"))
+        for item in (job.get("labor") or [])
+        if isinstance(item, dict)
+        and item.get("material_id") is not None
+        and _number(item.get("qty")) > 0
+        and _number(item.get("rate")) > 0
+        and _number(item.get("extended_cost")) > 0
+    }
+    missing_labor = [
+        material.get("item_code") or material.get("description") or "material"
+        for material in labor_expected
+        if material.get("id") is None or str(material.get("id")) not in valid_labor_material_ids
+    ]
+    checks.append(_check(
+        "labor_coverage",
+        "fail" if missing_labor else "pass",
+        (
+            "Every active installation material has a positive calculated labor line."
+            if not missing_labor
+            else f"{len(missing_labor)} active installation material(s) are missing positive labor cost."
+        ),
+        missing_labor,
     ))
 
     historical_prices = [

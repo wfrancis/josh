@@ -56,7 +56,7 @@ from rfms_parser import parse_rfms, ai_merge_materials
 from quote_parser import MAX_QUOTE_FILE_BYTES, parse_quote_file, set_openai_config
 from dropbox_scanner import match_folder
 from sundry_calc import calculate_sundries_for_materials
-from labor_calc import calculate_labor_for_materials, load_labor_catalog, load_labor_catalog_from_pdf, get_labor_catalog
+from labor_calc import LABOR_RULES, calculate_labor_for_materials, load_labor_catalog, load_labor_catalog_from_pdf, get_labor_catalog
 from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf, generate_proposal_pdf
 from proposal_bundler import generate_proposal_data
@@ -3528,6 +3528,7 @@ def _readiness_trust_summary(
         "manual_override_count": manual_override_count,
         "unknown_material_count": unknown_count,
         "low_confidence_material_count": low_confidence_count,
+        "labor_catalog_count": len(get_labor_catalog_entries()),
         "artifact_count": len(artifact_receipts),
         "source_fingerprint": proposal.get("audit_source_fingerprint"),
     }
@@ -3588,6 +3589,8 @@ def _evaluate_job_readiness(job: dict) -> dict:
         golden_verification_status=golden_statuses["verification"],
         current_replay_status=golden_statuses["current"],
         current_replay_drift_classification=golden_statuses["current_drift_classification"],
+        labor_catalog_count=len(get_labor_catalog_entries()),
+        labor_required_types=set(LABOR_RULES),
         build=build,
         trust_summary=_readiness_trust_summary(
             job,

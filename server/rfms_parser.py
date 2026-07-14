@@ -13,7 +13,8 @@ Strategy:
   2. Separate into: material lines, install lines, sundry lines.
   3. Send material + install lines to OpenAI GPT to classify each material
      by matching it to its corresponding install line.
-  4. If AI is unavailable, materials stay "unknown" for manual review.
+  4. If AI is unavailable, use exact item-code matches to deterministic
+     install-line rules before leaving a material "unknown" for review.
 """
 
 import json
@@ -152,6 +153,53 @@ def _extract_install_code(desc: str) -> str:
         if re.search(r'[A-Za-z]', label):
             return (prefix + label).upper() if prefix else label.upper()
     return ""
+
+
+def _infer_material_type_from_install(desc: str) -> str:
+    """Classify an RFMS install line using conservative, auditable rules."""
+    value = re.sub(r"\s+", " ", (desc or "").lower()).strip()
+    if not value:
+        return "unknown"
+
+    # Location-specific tile descriptions must win over generic tile words.
+    if "deco wall tile" in value:
+        return "wall_tile"
+    if "backsplash" in value or "back splash" in value:
+        return "backsplash"
+    if any(term in value for term in ("shower surround", "tub surround", "tub/shower surround")):
+        return "tub_shower_surround"
+
+    if "carpet tile" in value or "modular carpet" in value:
+        return "cpt_tile"
+    if "broadloom" in value:
+        if any(term in value for term in ("corridor", "common area", "stair", "direct glue")):
+            return "corridor_broadloom"
+        return "unit_carpet_pattern" if "pattern" in value else "unit_carpet_no_pattern"
+    if any(term in value for term in ("luxury vinyl", "vinyl plank", " lvt", " lvp")):
+        return "unit_lvt"
+    if any(term in value for term in ("rubber base", "vinyl base", "cove base", "wall base")):
+        return "rubber_base"
+    if re.search(r"\bvct\b", value) or "vinyl composition tile" in value:
+        return "vct"
+    if "rubber tile" in value:
+        return "rubber_tile"
+    if any(term in value for term in ("rubber sheet", "sheet rubber", "rolled rubber")):
+        return "rubber_sheet"
+    if "floor tile" in value:
+        return "floor_tile"
+    if "wall tile" in value:
+        return "wall_tile"
+    if any(term in value for term in ("hardwood", "engineered wood", "wood flooring")):
+        return "wood"
+    if "tread" in value and "riser" in value:
+        return "tread_riser"
+    if any(term in value for term in ("schluter", "transition", "edge trim")):
+        return "transitions"
+    if "waterproof" in value:
+        return "waterproofing"
+    if "sound mat" in value or "acoustical underlayment" in value:
+        return "sound_mat"
+    return "unknown"
 
 
 def _extract_unit(desc: str, material_type: str) -> str:
@@ -429,6 +477,7 @@ def parse_rfms(file_path: str) -> dict:
     idx = 0
 
     install_qtys = {}     # item_code -> install qty (net installed area)
+    install_types: dict[str, set[str]] = {}
 
     for desc, qty in all_rows:
         if _is_install(desc):
@@ -438,6 +487,9 @@ def parse_rfms(file_path: str) -> dict:
             install_code = _extract_install_code(desc)
             if install_code:
                 install_qtys[install_code] = install_qtys.get(install_code, 0) + qty
+                install_type = _infer_material_type_from_install(desc)
+                if install_type != "unknown":
+                    install_types.setdefault(install_code, set()).add(install_type)
         elif _is_sundry(desc):
             # Capture measured sundry quantities for carpet materials
             desc_lower = desc.lower().strip()
@@ -481,10 +533,15 @@ def parse_rfms(file_path: str) -> dict:
         unit = _extract_unit(desc, material_type)
         item_code = _extract_item_label(desc)
 
+        install_candidates = install_types.get((item_code or "").upper(), set())
+        install_fallback = next(iter(install_candidates)) if len(install_candidates) == 1 else "unknown"
         fallback = _infer_material_type_fallback(item_code, desc)
         code_upper = (item_code or "").upper()
         force_prefix_rule = code_upper.startswith(("B-", "WB-", "WM-", "RF-", "VCT-"))
-        if fallback != "unknown" and (material_type == "unknown" or force_prefix_rule):
+        if material_type == "unknown" and install_fallback != "unknown":
+            material_type = install_fallback
+            ai_confidence = 1.0  # Exact RFMS item-code/install-line match.
+        elif fallback != "unknown" and (material_type == "unknown" or force_prefix_rule):
             material_type = fallback
             ai_confidence = 0.5  # deterministic hard rule: medium confidence
 

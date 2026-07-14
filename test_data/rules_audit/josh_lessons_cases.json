@@ -77,6 +77,72 @@
       "requires_labor": true
     }
   },
+  "labor_catalog": [
+    {
+      "labor_type": "Project Tile",
+      "description": "0-13x0-13 Porcelain Set Monolithic 1000SF or Less",
+      "cost": 4.0,
+      "retail_display": "",
+      "unit": "SF",
+      "gpm_markup": 0.0
+    },
+    {
+      "labor_type": "Project Tile",
+      "description": "Mosaic Sheet Backed Porcelain SAME Thickness as Adjacent Tiles 1000SF or Less",
+      "cost": 6.0,
+      "retail_display": "",
+      "unit": "SF",
+      "gpm_markup": 0.0
+    },
+    {
+      "labor_type": "Project Wall Base",
+      "description": "4 inch Cove Base",
+      "cost": 0.64,
+      "retail_display": "",
+      "unit": "LF",
+      "gpm_markup": 0.0
+    },
+    {
+      "labor_type": "Project Carpet",
+      "description": "Carpet Tile All Monolithic or Ashlar Pattern",
+      "cost": 3.85,
+      "retail_display": "",
+      "unit": "SY",
+      "gpm_markup": 0.0
+    },
+    {
+      "labor_type": "Project Resilient Rolled Sheet Vinyl & Rubber",
+      "description": "Commercial Sheet Vinyl Over 1/4 in Thickness 1000SY or Less",
+      "cost": 16.0,
+      "retail_display": "",
+      "unit": "SY",
+      "gpm_markup": 0.0
+    },
+    {
+      "labor_type": "Project Resilient Rolled Sheet Vinyl & Rubber",
+      "description": "Rolled Rubber over 3mm",
+      "cost": 2.75,
+      "retail_display": "",
+      "unit": "SF",
+      "gpm_markup": 0.0
+    },
+    {
+      "labor_type": "Project Resilient Rolled Sheet Vinyl & Rubber",
+      "description": "X ADD for Weld Commercial Vinyl",
+      "cost": 3.21,
+      "retail_display": "",
+      "unit": "LF",
+      "gpm_markup": 0.0
+    },
+    {
+      "labor_type": "Project Resilient Tile, Rubber, & Stair Finishes",
+      "description": "VCT or MCT Glue Down 1000SF or Less",
+      "cost": 0.64,
+      "retail_display": "",
+      "unit": "SF",
+      "gpm_markup": 0.0
+    }
+  ],
   "pricing": {
     "default_unit_price": 10.0,
     "by_item_code": {
