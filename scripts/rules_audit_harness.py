@@ -139,6 +139,31 @@ def validate_quote_receipt_recovery_contract(client: "Client") -> Check:
     )
 
 
+def validate_quote_price_conflict_contract(client: "Client") -> Check:
+    try:
+        _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
+    except HarnessError as exc:
+        return Check("quote_price_conflicts", "FAIL", f"deployed price-conflict probe unavailable: {exc}")
+    contract = probe.get("quote_price_conflict_contract") or {}
+    rows = contract.get("result") or []
+    ok = (
+        contract.get("status") == "pass"
+        and len(rows) == 1
+        and rows[0].get("item_code") == "T-100"
+        and rows[0].get("delta") == 0.24
+        and rows[0].get("match_basis") == "exact_item_code"
+    )
+    return Check(
+        "quote_price_conflicts",
+        "PASS" if ok else "FAIL",
+        (
+            "verified exact-code quote conflicts are visible without replacing accepted prices"
+            if ok else "deployed quote price-conflict contract failed"
+        ),
+        contract,
+    )
+
+
 def validate_transition_pricing_contract(client: "Client") -> Check:
     try:
         _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
@@ -1564,6 +1589,18 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
         for key in ("grand_total", "subtotal", "tax_amount", "gpm_profit", "gpm_labor", "gpm_material")
         if totals.get(key) is not None
     }
+    target_bundles = [
+        {
+            "bundle_name": bundle.get("bundle_name"),
+            "target_total": (
+                bundle.get("price_override")
+                if bundle.get("price_override") is not None
+                else bundle.get("total_price") or 0
+            ),
+        }
+        for bundle in (accepted.get("bundles") or [])
+        if isinstance(bundle, dict) and bundle.get("bundle_name")
+    ]
     def mutable_state(job: dict[str, Any]) -> dict[str, Any]:
         return {
             "materials": job.get("materials") or [],
@@ -1582,6 +1619,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
                 "jr_quote_id": "HARNESS",
                 "reviewer_name": "Rules Audit Harness",
                 "target_totals": target_totals,
+                "target_bundles": target_bundles,
                 "notes": "Synthetic golden baseline from rules_audit_harness.py",
             },
         )
@@ -1607,6 +1645,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
     baseline_accepted_status = baseline_summary.get("accepted_proposal_status")
     baseline_overall_status = baseline_summary.get("overall_status")
     baseline_jr_status = baseline_summary.get("jr_target_status")
+    baseline_jr_bundle_rows = (baseline_replay.get("diff") or {}).get("jr_bundles") or []
     structural_edit_count = int(baseline_summary.get("accepted_structural_edit_count") or 0)
     current_status = current_replay.get("status")
     trust_summary = readiness.get("trust_summary") or {}
@@ -1615,6 +1654,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
         "engine_fingerprint", "config_fingerprint", "golden_baseline_version",
         "jr_target_total", "accepted_proposal_total", "replay_total",
         "manual_override_count", "unknown_material_count", "low_confidence_material_count",
+        "vendor_price_conflict_count", "vendor_price_conflicts",
     }
     missing_trust_fields = sorted(required_trust_fields - set(trust_summary))
     ok = (
@@ -1624,6 +1664,8 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
         and baseline_accepted_status == "pass"
         and baseline_overall_status == "pass"
         and baseline_jr_status == "pass"
+        and len(baseline_jr_bundle_rows) == len(target_bundles)
+        and all(row.get("status") == "pass" for row in baseline_jr_bundle_rows)
         and structural_edit_count >= (2 if combined_name else 1)
         and current_status in {"pass", "warn", "fail"}
         and state.get("golden_job")
@@ -1642,6 +1684,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
             "baseline_accepted_status": baseline_accepted_status,
             "baseline_overall_status": baseline_overall_status,
             "baseline_jr_status": baseline_jr_status,
+            "baseline_jr_bundle_count": len(baseline_jr_bundle_rows),
             "accepted_structural_edit_count": structural_edit_count,
             "current_status": current_status,
             "combined_bundle": combined_name,
@@ -1653,6 +1696,7 @@ def validate_golden_reproducibility(client: Client, job_id: str, proposal: dict[
             "golden_job": baseline.get("golden_job"),
             "latest_replay": state.get("latest_replay"),
             "target_totals": target_totals,
+            "target_bundles": target_bundles,
         },
     )
 
@@ -1752,6 +1796,7 @@ def main() -> int:
         checks.append(validate_build_identity(client, args.expected_commit))
         checks.append(validate_vendor_ingestion_health(client))
         checks.append(validate_quote_receipt_recovery_contract(client))
+        checks.append(validate_quote_price_conflict_contract(client))
         checks.append(validate_transition_pricing_contract(client))
         checks.append(validate_classification_fallback_contract(client))
         checks.append(try_rule_registry(client))

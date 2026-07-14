@@ -138,6 +138,7 @@ def make_golden_snapshot(
     labor_catalog: list[dict],
     ruleset: dict | None,
     target_totals: dict,
+    target_bundles: list[dict] | None = None,
     tolerance: dict | None = None,
     build: dict | None = None,
     artifact_manifest: list[dict] | None = None,
@@ -155,6 +156,7 @@ def make_golden_snapshot(
         "proposal_data": proposal_data,
         "accepted_totals": proposal_totals(proposal_data),
         "target_totals": {k: _money(v) for k, v in (target_totals or {}).items() if v not in (None, "")},
+        "target_bundles": _copy_jsonable(target_bundles or []),
         "company_rates": _copy_jsonable(company_rates),
         "labor_catalog": _copy_jsonable(labor_catalog),
         "ruleset": {
@@ -188,6 +190,7 @@ def make_golden_snapshot(
         "materials": _line_snapshot(snapshot["materials"], MATERIAL_FIELDS_FOR_FINGERPRINT),
         "proposal_data": proposal_data,
         "target_totals": snapshot["target_totals"],
+        "target_bundles": snapshot["target_bundles"],
         "rates": snapshot["company_rates"],
         "labor_catalog": snapshot["labor_catalog"],
         "ruleset": snapshot["ruleset"],
@@ -823,6 +826,46 @@ def compare_replay(
 
     accepted_bundles = [b for b in accepted.get("bundles") or [] if isinstance(b, dict)]
     generated_bundles = [b for b in generated.get("bundles") or [] if isinstance(b, dict)]
+    jr_bundle_rows = []
+    target_bundle_rows = (snapshot.get("target_bundles") or []) if target_proposal is None else []
+    for target_bundle in target_bundle_rows:
+        if not isinstance(target_bundle, dict):
+            continue
+        bundle_name = str(target_bundle.get("bundle_name") or "").strip()
+        target = _money(target_bundle.get("target_total"))
+        actual_bundle = next(
+            (bundle for bundle in generated_bundles if bundle.get("bundle_name") == bundle_name),
+            None,
+        )
+        if actual_bundle is None:
+            jr_bundle_rows.append({
+                "bundle_name": bundle_name,
+                "jr_label": target_bundle.get("jr_label") or bundle_name,
+                "target_total": target,
+                "actual_total": None,
+                "delta": None,
+                "status": "fail",
+                "source_page": target_bundle.get("source_page"),
+                "message": "The accepted bundle is missing from this replay.",
+            })
+            continue
+        actual = effective_bundle_total(actual_bundle)
+        delta = round(actual - target, 2)
+        jr_bundle_rows.append({
+            "bundle_name": bundle_name,
+            "jr_label": target_bundle.get("jr_label") or bundle_name,
+            "target_total": target,
+            "actual_total": actual,
+            "delta": delta,
+            "status": _money_status(delta, target, tolerance, "bundle"),
+            "source_page": target_bundle.get("source_page"),
+            "notes": target_bundle.get("notes") or "",
+            "target_source": "jr",
+        })
+    jr_bundle_rows.sort(
+        key=lambda row: abs(row.get("delta") or 0),
+        reverse=True,
+    )
     if target_proposal is None:
         reference_bundles = [
             b for b in ((snapshot.get("raw_engine_proposal") or {}).get("bundles") or [])
@@ -989,6 +1032,7 @@ def compare_replay(
         "status": status,
         "totals": total_rows,
         "jr_totals": jr_total_rows,
+        "jr_bundles": jr_bundle_rows,
         "bundles": bundle_rows,
         "structural": structural,
     }
@@ -1269,9 +1313,13 @@ def replay_golden_job(
         else "metadata_only" if metadata_drift_count
         else "none"
     )
+    jr_comparison_rows = [
+        *(diff.get("jr_totals") or []),
+        *(diff.get("jr_bundles") or []),
+    ]
     jr_target_status = (
-        _max_status(*(row.get("status", "pass") for row in diff.get("jr_totals") or []))
-        if diff.get("jr_totals")
+        _max_status(*(row.get("status", "pass") for row in jr_comparison_rows))
+        if jr_comparison_rows
         else "not_compared"
     )
     summary = {
@@ -1291,6 +1339,8 @@ def replay_golden_job(
         "baseline_ruleset_version": (snapshot.get("ruleset") or {}).get("version"),
         "source_fingerprint": golden_job.get("source_fingerprint"),
         "target_totals": snapshot.get("target_totals") or {},
+        "target_bundle_count": len(snapshot.get("target_bundles") or []),
+        "compared_target_bundle_count": len(diff.get("jr_bundles") or []),
         "accepted_totals": snapshot.get("accepted_totals") or {},
         "generated_totals": proposal_totals(proposal),
         "accepted_numeric_edit_count": accepted_money_replay_count,

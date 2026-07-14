@@ -21,6 +21,7 @@ ENGINE_FILES = (
     "sundry_calc.py",
     "proposal_bundler.py",
     "proposal_totals.py",
+    "quote_evidence.py",
     "quote_parser.py",
     "readiness.py",
     "reproducibility.py",

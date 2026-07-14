@@ -63,6 +63,7 @@ from pdf_generator import generate_bid_pdf, generate_proposal_pdf
 from proposal_bundler import generate_proposal_data
 from proposal_totals import effective_bundle_total, normalize_proposal_totals
 from material_pricing import material_pricing_context
+from quote_evidence import find_verified_quote_price_conflicts
 from reproducibility import DEFAULT_TOLERANCE, apply_accepted_numeric_edits, make_golden_snapshot, replay_golden_job
 from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE, STAIR_SUNDRY_KITS
 from email_agent import compose_quote_request, send_email, generate_quote_request_text
@@ -845,6 +846,7 @@ class RulesetRollbackRequest(BaseModel):
 class GoldenBaselineRequest(BaseModel):
     jr_quote_id: Optional[str] = ""
     target_totals: Optional[dict] = None
+    target_bundles: Optional[list[dict]] = None
     tolerance: Optional[dict] = None
     notes: Optional[str] = ""
     reviewer_name: Optional[str] = ""
@@ -3502,6 +3504,27 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
         ) else "fail",
         "result": recovery_probe,
     }
+    conflict_probe = find_verified_quote_price_conflicts(
+        [
+            {"id": 1, "item_code": "T-100", "unit_price": 5.82, "unit": "SF", "price_source": "vendor_quote"},
+            {"id": 2, "item_code": "ST-100", "unit_price": 13.75, "unit": "SF", "price_source": "vendor_quote"},
+            {"id": 3, "item_code": "T-108", "unit_price": 4.65, "unit": "SF", "price_source": "vendor_quote", "quote_source_hash": recovery_hash},
+        ],
+        [
+            {"product_name": "T-100 - Cornerstone", "unit_price": 6.06, "unit": "SF", "source_hash": recovery_hash, "file_name": "ergon.eml"},
+            {"product_name": "ST-100 - Slab", "unit_price": 13.75, "unit": "SF", "source_hash": recovery_hash, "file_name": "slab.eml"},
+            {"product_name": "T-108 - Stonehenge", "unit_price": 4.90, "unit": "SF", "source_hash": recovery_hash, "file_name": "ergon.eml"},
+        ],
+        {recovery_hash},
+    )
+    response["quote_price_conflict_contract"] = {
+        "status": "pass" if (
+            len(conflict_probe) == 1
+            and conflict_probe[0]["item_code"] == "T-100"
+            and conflict_probe[0]["delta"] == 0.24
+        ) else "fail",
+        "result": conflict_probe,
+    }
     transition_cases = {
         "lf_to_sticks": {
             "material_type": "transitions", "price_source": "price_book",
@@ -3598,6 +3621,57 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
     return response
 
 
+def _accepted_bundle_options(proposal: dict | None) -> list[dict]:
+    return [
+        {
+            "bundle_name": str(bundle.get("bundle_name") or "").strip(),
+            "accepted_total": effective_bundle_total(bundle),
+        }
+        for bundle in ((proposal or {}).get("bundles") or [])
+        if isinstance(bundle, dict) and str(bundle.get("bundle_name") or "").strip()
+    ]
+
+
+def _validated_jr_bundle_targets(raw_targets: list[dict] | None, proposal: dict) -> list[dict]:
+    if not raw_targets:
+        return []
+    options = _accepted_bundle_options(proposal)
+    accepted_names = {row["bundle_name"] for row in options}
+    accepted_order = [row["bundle_name"] for row in options]
+    targets_by_name: dict[str, dict] = {}
+    for index, raw in enumerate(raw_targets):
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail=f"JR bundle target {index + 1} must be an object.")
+        bundle_name = str(raw.get("bundle_name") or "").strip()
+        if not bundle_name:
+            raise HTTPException(status_code=400, detail=f"JR bundle target {index + 1} is missing a bundle name.")
+        if bundle_name not in accepted_names:
+            raise HTTPException(status_code=400, detail=f"JR bundle target '{bundle_name}' does not match an accepted proposal bundle.")
+        if bundle_name in targets_by_name:
+            raise HTTPException(status_code=400, detail=f"JR bundle target '{bundle_name}' was entered more than once.")
+        target_total = _as_money_number(raw.get("target_total"))
+        if target_total is None or target_total < 0:
+            raise HTTPException(status_code=400, detail=f"JR bundle target '{bundle_name}' must have a non-negative total.")
+        source_page = raw.get("source_page")
+        if source_page in (None, ""):
+            source_page = None
+        else:
+            try:
+                source_page = int(source_page)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=f"JR bundle target '{bundle_name}' has an invalid source page.") from exc
+            if source_page <= 0:
+                raise HTTPException(status_code=400, detail=f"JR bundle target '{bundle_name}' source page must be positive.")
+        targets_by_name[bundle_name] = {
+            "bundle_name": bundle_name,
+            "jr_label": str(raw.get("jr_label") or bundle_name).strip()[:300] or bundle_name,
+            "target_total": target_total,
+            "source_page": source_page,
+            "notes": str(raw.get("notes") or "").strip()[:1000],
+        }
+    return [targets_by_name[name] for name in accepted_order if name in targets_by_name]
+
+
 def _public_golden_job(golden: dict | None) -> dict | None:
     if not golden:
         return None
@@ -3611,6 +3685,7 @@ def _public_golden_job(golden: dict | None) -> dict | None:
         "name": golden.get("name"),
         "jr_quote_id": golden.get("jr_quote_id"),
         "target_totals": snapshot.get("target_totals") or golden.get("target_totals") or {},
+        "target_bundles": snapshot.get("target_bundles") or [],
         "accepted_totals": snapshot.get("accepted_totals") or {},
         "tolerance": golden.get("tolerance") or snapshot.get("tolerance") or DEFAULT_TOLERANCE,
         "ruleset_version": golden.get("ruleset_version"),
@@ -3831,6 +3906,11 @@ def _readiness_trust_summary(
         and not _imported_artifact_is_verified(item)
     })
     missing_vendor_receipt_count = len(vendor_quote_materials) - len(verified_vendor_quote_materials)
+    vendor_price_conflicts = find_verified_quote_price_conflicts(
+        active_materials,
+        job.get("quotes") or [],
+        verified_vendor_hashes,
+    )
 
     artifact_receipts = list_job_artifacts(job["id"])
     pdf_receipt = next(
@@ -3839,14 +3919,16 @@ def _readiness_trust_summary(
     )
     replay_summary = (latest_replay or {}).get("summary") or {}
     replay_diff = (latest_replay or {}).get("diff") or {}
+    replay_bundle_rows = replay_diff.get("jr_bundles") or replay_diff.get("bundles") or []
     largest_deltas = [
         {
             "bundle_name": row.get("bundle_name"),
             "delta": row.get("delta"),
             "status": row.get("status"),
+            "target_source": row.get("target_source") or ("jr" if replay_diff.get("jr_bundles") else "accepted_proposal"),
         }
         for row in sorted(
-            [row for row in (replay_diff.get("bundles") or []) if isinstance(row, dict)],
+            [row for row in replay_bundle_rows if isinstance(row, dict)],
             key=lambda row: abs(_as_number(row.get("delta")) or 0),
             reverse=True,
         )[:3]
@@ -3878,8 +3960,10 @@ def _readiness_trust_summary(
         "vendor_quote_material_count": len(vendor_quote_materials),
         "verified_vendor_quote_material_count": len(verified_vendor_quote_materials),
         "missing_vendor_receipt_count": missing_vendor_receipt_count,
+        "vendor_price_conflict_count": len(vendor_price_conflicts),
+        "vendor_price_conflicts": vendor_price_conflicts[:20],
         "quote_source_files_needed": quote_source_files_needed,
-        "evidence_recovery_needed": bool(missing_vendor_receipt_count or quote_source_files_needed),
+        "evidence_recovery_needed": bool(missing_vendor_receipt_count or quote_source_files_needed or vendor_price_conflicts),
         "source_fingerprint": proposal.get("audit_source_fingerprint"),
     }
 
@@ -3991,6 +4075,7 @@ def api_get_job_reproducibility(job_id: str):
         "live_source_matches_baseline": statuses["source_matches"],
         "replays": [_public_replay(replay) for replay in replays[:10]],
         "active_version_replays": [_public_replay(replay) for replay in active_replays[:10]],
+        "accepted_bundles": _accepted_bundle_options(proposal),
         "default_tolerance": DEFAULT_TOLERANCE,
     }
 
@@ -4149,6 +4234,7 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
         target_totals[key] = number
     if target_totals.get("grand_total") is None or target_totals["grand_total"] <= 0:
         raise HTTPException(status_code=400, detail="Enter a positive Job Runner grand total before capturing the golden baseline.")
+    target_bundles = _validated_jr_bundle_targets(body.target_bundles, proposal_data)
 
     raw_tolerance = body.tolerance or {}
     unknown_tolerance_fields = sorted(set(raw_tolerance) - set(DEFAULT_TOLERANCE))
@@ -4184,6 +4270,7 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
         labor_catalog=get_labor_catalog_entries(),
         ruleset=ruleset,
         target_totals=target_totals,
+        target_bundles=target_bundles,
         tolerance=tolerance,
         build=build_manifest_for_snapshot(),
         artifact_manifest=_job_artifact_manifest(job["id"]),
@@ -4222,6 +4309,7 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
         "current_drift_classification": None,
         "replays": [],
         "active_version_replays": [],
+        "accepted_bundles": _accepted_bundle_options(proposal_data),
         "default_tolerance": DEFAULT_TOLERANCE,
     }
 

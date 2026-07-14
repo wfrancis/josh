@@ -133,6 +133,56 @@ function BundleDeltas({ replay }) {
   )
 }
 
+function JRBundleDeltas({ replay }) {
+  const rows = replay?.diff?.jr_bundles || []
+  if (!rows.length) return null
+  const visible = rows.filter(row => row.status !== 'pass' || Number(row.delta || 0) !== 0).slice(0, 15)
+  return (
+    <div>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-xs font-bold uppercase text-gray-500">Job Runner Bundle Delta</h3>
+        <span className="text-[10px] font-semibold uppercase text-gray-600">{rows.length} targets / largest first</span>
+      </div>
+      {visible.length > 0 ? (
+        <div className="max-h-80 overflow-auto border-y border-white/[0.06]">
+          <table className="w-full min-w-[620px] text-sm">
+            <thead className="sticky top-0 bg-[#111827] text-[10px] uppercase text-gray-500">
+              <tr>
+                <th className="px-3 py-2 text-left font-bold">Bundle</th>
+                <th className="px-3 py-2 text-right font-bold">JR</th>
+                <th className="px-3 py-2 text-right font-bold">Accepted replay</th>
+                <th className="px-3 py-2 text-right font-bold">Delta</th>
+                <th className="px-3 py-2 text-left font-bold">Status</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/[0.04]">
+              {visible.map(row => (
+                <tr key={row.bundle_name} className="text-gray-300">
+                  <td className="px-3 py-2">
+                    <p className="font-medium text-gray-200">{row.jr_label || row.bundle_name}</p>
+                    {row.jr_label && row.jr_label !== row.bundle_name && <p className="mt-0.5 text-[11px] text-gray-600">{row.bundle_name}</p>}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">{shortMoney(row.target_total)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{row.actual_total == null ? '-' : shortMoney(row.actual_total)}</td>
+                  <td className={`px-3 py-2 text-right font-semibold tabular-nums ${Number(row.delta || 0) > 0 ? 'text-amber-300' : 'text-blue-300'}`}>
+                    {row.delta == null ? '-' : shortMoney(row.delta)}
+                  </td>
+                  <td className="px-3 py-2"><StatusBadge status={row.status} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 border-y border-emerald-500/15 py-3 text-sm text-emerald-200">
+          <CheckCircle2 className="h-4 w-4" />
+          Every stored JR bundle target matches this replay.
+        </div>
+      )}
+    </div>
+  )
+}
+
 function StructuralIssues({ replay }) {
   const rows = replay?.diff?.structural || []
   if (!rows.length) return null
@@ -205,6 +255,7 @@ export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
   const [runningMode, setRunningMode] = useState(null)
   const [selectedMode, setSelectedMode] = useState('baseline')
   const [showCapture, setShowCapture] = useState(false)
+  const [bundleTargets, setBundleTargets] = useState({})
   const [form, setForm] = useState({
     jr_quote_id: '',
     reviewer_name: '',
@@ -229,13 +280,18 @@ export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
     }
   }
 
-  useEffect(() => { load() }, [jobId])
+  useEffect(() => {
+    setBundleTargets({})
+    load()
+  }, [jobId])
 
   const golden = data?.golden_job
   const activeReplays = data?.active_version_replays || []
   const baselineReplay = data?.baseline_replay || activeReplays.find(replay => replay.mode === 'baseline')
   const currentReplay = data?.current_replay || activeReplays.find(replay => replay.mode === 'current')
   const latest = (selectedMode === 'baseline' ? baselineReplay : currentReplay) || data?.latest_replay
+  const acceptedBundles = data?.accepted_bundles || []
+  const enteredBundleTargetCount = acceptedBundles.filter(bundle => parseMoney(bundleTargets[bundle.bundle_name]) != null).length
   const canCapture = useMemo(() => (
     (parseMoney(form.grand_total) || 0) > 0
     && form.jr_quote_id.trim().length > 0
@@ -244,6 +300,9 @@ export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
 
   function startNewVersion() {
     const targets = golden?.target_totals || {}
+    setBundleTargets(Object.fromEntries(
+      (golden?.target_bundles || []).map(bundle => [bundle.bundle_name, bundle.target_total ?? ''])
+    ))
     setForm({
       jr_quote_id: golden?.jr_quote_id || '',
       reviewer_name: golden?.reviewer_name || '',
@@ -264,16 +323,22 @@ export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
       const value = parseMoney(form[key])
       if (value != null) target_totals[key] = value
     })
+    const target_bundles = acceptedBundles.flatMap(bundle => {
+      const value = parseMoney(bundleTargets[bundle.bundle_name])
+      return value == null ? [] : [{ bundle_name: bundle.bundle_name, target_total: value }]
+    })
     setSaving(true)
     setError(null)
     try {
-      setData(await api.captureGoldenBaseline(jobId, {
+      await api.captureGoldenBaseline(jobId, {
         jr_quote_id: form.jr_quote_id,
         reviewer_name: form.reviewer_name,
         target_totals,
+        target_bundles,
         notes: form.notes,
-      }))
+      })
       setShowCapture(false)
+      await load()
       onConfidenceChange?.()
     } catch (err) {
       setError(err.message)
@@ -317,6 +382,7 @@ export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
               <span>JR {golden.jr_quote_id || '-'}</span>
               <span>Baseline v{golden.version_number || '-'}</span>
               <span>Ruleset v{golden.ruleset_version || '-'}</span>
+              <span>{golden.target_bundles?.length || 0} JR bundle targets</span>
               {golden.reviewer_name && <span>Reviewed by {golden.reviewer_name}</span>}
               <span className="font-mono">{String(golden.source_fingerprint || '').slice(0, 10)}</span>
             </div>
@@ -403,6 +469,44 @@ export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
               placeholder="Sun Valley accepted baseline"
             />
           </label>
+          {acceptedBundles.length > 0 && (
+            <div className="border-t border-white/[0.06] pt-4">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs font-bold uppercase text-gray-400">JR Bundle Breakouts</p>
+                <span className="text-[10px] font-semibold uppercase text-gray-600">
+                  {enteredBundleTargetCount} / {acceptedBundles.length} entered
+                </span>
+              </div>
+              <div className="max-h-96 overflow-auto border-y border-white/[0.06]">
+                <table className="w-full min-w-[560px] text-sm">
+                  <thead className="sticky top-0 bg-[#111827] text-[10px] uppercase text-gray-500">
+                    <tr>
+                      <th className="px-3 py-2 text-left font-bold">Accepted bundle</th>
+                      <th className="px-3 py-2 text-right font-bold">Accepted</th>
+                      <th className="w-40 px-3 py-2 text-right font-bold">JR target</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/[0.04]">
+                    {acceptedBundles.map(bundle => (
+                      <tr key={bundle.bundle_name}>
+                        <td className="px-3 py-2 text-gray-300">{bundle.bundle_name}</td>
+                        <td className="px-3 py-2 text-right tabular-nums text-gray-500">{shortMoney(bundle.accepted_total)}</td>
+                        <td className="px-3 py-1.5">
+                          <input
+                            value={bundleTargets[bundle.bundle_name] ?? ''}
+                            onChange={event => setBundleTargets(current => ({ ...current, [bundle.bundle_name]: event.target.value }))}
+                            className="input w-full text-right text-sm tabular-nums"
+                            placeholder="$0"
+                            aria-label={`JR target for ${bundle.bundle_name}`}
+                          />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
           <button
             onClick={captureBaseline}
             disabled={saving || !canCapture}
@@ -505,6 +609,7 @@ export default function ReproducibilityPanel({ jobId, onConfidenceChange }) {
               </div>
               <TotalsTable replay={latest} />
               <TotalsTable replay={latest} rowsKey="jr_totals" title="Job Runner Target Delta" />
+              <JRBundleDeltas replay={latest} />
               <StructuralIssues replay={latest} />
               <BundleDeltas replay={latest} />
               <DriftRows replay={latest} />

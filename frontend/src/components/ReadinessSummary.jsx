@@ -40,6 +40,7 @@ export default function ReadinessSummary({ readiness, onRefresh, onRecoverEviden
   const build = readiness.build || {}
   const trust = readiness.trust_summary || {}
   const evidenceRecoveryNeeded = Boolean(trust.evidence_recovery_needed)
+  const vendorPriceConflicts = trust.vendor_price_conflicts || []
   const goldenBadgeStatus = readiness.golden_verification_status === 'golden_verified' ? 'golden' : null
   const metadataBadgeStatus = readiness.golden_status === 'metadata_changed'
     || (readiness.current_replay_status === 'warn' && readiness.current_replay_drift_classification === 'metadata_only')
@@ -131,6 +132,40 @@ export default function ReadinessSummary({ readiness, onRefresh, onRecoverEviden
                   Missing originals: {trust.quote_source_files_needed.join(', ')}
                 </p>
               )}
+              {vendorPriceConflicts.length > 0 && (
+                <div className="mt-3 border-t border-amber-500/15 pt-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs font-bold uppercase text-amber-300">Verified quote price differs</p>
+                    <span className="text-[10px] font-semibold uppercase text-gray-500">
+                      {trust.vendor_price_conflict_count || vendorPriceConflicts.length} conflict{(trust.vendor_price_conflict_count || vendorPriceConflicts.length) === 1 ? '' : 's'}
+                    </span>
+                  </div>
+                  <div className="mt-2 max-h-56 overflow-auto border-y border-white/[0.06]">
+                    <table className="w-full min-w-[580px] text-xs">
+                      <thead className="sticky top-0 bg-[#111827] text-[10px] uppercase text-gray-500">
+                        <tr>
+                          <th className="px-2 py-2 text-left font-semibold">Material</th>
+                          <th className="px-2 py-2 text-right font-semibold">Accepted</th>
+                          <th className="px-2 py-2 text-right font-semibold">Quote</th>
+                          <th className="px-2 py-2 text-right font-semibold">Difference</th>
+                          <th className="px-2 py-2 text-left font-semibold">Source</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-white/[0.04]">
+                        {vendorPriceConflicts.map((row, index) => (
+                          <tr key={`${row.material_id}-${row.source_hash}-${index}`} className="text-gray-300">
+                            <td className="px-2 py-2 font-semibold text-gray-200">{row.item_code}</td>
+                            <td className="px-2 py-2 text-right tabular-nums">{formatMoney(row.accepted_price)} / {row.accepted_unit}</td>
+                            <td className="px-2 py-2 text-right tabular-nums">{formatMoney(row.quote_price)} / {row.quote_unit}</td>
+                            <td className="px-2 py-2 text-right font-semibold tabular-nums text-amber-300">{formatMoney(row.delta)}</td>
+                            <td className="max-w-52 truncate px-2 py-2 text-gray-500" title={row.source_file}>{row.source_file || 'Verified quote'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
             </div>
             {onRecoverEvidence && (
               <button onClick={onRecoverEvidence} className="btn-secondary flex items-center justify-center gap-2 text-sm sm:flex-shrink-0">
@@ -144,7 +179,9 @@ export default function ReadinessSummary({ readiness, onRefresh, onRecoverEviden
 
       {trust.largest_deltas?.length > 0 && (
         <div className="mt-4 border-t border-white/[0.06] pt-3">
-          <p className="text-[10px] font-semibold uppercase text-gray-500">Largest replay deltas</p>
+          <p className="text-[10px] font-semibold uppercase text-gray-500">
+            {trust.largest_deltas.some(delta => delta.target_source === 'jr') ? 'Largest JR bundle deltas' : 'Largest replay deltas'}
+          </p>
           <div className="mt-2 flex flex-wrap gap-x-5 gap-y-2">
             {trust.largest_deltas.map((delta, index) => (
               <span key={`${delta.bundle_name}-${index}`} className={delta.status === 'fail' ? 'text-sm text-red-300' : delta.status === 'warn' ? 'text-sm text-amber-300' : 'text-sm text-gray-300'}>
