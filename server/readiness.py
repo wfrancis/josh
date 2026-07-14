@@ -327,10 +327,28 @@ def evaluate_job_readiness(
         for item in (bundle.get("labor_items") or [])
         if isinstance(item, dict)
     ]
+    proposal_material_keys_by_id = {
+        str(item.get("id")): material_key(item)
+        for bundle in (proposal.get("bundles") or [])
+        if isinstance(bundle, dict)
+        for item in (bundle.get("materials") or [])
+        if isinstance(item, dict)
+        and item.get("id") is not None
+        and material_key(item)
+    }
     valid_labor_material_ids = {
         str(item.get("material_id"))
-        for item in [*labor_rows, *proposal_labor_rows]
+        for item in labor_rows
         if item.get("material_id") is not None
+        and _number(item.get("qty")) > 0
+        and _number(item.get("rate")) > 0
+        and _number(item.get("extended_cost")) > 0
+    }
+    valid_proposal_labor_keys = {
+        proposal_material_keys_by_id[str(item.get("material_id"))]
+        for item in proposal_labor_rows
+        if item.get("material_id") is not None
+        and str(item.get("material_id")) in proposal_material_keys_by_id
         and _number(item.get("qty")) > 0
         and _number(item.get("rate")) > 0
         and _number(item.get("extended_cost")) > 0
@@ -338,7 +356,10 @@ def evaluate_job_readiness(
     missing_labor = [
         material.get("item_code") or material.get("description") or "material"
         for material in labor_expected
-        if material.get("id") is None or str(material.get("id")) not in valid_labor_material_ids
+        if (
+            (material.get("id") is None or str(material.get("id")) not in valid_labor_material_ids)
+            and material_key(material) not in valid_proposal_labor_keys
+        )
     ]
     checks.append(_check(
         "labor_coverage",

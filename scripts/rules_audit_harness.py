@@ -884,7 +884,11 @@ def validate_accepted_proposal_labor_fallback(
     checks_before = {check.get("id"): check for check in (readiness_before.get("checks") or [])}
 
     accepted_labor = []
-    for material in materials:
+    accepted_materials = copy.deepcopy(materials)
+    for index, material in enumerate(accepted_materials):
+        # Legacy proposals can retain the original import IDs after the same
+        # item codes are re-imported into new job_material rows.
+        material["id"] = -(index + 1)
         material_id = material.get("id")
         quantity = float(material.get("installed_qty") or material.get("order_qty") or 0)
         if material_id is None or quantity <= 0:
@@ -903,7 +907,7 @@ def validate_accepted_proposal_labor_fallback(
     proposal = {
         "bundles": [{
             "bundle_name": "Harness Legacy Accepted Labor",
-            "materials": copy.deepcopy(materials),
+            "materials": accepted_materials,
             "sundry_items": [],
             "labor_items": accepted_labor,
             "material_cost": material_cost,
@@ -939,12 +943,16 @@ def validate_accepted_proposal_labor_fallback(
         and not top_level_labor_before
         and not top_level_labor_after
         and bool(accepted_labor)
+        and all(
+            accepted.get("id") != current.get("id")
+            for accepted, current in zip(accepted_materials, materials)
+        )
     )
     return Check(
         "accepted_proposal_labor_fallback",
         "PASS" if passed else "FAIL",
         (
-            "accepted proposal labor passed while a truly empty labor bid stayed blocked"
+            "accepted proposal labor with legacy material IDs passed while a truly empty labor bid stayed blocked"
             if passed
             else "legacy accepted proposal labor fallback did not preserve honest blocking"
         ),
@@ -954,6 +962,10 @@ def validate_accepted_proposal_labor_fallback(
             "top_level_labor_before": len(top_level_labor_before),
             "top_level_labor_after": len(top_level_labor_after),
             "accepted_labor_rows": len(accepted_labor),
+            "accepted_material_ids_differ": all(
+                accepted.get("id") != current.get("id")
+                for accepted, current in zip(accepted_materials, materials)
+            ),
             "after_message": (checks_after.get("labor_coverage") or {}).get("message"),
         },
     )
