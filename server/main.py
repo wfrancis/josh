@@ -1075,6 +1075,7 @@ def api_system_vendor_ingestion():
             "provider": provider.get("provider"),
             "model": settings.get("openai_model", "gpt-5-mini"),
             "multi_pass_count": multi_pass_count,
+            "image_only_pdf_vision": True,
         },
         "email_monitor": {
             "enabled": automation_enabled,

@@ -3,6 +3,7 @@ Parse vendor quotes from email, PDF, text, CSV, and XLSX files.
 Uses pdfplumber for PDF text extraction and the model selected in Settings for structured parsing.
 """
 
+import base64
 import email
 import json
 import math
@@ -10,6 +11,7 @@ import os
 import re
 import tempfile
 from email import policy
+from io import BytesIO
 from typing import Optional
 
 import statistics
@@ -22,6 +24,9 @@ from ai_client import chat_complete, get_provider_info
 MAX_QUOTE_FILE_BYTES = 25 * 1024 * 1024
 MAX_AI_TEXT_CHARS = 200_000
 MAX_NESTED_EMAIL_DEPTH = 2
+MAX_PDF_VISION_PAGES = 8
+MAX_PDF_VISION_IMAGE_BYTES = 18 * 1024 * 1024
+PDF_VISION_RESOLUTION = 144
 
 
 def _bounded_quote_text(value: str) -> str:
@@ -120,6 +125,30 @@ def _extract_pdf_text(pdf_path: str) -> str:
     return _bounded_quote_text("\n".join(text_parts))
 
 
+def _extract_pdf_page_images(pdf_path: str) -> list[str]:
+    """Render image-only quote pages as bounded JPEG data URLs for vision parsing."""
+    image_data_urls = []
+    total_image_bytes = 0
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages[:MAX_PDF_VISION_PAGES]:
+            rendered = page.to_image(
+                resolution=PDF_VISION_RESOLUTION,
+                antialias=True,
+            ).original.convert("RGB")
+            image_buffer = BytesIO()
+            try:
+                rendered.save(image_buffer, format="JPEG", quality=82, optimize=True)
+            finally:
+                rendered.close()
+            image_bytes = image_buffer.getvalue()
+            if total_image_bytes + len(image_bytes) > MAX_PDF_VISION_IMAGE_BYTES:
+                break
+            total_image_bytes += len(image_bytes)
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+            image_data_urls.append(f"data:image/jpeg;base64,{encoded}")
+    return image_data_urls
+
+
 def _extract_eml(eml_path: str) -> dict:
     """
     Parse an .eml file. Returns:
@@ -178,7 +207,12 @@ def _extract_eml(eml_path: str) -> dict:
     }
 
 
-def _call_ai_single(quote_text: str, api_key: str, model: str) -> list[dict]:
+def _call_ai_single(
+    quote_text: str,
+    api_key: str,
+    model: str,
+    image_data_urls: list[str] | None = None,
+) -> list[dict]:
     """Single pass: send text to AI and parse the structured response."""
     content = chat_complete(
         system=SYSTEM_PROMPT,
@@ -186,6 +220,7 @@ def _call_ai_single(quote_text: str, api_key: str, model: str) -> list[dict]:
         api_key=api_key,
         model=model,
         json_mode=True,
+        image_data_urls=image_data_urls,
     )
     parsed = json.loads(content)
     return _normalize_products(parsed.get("products", []) if isinstance(parsed, dict) else [])
@@ -237,7 +272,12 @@ def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
     return merged
 
 
-def _call_openai(quote_text: str, *, strict: bool = False) -> list[dict]:
+def _call_openai(
+    quote_text: str,
+    *,
+    strict: bool = False,
+    image_data_urls: list[str] | None = None,
+) -> list[dict]:
     """Multi-pass AI call: runs N passes and merges results for accuracy."""
     quote_text = _bounded_quote_text(quote_text)
     from models import get_settings
@@ -253,13 +293,13 @@ def _call_openai(quote_text: str, *, strict: bool = False) -> list[dict]:
         return []
 
     if num_passes <= 1:
-        return _call_ai_single(quote_text, api_key, model)
+        return _call_ai_single(quote_text, api_key, model, image_data_urls)
 
     # Run multiple passes
     all_results = []
     for i in range(num_passes):
         try:
-            result = _call_ai_single(quote_text, api_key, model)
+            result = _call_ai_single(quote_text, api_key, model, image_data_urls)
             all_results.append(result)
         except Exception:
             if strict or i == 0:
@@ -275,9 +315,17 @@ def _call_openai(quote_text: str, *, strict: bool = False) -> list[dict]:
 def parse_quote_pdf(pdf_path: str, *, strict: bool = False) -> list[dict]:
     """Parse a vendor quote from a PDF file."""
     text = _extract_pdf_text(pdf_path)
-    if not text.strip():
+    if text.strip():
+        return _call_openai(text, strict=strict)
+    page_images = _extract_pdf_page_images(pdf_path)
+    if not page_images:
         return []
-    return _call_openai(text, strict=strict)
+    return _call_openai(
+        "This PDF has no extractable text. The attached images are its pages in order. "
+        "Read the visible quote and extract every priced product row.",
+        strict=strict,
+        image_data_urls=page_images,
+    )
 
 
 def _deduplicate_products(products: list[dict]) -> list[dict]:

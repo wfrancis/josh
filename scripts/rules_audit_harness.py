@@ -201,6 +201,7 @@ def validate_vendor_ingestion_health(client: "Client") -> Check:
         and (health.get("dropbox_import") or {}).get("automatic_sync") is False
         and (health.get("dropbox_import") or {}).get("requires_user_action") is True
         and (health.get("dropbox_import") or {}).get("structured_csv_contract") == "named_columns_without_ai"
+        and (health.get("ai_parser") or {}).get("image_only_pdf_vision") is True
         and bool(health.get("durable_artifact_root"))
     )
     parser_ready = bool((health.get("ai_parser") or {}).get("available"))
@@ -536,6 +537,109 @@ class Client:
 
 def now_label() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def build_image_only_quote_pdf() -> bytes:
+    """Create a deterministic scanned-style quote with no extractable text layer."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    image = Image.new("RGB", (1200, 800), "white")
+    draw = ImageDraw.Draw(image)
+    try:
+        heading_font = ImageFont.load_default(size=52)
+        body_font = ImageFont.load_default(size=44)
+    except TypeError:
+        heading_font = ImageFont.load_default()
+        body_font = heading_font
+    draw.text((70, 60), "HARNESS VENDOR QUOTE", fill="black", font=heading_font)
+    rows = [
+        "VENDOR: HARNESS VISION SUPPLY",
+        "ITEM CODE: OCR-100",
+        "PRODUCT: HARNESS SCANNED TILE",
+        "UNIT PRICE: $7.25 PER SF",
+    ]
+    y = 180
+    for row in rows:
+        draw.text((70, y), row, fill="black", font=body_font)
+        y += 105
+    output = io.BytesIO()
+    image.save(output, format="PDF", resolution=144)
+    image.close()
+    return output.getvalue()
+
+
+def validate_scanned_pdf_quote(client: Client) -> Check:
+    """Prove image-only vendor PDFs use visual parsing on the deployed app."""
+    temp_job_id = None
+    details: dict[str, Any] = {}
+    cleanup_error = None
+    try:
+        _, created, _ = client.request(
+            "POST",
+            "/api/jobs",
+            json_body={
+                "project_name": f"Rules Audit Scanned Quote {now_label()}",
+                "gc_name": "Harness QA",
+                "salesperson": "Harness QA",
+                "tax_rate": 0,
+                "gpm_pct": 0,
+                "notes": "Disposable staging job for image-only PDF quote parsing.",
+            },
+        )
+        temp_job_id = str(created["id"])
+        pdf_bytes = build_image_only_quote_pdf()
+        source_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        _, response, _ = client.post_multipart(
+            f"/api/jobs/{temp_job_id}/upload-quotes",
+            files=[(
+                "files",
+                "harness_scanned_quote.pdf",
+                "application/pdf",
+                pdf_bytes,
+            )],
+        )
+        parsed_products = response.get("parsed_products") or []
+        matched_product = next(
+            (
+                product for product in parsed_products
+                if "OCR-100" in str(product.get("product_name") or "").upper()
+                and round(float(product.get("unit_price") or 0), 2) == 7.25
+                and str(product.get("unit") or "").upper() == "SF"
+                and product.get("_source_hash") == source_hash
+            ),
+            None,
+        )
+        ok = bool(matched_product and not (response.get("file_errors") or []))
+        status = "PASS" if ok else "FAIL"
+        summary = (
+            "image-only vendor PDFs are visually parsed with exact source provenance"
+            if ok else "image-only vendor PDF parsing did not return the expected priced row"
+        )
+        details = {
+            "job_id": temp_job_id,
+            "source_hash": source_hash,
+            "pdf_bytes": len(pdf_bytes),
+            "matched_product": matched_product,
+            "parsed_products": parsed_products,
+            "file_errors": response.get("file_errors") or [],
+        }
+    except Exception as exc:
+        status = "FAIL"
+        summary = f"image-only vendor PDF workflow failed: {type(exc).__name__}: {exc}"
+        details["error"] = str(exc)
+    finally:
+        if temp_job_id:
+            try:
+                client.request("DELETE", f"/api/jobs/{temp_job_id}")
+            except Exception as exc:
+                cleanup_error = f"{type(exc).__name__}: {exc}"
+    if cleanup_error:
+        status = "FAIL"
+        summary = f"{summary}; cleanup failed"
+        details["cleanup_error"] = cleanup_error
+    else:
+        details["cleanup"] = "deleted"
+    return Check("scanned_pdf_quote", status, summary, details)
 
 
 def load_fixture(path: str) -> dict[str, Any]:
@@ -2374,6 +2478,7 @@ def main() -> int:
         checks.append(try_rule_registry(client))
         checks.append(try_rule_eval(client, fixture))
         checks.append(ensure_fixture_labor_catalog(client, fixture, args.seed_fixture_labor_catalog))
+        checks.append(validate_scanned_pdf_quote(client))
         checks.append(validate_vendor_price_decision_workflow(client, fixture))
 
         job_id, created_job, job_check = create_or_use_job(client, fixture, args.job_id)

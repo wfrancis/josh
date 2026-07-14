@@ -5,6 +5,7 @@ Falls back to Anthropic when no OpenAI API key is available.
 
 import json
 import os
+import re
 from typing import Optional
 
 # Model mapping: OpenAI model names → Anthropic equivalents
@@ -33,6 +34,7 @@ def chat_complete(
     api_key: str = None,
     model: str = None,
     json_mode: bool = False,
+    image_data_urls: list[str] | None = None,
 ) -> str:
     """
     Send a chat completion request to whichever AI provider is available.
@@ -44,6 +46,7 @@ def chat_complete(
         api_key: OpenAI API key (if set, forces OpenAI)
         model: Model name (OpenAI naming; auto-mapped for Anthropic)
         json_mode: If True, request JSON output format
+        image_data_urls: Optional base64 data URLs for visual input
     """
     if model is None:
         from models import get_settings
@@ -52,9 +55,9 @@ def chat_complete(
     provider = _detect_provider(api_key)
 
     if provider == "openai":
-        return _openai_complete(system, user, api_key, model, json_mode)
+        return _openai_complete(system, user, api_key, model, json_mode, image_data_urls)
     elif provider == "anthropic":
-        return _anthropic_complete(system, user, model, json_mode)
+        return _anthropic_complete(system, user, model, json_mode, image_data_urls)
     else:
         raise RuntimeError(
             "No AI API key available. Set either openai_api_key in Settings "
@@ -62,7 +65,14 @@ def chat_complete(
         )
 
 
-def _openai_complete(system: str, user: str, api_key: str, model: str, json_mode: bool) -> str:
+def _openai_complete(
+    system: str,
+    user: str,
+    api_key: str,
+    model: str,
+    json_mode: bool,
+    image_data_urls: list[str] | None = None,
+) -> str:
     """Call OpenAI chat completions API."""
     import openai
 
@@ -71,11 +81,22 @@ def _openai_complete(system: str, user: str, api_key: str, model: str, json_mode
         client_kwargs["api_key"] = api_key
     client = openai.OpenAI(**client_kwargs)
 
+    user_content = user
+    if image_data_urls:
+        user_content = [{"type": "text", "text": user}]
+        user_content.extend(
+            {
+                "type": "image_url",
+                "image_url": {"url": image_data_url, "detail": "high"},
+            }
+            for image_data_url in image_data_urls
+        )
+
     kwargs = {
         "model": model,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user", "content": user_content},
         ],
     }
     if json_mode:
@@ -85,7 +106,13 @@ def _openai_complete(system: str, user: str, api_key: str, model: str, json_mode
     return response.choices[0].message.content
 
 
-def _anthropic_complete(system: str, user: str, model: str, json_mode: bool) -> str:
+def _anthropic_complete(
+    system: str,
+    user: str,
+    model: str,
+    json_mode: bool,
+    image_data_urls: list[str] | None = None,
+) -> str:
     """Call Anthropic messages API."""
     import anthropic
 
@@ -97,11 +124,32 @@ def _anthropic_complete(system: str, user: str, model: str, json_mode: bool) -> 
     if json_mode:
         effective_system = system + "\n\nIMPORTANT: Return ONLY valid JSON. No markdown, no code fences, no explanation."
 
+    user_content = user
+    if image_data_urls:
+        content_blocks = []
+        for image_data_url in image_data_urls:
+            match = re.fullmatch(
+                r"data:(image/(?:jpeg|png|gif|webp));base64,([A-Za-z0-9+/=]+)",
+                image_data_url,
+            )
+            if not match:
+                raise ValueError("Unsupported image data URL for Anthropic")
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": match.group(1),
+                    "data": match.group(2),
+                },
+            })
+        content_blocks.append({"type": "text", "text": user})
+        user_content = content_blocks
+
     response = client.messages.create(
         model=mapped_model,
         max_tokens=4096,
         system=effective_system,
-        messages=[{"role": "user", "content": user}],
+        messages=[{"role": "user", "content": user_content}],
     )
 
     content = response.content[0].text
