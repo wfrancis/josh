@@ -14,8 +14,6 @@ from email import policy
 from io import BytesIO
 from typing import Optional
 
-import statistics
-
 import pdfplumber
 
 from ai_client import chat_complete, get_provider_info
@@ -112,6 +110,19 @@ def _normalize_products(products) -> list[dict]:
     return normalized
 
 
+def _product_identity_key(product: dict) -> tuple[str, str]:
+    """Return a conservative identity for reconciling repeated AI reads."""
+    raw_name = str(product.get("product_name") or "").lower()
+    code_match = re.match(r"^\s*([a-z]{1,10}\s*-?\s*\d{2,}[a-z0-9.-]*)\b", raw_name)
+    if code_match:
+        name = f"code:{re.sub(r'[^a-z0-9]+', '', code_match.group(1))}"
+        vendor = ""
+    else:
+        name = f"name:{re.sub(r'[^a-z0-9]+', '', raw_name)}"
+        vendor = re.sub(r"[^a-z0-9]+", "", str(product.get("vendor") or "").lower())
+    return name, vendor
+
+
 def _extract_pdf_text(pdf_path: str) -> str:
     """Extract all text from a PDF file using pdfplumber."""
     text_parts = []
@@ -131,16 +142,20 @@ def _extract_pdf_page_images(pdf_path: str) -> list[str]:
     total_image_bytes = 0
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages[:MAX_PDF_VISION_PAGES]:
-            rendered = page.to_image(
+            page_image = page.to_image(
                 resolution=PDF_VISION_RESOLUTION,
                 antialias=True,
-            ).original.convert("RGB")
-            image_buffer = BytesIO()
+            )
+            original = page_image.original
+            rendered = original.convert("RGB")
             try:
-                rendered.save(image_buffer, format="JPEG", quality=82, optimize=True)
+                with BytesIO() as image_buffer:
+                    rendered.save(image_buffer, format="JPEG", quality=82, optimize=True)
+                    image_bytes = image_buffer.getvalue()
             finally:
                 rendered.close()
-            image_bytes = image_buffer.getvalue()
+                if original is not rendered:
+                    original.close()
             if total_image_bytes + len(image_bytes) > MAX_PDF_VISION_IMAGE_BYTES:
                 break
             total_image_bytes += len(image_bytes)
@@ -228,48 +243,114 @@ def _call_ai_single(
 
 def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
     """
-    Merge results from multiple passes. For each product found,
-    take the median price across passes for stability.
-    """
-    if len(all_results) == 1:
-        return all_results[0]
+    Merge repeated extraction results without inventing source values.
 
-    # Index products by normalized name across all passes
-    product_map: dict[str, list[dict]] = {}
+    Punctuation-only name differences are treated as the same row. If passes
+    disagree on the price or unit for that row, parsing fails closed so the
+    caller cannot write an averaged value that never appeared on the quote.
+    """
+    product_map: dict[tuple[str, str], list[dict]] = {}
     for pass_result in all_results:
-        for product in pass_result:
-            key = (product.get("product_name", "").strip().lower(),
-                   product.get("vendor", "").strip().lower())
-            norm_key = f"{key[0]}||{key[1]}"
-            product_map.setdefault(norm_key, []).append(product)
+        for product in _normalize_products(pass_result):
+            product_map.setdefault(_product_identity_key(product), []).append(product)
 
     merged = []
-    seen = set()
-    for norm_key, variants in product_map.items():
-        if norm_key in seen:
-            continue
-        seen.add(norm_key)
+    for variants in product_map.values():
+        base = dict(variants[0])
+        label = str(base.get("product_name") or "product")
+        prices = sorted({round(float(v["unit_price"]), 4) for v in variants})
+        if len(prices) != 1:
+            raise ValueError(
+                f"AI quote-reading passes disagree on the price for {label}: "
+                f"{', '.join(f'${price:g}' for price in prices)}. Review the source and retry."
+            )
+        base["unit_price"] = prices[0]
 
-        # Use the most common version as the base
-        base = variants[0]
+        units = sorted({str(v.get("unit") or "").strip().upper() for v in variants if v.get("unit")})
+        if len(units) > 1:
+            raise ValueError(
+                f"AI quote-reading passes disagree on the unit for {label}: "
+                f"{', '.join(units)}. Review the source and retry."
+            )
+        if units:
+            base["unit"] = units[0]
 
-        # Take median unit_price for stability
-        prices = [v.get("unit_price", 0) for v in variants if v.get("unit_price")]
-        if prices:
-            base["unit_price"] = round(statistics.median(prices), 2)
+        if not base.get("vendor"):
+            base["vendor"] = next((v.get("vendor") for v in variants if v.get("vendor")), "")
 
-        # Take median freight if numeric, otherwise keep first string value
         freights = [v.get("freight") for v in variants if v.get("freight")]
         if freights:
-            numeric_freights = [f for f in freights if isinstance(f, (int, float))]
+            numeric_freights = sorted({
+                round(float(f), 4)
+                for f in freights
+                if isinstance(f, (int, float)) and not isinstance(f, bool)
+            })
+            if len(numeric_freights) > 1:
+                raise ValueError(
+                    f"AI quote-reading passes disagree on freight for {label}. "
+                    "Review the source and retry."
+                )
             if numeric_freights:
-                base["freight"] = round(statistics.median(numeric_freights), 2)
+                base["freight"] = numeric_freights[0]
             else:
-                base["freight"] = freights[0]  # Keep string like "FOB La Grange, GA"
+                base["freight"] = freights[0]
 
         merged.append(base)
 
-    return merged
+    return _normalize_products(merged)
+
+
+def quote_multipass_audit_contract() -> dict:
+    """Return a deterministic contract used by the deployed release harness."""
+    duplicate_passes = [
+        [{
+            "vendor": "Harness Vision Supply",
+            "product_name": "OCR-100 - Harness Scanned Tile",
+            "unit_price": 7.25,
+            "unit": "SF",
+        }],
+        [{
+            "vendor": "Harness Vision Supply",
+            "product_name": "OCR-100 / Scanned Tile by Harness",
+            "unit_price": 7.25,
+            "unit": "SF",
+        }],
+    ]
+    merged = _merge_multipass_results(duplicate_passes)
+
+    price_conflict = None
+    try:
+        _merge_multipass_results([
+            duplicate_passes[0],
+            [{**duplicate_passes[1][0], "unit_price": 7.75}],
+        ])
+    except ValueError as exc:
+        price_conflict = str(exc)
+
+    unit_conflict = None
+    try:
+        _merge_multipass_results([
+            duplicate_passes[0],
+            [{**duplicate_passes[1][0], "unit": "EA"}],
+        ])
+    except ValueError as exc:
+        unit_conflict = str(exc)
+
+    passed = (
+        len(merged) == 1
+        and merged[0].get("unit_price") == 7.25
+        and merged[0].get("unit") == "SF"
+        and bool(price_conflict)
+        and bool(unit_conflict)
+    )
+    return {
+        "status": "pass" if passed else "fail",
+        "merged": merged,
+        "price_conflict_rejected": bool(price_conflict),
+        "price_conflict_error": price_conflict,
+        "unit_conflict_rejected": bool(unit_conflict),
+        "unit_conflict_error": unit_conflict,
+    }
 
 
 def _call_openai(

@@ -202,6 +202,10 @@ def validate_vendor_ingestion_health(client: "Client") -> Check:
         and (health.get("dropbox_import") or {}).get("requires_user_action") is True
         and (health.get("dropbox_import") or {}).get("structured_csv_contract") == "named_columns_without_ai"
         and (health.get("ai_parser") or {}).get("image_only_pdf_vision") is True
+        and (health.get("ai_parser") or {}).get("multi_pass_disagreement_policy")
+        == "reject_without_pricing_writes"
+        and (health.get("ai_parser") or {}).get("semantic_duplicate_policy")
+        == "merge_explicit_item_code_or_punctuation_identity"
         and bool(health.get("durable_artifact_root"))
     )
     parser_ready = bool((health.get("ai_parser") or {}).get("available"))
@@ -268,6 +272,32 @@ def validate_quote_price_conflict_contract(client: "Client") -> Check:
         (
             "verified exact-code quote conflicts remain visible after a manual relabel"
             if ok else "deployed quote price-conflict contract failed"
+        ),
+        contract,
+    )
+
+
+def validate_quote_multipass_contract(client: "Client") -> Check:
+    try:
+        _, probe, _ = client.request("POST", "/api/rules/audit-harness", json_body={})
+    except HarnessError as exc:
+        return Check("quote_multipass", "FAIL", f"deployed multi-pass probe unavailable: {exc}")
+    contract = probe.get("quote_multipass_contract") or {}
+    merged = contract.get("merged") or []
+    ok = (
+        contract.get("status") == "pass"
+        and len(merged) == 1
+        and merged[0].get("unit_price") == 7.25
+        and merged[0].get("unit") == "SF"
+        and contract.get("price_conflict_rejected") is True
+        and contract.get("unit_conflict_rejected") is True
+    )
+    return Check(
+        "quote_multipass",
+        "PASS" if ok else "FAIL",
+        (
+            "multi-pass quote parsing merges punctuation drift and rejects source-value disagreements"
+            if ok else "deployed multi-pass quote parsing can duplicate or invent source values"
         ),
         contract,
     )
@@ -599,17 +629,18 @@ def validate_scanned_pdf_quote(client: Client) -> Check:
             )],
         )
         parsed_products = response.get("parsed_products") or []
-        matched_product = next(
-            (
-                product for product in parsed_products
-                if "OCR-100" in str(product.get("product_name") or "").upper()
-                and round(float(product.get("unit_price") or 0), 2) == 7.25
-                and str(product.get("unit") or "").upper() == "SF"
-                and product.get("_source_hash") == source_hash
-            ),
-            None,
+        identity_products = [
+            product for product in parsed_products
+            if "OCR-100" in str(product.get("product_name") or "").upper()
+        ]
+        matched_product = identity_products[0] if len(identity_products) == 1 else None
+        ok = bool(
+            matched_product
+            and round(float(matched_product.get("unit_price") or 0), 2) == 7.25
+            and str(matched_product.get("unit") or "").upper() == "SF"
+            and matched_product.get("_source_hash") == source_hash
+            and not (response.get("file_errors") or [])
         )
-        ok = bool(matched_product and not (response.get("file_errors") or []))
         status = "PASS" if ok else "FAIL"
         summary = (
             "image-only vendor PDFs are visually parsed with exact source provenance"
@@ -620,6 +651,7 @@ def validate_scanned_pdf_quote(client: Client) -> Check:
             "source_hash": source_hash,
             "pdf_bytes": len(pdf_bytes),
             "matched_product": matched_product,
+            "identity_product_count": len(identity_products),
             "parsed_products": parsed_products,
             "file_errors": response.get("file_errors") or [],
         }
@@ -2469,6 +2501,7 @@ def main() -> int:
         checks.append(validate_vendor_ingestion_health(client))
         checks.append(validate_quote_receipt_recovery_contract(client))
         checks.append(validate_quote_price_conflict_contract(client))
+        checks.append(validate_quote_multipass_contract(client))
         checks.append(validate_transition_pricing_contract(client))
         checks.append(validate_proposal_cent_arithmetic_contract(client))
         checks.append(validate_labor_line_rounding_contract(client))

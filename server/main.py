@@ -55,7 +55,12 @@ from models import (
     get_latest_golden_replay_for_version,
 )
 from rfms_parser import ai_merge_materials, infer_material_type_fallback, parse_rfms
-from quote_parser import MAX_QUOTE_FILE_BYTES, parse_quote_file, set_openai_config
+from quote_parser import (
+    MAX_QUOTE_FILE_BYTES,
+    parse_quote_file,
+    quote_multipass_audit_contract,
+    set_openai_config,
+)
 from dropbox_scanner import match_folder
 from sundry_calc import calculate_sundries_for_materials
 from labor_calc import LABOR_RULES, calculate_labor_for_materials, labor_line_values, load_labor_catalog, load_labor_catalog_from_pdf, get_labor_catalog
@@ -1075,6 +1080,8 @@ def api_system_vendor_ingestion():
             "provider": provider.get("provider"),
             "model": settings.get("openai_model", "gpt-5-mini"),
             "multi_pass_count": multi_pass_count,
+            "multi_pass_disagreement_policy": "reject_without_pricing_writes",
+            "semantic_duplicate_policy": "merge_explicit_item_code_or_punctuation_identity",
             "image_only_pdf_vision": True,
         },
         "email_monitor": {
@@ -3812,6 +3819,7 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
         ) else "fail",
         "result": conflict_probe,
     }
+    response["quote_multipass_contract"] = quote_multipass_audit_contract()
     transition_cases = {
         "lf_to_sticks": {
             "material_type": "transitions", "price_source": "price_book",
