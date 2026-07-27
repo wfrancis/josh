@@ -1127,6 +1127,8 @@ def material_quotes_email_center(
             "slug": job.get("slug") or "",
             "project_name": job.get("project_name") or "Untitled Bid",
             "gc_name": job.get("gc_name") or "",
+            "city": job.get("city") or "",
+            "state": job.get("state") or "",
         }
         for job in list_jobs()
     ]
@@ -1288,6 +1290,8 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
                 "project_name": job.get("project_name") or "Untitled Bid",
                 "gc_name": job.get("gc_name") or "",
                 "salesperson": job.get("salesperson") or "",
+                "city": job.get("city") or "",
+                "state": job.get("state") or "",
                 "material_count": len(materials),
                 "unpriced_count": len(unpriced),
                 "unrequested_count": unrequested_count,

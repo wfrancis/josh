@@ -3,6 +3,8 @@ import { createPortal } from 'react-dom'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import {
   AlertTriangle,
+  ArrowRight,
+  Briefcase,
   Check,
   Inbox,
   Loader2,
@@ -103,6 +105,14 @@ export default function QuoteEmailCenter() {
   const clearJobFilter = () => {
     const next = new URLSearchParams(location.search)
     next.delete('job')
+    navigate(`/material-quotes/email${next.toString() ? `?${next}` : ''}`)
+  }
+
+  const selectJob = (event) => {
+    const next = new URLSearchParams(location.search)
+    const nextJobId = event.target.value
+    if (nextJobId) next.set('job', nextJobId)
+    else next.delete('job')
     navigate(`/material-quotes/email${next.toString() ? `?${next}` : ''}`)
   }
 
@@ -289,6 +299,12 @@ export default function QuoteEmailCenter() {
   const selectedJob = asArray(center.jobs).find(
     (job) => String(job.id) === String(jobFilter),
   )
+  const bidOptions = useMemo(
+    () => asArray(center.jobs).slice().sort((left, right) => (
+      String(left.project_name || '').localeCompare(String(right.project_name || ''))
+    )),
+    [center.jobs],
+  )
   const outlook = center.outlook || {}
   const outlookConnected = Boolean(
     outlook.session_authenticated ?? outlook.connected,
@@ -357,20 +373,59 @@ export default function QuoteEmailCenter() {
         </div>
       </section>
 
-      {selectedJob && (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-blue-500/20 bg-blue-500/[0.05] px-4 py-3">
-          <p className="text-sm text-blue-200">
-            Showing <strong>{selectedJob.project_name}</strong>
-          </p>
-          <button
-            type="button"
-            onClick={clearJobFilter}
-            className="text-xs font-semibold text-blue-300 hover:text-white"
-          >
-            Show All Bids
-          </button>
+      <section className="rounded-lg border border-white/[0.08] bg-white/[0.025]">
+        <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-end lg:justify-between">
+          <label className="block min-w-0 lg:w-[360px]">
+            <span className="mb-1.5 flex items-center gap-2 text-xs font-semibold text-gray-500">
+              <Briefcase className="h-3.5 w-3.5" />
+              Bid emails
+            </span>
+            <select
+              value={jobFilter}
+              onChange={selectJob}
+              className="w-full rounded-md border border-white/[0.1] bg-[#0D1322] px-3 py-2.5 text-sm font-semibold text-gray-200 outline-none focus:border-blue-400/50"
+            >
+              <option value="">All bids</option>
+              {bidOptions.map((job) => {
+                const location = [job.city, job.state].filter(Boolean).join(', ')
+                const detail = [job.gc_name, location].filter(Boolean).join(' | ')
+                return (
+                  <option key={job.id} value={job.id}>
+                    {job.project_name}{detail ? ` - ${detail}` : ''}
+                  </option>
+                )
+              })}
+            </select>
+          </label>
+
+          {selectedJob ? (
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="min-w-0 lg:text-right">
+                <p className="truncate text-sm font-semibold text-white">{selectedJob.project_name}</p>
+                <p className="mt-0.5 text-xs text-gray-500">
+                  {[selectedJob.gc_name, [selectedJob.city, selectedJob.state].filter(Boolean).join(', ')].filter(Boolean).join(' | ') || 'Selected bid'}
+                </p>
+              </div>
+              <Link
+                to={`/jobs/${selectedJob.slug || selectedJob.id}?step=quotes`}
+                className="inline-flex min-h-10 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
+              >
+                Open Bid
+                <ArrowRight className="h-3.5 w-3.5" />
+              </Link>
+              <button
+                type="button"
+                onClick={clearJobFilter}
+                className="min-h-10 rounded-md px-3 text-xs font-semibold text-blue-300 hover:bg-blue-500/[0.08] hover:text-white"
+              >
+                All Bids
+              </button>
+            </div>
+          ) : (
+            <p className="text-xs text-gray-500">Showing email work from every bid.</p>
+          )}
         </div>
-      )}
+      </section>
 
       {error && (
         <div className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
