@@ -4964,6 +4964,10 @@ def _simulation_shadow(
             if not row or not row["sql"]:
                 raise ValueError(f"Simulation schema is missing {table}.")
             shadow.execute(str(row["sql"]))
+        shadow.execute(
+            """CREATE UNIQUE INDEX idx_sim_imported_files_dedup
+               ON imported_files(job_id, file_hash)"""
+        )
         job_row = source.execute(
             "SELECT * FROM jobs WHERE id=?",
             (job_id,),
