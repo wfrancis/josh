@@ -308,6 +308,7 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
   const outlookConnected = outlook?.session_authenticated !== undefined
     ? Boolean(outlook.session_authenticated)
     : Boolean(outlook?.connected || normalizeStatus(outlook?.status) === 'connected')
+  const mailboxLocked = Boolean(review?.mailbox_locked)
   const unpricedCount = (job?.materials || []).filter((material) => !Number(material.unit_price)).length
   const unresolvedPriceCount = priceMatches.filter((match) => (
     !match.decision
@@ -923,7 +924,11 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
             </section>
 
             <section>
-              <SectionHeading icon={Clock3} title="Request Timeline" count={requests.length} />
+              <SectionHeading
+                icon={Clock3}
+                title="Request Timeline"
+                count={mailboxLocked ? 'Hidden' : requests.length}
+              />
               {requests.length ? (
                 <div className="space-y-3">
                   {requests.map((request) => {
@@ -1093,12 +1098,20 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
                   })}
                 </div>
               ) : (
-                <EmptyRow>No quote requests have been sent for this bid.</EmptyRow>
+                <EmptyRow>
+                  {mailboxLocked
+                    ? 'Connect Outlook to view saved quote history. Nothing was deleted.'
+                    : 'No quote requests have been sent for this bid.'}
+                </EmptyRow>
               )}
             </section>
 
             <section>
-              <SectionHeading icon={Inbox} title="Needs Matching" count={needsMatching.length} />
+              <SectionHeading
+                icon={Inbox}
+                title="Needs Matching"
+                count={mailboxLocked ? 'Hidden' : needsMatching.length}
+              />
               {needsMatching.length ? (
                 <div className="space-y-3">
                   {needsMatching.map((message, index) => {
@@ -1241,12 +1254,20 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
                   })}
                 </div>
               ) : (
-                <EmptyRow>No emails need Josh to choose a bid.</EmptyRow>
+                <EmptyRow>
+                  {mailboxLocked
+                    ? 'Connect Outlook to check saved vendor replies.'
+                    : 'No emails need Josh to choose a bid.'}
+                </EmptyRow>
               )}
             </section>
 
             <section>
-              <SectionHeading icon={CircleDollarSign} title="Price Review" count={priceMatches.length} />
+              <SectionHeading
+                icon={CircleDollarSign}
+                title="Price Review"
+                count={mailboxLocked ? 'Hidden' : priceMatches.length}
+              />
               {priceMatches.length ? (
                 <div className="space-y-3">
                   {priceMatches.map((match, index) => {
@@ -1389,7 +1410,11 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
                   })}
                 </div>
               ) : (
-                <EmptyRow>No vendor prices need a decision.</EmptyRow>
+                <EmptyRow>
+                  {mailboxLocked
+                    ? 'Connect Outlook to view vendor prices waiting for a decision.'
+                    : 'No vendor prices need a decision.'}
+                </EmptyRow>
               )}
             </section>
 
