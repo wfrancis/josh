@@ -81,7 +81,9 @@ export default function JobDetail() {
       if (!preserveStep) {
         const hasMaterials = Boolean(data.materials?.length)
         const hasUnpricedMaterials = data.materials?.some(material => !Number(material.unit_price))
-        if (hasMaterials && (data.bundles?.length > 0 || data.bid_data) && !hasUnpricedMaterials) setStep('bid')
+        const requestedStep = new URLSearchParams(window.location.search).get('step')
+        if (hasMaterials && requestedStep === 'quotes') setStep('quotes')
+        else if (hasMaterials && (data.bundles?.length > 0 || data.bid_data) && !hasUnpricedMaterials) setStep('bid')
         else setStep('takeoff')
       }
       // Load quote requests for status tracking

@@ -447,7 +447,9 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
   }
 
   const connectOutlook = () => {
-    window.location.assign(api.outlookConnectUrl(window.location.href))
+    window.location.assign(
+      api.outlookConnectUrl(`${window.location.pathname}?step=quotes`),
+    )
   }
 
   const disconnectOutlook = () => {
