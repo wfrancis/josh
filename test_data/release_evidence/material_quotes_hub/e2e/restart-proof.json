@@ -1,0 +1,75 @@
+{
+  "app": "si-bid-stg-20260714-c0fa",
+  "machine_id": "784443eadd64d8",
+  "machine_version": 33,
+  "restarted_at": "2026-07-27T18:35:17Z",
+  "deployed_commit": "a2147d7bdc8fc60c54a4acf81dda6717463eb083",
+  "deployed_tag": "material-quotes-hub-e2e-racefix-20260727",
+  "artifacts": [
+    {
+      "kind": "alpha_sent_email",
+      "sha256": "9d118c0c1e3c0a0bc86d726d4b824c70a884379141751e73210bd099569df237",
+      "verified_after_restart": true
+    },
+    {
+      "kind": "beta_sent_email",
+      "sha256": "18bb18346c0cd2954e911e37477c59bc3fa7648ff0506ef6dae0c87d5de625f1",
+      "verified_after_restart": true
+    },
+    {
+      "kind": "alpha_reply_email",
+      "sha256": "764071e222e22639b143514aa8156f0d150ced842088de22f952490db570c260",
+      "verified_after_restart": true
+    },
+    {
+      "kind": "alpha_quote_csv",
+      "sha256": "b92a99ec9696f992ec7698994454a41ffc2ddc80a3b003df7da87d86001c06ca",
+      "verified_after_restart": true
+    },
+    {
+      "kind": "beta_reply_email",
+      "sha256": "c44efe4e302e9c8a2c263fac044b767aba5ebdbb69bf83ee2c82198ddcc4bfcb",
+      "verified_after_restart": true
+    },
+    {
+      "kind": "beta_quote_csv",
+      "sha256": "a528b5d4772640bbe8e080d7f7803fad9aa5c23280f9d3349f865670be876c21",
+      "verified_after_restart": true
+    }
+  ],
+  "prices": [
+    {
+      "job_id": 46,
+      "item_code": "ALPHA-LVT-101",
+      "unit": "SF",
+      "unit_price": 2.45,
+      "quote_status": "quoted"
+    },
+    {
+      "job_id": 46,
+      "item_code": "COMMON-TRIM-900",
+      "unit": "LF",
+      "unit_price": 4.1,
+      "quote_status": "quoted"
+    },
+    {
+      "job_id": 47,
+      "item_code": "BETA-CPT-202",
+      "unit": "SY",
+      "unit_price": 18.75,
+      "quote_status": "quoted"
+    },
+    {
+      "job_id": 47,
+      "item_code": "COMMON-TRIM-900",
+      "unit": "LF",
+      "unit_price": 4.25,
+      "quote_status": "quoted"
+    }
+  ],
+  "cleanup": {
+    "unfinished_requests_cancelled": [5, 6],
+    "future_followups_cancelled": 4,
+    "outlook_connections_remaining": 0
+  }
+}
