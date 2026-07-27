@@ -2831,13 +2831,23 @@ def _price_products_for_message(message_id: int, request: dict, match_method: st
         "file_hash": message.get("raw_hash"),
         "artifact_path": message.get("raw_artifact_path"),
     }
+    parse_errors = [
+        {
+            "type": "attachment_failure",
+            "value": (
+                f"{manifest.get('file_name') or 'attachment'}: "
+                f"{manifest.get('error') or 'Attachment was not saved.'}"
+            ),
+        }
+        for manifest in manifests
+        if isinstance(manifest, dict) and manifest.get("error")
+    ]
     sources = []
     for manifest in [raw_manifest, *manifests]:
         copied = _copy_artifact_to_job(manifest, request["job_id"])
         if copied:
             sources.append(copied)
     products_with_source = []
-    parse_errors = []
     raw_products_found = False
     for source_index, source in enumerate(sources):
         if source_index > 0 and raw_products_found:

@@ -368,6 +368,53 @@ def _graph_raw(
     return response
 
 
+def _graph_bytes_limited(
+    path_or_url: str,
+    *,
+    access_token: str,
+    max_bytes: int,
+    headers: dict | None = None,
+) -> tuple[bytes, str]:
+    url = (
+        path_or_url
+        if path_or_url.startswith("https://")
+        else GRAPH_ROOT + path_or_url
+    )
+    request_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/octet-stream",
+        **(headers or {}),
+    }
+    with _http_client() as client:
+        with client.stream("GET", url, headers=request_headers) as response:
+            if response.status_code >= 400:
+                raw_error = response.read()
+                try:
+                    detail = (
+                        json.loads(raw_error.decode("utf-8"))
+                        .get("error", {})
+                        .get("message")
+                    )
+                except (UnicodeDecodeError, ValueError, AttributeError):
+                    detail = ""
+                raise GraphRequestError(
+                    detail
+                    or f"Microsoft Graph request failed ({response.status_code}).",
+                    response.status_code,
+                )
+            chunks = []
+            total = 0
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise GraphRequestError(
+                        f"Downloaded content exceeds the {max_bytes // (1024 * 1024)} MB limit.",
+                        413,
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks), str(response.headers.get("content-type") or "")
+
+
 def _graph_json(
     method: str,
     path_or_url: str,
@@ -650,10 +697,10 @@ def send_mail(
 def _message_mime(graph_message_id: str, token: str) -> bytes | None:
     encoded_id = quote(graph_message_id, safe="")
     try:
-        response = _graph_raw(
-            "GET",
+        content, _ = _graph_bytes_limited(
             f"/me/messages/{encoded_id}/$value",
             access_token=token,
+            max_bytes=MAX_ATTACHMENT_BYTES * 2,
             headers={
                 "Accept": "message/rfc822",
                 "Prefer": 'IdType="ImmutableId"',
@@ -661,7 +708,7 @@ def _message_mime(graph_message_id: str, token: str) -> bytes | None:
         )
     except (GraphRequestError, httpx.TransportError):
         return None
-    return response.content or None
+    return content or None
 
 
 def _strip_html(value: str) -> str:
@@ -693,7 +740,7 @@ def _message_attachments(graph_id: str, token: str) -> list[dict]:
         "GET",
         f"/me/messages/{encoded_id}/attachments",
         access_token=token,
-        params={"$select": "id,name,contentType,size,contentBytes"},
+        params={"$select": "id,name,contentType,size,isInline"},
         headers={"Prefer": 'IdType="ImmutableId"'},
     )
     items = list(result.get("value") or [])
@@ -703,45 +750,95 @@ def _message_attachments(graph_id: str, token: str) -> list[dict]:
         if next_link in seen_pages:
             break
         seen_pages.add(next_link)
-        result = _graph_json("GET", next_link, access_token=token)
+        result = _graph_json(
+            "GET",
+            next_link,
+            access_token=token,
+            headers={"Prefer": 'IdType="ImmutableId"'},
+        )
         items.extend(result.get("value") or [])
     attachments = []
     for item in items:
         declared_size = int(item.get("size") or 0)
+        attachment = {
+            "id": item.get("id"),
+            "name": item.get("name") or "attachment",
+            "content_type": item.get("contentType") or "",
+            "size": declared_size,
+        }
         if declared_size > MAX_ATTACHMENT_BYTES:
             attachments.append(
                 {
-                    "id": item.get("id"),
-                    "name": item.get("name") or "attachment",
-                    "content_type": item.get("contentType") or "",
-                    "size": declared_size,
+                    **attachment,
                     "error": "Attachment is larger than 25 MB.",
                 }
             )
             continue
-        content = item.get("contentBytes")
-        if not content:
+        attachment_id = str(item.get("id") or "").strip()
+        attachment_type = str(item.get("@odata.type") or "").lower()
+        if not attachment_id:
             attachments.append(
                 {
-                    "id": item.get("id"),
-                    "name": item.get("name") or "attachment",
-                    "content_type": item.get("contentType") or "",
-                    "size": declared_size,
-                    "error": "Microsoft did not return the attachment content.",
+                    **attachment,
+                    "error": "Microsoft did not return an attachment ID.",
+                }
+            )
+            continue
+        if attachment_type.endswith("referenceattachment"):
+            attachments.append(
+                {
+                    **attachment,
+                    "error": "Linked cloud attachments require Josh to review the email.",
                 }
             )
             continue
         try:
-            data = base64.b64decode(content)
-        except (ValueError, TypeError):
+            encoded_attachment_id = quote(attachment_id, safe="")
+            data, response_content_type = _graph_bytes_limited(
+                (
+                    f"/me/messages/{encoded_id}/attachments/"
+                    f"{encoded_attachment_id}/$value"
+                ),
+                access_token=token,
+                max_bytes=MAX_ATTACHMENT_BYTES,
+                headers={
+                    "Accept": "application/octet-stream",
+                    "Prefer": 'IdType="ImmutableId"',
+                },
+            )
+        except (GraphRequestError, httpx.TransportError) as exc:
+            attachments.append(
+                {
+                    **attachment,
+                    "error": f"Microsoft could not download this attachment: {exc}",
+                }
+            )
+            continue
+        if not data:
+            attachments.append(
+                {
+                    **attachment,
+                    "error": "Microsoft returned an empty attachment.",
+                }
+            )
             continue
         if len(data) > MAX_ATTACHMENT_BYTES:
+            attachments.append(
+                {
+                    **attachment,
+                    "size": len(data),
+                    "error": "Attachment is larger than 25 MB.",
+                }
+            )
             continue
         attachments.append(
             {
-                "id": item.get("id"),
-                "name": item.get("name") or "attachment",
-                "content_type": item.get("contentType") or "",
+                **attachment,
+                "content_type": (
+                    item.get("contentType")
+                    or response_content_type
+                    or ""
+                ),
                 "size": len(data),
                 "data": data,
             }
@@ -780,7 +877,12 @@ def sync_inbox_once(connection_email: str | None = None) -> dict:
         if not next_link or next_link in seen_pages:
             break
         seen_pages.add(next_link)
-        response = _graph_json("GET", next_link, access_token=token)
+        response = _graph_json(
+            "GET",
+            next_link,
+            access_token=token,
+            headers={"Prefer": 'IdType="ImmutableId"'},
+        )
     processed = []
     skipped = 0
     for summary in summaries:
