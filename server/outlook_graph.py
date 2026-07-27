@@ -680,7 +680,7 @@ def _message_detail(graph_id: str, token: str) -> dict:
             "$select": (
                 "id,internetMessageId,conversationId,subject,body,from,toRecipients,"
                 "receivedDateTime,sentDateTime,internetMessageHeaders,hasAttachments,"
-                "isDraft,parentFolderId,size"
+                "isDraft,parentFolderId"
             )
         },
         headers={"Prefer": 'IdType="ImmutableId"'},
@@ -721,6 +721,15 @@ def _message_attachments(graph_id: str, token: str) -> list[dict]:
             continue
         content = item.get("contentBytes")
         if not content:
+            attachments.append(
+                {
+                    "id": item.get("id"),
+                    "name": item.get("name") or "attachment",
+                    "content_type": item.get("contentType") or "",
+                    "size": declared_size,
+                    "error": "Microsoft did not return the attachment content.",
+                }
+            )
             continue
         try:
             data = base64.b64decode(content)
@@ -823,7 +832,14 @@ def sync_inbox_once(connection_email: str | None = None) -> dict:
             if preview["status"] == "ignored":
                 skipped += 1
                 continue
-        if int(detail.get("size") or 0) <= MAX_ATTACHMENT_BYTES * 2:
+        body_size = len(
+            str((detail.get("body") or {}).get("content") or "").encode("utf-8")
+        )
+        estimated_mime_size = body_size + sum(
+            (int(attachment.get("size") or 0) * 4 // 3)
+            for attachment in attachments
+        )
+        if estimated_mime_size <= MAX_ATTACHMENT_BYTES * 2:
             message["raw_bytes"] = _message_mime(str(summary["id"]), token)
         processed.append(process_incoming_message(message))
     conn = _get_conn()
