@@ -246,8 +246,14 @@ def validate_deterministic_quote_contract(client: "Client") -> Check:
         and contract.get("matching_engine") == "deterministic-v1"
         and checks.get("direct_reply") is True
         and checks.get("standalone_exact") is True
-        and checks.get("sender_only_review") is True
+        and checks.get("sender_only_ignored") is True
         and checks.get("unrelated_ignored") is True
+        and checks.get("labeled_ocr_price") is True
+        and checks.get("accounting_negative_rejected") is True
+        and checks.get("decimal_comma_rejected") is True
+        and checks.get("broken_sibling_blocks_automatic") is True
+        and checks.get("broken_sibling_parser_rejected") is True
+        and checks.get("ai_dependencies_absent") is True
         and checks.get("ai_calls") == 0
     )
     return Check(
@@ -575,6 +581,7 @@ class Client:
         *,
         fields: dict[str, str] | None = None,
         files: list[tuple[str, str, str, bytes]],
+        ok_statuses: tuple[int, ...] = (200,),
     ) -> tuple[int, Any, str]:
         boundary = "----rules-audit-" + uuid.uuid4().hex
         chunks: list[bytes] = []
@@ -598,6 +605,7 @@ class Client:
             path,
             body=body,
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            ok_statuses=ok_statuses,
         )
 
     @staticmethod
@@ -662,6 +670,49 @@ def validate_scanned_pdf_quote(client: Client) -> Check:
             },
         )
         temp_job_id = str(created["id"])
+        _, before_failed_batch_job, _ = client.request(
+            "GET",
+            f"/api/jobs/{temp_job_id}",
+        )
+        _, before_failed_batch_imports, _ = client.request(
+            "GET",
+            f"/api/jobs/{temp_job_id}/imported-files",
+        )
+        failed_batch_status, failed_batch_response, _ = client.post_multipart(
+            f"/api/jobs/{temp_job_id}/upload-quotes",
+            files=[
+                (
+                    "files",
+                    "exact_row.csv",
+                    "text/csv",
+                    (
+                        "item_code,description,unit_price,unit\n"
+                        "SAFE-100,Safe Row,4.25,SF\n"
+                    ).encode("utf-8"),
+                ),
+                (
+                    "files",
+                    "broken.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    b"not a workbook",
+                ),
+            ],
+            ok_statuses=(422,),
+        )
+        _, after_failed_batch_job, _ = client.request(
+            "GET",
+            f"/api/jobs/{temp_job_id}",
+        )
+        _, after_failed_batch_imports, _ = client.request(
+            "GET",
+            f"/api/jobs/{temp_job_id}/imported-files",
+        )
+        failed_batch_left_no_evidence = bool(
+            failed_batch_status == 422
+            and (before_failed_batch_job.get("quotes") or [])
+            == (after_failed_batch_job.get("quotes") or [])
+            and before_failed_batch_imports == after_failed_batch_imports
+        )
         pdf_bytes = build_image_only_quote_pdf()
         source_hash = hashlib.sha256(pdf_bytes).hexdigest()
         _, response, _ = client.post_multipart(
@@ -678,17 +729,21 @@ def validate_scanned_pdf_quote(client: Client) -> Check:
             product for product in parsed_products
             if "OCR-100" in " ".join(
                 str(product.get(field) or "").upper()
-                for field in ("product_name", "notes", "description")
+                for field in ("item_code", "product_name", "notes", "description")
             )
         ]
         matched_product = identity_products[0] if len(identity_products) == 1 else None
         ok = bool(
             matched_product
             and len(parsed_products) == 1
+            and matched_product.get("item_code") == "OCR-100"
             and round(float(matched_product.get("unit_price") or 0), 2) == 7.25
             and str(matched_product.get("unit") or "").upper() == "SF"
             and matched_product.get("_source_hash") == source_hash
             and not (response.get("file_errors") or [])
+            and response.get("pricing_writes") == 0
+            and response.get("ai_calls") == 0
+            and failed_batch_left_no_evidence
         )
         status = "PASS" if ok else "FAIL"
         summary = (
@@ -703,6 +758,11 @@ def validate_scanned_pdf_quote(client: Client) -> Check:
             "identity_product_count": len(identity_products),
             "parsed_products": parsed_products,
             "file_errors": response.get("file_errors") or [],
+            "failed_batch": {
+                "status": failed_batch_status,
+                "response": failed_batch_response,
+                "left_no_evidence": failed_batch_left_no_evidence,
+            },
         }
     except Exception as exc:
         status = "FAIL"

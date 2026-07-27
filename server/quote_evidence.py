@@ -88,7 +88,7 @@ def find_verified_quote_price_conflicts(
             continue
         text = " ".join(
             str(quote.get(field) or "")
-            for field in ("product_name", "description", "notes")
+            for field in ("item_code", "product_name", "description", "notes")
         )
         codes = extract_item_code_tokens(text)
         if not codes:
@@ -110,6 +110,9 @@ def find_verified_quote_price_conflicts(
             "vendor": str(quote.get("vendor") or "").strip(),
             "quote_price": price,
             "quote_unit": unit,
+            "quote_source_unit": str(
+                quote.get("source_unit") or quote.get("unit") or ""
+            ).strip(),
             "product_name": str(quote.get("product_name") or "").strip(),
         })
 
@@ -152,6 +155,7 @@ def find_verified_quote_price_conflicts(
                 "accepted_source": str(material.get("price_source") or "").strip().lower(),
                 "quote_price": round(quote["quote_price"], 2),
                 "quote_unit": quote["quote_unit"],
+                "quote_source_unit": quote["quote_source_unit"],
                 "delta": delta,
                 "source_hash": quote["source_hash"],
                 "source_file": quote["source_file"],

@@ -100,6 +100,7 @@ from quote_automation import (
     mark_request_accepted,
     mark_request_send_failed,
     mark_request_send_uncertain,
+    parse_quote_file_deterministic,
     record_request_send_token,
     quote_review,
     quote_workflow,
@@ -2861,13 +2862,208 @@ def _quote_upload_outcomes(
 async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     """Upload vendor quote files, parse them, return pricing."""
     if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
-        raise HTTPException(
-            status_code=410,
-            detail=(
-                "Use the Material Quotes tab. In deterministic mode, quote files "
-                "must be linked to recorded email evidence before prices can change."
-            ),
-        )
+        db_id = _resolve_job_id(job_id)
+        job = load_job(db_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        import hashlib as _hashlib
+
+        all_products = []
+        skipped_files = []
+        file_errors = []
+        parsed_files = []
+        with tempfile.TemporaryDirectory(prefix="quote-review-") as temp_dir:
+            for upload in files:
+                content = await upload.read(MAX_QUOTE_FILE_BYTES + 1)
+                if len(content) > MAX_QUOTE_FILE_BYTES:
+                    file_errors.append({
+                        "file": upload.filename,
+                        "error": f"File exceeds the {MAX_QUOTE_FILE_BYTES // (1024 * 1024)} MB limit.",
+                    })
+                    continue
+
+                file_hash = _hashlib.sha256(content).hexdigest()
+                if _file_is_durably_imported(db_id, file_hash):
+                    skipped_files.append(upload.filename)
+                    continue
+
+                safe_name = _safe_artifact_name(
+                    upload.filename or "vendor_quote"
+                )
+                temp_path = os.path.join(
+                    temp_dir,
+                    f"{file_hash[:12]}_{safe_name}",
+                )
+                with open(temp_path, "wb") as handle:
+                    handle.write(content)
+
+                try:
+                    products = parse_quote_file_deterministic(temp_path)
+                except Exception as exc:
+                    file_errors.append({
+                        "file": upload.filename,
+                        "error": str(exc),
+                    })
+                    continue
+                incomplete_products = [
+                    product
+                    for product in products
+                    if not str(product.get("item_code") or "").strip()
+                    or not str(product.get("source_unit") or "").strip()
+                    or not (_as_number(product.get("unit_price")) or 0) > 0
+                ]
+                if not products or incomplete_products:
+                    file_errors.append({
+                        "file": upload.filename,
+                        "error": (
+                            "Every price row needs an exact item code, unit, "
+                            "and positive unit price."
+                        ),
+                    })
+                    continue
+                for product in products:
+                    product["file_name"] = upload.filename
+                    product["_source_hash"] = file_hash
+                all_products.extend(products)
+                parsed_files.append({
+                    "file_name": upload.filename,
+                    "file_hash": file_hash,
+                    "file_size": len(content),
+                    "temp_path": temp_path,
+                })
+
+            if file_errors:
+                detail = "; ".join(
+                    f"{item['file']}: {item['error']}"
+                    for item in file_errors[:5]
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "No vendor pricing or evidence was saved. Every selected "
+                        f"file must contain exact reviewable prices. {detail}"
+                    ),
+                )
+
+            durable_files = []
+            try:
+                for parsed_file in parsed_files:
+                    durable_path = _job_upload_path(
+                        db_id,
+                        (
+                            f"{parsed_file['file_hash'][:12]}_"
+                            f"{parsed_file['file_name'] or 'vendor_quote'}"
+                        ),
+                        "quote",
+                    )
+                    file_record = {
+                        **parsed_file,
+                        "durable_path": durable_path,
+                        "artifact_path": os.path.relpath(
+                            durable_path,
+                            ARTIFACT_ROOT,
+                        ),
+                        "existed_before": os.path.isfile(durable_path),
+                    }
+                    durable_files.append(file_record)
+                    pending_fd, pending_path = tempfile.mkstemp(
+                        prefix=".quote-pending-",
+                        dir=os.path.dirname(durable_path),
+                    )
+                    os.close(pending_fd)
+                    try:
+                        shutil.copyfile(
+                            parsed_file["temp_path"],
+                            pending_path,
+                        )
+                        if _file_hash(pending_path) != parsed_file["file_hash"]:
+                            raise OSError(
+                                "Durable quote copy failed its hash check."
+                            )
+                        os.replace(pending_path, durable_path)
+                    finally:
+                        if os.path.exists(pending_path):
+                            os.remove(pending_path)
+
+                conn = _get_conn()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    save_quotes(db_id, all_products, conn=conn)
+                    for file_record in durable_files:
+                        record_job_artifact(
+                            db_id,
+                            "vendor_quote",
+                            file_record["artifact_path"],
+                            file_record["file_hash"],
+                            file_record["file_size"],
+                            conn=conn,
+                        )
+                        record_imported_file(
+                            db_id,
+                            file_record["file_name"],
+                            file_record["file_hash"],
+                            file_record["file_size"],
+                            source="manual_review",
+                            artifact_path=file_record["artifact_path"],
+                            artifact_kind="vendor_quote",
+                            conn=conn,
+                        )
+                    log_activity(
+                        db_id,
+                        "quotes_uploaded_for_review",
+                        (
+                            f"Uploaded {len(parsed_files)} quote file(s) for "
+                            "review; no material prices changed"
+                        ),
+                        {
+                            "files": [
+                                parsed_file["file_name"]
+                                for parsed_file in parsed_files
+                            ],
+                            "product_count": len(all_products),
+                            "auto_matched": 0,
+                            "ai_calls": 0,
+                        },
+                        conn=conn,
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.close()
+            except Exception:
+                for file_record in durable_files:
+                    if (
+                        not file_record["existed_before"]
+                        and not _file_is_durably_imported(
+                            db_id,
+                            file_record["file_hash"],
+                        )
+                    ):
+                        try:
+                            os.remove(file_record["durable_path"])
+                        except FileNotFoundError:
+                            pass
+                raise
+
+            refreshed = load_job(db_id) or {}
+            return {
+                "products": refreshed.get("quotes") or [],
+                "parsed_products": all_products,
+                "auto_matched": 0,
+                "quote_price_matched": 0,
+                "quote_price_matched_items": [],
+                "provenance_repaired": 0,
+                "provenance_repaired_items": [],
+                "linked_requests": [],
+                "skipped_files": skipped_files,
+                "file_errors": [],
+                "review_required": True,
+                "pricing_writes": 0,
+                "ai_calls": 0,
+            }
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:

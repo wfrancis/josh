@@ -1815,12 +1815,31 @@ def _header_key(value: Any) -> str:
 
 
 def _positive_price(value: Any) -> float | None:
-    cleaned = re.sub(r"[^0-9.+-]", "", str(value or ""))
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return round(number, 4) if math.isfinite(number) and number > 0 else None
+    text = str(value or "").strip()
+    match = re.fullmatch(
+        r"(?i)(?:USD\s*)?\$?\s*"
+        r"(?P<number>(?:(?:\d{1,3}(?:,\d{3})+|\d+)"
+        r"(?:\.\d{1,4})?|\.\d{1,4}))",
+        text,
+    )
+    if not match:
+        return None
     try:
-        number = float(cleaned)
+        number = float(match.group("number").replace(",", ""))
     except (TypeError, ValueError):
         return None
     return round(number, 4) if math.isfinite(number) and number > 0 else None
+
+
+def _product_name_with_code(code: str, description: str) -> str:
+    if code and description and not contains_exact_fact(description, code):
+        return f"{code} - {description}"
+    return description or code
 
 
 def _products_from_rows(rows: list[list[Any]]) -> list[dict]:
@@ -1861,7 +1880,7 @@ def _products_from_rows(rows: list[list[Any]]) -> list[dict]:
         products.append(
             {
                 "item_code": code,
-                "product_name": description or code,
+                "product_name": _product_name_with_code(code, description),
                 "description": description,
                 "vendor": str(mapped.get("vendor") or "").strip(),
                 "unit_price": price,
@@ -1897,7 +1916,10 @@ def _products_from_text(text: str) -> list[dict]:
         products.append(
             {
                 "item_code": code,
-                "product_name": match.group("description").strip(" -,:") or code,
+                "product_name": _product_name_with_code(
+                    code,
+                    match.group("description").strip(" -,:"),
+                ),
                 "description": match.group("description").strip(" -,:"),
                 "vendor": "",
                 "unit_price": price,
@@ -1908,11 +1930,83 @@ def _products_from_text(text: str) -> list[dict]:
                 "notes": "",
             }
         )
+
+    item_label_pattern = re.compile(
+        r"(?im)^\s*(?:ITEM\s*(?:CODE|NUMBER|#)|SKU|PRODUCT\s+CODE)"
+        r"\s*[:#-]\s*(?P<code>[A-Za-z][A-Za-z0-9._/-]{2,})\s*$"
+    )
+    item_labels = list(item_label_pattern.finditer(text))
+    vendor_match = re.search(
+        r"(?im)^\s*VENDOR\s*[:#-]\s*(?P<vendor>[^\r\n]{2,120})\s*$",
+        text,
+    )
+    for index, item_match in enumerate(item_labels):
+        block_end = (
+            item_labels[index + 1].start()
+            if index + 1 < len(item_labels)
+            else len(text)
+        )
+        block = text[item_match.start():block_end]
+        price_match = re.search(
+            r"(?im)^\s*(?:UNIT\s*(?:PRICE|COST)|PRICE\s+PER\s+UNIT)"
+            r"\s*[:#-]?\s*\$?\s*"
+            r"(?P<price>\d{1,6}(?:,\d{3})*(?:\.\d{1,4})?)"
+            r"\s*(?:(?:/|PER)\s*(?P<unit>SF|SY|LF|EA|PC|ROLL|BOX|CTN))?\s*$",
+            block,
+        )
+        if not price_match:
+            continue
+        source_unit = price_match.group("unit")
+        if not source_unit:
+            unit_match = re.search(
+                r"(?im)^\s*(?:UOM|UNIT(?:\s+OF\s+MEASURE)?)"
+                r"\s*[:#-]\s*(?P<unit>SF|SY|LF|EA|PC|ROLL|BOX|CTN)\s*$",
+                block,
+            )
+            source_unit = unit_match.group("unit") if unit_match else ""
+        price = _positive_price(price_match.group("price"))
+        code = item_match.group("code")
+        if (
+            price is None
+            or not source_unit
+            or not (re.search(r"\d", code) or "-" in code)
+        ):
+            continue
+        description_match = re.search(
+            r"(?im)^\s*(?:PRODUCT|ITEM\s+DESCRIPTION|DESCRIPTION)"
+            r"\s*[:#-]\s*(?P<description>[^\r\n]{2,240})\s*$",
+            block,
+        )
+        description = (
+            description_match.group("description").strip()
+            if description_match
+            else code
+        )
+        products.append(
+            {
+                "item_code": code,
+                "product_name": _product_name_with_code(code, description),
+                "description": description,
+                "vendor": (
+                    vendor_match.group("vendor").strip()
+                    if vendor_match
+                    else ""
+                ),
+                "unit_price": price,
+                "unit": normalize_quote_unit(source_unit),
+                "source_unit": _exact_unit_text(source_unit),
+                "freight": "",
+                "lead_time": "",
+                "notes": "",
+            }
+        )
+
     unique = {}
     for product in products:
         key = (
             normalize_item_code(product["item_code"]),
             product["unit"],
+            _exact_unit_key(product.get("source_unit")),
             product["unit_price"],
         )
         unique[key] = product
@@ -1990,15 +2084,15 @@ def parse_quote_file_deterministic(path: str, *, depth: int = 0) -> list[dict]:
                     temp = ARTIFACT_ROOT / "shared" / "tmp" / f"{_sha256_bytes(data)[:12]}{nested_suffix}"
                     temp.parent.mkdir(parents=True, exist_ok=True)
                     temp.write_bytes(data)
-                    try:
-                        products.extend(
-                            parse_quote_file_deterministic(
-                                str(temp),
-                                depth=depth + 1,
-                            )
+                    nested_products = parse_quote_file_deterministic(
+                        str(temp),
+                        depth=depth + 1,
+                    )
+                    if not nested_products:
+                        raise ValueError(
+                            f"Attachment {part.get_filename()} has no exact quote rows."
                         )
-                    except Exception:
-                        continue
+                    products.extend(nested_products)
             elif part.get_content_type() == "text/plain":
                 payload = part.get_payload(decode=True)
                 if payload:
@@ -2030,15 +2124,15 @@ def parse_quote_file_deterministic(path: str, *, depth: int = 0) -> list[dict]:
                     temp = ARTIFACT_ROOT / "shared" / "tmp" / f"{_sha256_bytes(bytes(data))[:12]}{nested_suffix}"
                     temp.parent.mkdir(parents=True, exist_ok=True)
                     temp.write_bytes(bytes(data))
-                    try:
-                        products.extend(
-                            parse_quote_file_deterministic(
-                                str(temp),
-                                depth=depth + 1,
-                            )
+                    nested_products = parse_quote_file_deterministic(
+                        str(temp),
+                        depth=depth + 1,
+                    )
+                    if not nested_products:
+                        raise ValueError(
+                            f"Attachment {name} has no exact quote rows."
                         )
-                    except Exception:
-                        continue
+                    products.extend(nested_products)
             return products
         finally:
             message.close()
@@ -2705,6 +2799,21 @@ def _refresh_request_completion(
             conn.close()
 
 
+def _message_price_decision(
+    evaluation: dict,
+    parse_errors: list[dict],
+) -> tuple[str, str]:
+    if parse_errors:
+        return (
+            "needs_review",
+            (
+                "One or more files in this email could not be read. "
+                "No price from the email can be automatic."
+            ),
+        )
+    return str(evaluation["status"]), str(evaluation["reason"])
+
+
 def _price_products_for_message(message_id: int, request: dict, match_method: str) -> dict:
     conn = _get_conn()
     try:
@@ -2781,8 +2890,7 @@ def _price_products_for_message(message_id: int, request: dict, match_method: st
             request_stale=request_stale,
         )
         material = evaluation["material"]
-        status = evaluation["status"]
-        reason = evaluation["reason"]
+        status, reason = _message_price_decision(evaluation, parse_errors)
         match_id = _record_price_match(
             message_id=message_id,
             request=request,
@@ -5105,6 +5213,61 @@ def deterministic_contract() -> dict:
         duplicate_unit_columns_rejected = False
     except ValueError:
         duplicate_unit_columns_rejected = True
+    labeled_ocr_products = _products_from_text(
+        "\n".join(
+            [
+                "VENDOR: Harness Supply",
+                "ITEM CODE: OCR-100",
+                "PRODUCT: Harness Scanned Tile",
+                "UNIT PRICE: $7.25 PER SF",
+            ]
+        )
+    )
+    labeled_ocr_product = (
+        labeled_ocr_products[0]
+        if len(labeled_ocr_products) == 1
+        else {}
+    )
+    module_source = Path(__file__).read_text(encoding="utf-8")
+    ai_dependency_imports = re.findall(
+        r"^\s*(?:from\s+(?:openai|ai_client)\b|import\s+(?:openai|ai_client)\b)",
+        module_source,
+        flags=re.MULTILINE,
+    )
+    mixed_attachment_email = EmailMessage()
+    mixed_attachment_email["From"] = "vendor@example.com"
+    mixed_attachment_email["To"] = "estimator@example.com"
+    mixed_attachment_email["Subject"] = "Mixed attachment safety proof"
+    mixed_attachment_email.set_content("Pricing is attached.")
+    mixed_attachment_email.add_attachment(
+        (
+            "item_code,description,unit_price,unit\n"
+            "CPT-100,Harness Carpet,4.25,SY\n"
+        ).encode("utf-8"),
+        maintype="text",
+        subtype="csv",
+        filename="valid.csv",
+    )
+    mixed_attachment_email.add_attachment(
+        b"not a workbook",
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="broken.xlsx",
+    )
+    mixed_email_bytes = mixed_attachment_email.as_bytes()
+    mixed_email_path = (
+        ARTIFACT_ROOT
+        / "shared"
+        / "tmp"
+        / f"contract-mixed-{_sha256_bytes(mixed_email_bytes)[:12]}.eml"
+    )
+    mixed_email_path.parent.mkdir(parents=True, exist_ok=True)
+    mixed_email_path.write_bytes(mixed_email_bytes)
+    try:
+        parse_quote_file_deterministic(str(mixed_email_path))
+        mixed_attachment_parser_rejected = False
+    except Exception:
+        mixed_attachment_parser_rejected = True
     checks = {
         "direct_reply": direct_reply["status"]
         == "matched",
@@ -5134,6 +5297,27 @@ def deterministic_contract() -> dict:
         ),
         "generic_price_requires_review": generic_price_rows == [],
         "duplicate_unit_columns_rejected": duplicate_unit_columns_rejected,
+        "accounting_negative_rejected": _positive_price("(5.00)") is None,
+        "decimal_comma_rejected": _positive_price("7,25") is None,
+        "broken_sibling_blocks_automatic": _message_price_decision(
+            {
+                "status": "ready_to_apply",
+                "reason": "Exact direct reply.",
+            },
+            [{"type": "parse_failure", "value": "broken.xlsx"}],
+        )[0]
+        == "needs_review",
+        "broken_sibling_parser_rejected": mixed_attachment_parser_rejected,
+        "labeled_ocr_price": (
+            labeled_ocr_product.get("item_code") == "OCR-100"
+            and labeled_ocr_product.get("product_name")
+            == "OCR-100 - Harness Scanned Tile"
+            and labeled_ocr_product.get("vendor") == "Harness Supply"
+            and labeled_ocr_product.get("unit_price") == 7.25
+            and labeled_ocr_product.get("unit") == "SF"
+            and labeled_ocr_product.get("source_unit") == "SF"
+        ),
+        "ai_dependencies_absent": not ai_dependency_imports,
         "standalone_exact": match_message_to_requests(
             {
                 "sender_email": "vendor@example.com",

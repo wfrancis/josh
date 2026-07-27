@@ -109,10 +109,12 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS job_quotes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id INTEGER NOT NULL,
+                item_code TEXT,
                 product_name TEXT,
                 vendor TEXT,
                 unit_price REAL DEFAULT 0,
                 unit TEXT,
+                source_unit TEXT,
                 description TEXT,
                 file_name TEXT,
                 source_hash TEXT,
@@ -641,6 +643,8 @@ def init_db() -> None:
             ("current_version_id", "ALTER TABLE golden_jobs ADD COLUMN current_version_id INTEGER"),
             ("golden_version_id", "ALTER TABLE golden_job_replays ADD COLUMN golden_version_id INTEGER"),
             ("job_quote_source_hash", "ALTER TABLE job_quotes ADD COLUMN source_hash TEXT"),
+            ("job_quote_item_code", "ALTER TABLE job_quotes ADD COLUMN item_code TEXT"),
+            ("job_quote_source_unit", "ALTER TABLE job_quotes ADD COLUMN source_unit TEXT"),
             ("vendor_price_source_hash", "ALTER TABLE vendor_prices ADD COLUMN source_hash TEXT"),
             ("qr_vendor_email", "ALTER TABLE quote_requests ADD COLUMN vendor_email TEXT DEFAULT ''"),
             ("qr_mailbox_email", "ALTER TABLE quote_requests ADD COLUMN mailbox_email TEXT DEFAULT ''"),
@@ -697,8 +701,10 @@ def init_db() -> None:
               AND id NOT IN (
                   SELECT MIN(id) FROM job_quotes
                   WHERE source_hash IS NOT NULL AND source_hash != ''
-                  GROUP BY job_id, source_hash, COALESCE(product_name, ''),
-                           COALESCE(vendor, ''), COALESCE(unit_price, 0), COALESCE(unit, '')
+                  GROUP BY job_id, source_hash, COALESCE(item_code, ''),
+                           COALESCE(product_name, ''), COALESCE(vendor, ''),
+                           COALESCE(unit_price, 0), COALESCE(unit, ''),
+                           COALESCE(source_unit, '')
               )
             """
         )
@@ -714,6 +720,8 @@ def init_db() -> None:
               )
             """
         )
+        conn.commit()
+        conn.execute("DROP INDEX IF EXISTS idx_job_quotes_source_product")
         conn.commit()
 
         # Indexes for vendor_prices
@@ -749,7 +757,10 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_quote_simulations_job ON quote_simulation_runs(job_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_vendor_prices_verified_code ON vendor_prices(verified, item_code, unit, created_at DESC)",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_job_quotes_source_product
-               ON job_quotes(job_id, source_hash, COALESCE(product_name, ''), COALESCE(vendor, ''), COALESCE(unit_price, 0), COALESCE(unit, ''))
+               ON job_quotes(job_id, source_hash, COALESCE(item_code, ''),
+                             COALESCE(product_name, ''), COALESCE(vendor, ''),
+                             COALESCE(unit_price, 0), COALESCE(unit, ''),
+                             COALESCE(source_unit, ''))
                WHERE source_hash IS NOT NULL AND source_hash != ''""",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_vendor_prices_source_product
                ON vendor_prices(job_id, source_hash, COALESCE(product_name, ''), COALESCE(vendor_name, ''), COALESCE(unit_price, 0), COALESCE(unit, ''))
@@ -1307,13 +1318,14 @@ def save_quotes(
                 continue  # Skip error entries
             cur = conn.execute("""
                 INSERT OR IGNORE INTO job_quotes
-                    (job_id, product_name, vendor, unit_price, unit, description, file_name,
-                     quoted_at, freight, lead_time, notes, source_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (job_id, item_code, product_name, vendor, unit_price, unit,
+                     source_unit, description, file_name, quoted_at, freight,
+                     lead_time, notes, source_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                job_id, q.get("product_name"), q.get("vendor"),
-                q.get("unit_price", 0), q.get("unit"),
-                q.get("description"), q.get("file_name"),
+                job_id, q.get("item_code"), q.get("product_name"),
+                q.get("vendor"), q.get("unit_price", 0), q.get("unit"),
+                q.get("source_unit"), q.get("description"), q.get("file_name"),
                 datetime.now().isoformat(),
                 q.get("freight"), q.get("lead_time"), q.get("notes"), q.get("_source_hash")
             ))
@@ -3470,9 +3482,11 @@ def is_file_imported(job_id: int, file_hash: str) -> bool:
 def record_imported_file(job_id: int, file_name: str, file_hash: str,
                          file_size: int = 0, source: str = "manual",
                          artifact_path: str | None = None,
-                         artifact_kind: str = "source"):
+                         artifact_kind: str = "source",
+                         conn: sqlite3.Connection | None = None):
     """Record an import and repair legacy rows when durable evidence is re-uploaded."""
-    conn = _get_conn()
+    owns_connection = conn is None
+    conn = conn or _get_conn()
     try:
         conn.execute(
             "INSERT INTO imported_files "
@@ -3486,9 +3500,11 @@ def record_imported_file(job_id: int, file_name: str, file_hash: str,
             "imported_at=excluded.imported_at",
             (job_id, file_name, file_hash, file_size, source, artifact_path, artifact_kind, datetime.now().isoformat())
         )
-        conn.commit()
+        if owns_connection:
+            conn.commit()
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
 
 def list_imported_files(job_id: int) -> list[dict]:
@@ -3511,9 +3527,11 @@ def record_job_artifact(
     artifact_path: str,
     file_hash: str,
     file_size: int = 0,
+    conn: sqlite3.Connection | None = None,
 ) -> None:
     """Record a durable artifact receipt for a job."""
-    conn = _get_conn()
+    owns_connection = conn is None
+    conn = conn or _get_conn()
     try:
         conn.execute(
             """
@@ -3526,9 +3544,11 @@ def record_job_artifact(
             """,
             (job_id, artifact_kind, artifact_path, file_hash, file_size, datetime.now().isoformat()),
         )
-        conn.commit()
+        if owns_connection:
+            conn.commit()
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
 
 def list_job_artifacts(job_id: int) -> list[dict]:
@@ -3657,20 +3677,30 @@ def mark_notification_read(notification_id: int) -> bool:
 
 # ── Activity Log ─────────────────────────────────────────────────────────────
 
-def log_activity(job_id: int, action: str, summary: str, detail: dict = None, user: str = "System") -> int:
+def log_activity(
+    job_id: int,
+    action: str,
+    summary: str,
+    detail: dict = None,
+    user: str = "System",
+    conn: sqlite3.Connection | None = None,
+) -> int:
     """Record an activity event for a job."""
     import json as _json
-    conn = _get_conn()
+    owns_connection = conn is None
+    conn = conn or _get_conn()
     try:
         detail_str = _json.dumps(detail) if detail else None
         cur = conn.execute(
             "INSERT INTO job_activity (job_id, action, summary, detail, created_at, user) VALUES (?, ?, ?, ?, ?, ?)",
             (job_id, action, summary, detail_str, datetime.now().isoformat(), user)
         )
-        conn.commit()
+        if owns_connection:
+            conn.commit()
         return cur.lastrowid
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
 
 def get_activity(job_id: int, limit: int = 50) -> list[dict]:
