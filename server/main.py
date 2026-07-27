@@ -101,14 +101,20 @@ from quote_automation import (
     mark_request_accepted,
     mark_request_send_failed,
     mark_request_send_uncertain,
+    material_quote_bid_summaries,
+    material_quote_email_draft,
+    material_quotes_email_center,
     parse_quote_file_deterministic,
     record_request_send_token,
+    remove_material_quote_email_draft,
     quote_review,
     quote_workflow,
     repair_existing_price_evidence,
     request_send_guard,
+    save_material_quote_email_draft,
     save_vendor_mapping,
     simulation_report_markdown,
+    update_material_quote_email_draft_group,
     advance_simulation_run,
 )
 from outlook_graph import (
@@ -7679,6 +7685,166 @@ def api_quote_plan(job_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.get("/api/material-quotes/bids")
+def api_material_quote_bids(request: Request):
+    session_email = _outlook_session_email(request, required=False)
+    return material_quote_bid_summaries(session_email)
+
+
+@app.get("/api/material-quotes/email-center")
+def api_material_quote_email_center(request: Request):
+    session_email = _outlook_session_email(request, required=False)
+    return material_quotes_email_center(
+        mailbox_email=session_email,
+        outlook=outlook_status(session_email),
+    )
+
+
+@app.get("/api/jobs/{job_id}/quotes/email-draft")
+def api_get_material_quote_email_draft(job_id: str):
+    db_id = _resolve_job_id(job_id)
+    return {"draft": material_quote_email_draft(db_id)}
+
+
+@app.put("/api/jobs/{job_id}/quotes/email-draft")
+async def api_save_material_quote_email_draft(job_id: str, request: Request):
+    db_id = _resolve_job_id(job_id)
+    body = await request.json()
+    try:
+        draft = save_material_quote_email_draft(
+            db_id,
+            source_fingerprint=str(body.get("source_fingerprint") or ""),
+            groups=body.get("groups") or [],
+            prepared_by=str(body.get("prepared_by") or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    log_activity(
+        db_id,
+        "quote_email_draft_saved",
+        f"Prepared {draft.get('group_count', 0)} vendor email group(s). No email was sent.",
+        {
+            "group_ids": [
+                group.get("group_id") for group in draft.get("groups") or []
+            ],
+            "source_fingerprint": draft.get("source_fingerprint"),
+            "matching_engine": "deterministic-v1",
+        },
+    )
+    return {
+        "status": "saved",
+        "message": "Draft ready. No email has been sent.",
+        "draft": draft,
+        "ai_calls": 0,
+    }
+
+
+@app.patch("/api/jobs/{job_id}/quotes/email-draft/groups/{group_id}")
+async def api_update_material_quote_email_draft_group(
+    job_id: str,
+    group_id: str,
+    request: Request,
+):
+    db_id = _resolve_job_id(job_id)
+    body = await request.json()
+    try:
+        draft = update_material_quote_email_draft_group(
+            db_id,
+            group_id,
+            body,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "saved", "draft": draft, "ai_calls": 0}
+
+
+@app.delete("/api/jobs/{job_id}/quotes/email-draft")
+def api_delete_material_quote_email_draft(job_id: str):
+    db_id = _resolve_job_id(job_id)
+    return {"deleted": remove_material_quote_email_draft(db_id)}
+
+
+@app.post("/api/jobs/{job_id}/quotes/email-draft/send")
+async def api_send_material_quote_email_draft(job_id: str, request: Request):
+    db_id = _resolve_job_id(job_id)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    draft = material_quote_email_draft(db_id)
+    if not draft:
+        raise HTTPException(
+            status_code=404,
+            detail="No saved email draft exists for this bid.",
+        )
+    if draft.get("stale"):
+        raise HTTPException(
+            status_code=409,
+            detail="This draft is out of date. Prepare it again from the bid.",
+        )
+    session_email = _outlook_session_email(request)
+    groups = [
+        group for group in draft.get("groups") or [] if group.get("can_send")
+    ]
+    if not groups:
+        raise HTTPException(
+            status_code=400,
+            detail="No complete vendor groups are ready to send.",
+        )
+    reviewer_name = str(
+        body.get("reviewer_name")
+        or draft.get("prepared_by")
+        or session_email
+        or "Estimator"
+    ).strip()
+    result = _send_quote_groups(
+        db_id=db_id,
+        session_email=session_email,
+        reviewer_name=reviewer_name,
+        expected_source_fingerprint=str(
+            draft.get("source_fingerprint") or ""
+        ),
+        groups=groups,
+    )
+    consumed_group_ids = {
+        str(item.get("group_id") or "")
+        for item in result.get("results") or []
+        if (
+            (item.get("quote_request") or {}).get("id")
+            or item.get("request_id")
+        )
+    }
+    remaining_groups = [
+        group
+        for group in draft.get("groups") or []
+        if str(group.get("group_id") or "") not in consumed_group_ids
+    ]
+    if consumed_group_ids:
+        if remaining_groups:
+            save_material_quote_email_draft(
+                db_id,
+                source_fingerprint=str(
+                    draft.get("source_fingerprint") or ""
+                ),
+                groups=remaining_groups,
+                prepared_by=reviewer_name,
+            )
+        else:
+            remove_material_quote_email_draft(db_id)
+    result["draft"] = material_quote_email_draft(db_id)
+    result["sent_group_count"] = sum(
+        1
+        for item in result.get("results") or []
+        if item.get("status") == "accepted"
+    )
+    result["remaining_group_count"] = (
+        result["draft"].get("group_count", 0)
+        if result.get("draft")
+        else 0
+    )
+    return result
+
+
 @app.post("/api/jobs/{job_id}/quotes/evidence-repair")
 async def api_quote_evidence_repair(
     job_id: str,
@@ -7720,68 +7886,14 @@ async def api_quote_evidence_repair(
     return result
 
 
-@app.post("/api/jobs/{job_id}/quotes/approve-and-send")
-async def api_approve_and_send_quotes(job_id: str, request: Request):
-    db_id = _resolve_job_id(job_id)
-    session_email = _outlook_session_email(request)
-    body = await request.json()
-    current_plan = build_quote_plan(db_id)
-    expected_source_fingerprint = str(
-        body.get("source_fingerprint") or ""
-    ).strip()
-    if (
-        not expected_source_fingerprint
-        or expected_source_fingerprint != current_plan["source_fingerprint"]
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="This quote plan is out of date. Refresh it before sending.",
-        )
-    reviewer_name = str(body.get("reviewer_name") or session_email or "Estimator").strip()
-    groups = body.get("groups")
-    if not isinstance(groups, list) or not groups:
-        groups = [
-            group for group in build_quote_plan(db_id)["groups"] if group.get("can_send")
-        ]
-    if not groups:
-        raise HTTPException(
-            status_code=400,
-            detail="No complete vendor groups are ready to send.",
-        )
-    current_groups = {
-        frozenset(
-            int(item["id"])
-            for item in group.get("materials_to_send") or []
-            if item.get("id") is not None
-        ): str(group.get("request_fingerprint") or "")
-        for group in current_plan.get("groups") or []
-        if group.get("materials_to_send")
-    }
-    for group in groups:
-        requested_ids = set()
-        for item in (
-            group.get("materials_to_send")
-            or group.get("materials")
-            or group.get("material_ids")
-            or []
-        ):
-            value = item.get("id") if isinstance(item, dict) else item
-            try:
-                requested_ids.add(int(value))
-            except (TypeError, ValueError):
-                continue
-        expected_group_fingerprint = current_groups.get(frozenset(requested_ids))
-        if (
-            not requested_ids
-            or not expected_group_fingerprint
-            or str(group.get("request_fingerprint") or "")
-            != expected_group_fingerprint
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="A vendor group changed. Refresh the quote plan before sending.",
-            )
-
+def _send_quote_groups(
+    *,
+    db_id: int,
+    session_email: str,
+    reviewer_name: str,
+    expected_source_fingerprint: str,
+    groups: list[dict],
+) -> dict:
     results = []
     for group in groups:
         quote_request = None
@@ -7857,6 +7969,7 @@ async def api_approve_and_send_quotes(job_id: str, request: Request):
             results.append(
                 {
                     "status": "accepted",
+                    "group_id": group.get("group_id"),
                     "vendor_name": vendor_name,
                     "quote_request": quote_request,
                     "proof_reconciled": bool(sent.get("proof_reconciled")),
@@ -7873,6 +7986,7 @@ async def api_approve_and_send_quotes(job_id: str, request: Request):
             results.append(
                 {
                     "status": "uncertain",
+                    "group_id": group.get("group_id"),
                     "vendor_name": vendor_name or "Unknown",
                     "error": str(exc),
                     "request_id": request_id,
@@ -7899,6 +8013,7 @@ async def api_approve_and_send_quotes(job_id: str, request: Request):
                         if failure_status == "send_uncertain"
                         else "failed"
                     ),
+                    "group_id": group.get("group_id"),
                     "vendor_name": vendor_name or "Unknown",
                     "error": str(exc),
                     "request_id": request_id,
@@ -7916,6 +8031,76 @@ async def api_approve_and_send_quotes(job_id: str, request: Request):
         "matching_engine": "deterministic-v1",
         "ai_calls": 0,
     }
+
+
+@app.post("/api/jobs/{job_id}/quotes/approve-and-send")
+async def api_approve_and_send_quotes(job_id: str, request: Request):
+    db_id = _resolve_job_id(job_id)
+    session_email = _outlook_session_email(request)
+    body = await request.json()
+    current_plan = build_quote_plan(db_id)
+    expected_source_fingerprint = str(
+        body.get("source_fingerprint") or ""
+    ).strip()
+    if (
+        not expected_source_fingerprint
+        or expected_source_fingerprint != current_plan["source_fingerprint"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="This quote plan is out of date. Refresh it before sending.",
+        )
+    reviewer_name = str(body.get("reviewer_name") or session_email or "Estimator").strip()
+    groups = body.get("groups")
+    if not isinstance(groups, list) or not groups:
+        groups = [
+            group for group in build_quote_plan(db_id)["groups"] if group.get("can_send")
+        ]
+    if not groups:
+        raise HTTPException(
+            status_code=400,
+            detail="No complete vendor groups are ready to send.",
+        )
+    current_groups = {
+        frozenset(
+            int(item["id"])
+            for item in group.get("materials_to_send") or []
+            if item.get("id") is not None
+        ): str(group.get("request_fingerprint") or "")
+        for group in current_plan.get("groups") or []
+        if group.get("materials_to_send")
+    }
+    for group in groups:
+        requested_ids = set()
+        for item in (
+            group.get("materials_to_send")
+            or group.get("materials")
+            or group.get("material_ids")
+            or []
+        ):
+            value = item.get("id") if isinstance(item, dict) else item
+            try:
+                requested_ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        expected_group_fingerprint = current_groups.get(frozenset(requested_ids))
+        if (
+            not requested_ids
+            or not expected_group_fingerprint
+            or str(group.get("request_fingerprint") or "")
+            != expected_group_fingerprint
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="A vendor group changed. Refresh the quote plan before sending.",
+            )
+    return _send_quote_groups(
+        db_id=db_id,
+        session_email=session_email,
+        reviewer_name=reviewer_name,
+        expected_source_fingerprint=expected_source_fingerprint,
+        groups=groups,
+    )
 
 
 @app.get("/api/jobs/{job_id}/quotes/review")

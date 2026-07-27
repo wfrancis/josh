@@ -293,6 +293,16 @@ def init_db() -> None:
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS quote_email_drafts (
+                job_id INTEGER PRIMARY KEY,
+                source_fingerprint TEXT NOT NULL,
+                groups_json TEXT NOT NULL DEFAULT '[]',
+                prepared_by TEXT DEFAULT '',
+                prepared_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS quote_request_materials (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 quote_request_id INTEGER NOT NULL,
@@ -819,6 +829,7 @@ def init_db() -> None:
                ON quote_followup_events(send_token)
                WHERE send_token IS NOT NULL AND send_token != ''""",
             "CREATE INDEX IF NOT EXISTS idx_quote_simulations_job ON quote_simulation_runs(job_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_quote_email_drafts_updated ON quote_email_drafts(updated_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_vendor_prices_verified_code ON vendor_prices(verified, item_code, unit, created_at DESC)",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_job_quotes_source_product
                ON job_quotes(job_id, source_hash, COALESCE(item_code, ''),
@@ -3821,6 +3832,105 @@ def get_comments(job_id: int) -> list[dict]:
 
 
 # --------------- Quote Requests ---------------
+
+def _decode_quote_email_draft(row: sqlite3.Row | dict | None) -> dict | None:
+    if not row:
+        return None
+    draft = dict(row)
+    try:
+        draft["groups"] = json.loads(draft.pop("groups_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        draft["groups"] = []
+    return draft
+
+
+def get_quote_email_draft(job_id: int) -> dict | None:
+    """Return the saved email draft for a bid."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM quote_email_drafts WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        return _decode_quote_email_draft(row)
+    finally:
+        conn.close()
+
+
+def list_quote_email_drafts() -> list[dict]:
+    """Return all bid-owned email drafts, newest first."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM quote_email_drafts ORDER BY updated_at DESC, job_id"
+        ).fetchall()
+        return [_decode_quote_email_draft(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def save_quote_email_draft(
+    job_id: int,
+    *,
+    source_fingerprint: str,
+    groups: list[dict],
+    prepared_by: str = "",
+) -> dict:
+    """Create or replace one bid-owned email draft."""
+    conn = _get_conn()
+    try:
+        now = datetime.now().isoformat()
+        existing = conn.execute(
+            "SELECT prepared_at, prepared_by FROM quote_email_drafts WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        prepared_at = existing["prepared_at"] if existing else now
+        resolved_prepared_by = (
+            str(prepared_by or "").strip()
+            or (str(existing["prepared_by"] or "").strip() if existing else "")
+        )
+        conn.execute(
+            """INSERT INTO quote_email_drafts
+               (job_id, source_fingerprint, groups_json, prepared_by,
+                prepared_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(job_id) DO UPDATE SET
+                   source_fingerprint=excluded.source_fingerprint,
+                   groups_json=excluded.groups_json,
+                   prepared_by=excluded.prepared_by,
+                   updated_at=excluded.updated_at""",
+            (
+                job_id,
+                source_fingerprint,
+                json.dumps(groups),
+                resolved_prepared_by,
+                prepared_at,
+                now,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM quote_email_drafts WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        return _decode_quote_email_draft(row)
+    finally:
+        conn.close()
+
+
+def delete_quote_email_draft(job_id: int) -> bool:
+    """Delete one bid-owned email draft."""
+    conn = _get_conn()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM quote_email_drafts WHERE job_id=?",
+            (job_id,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
 
 def create_quote_request(job_id: int, vendor_name: str, material_ids: list,
                          request_text: str = "", vendor_id: int = None,

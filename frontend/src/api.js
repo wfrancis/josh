@@ -154,6 +154,26 @@ export const api = {
   updateQuote: (quoteId, data) => request('/quotes/' + quoteId, { method: 'PUT', body: JSON.stringify(data) }),
   getQuoteWorkflow: (jobId) => request(`/jobs/${jobId}/quotes/workflow`),
   getQuotePlan: (jobId) => request(`/jobs/${jobId}/quotes/plan`),
+  getMaterialQuoteBids: () => request('/material-quotes/bids'),
+  getMaterialQuoteEmailCenter: () => request('/material-quotes/email-center'),
+  getQuoteEmailDraft: (jobId) => request(`/jobs/${jobId}/quotes/email-draft`),
+  saveQuoteEmailDraft: (jobId, data) =>
+    request(`/jobs/${jobId}/quotes/email-draft`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  updateQuoteEmailDraftGroup: (jobId, groupId, data) =>
+    request(`/jobs/${jobId}/quotes/email-draft/groups/${encodeURIComponent(groupId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+  deleteQuoteEmailDraft: (jobId) =>
+    request(`/jobs/${jobId}/quotes/email-draft`, { method: 'DELETE' }),
+  sendQuoteEmailDraft: (jobId, data = {}) =>
+    request(`/jobs/${jobId}/quotes/email-draft/send`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   repairQuoteEvidence: async (jobId, files) => {
     const form = new FormData()
     files.forEach((file) => form.append('files', file))

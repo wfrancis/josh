@@ -32,7 +32,11 @@ import pdfplumber
 
 from models import (
     _get_conn,
+    delete_quote_email_draft,
+    get_quote_email_draft,
     get_price_history,
+    list_jobs,
+    list_quote_email_drafts,
     list_quote_requests,
     load_job,
     log_activity,
@@ -40,6 +44,7 @@ from models import (
     record_job_artifact,
     record_material_price_decision,
     save_quotes,
+    save_quote_email_draft,
     save_vendor_prices_from_quotes,
 )
 from quote_evidence import normalize_quote_unit
@@ -713,6 +718,611 @@ def build_quote_plan(job_id: int) -> dict:
         "unpriced_count": sum(len(group["materials"]) for group in planned_groups),
         "ready_group_count": sum(1 for group in planned_groups if group["can_send"]),
         "price_history": price_history_by_material,
+        "matching_engine": {"name": "deterministic-v1", "ai_calls": 0},
+    }
+
+
+def _draft_material_ids(group: dict) -> list[int]:
+    raw_items = (
+        group.get("material_ids")
+        or group.get("materials_to_send")
+        or group.get("materials")
+        or []
+    )
+    result = []
+    for item in raw_items if isinstance(raw_items, list) else []:
+        value = item.get("id") if isinstance(item, dict) else item
+        try:
+            material_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if material_id not in result:
+            result.append(material_id)
+    return result
+
+
+def _draft_group_issues(
+    group: dict,
+    *,
+    materials: list[dict],
+    current_materials: dict[int, dict],
+    open_material_ids: set[int],
+    stale: bool,
+) -> list[str]:
+    issues = []
+    if stale:
+        issues.append("Bid materials changed after this draft was saved.")
+    vendor_name = str(group.get("vendor_name") or "").strip()
+    if not vendor_name or normalize_text(vendor_name) == "unassigned":
+        issues.append("Choose a vendor.")
+    if not is_valid_email(group.get("vendor_email")):
+        issues.append("Add a valid vendor email.")
+    if not str(group.get("subject") or "").strip():
+        issues.append("Add an email subject.")
+    if not str(group.get("body") or "").strip():
+        issues.append("Add the email message.")
+    if not materials:
+        issues.append("Choose at least one material.")
+    missing_ids = [
+        material_id
+        for material_id in _draft_material_ids(group)
+        if material_id not in current_materials
+    ]
+    if missing_ids:
+        issues.append("A material is no longer part of this bid.")
+    if any(float(material.get("unit_price") or 0) > 0 for material in materials):
+        issues.append("A material already has a price.")
+    if any(int(material["id"]) in open_material_ids for material in materials):
+        issues.append("A material already has an open quote request.")
+    if materials and not hmac.compare_digest(
+        snapshot_hash(materials),
+        str(group.get("request_fingerprint") or ""),
+    ):
+        issues.append("The material group changed after this draft was saved.")
+    return list(dict.fromkeys(issues))
+
+
+def material_quote_email_draft(job_id: int) -> dict | None:
+    """Return one draft with current material and send-safety state."""
+    draft = get_quote_email_draft(job_id)
+    if not draft:
+        return None
+    job = load_job(job_id)
+    if not job:
+        return None
+    current_fingerprint = _job_source_fingerprint(job)
+    stale = not hmac.compare_digest(
+        current_fingerprint,
+        str(draft.get("source_fingerprint") or ""),
+    )
+    current_materials = {
+        int(material["id"]): material
+        for material in job.get("materials") or []
+        if material.get("id") is not None
+    }
+    open_material_ids = {
+        material_id
+        for request in list_quote_requests(job_id)
+        if str(request.get("status") or "").lower() in OPEN_REQUEST_STATUSES
+        for material_id in _request_material_ids(request)
+    }
+    groups = []
+    for stored_group in draft.get("groups") or []:
+        group = dict(stored_group)
+        material_ids = _draft_material_ids(group)
+        materials = [
+            current_materials[material_id]
+            for material_id in material_ids
+            if material_id in current_materials
+        ]
+        issues = _draft_group_issues(
+            group,
+            materials=materials,
+            current_materials=current_materials,
+            open_material_ids=open_material_ids,
+            stale=stale,
+        )
+        groups.append(
+            {
+                **group,
+                "material_ids": material_ids,
+                "materials": [
+                    {
+                        "id": material.get("id"),
+                        "item_code": material.get("item_code") or "",
+                        "description": material.get("description") or "",
+                        "unit": _exact_unit_text(material.get("unit")),
+                        "quantity": float(
+                            material.get("order_qty")
+                            or material.get("installed_qty")
+                            or 0
+                        ),
+                        "unit_price": float(material.get("unit_price") or 0),
+                    }
+                    for material in materials
+                ],
+                "issues": issues,
+                "can_send": not issues,
+            }
+        )
+    return {
+        **draft,
+        "project_name": job.get("project_name") or "",
+        "gc_name": job.get("gc_name") or "",
+        "slug": job.get("slug") or "",
+        "current_source_fingerprint": current_fingerprint,
+        "stale": stale,
+        "groups": groups,
+        "group_count": len(groups),
+        "ready_group_count": sum(1 for group in groups if group["can_send"]),
+        "needs_setup_count": sum(1 for group in groups if not group["can_send"]),
+    }
+
+
+def save_material_quote_email_draft(
+    job_id: int,
+    *,
+    source_fingerprint: str,
+    groups: list[dict],
+    prepared_by: str = "",
+) -> dict:
+    """Validate and save bid-owned vendor email groups without sending."""
+    job = load_job(job_id)
+    if not job:
+        raise ValueError("Job not found")
+    current_source_fingerprint = _job_source_fingerprint(job)
+    if not source_fingerprint or not hmac.compare_digest(
+        current_source_fingerprint,
+        str(source_fingerprint),
+    ):
+        raise ValueError(
+            "This quote plan is out of date. Refresh it before saving."
+        )
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("Add at least one vendor group.")
+    current_materials = {
+        int(material["id"]): material
+        for material in job.get("materials") or []
+        if material.get("id") is not None
+    }
+    open_material_ids = {
+        material_id
+        for request in list_quote_requests(job_id)
+        if str(request.get("status") or "").lower() in OPEN_REQUEST_STATUSES
+        for material_id in _request_material_ids(request)
+    }
+    existing = get_quote_email_draft(job_id) or {}
+    existing_group_ids = {
+        tuple(sorted(_draft_material_ids(group))): str(group.get("group_id") or "")
+        for group in existing.get("groups") or []
+        if _draft_material_ids(group)
+    }
+    used_material_ids: set[int] = set()
+    normalized_groups = []
+    for raw_group in groups[:100]:
+        if not isinstance(raw_group, dict):
+            continue
+        material_ids = _draft_material_ids(raw_group)
+        if not material_ids:
+            continue
+        duplicate_ids = used_material_ids.intersection(material_ids)
+        if duplicate_ids:
+            raise ValueError(
+                f"Material {min(duplicate_ids)} appears in more than one vendor group."
+            )
+        missing_ids = set(material_ids) - set(current_materials)
+        if missing_ids:
+            raise ValueError(
+                f"Material {min(missing_ids)} is no longer part of this bid."
+            )
+        unavailable_ids = {
+            material_id
+            for material_id in material_ids
+            if (
+                float(current_materials[material_id].get("unit_price") or 0) > 0
+                or material_id in open_material_ids
+            )
+        }
+        if unavailable_ids:
+            raise ValueError(
+                f"Material {min(unavailable_ids)} is already priced or requested."
+            )
+        selected = [
+            material
+            for material in job.get("materials") or []
+            if int(material.get("id") or 0) in set(material_ids)
+        ]
+        current_group_id = existing_group_ids.get(tuple(sorted(material_ids)))
+        group_id = current_group_id or uuid.uuid4().hex
+        vendor_name = str(raw_group.get("vendor_name") or "").strip()
+        vendor = _vendor_for_material(vendor_name, _vendor_rows()) if vendor_name else None
+        normalized_groups.append(
+            {
+                "group_id": group_id,
+                "vendor_id": raw_group.get("vendor_id") or (
+                    vendor.get("id") if vendor else None
+                ),
+                "vendor_name": vendor_name or "Unassigned",
+                "vendor_email": normalize_email(
+                    raw_group.get("vendor_email")
+                    or (vendor.get("contact_email") if vendor else "")
+                ),
+                "contact_name": str(
+                    raw_group.get("contact_name")
+                    or (vendor.get("contact_name") if vendor else "")
+                    or ""
+                ).strip(),
+                "material_ids": material_ids,
+                "subject": str(raw_group.get("subject") or "").strip()
+                or _quote_subject(job),
+                "body": str(raw_group.get("body") or "").strip()
+                or _quote_body(job, selected),
+                "request_fingerprint": snapshot_hash(selected),
+            }
+        )
+        used_material_ids.update(material_ids)
+    if not normalized_groups:
+        raise ValueError("Add at least one vendor group with materials.")
+    save_quote_email_draft(
+        job_id,
+        source_fingerprint=current_source_fingerprint,
+        groups=normalized_groups,
+        prepared_by=prepared_by,
+    )
+    return material_quote_email_draft(job_id)
+
+
+def update_material_quote_email_draft_group(
+    job_id: int,
+    group_id: str,
+    changes: dict,
+) -> dict:
+    """Edit recipient and email copy while keeping the material snapshot locked."""
+    draft = get_quote_email_draft(job_id)
+    if not draft:
+        raise ValueError("No saved email draft exists for this bid.")
+    allowed = {"vendor_email", "subject", "body"}
+    updated = False
+    groups = []
+    for raw_group in draft.get("groups") or []:
+        group = dict(raw_group)
+        if str(group.get("group_id") or "") == str(group_id):
+            for field in allowed:
+                if field in changes:
+                    value = str(changes.get(field) or "")
+                    group[field] = (
+                        normalize_email(value)
+                        if field == "vendor_email"
+                        else value.strip()
+                    )
+            updated = True
+        groups.append(group)
+    if not updated:
+        raise ValueError("Email draft group not found.")
+    save_quote_email_draft(
+        job_id,
+        source_fingerprint=str(draft.get("source_fingerprint") or ""),
+        groups=groups,
+        prepared_by=str(draft.get("prepared_by") or ""),
+    )
+    return material_quote_email_draft(job_id)
+
+
+def remove_material_quote_email_draft(job_id: int) -> bool:
+    return delete_quote_email_draft(job_id)
+
+
+def _mailbox_quote_requests(mailbox_email: str | None) -> list[dict]:
+    if not mailbox_email:
+        return []
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT qr.*, j.project_name, j.gc_name, j.slug
+               FROM quote_requests qr
+               JOIN jobs j ON j.id=qr.job_id
+               WHERE lower(qr.mailbox_email)=?
+               ORDER BY qr.created_at DESC, qr.id DESC""",
+            (normalize_email(mailbox_email),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _all_quote_requests_for_bid_summary() -> list[dict]:
+    """Return request rows for status counts without exposing mailbox content."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT qr.*, j.project_name, j.gc_name, j.slug
+               FROM quote_requests qr
+               JOIN jobs j ON j.id=qr.job_id
+               ORDER BY qr.created_at DESC, qr.id DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _email_center_request(request: dict, job: dict) -> dict:
+    item = dict(request)
+    item["material_snapshot"] = _json_loads(
+        item.get("material_snapshot_json"),
+        [],
+    )
+    item["material_ids"] = sorted(_request_material_ids(item))
+    item["materials"] = _request_materials(int(item["id"]))
+    item["followups"] = _followups_for_request(int(item["id"]))
+    item["messages"] = _messages_for_request(int(item["id"]))
+    workflow_state = _request_workflow_state(item, job)
+    item["stale"] = workflow_state["stale"]
+    item["status"] = workflow_state["status"]
+    if item["stale"] and str(request.get("status") or "").lower() not in {
+        "complete",
+        "cancelled",
+        "stale",
+        "received",
+    }:
+        mark_request_stale(int(item["id"]))
+    item.pop("send_token", None)
+    return item
+
+
+def material_quotes_email_center(
+    *,
+    mailbox_email: str | None,
+    outlook: dict | None = None,
+) -> dict:
+    """Return the global mailbox view while keeping drafts bid-owned."""
+    drafts = []
+    for stored in list_quote_email_drafts():
+        draft = material_quote_email_draft(int(stored["job_id"]))
+        if draft:
+            drafts.append(draft)
+    requests = []
+    if mailbox_email:
+        jobs: dict[int, dict] = {}
+        for request in _mailbox_quote_requests(mailbox_email):
+            job_id = int(request["job_id"])
+            job = jobs.get(job_id)
+            if job is None:
+                job = load_job(job_id) or {}
+                jobs[job_id] = job
+            requests.append(_email_center_request(request, job))
+        review = quote_review(mailbox_email=mailbox_email)
+    else:
+        review = {"messages": [], "price_matches": [], "mailbox_locked": True}
+
+    ready_count = sum(draft.get("ready_group_count", 0) for draft in drafts)
+    needs_you_request_count = sum(
+        1
+        for request in requests
+        if request.get("status")
+        in {"send_failed", "send_uncertain", "stale", "needs_review"}
+    )
+    waiting_count = sum(
+        1
+        for request in requests
+        if request.get("status")
+        in {"approved", "sending", "sent", "waiting", "received_partial"}
+    )
+    overdue_count = sum(
+        1 for request in requests if request.get("status") == "overdue"
+    )
+    complete_count = sum(
+        1
+        for request in requests
+        if request.get("status") in {"complete", "received", "cancelled"}
+    )
+    needs_you_count = (
+        sum(draft.get("needs_setup_count", 0) for draft in drafts)
+        + needs_you_request_count
+        + len(review.get("messages") or [])
+        + len(review.get("price_matches") or [])
+    )
+    job_rows = [
+        {
+            "id": job.get("id"),
+            "slug": job.get("slug") or "",
+            "project_name": job.get("project_name") or "Untitled Bid",
+            "gc_name": job.get("gc_name") or "",
+        }
+        for job in list_jobs()
+    ]
+    return {
+        "outlook": outlook or {"configured": False, "connected": False},
+        "mailbox_locked": not bool(mailbox_email),
+        "drafts": drafts,
+        "requests": requests,
+        "review": review,
+        "jobs": job_rows,
+        "summary": {
+            "ready_to_send": ready_count,
+            "waiting": waiting_count,
+            "overdue": overdue_count,
+            "needs_you": needs_you_count,
+            "complete": complete_count,
+        },
+        "matching_engine": {"name": "deterministic-v1", "ai_calls": 0},
+    }
+
+
+def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
+    """Return compact bid rows sorted by the estimator's next action."""
+    request_rows = (
+        _mailbox_quote_requests(mailbox_email)
+        if mailbox_email
+        else _all_quote_requests_for_bid_summary()
+    )
+    requests_by_job: dict[int, list[dict]] = {}
+    for request in request_rows:
+        requests_by_job.setdefault(int(request["job_id"]), []).append(request)
+    review = (
+        quote_review(mailbox_email=mailbox_email)
+        if mailbox_email
+        else {"messages": [], "price_matches": []}
+    )
+    matching_by_job: dict[int, int] = {}
+    for message in review.get("messages") or []:
+        possible_job_ids = {
+            int(message["matched_job_id"])
+            for _ in (0,)
+            if message.get("matched_job_id") is not None
+        }
+        possible_job_ids.update(
+            int(candidate["job_id"])
+            for candidate in message.get("candidates") or []
+            if candidate.get("job_id") is not None
+        )
+        for job_id in possible_job_ids:
+            matching_by_job[job_id] = matching_by_job.get(job_id, 0) + 1
+    price_review_by_job: dict[int, int] = {}
+    for match in review.get("price_matches") or []:
+        job_id = int(match["job_id"])
+        price_review_by_job[job_id] = price_review_by_job.get(job_id, 0) + 1
+
+    stage_labels = {
+        "needs_review": "Needs Your Review",
+        "overdue": "Overdue",
+        "ready_to_send": "Ready to Send",
+        "needs_setup": "Needs Setup",
+        "waiting": "Waiting on Vendor",
+        "complete": "Complete",
+    }
+    priority = {
+        "needs_review": 0,
+        "overdue": 1,
+        "ready_to_send": 2,
+        "needs_setup": 3,
+        "waiting": 4,
+        "complete": 5,
+    }
+    bids = []
+    for summary in list_jobs():
+        job_id = int(summary["id"])
+        job = load_job(job_id) or {}
+        materials = job.get("materials") or []
+        unpriced = [
+            material
+            for material in materials
+            if float(material.get("unit_price") or 0) <= 0
+        ]
+        requests = []
+        requested_ids: set[int] = set()
+        status_counts: dict[str, int] = {}
+        for request in requests_by_job.get(job_id, []):
+            state = _request_workflow_state(request, job)
+            status = state["status"]
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if status not in {"complete", "received", "cancelled"}:
+                requested_ids.update(_request_material_ids(request))
+            requests.append({**request, **state})
+        unrequested_count = sum(
+            1
+            for material in unpriced
+            if int(material.get("id") or 0) not in requested_ids
+        )
+        draft = material_quote_email_draft(job_id)
+        ready_draft_count = draft.get("ready_group_count", 0) if draft else 0
+        draft_setup_count = draft.get("needs_setup_count", 0) if draft else 0
+        needs_matching = matching_by_job.get(job_id, 0)
+        price_review = price_review_by_job.get(job_id, 0)
+        request_needs_review = sum(
+            status_counts.get(status, 0)
+            for status in ("send_failed", "send_uncertain", "stale", "needs_review")
+        )
+        needs_review_count = (
+            needs_matching
+            + price_review
+            + request_needs_review
+            + (draft_setup_count if draft and draft.get("stale") else 0)
+        )
+        open_request_count = sum(
+            count
+            for status, count in status_counts.items()
+            if status not in {"complete", "received", "cancelled"}
+        )
+        if needs_review_count:
+            stage = "needs_review"
+        elif status_counts.get("overdue", 0):
+            stage = "overdue"
+        elif ready_draft_count:
+            stage = "ready_to_send"
+        elif unrequested_count or not materials:
+            stage = "needs_setup"
+        elif open_request_count:
+            stage = "waiting"
+        else:
+            stage = "complete"
+        slug = job.get("slug") or str(job_id)
+        if stage == "needs_setup":
+            next_action = {
+                "label": "Prepare Quotes" if materials else "Open Bid",
+                "url": (
+                    f"/jobs/{slug}?step=quotes"
+                    if materials
+                    else f"/jobs/{slug}"
+                ),
+            }
+        elif stage == "complete":
+            next_action = {"label": "View Bid", "url": f"/jobs/{slug}"}
+        else:
+            next_action = {
+                "label": {
+                    "needs_review": "Review Email",
+                    "overdue": "Check Overdue",
+                    "ready_to_send": "Open Email Center",
+                    "waiting": "View Status",
+                }[stage],
+                "url": f"/material-quotes/email?job={job_id}",
+            }
+        vendor_keys = {
+            normalize_text(material.get("vendor")) or "unassigned"
+            for material in unpriced
+        }
+        bids.append(
+            {
+                "job_id": job_id,
+                "slug": job.get("slug") or "",
+                "project_name": job.get("project_name") or "Untitled Bid",
+                "gc_name": job.get("gc_name") or "",
+                "salesperson": job.get("salesperson") or "",
+                "material_count": len(materials),
+                "unpriced_count": len(unpriced),
+                "unrequested_count": unrequested_count,
+                "vendor_group_count": len(vendor_keys),
+                "draft_group_count": draft.get("group_count", 0) if draft else 0,
+                "draft_ready_count": ready_draft_count,
+                "draft_stale": bool(draft and draft.get("stale")),
+                "request_count": len(requests),
+                "request_statuses": status_counts,
+                "needs_matching_count": needs_matching,
+                "price_review_count": price_review,
+                "quote_stage": stage,
+                "quote_stage_label": stage_labels[stage],
+                "next_action": next_action,
+                "updated_at": (
+                    draft.get("updated_at")
+                    if draft
+                    else job.get("created_at")
+                ),
+            }
+        )
+    bids.sort(
+        key=lambda bid: (
+            priority[bid["quote_stage"]],
+            str(bid.get("project_name") or "").lower(),
+        )
+    )
+    summary_counts = {
+        key: sum(1 for bid in bids if bid["quote_stage"] == key)
+        for key in stage_labels
+    }
+    return {
+        "bids": bids,
+        "summary": summary_counts,
+        "mailbox_locked": not bool(mailbox_email),
         "matching_engine": {"name": "deterministic-v1", "ai_calls": 0},
     }
 
@@ -1457,7 +2067,8 @@ def quote_review(
     conn = _get_conn()
     try:
         message_sql = """
-            SELECT qem.*, j.project_name AS matched_job_name
+            SELECT qem.*, j.project_name AS matched_job_name,
+                   j.slug AS matched_job_slug
             FROM quote_email_messages qem
             LEFT JOIN jobs j ON j.id=qem.matched_job_id
             WHERE qem.match_status IN ('needs_review','assigning')
@@ -1506,7 +2117,7 @@ def quote_review(
                     "evidence": _json_loads(candidate["evidence_json"], []),
                 }
                 for candidate in conn.execute(
-                    """SELECT qmc.*, j.project_name, qr.vendor_name
+                    """SELECT qmc.*, j.project_name, j.slug, qr.vendor_name
                        FROM quote_match_candidates qmc
                        JOIN jobs j ON j.id=qmc.job_id
                        LEFT JOIN quote_requests qr ON qr.id=qmc.quote_request_id
@@ -1517,7 +2128,7 @@ def quote_review(
             ]
 
         price_sql = """
-            SELECT qpm.*, j.project_name,
+            SELECT qpm.*, j.project_name, j.slug,
                    jm.description AS material_description,
                    COALESCE(jm.unit_price, 0) AS current_price,
                    COALESCE(jm.price_source, '') AS current_price_source

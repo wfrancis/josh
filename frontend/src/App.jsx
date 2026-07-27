@@ -8,6 +8,7 @@ import InternalRatesPage from './components/InternalRatesPage'
 import PricingRulesPage from './components/PricingRulesPage'
 import VendorContactsPage from './components/VendorContactsPage'
 import RulesRegistryPage from './components/RulesRegistryPage'
+import MaterialQuotesHub from './components/MaterialQuotesHub'
 
 export default function App() {
   return (
@@ -16,6 +17,8 @@ export default function App() {
         <Route path="/" element={<Dashboard />} />
         <Route path="/jobs" element={<AllJobs />} />
         <Route path="/jobs/:jobId" element={<JobDetail />} />
+        <Route path="/material-quotes" element={<MaterialQuotesHub />} />
+        <Route path="/material-quotes/email" element={<MaterialQuotesHub />} />
         <Route path="/pricing-rules" element={<PricingRulesPage />} />
         <Route path="/rules" element={<RulesRegistryPage />} />
         <Route path="/internal-rates" element={<PricingRulesPage />} />

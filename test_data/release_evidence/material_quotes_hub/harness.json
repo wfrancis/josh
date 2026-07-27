@@ -1,0 +1,998 @@
+{
+  "status": "pass",
+  "scope": "deployed simulator and static safety checks only",
+  "release_ready": false,
+  "required_next": "Complete the signed-in Outlook and Gmail workflow in Chrome before release.",
+  "base_url": "https://si-bid-stg-20260714-c0fa.fly.dev",
+  "job_id": 44,
+  "checks": [
+    {
+      "name": "deployed_build",
+      "passed": true,
+      "details": {
+        "commit": "3d18793-worktree-material-quotes-hub-3",
+        "expected_commit": "3d18793-worktree-material-quotes-hub-3",
+        "environment": "staging",
+        "frontend_asset": "assets/index-D8zw1vDS.js",
+        "runtime_fingerprint": "95381b04683bef35f001f80041ebad30f26c009d004d786bd6f88c4ebf892640"
+      }
+    },
+    {
+      "name": "staging_guards",
+      "passed": true,
+      "details": {
+        "configured": true,
+        "enabled": true,
+        "mode": "staging",
+        "missing": [],
+        "mailbox_allowlist_count": 1,
+        "test_recipient_allowlist_count": 1,
+        "test_sender_allowlist_count": 1,
+        "permissions": [
+          "Mail.Read",
+          "Mail.Send"
+        ],
+        "can_modify_mail": false,
+        "mailbox_recheck": {
+          "configured_mailbox_allowed": true,
+          "replacement_mailbox_blocked": true,
+          "checked_on_every_connection_use": true
+        },
+        "connected": false,
+        "email": null,
+        "connected_at": null,
+        "last_sync_at": null,
+        "subscription_expires_at": null,
+        "session_authenticated": false
+      }
+    },
+    {
+      "name": "deterministic_contract",
+      "passed": true,
+      "details": {
+        "status": "pass",
+        "checks": {
+          "direct_reply": true,
+          "direct_reply_verified_sender": true,
+          "unverified_reply_cannot_auto_price": true,
+          "quantity_not_price": true,
+          "explicit_text_price": true,
+          "short_code_not_substring": true,
+          "punctuation_normalized_exactly": true,
+          "total_cost_not_unit_price": true,
+          "generic_price_requires_review": true,
+          "duplicate_unit_columns_rejected": true,
+          "accounting_negative_rejected": true,
+          "decimal_comma_rejected": true,
+          "broken_sibling_blocks_automatic": true,
+          "broken_sibling_parser_rejected": true,
+          "labeled_ocr_price": true,
+          "ai_dependencies_absent": true,
+          "standalone_exact": true,
+          "sender_only_ignored": true,
+          "unrelated_ignored": true,
+          "ai_calls": 0
+        },
+        "matching_engine": "deterministic-v1"
+      }
+    },
+    {
+      "name": "per_bid_quote_plan",
+      "passed": true,
+      "details": {
+        "job_id": 44,
+        "source_fingerprint": "320f5e339afd8d2545b61442f8cab897c116dad88a25e751b0a88bb1cf42d371",
+        "groups": [
+          {
+            "vendor_id": 10,
+            "vendor_name": "Harness Quote Vendor 69a41ce8",
+            "vendor_email": "wbfranci@gmail.com",
+            "contact_name": "Harness Vendor",
+            "materials": [
+              {
+                "id": 248,
+                "item_code": "CPT-TEST-100",
+                "description": "Harness Carpet Tile",
+                "unit": "SY",
+                "quantity": 105.0,
+                "already_requested": false,
+                "price_history": {
+                  "min": null,
+                  "max": null,
+                  "avg": null,
+                  "latest": null,
+                  "records": [],
+                  "verified_same_unit_count": 0,
+                  "predicted_price": null,
+                  "prediction_is_suggestion": false,
+                  "age_days": null,
+                  "percentage_change": null,
+                  "similar_bid_count": 0
+                }
+              },
+              {
+                "id": 249,
+                "item_code": "LVT-TEST-200",
+                "description": "Harness LVT",
+                "unit": "SF",
+                "quantity": 210.0,
+                "already_requested": false,
+                "price_history": {
+                  "min": null,
+                  "max": null,
+                  "avg": null,
+                  "latest": null,
+                  "records": [],
+                  "verified_same_unit_count": 0,
+                  "predicted_price": null,
+                  "prediction_is_suggestion": false,
+                  "age_days": null,
+                  "percentage_change": null,
+                  "similar_bid_count": 0
+                }
+              }
+            ],
+            "issues": [],
+            "subject": "Quote Request - Deterministic Quote Harness 69a41ce8 - Flooring Materials",
+            "body": "Project: Deterministic Quote Harness 69a41ce8\nGeneral Contractor: Harness GC\nLocation: 123 Harness Street, Denver, CO, 80202\n\nPlease provide unit pricing, freight, availability, and lead time for:\n\n- CPT-TEST-100 - Harness Carpet Tile: 105 SY\n- LVT-TEST-200 - Harness LVT: 210 SF\n\nThank you.",
+            "request_fingerprint": "acc9486d2a42911969a2cd11673110503c49e38a2084cded07561064525ea254",
+            "can_send": true,
+            "materials_to_send": [
+              {
+                "id": 248,
+                "item_code": "CPT-TEST-100",
+                "description": "Harness Carpet Tile",
+                "unit": "SY",
+                "quantity": 105.0,
+                "already_requested": false,
+                "price_history": {
+                  "min": null,
+                  "max": null,
+                  "avg": null,
+                  "latest": null,
+                  "records": [],
+                  "verified_same_unit_count": 0,
+                  "predicted_price": null,
+                  "prediction_is_suggestion": false,
+                  "age_days": null,
+                  "percentage_change": null,
+                  "similar_bid_count": 0
+                }
+              },
+              {
+                "id": 249,
+                "item_code": "LVT-TEST-200",
+                "description": "Harness LVT",
+                "unit": "SF",
+                "quantity": 210.0,
+                "already_requested": false,
+                "price_history": {
+                  "min": null,
+                  "max": null,
+                  "avg": null,
+                  "latest": null,
+                  "records": [],
+                  "verified_same_unit_count": 0,
+                  "predicted_price": null,
+                  "prediction_is_suggestion": false,
+                  "age_days": null,
+                  "percentage_change": null,
+                  "similar_bid_count": 0
+                }
+              }
+            ]
+          }
+        ],
+        "unpriced_count": 2,
+        "ready_group_count": 1,
+        "price_history": {
+          "248": {
+            "min": null,
+            "max": null,
+            "avg": null,
+            "latest": null,
+            "records": [],
+            "verified_same_unit_count": 0,
+            "predicted_price": null,
+            "prediction_is_suggestion": false,
+            "age_days": null,
+            "percentage_change": null,
+            "similar_bid_count": 0
+          },
+          "249": {
+            "min": null,
+            "max": null,
+            "avg": null,
+            "latest": null,
+            "records": [],
+            "verified_same_unit_count": 0,
+            "predicted_price": null,
+            "prediction_is_suggestion": false,
+            "age_days": null,
+            "percentage_change": null,
+            "similar_bid_count": 0
+          }
+        },
+        "matching_engine": {
+          "name": "deterministic-v1",
+          "ai_calls": 0
+        }
+      }
+    },
+    {
+      "name": "hub_lists_unprepared_bid",
+      "passed": true,
+      "details": {
+        "job_id": 44,
+        "slug": "deterministic-quote-harness-69a41ce8",
+        "project_name": "Deterministic Quote Harness 69a41ce8",
+        "gc_name": "Harness GC",
+        "salesperson": "",
+        "material_count": 2,
+        "unpriced_count": 2,
+        "unrequested_count": 2,
+        "vendor_group_count": 1,
+        "draft_group_count": 0,
+        "draft_ready_count": 0,
+        "draft_stale": false,
+        "request_count": 0,
+        "request_statuses": {},
+        "needs_matching_count": 0,
+        "price_review_count": 0,
+        "quote_stage": "needs_setup",
+        "quote_stage_label": "Needs Setup",
+        "next_action": {
+          "label": "Prepare Quotes",
+          "url": "/jobs/deterministic-quote-harness-69a41ce8?step=quotes"
+        },
+        "updated_at": "2026-07-27T16:52:24.778135"
+      }
+    },
+    {
+      "name": "draft_prepares_without_sending",
+      "passed": true,
+      "details": {
+        "message": "Draft ready. No email has been sent.",
+        "group_id": "cfbdfe4cb07d4347b550752b11442bc3",
+        "request_count": 0
+      }
+    },
+    {
+      "name": "email_center_reads_saved_bid_draft",
+      "passed": true,
+      "details": {
+        "draft": {
+          "job_id": 44,
+          "source_fingerprint": "320f5e339afd8d2545b61442f8cab897c116dad88a25e751b0a88bb1cf42d371",
+          "prepared_by": "Harness Estimator",
+          "prepared_at": "2026-07-27T16:52:26.144117",
+          "updated_at": "2026-07-27T16:52:26.726662",
+          "groups": [
+            {
+              "group_id": "cfbdfe4cb07d4347b550752b11442bc3",
+              "vendor_id": 10,
+              "vendor_name": "Harness Quote Vendor 69a41ce8",
+              "vendor_email": "wbfranci@gmail.com",
+              "contact_name": "Harness Vendor",
+              "material_ids": [
+                248,
+                249
+              ],
+              "subject": "Harness saved subject 69a41ce8",
+              "body": "Harness saved email body 69a41ce8",
+              "request_fingerprint": "acc9486d2a42911969a2cd11673110503c49e38a2084cded07561064525ea254",
+              "materials": [
+                {
+                  "id": 248,
+                  "item_code": "CPT-TEST-100",
+                  "description": "Harness Carpet Tile",
+                  "unit": "SY",
+                  "quantity": 105.0,
+                  "unit_price": 0.0
+                },
+                {
+                  "id": 249,
+                  "item_code": "LVT-TEST-200",
+                  "description": "Harness LVT",
+                  "unit": "SF",
+                  "quantity": 210.0,
+                  "unit_price": 0.0
+                }
+              ],
+              "issues": [],
+              "can_send": true
+            }
+          ],
+          "project_name": "Deterministic Quote Harness 69a41ce8",
+          "gc_name": "Harness GC",
+          "slug": "deterministic-quote-harness-69a41ce8",
+          "current_source_fingerprint": "320f5e339afd8d2545b61442f8cab897c116dad88a25e751b0a88bb1cf42d371",
+          "stale": false,
+          "group_count": 1,
+          "ready_group_count": 1,
+          "needs_setup_count": 0
+        },
+        "bid_summary": {
+          "job_id": 44,
+          "slug": "deterministic-quote-harness-69a41ce8",
+          "project_name": "Deterministic Quote Harness 69a41ce8",
+          "gc_name": "Harness GC",
+          "salesperson": "",
+          "material_count": 2,
+          "unpriced_count": 2,
+          "unrequested_count": 2,
+          "vendor_group_count": 1,
+          "draft_group_count": 1,
+          "draft_ready_count": 1,
+          "draft_stale": false,
+          "request_count": 0,
+          "request_statuses": {},
+          "needs_matching_count": 0,
+          "price_review_count": 0,
+          "quote_stage": "ready_to_send",
+          "quote_stage_label": "Ready to Send",
+          "next_action": {
+            "label": "Open Email Center",
+            "url": "/material-quotes/email?job=44"
+          },
+          "updated_at": "2026-07-27T16:52:26.726662"
+        }
+      }
+    },
+    {
+      "name": "outlook_required_to_send",
+      "passed": true,
+      "details": {
+        "status": 401,
+        "body": {
+          "detail": "Connect and sign in to the approved Microsoft account first."
+        }
+      }
+    },
+    {
+      "name": "material_change_blocks_stale_draft",
+      "passed": true,
+      "details": {
+        "stale": true,
+        "send": {
+          "status": 409,
+          "body": {
+            "detail": "This draft is out of date. Prepare it again from the bid."
+          }
+        }
+      }
+    },
+    {
+      "name": "draft_group_identity_survives_refresh",
+      "passed": true,
+      "details": {
+        "before_group_id": "cfbdfe4cb07d4347b550752b11442bc3",
+        "after_group_id": "cfbdfe4cb07d4347b550752b11442bc3"
+      }
+    },
+    {
+      "name": "simulator_scenarios",
+      "passed": true,
+      "details": {
+        "id": 9,
+        "job_id": 44,
+        "scenario": "all",
+        "status": "pass",
+        "virtual_now": "2026-07-27T16:52:29.287146+00:00",
+        "snapshot_json": "{\"job_id\": 44, \"live_job_fingerprint\": \"a876326edca06e83b1c56d509d7fb7714e870515e8d8ca21d91f83ea73640b51\", \"source_job_snapshot\": {\"id\": 44, \"project_name\": \"Deterministic Quote Harness 69a41ce8\", \"gc_name\": \"Harness GC\", \"address\": \"123 Harness Street\", \"city\": \"Denver\", \"state\": \"CO\", \"zip\": \"80202\"}, \"source_material_snapshot\": [{\"id\": 248, \"item_code\": \"CPT-TEST-100\", \"description\": \"Harness Carpet Tile\", \"unit\": \"SY\", \"quantity\": 106.0, \"vendor\": \"Harness Quote Vendor 69a41ce8\"}, {\"id\": 249, \"item_code\": \"LVT-TEST-200\", \"description\": \"Harness LVT\", \"unit\": \"SF\", \"quantity\": 210.0, \"vendor\": \"Harness Quote Vendor 69a41ce8\"}], \"isolated_materials\": [{\"id\": 248, \"job_id\": 44, \"item_code\": \"CPT-TEST-100\", \"description\": \"Harness Carpet Tile\", \"material_type\": \"carpet_tile\", \"installed_qty\": 101.0, \"unit\": \"SY\", \"waste_pct\": 0.0, \"order_qty\": 106.0, \"vendor\": \"Simulation Vendor One\", \"unit_price\": 0, \"extended_cost\": 0.0, \"fixture_count\": 0, \"labor_rate_lf\": 0.0, \"labor_catalog\": null, \"ai_confidence\": 1.0, \"quote_status\": null, \"price_source\": null, \"freight_per_unit\": null, \"freight_source\": null, \"tack_strip_lf\": 0.0, \"seam_tape_lf\": 0.0, \"pad_sy\": 0.0, \"area_type\": \"unit\", \"is_mosaic\": 0, \"is_penny_hex\": 0, \"crack_isolation_sf\": 0.0, \"weld_rod_lf\": 0.0, \"quote_source_hash\": null, \"quote_file_name\": null}, {\"id\": 249, \"job_id\": 44, \"item_code\": \"LVT-TEST-200\", \"description\": \"Harness LVT\", \"material_type\": \"lvt\", \"installed_qty\": 200.0, \"unit\": \"SF\", \"waste_pct\": 0.0, \"order_qty\": 210.0, \"vendor\": \"Simulation Vendor One\", \"unit_price\": 0, \"extended_cost\": 0.0, \"fixture_count\": 0, \"labor_rate_lf\": 0.0, \"labor_catalog\": null, \"ai_confidence\": 1.0, \"quote_status\": null, \"price_source\": null, \"freight_per_unit\": null, \"freight_source\": null, \"tack_strip_lf\": 0.0, \"seam_tape_lf\": 0.0, \"pad_sy\": 0.0, \"area_type\": \"unit\", \"is_mosaic\": 0, \"is_penny_hex\": 0, \"crack_isolation_sf\": 0.0, \"weld_rod_lf\": 0.0, \"quote_source_hash\": null, \"quote_file_name\": null}], \"fake_request\": {\"id\": 9100001, \"job_id\": 44, \"vendor_email\": \"vendor-one@example.test\", \"contact_email\": \"vendor-one@example.test\", \"internet_message_id\": \"<simulation-request-1@example.test>\", \"conversation_id\": \"simulation-conversation-1\", \"project_name\": \"Deterministic Quote Harness 69a41ce8\", \"slug\": \"deterministic-quote-harness-69a41ce8\", \"gc_name\": \"Harness GC\", \"address\": \"123 Harness Street\", \"material_snapshot\": [{\"id\": 248, \"item_code\": \"CPT-TEST-100\", \"description\": \"Harness Carpet Tile\", \"unit\": \"SY\", \"quantity\": 106.0, \"vendor\": \"Simulation Vendor One\"}, {\"id\": 249, \"item_code\": \"LVT-TEST-200\", \"description\": \"Harness LVT\", \"unit\": \"SF\", \"quantity\": 210.0, \"vendor\": \"Simulation Vendor One\"}]}, \"fake_vendors\": [\"vendor-one@example.test\", \"vendor-two@example.test\"]}",
+        "result_json": "{\"status\": \"pass\", \"checks\": [{\"scenario\": \"normal_reply\", \"label\": \"Real price transaction saves the price and all proof together\", \"expected\": true, \"actual\": true, \"detail\": \"Runs the production price-application transaction in an isolated copy of this bid.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"changed_price\", \"label\": \"Josh can explicitly choose the quote after the current price changed\", \"expected\": true, \"actual\": true, \"detail\": \"The current price shown to Josh is checked again inside the locked transaction.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"changed_price\", \"label\": \"An old screen cannot overwrite a newer material price\", \"expected\": true, \"actual\": true, \"detail\": \"A stale expected price is rejected without changing the copied bid.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"changed_price\", \"label\": \"Cancelling a request also cancels its pending prices and follow-ups\", \"expected\": true, \"actual\": true, \"detail\": \"The real cancellation transaction runs against an isolated copy.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"ambiguous_bid\", \"label\": \"Removing an email from one bid keeps its other possible bid\", \"expected\": true, \"actual\": true, \"detail\": \"The real per-bid ignore transaction keeps the other candidate open.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"normal_reply\", \"label\": \"Old received requests are treated as complete\", \"expected\": true, \"actual\": true, \"detail\": \"The production workflow state helper terminalizes the old record before checking drift.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"no_response\", \"label\": \"Real follow-up claims happen once at day 3 and day 6\", \"expected\": true, \"actual\": true, \"detail\": \"Runs the production due-follow-up claim code in the isolated copy.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"no_response\", \"label\": \"A last-second quantity or unit change blocks the follow-up\", \"expected\": true, \"actual\": true, \"detail\": \"The final production send check replays the locked material snapshot.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"normal_reply\", \"label\": \"Direct reply can auto-price only the requested exact item\", \"expected\": \"ready_to_apply\", \"actual\": \"ready_to_apply\", \"detail\": \"Uses the real matcher, CSV parser, and price safety evaluator.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"changed_subject\", \"label\": \"Changed subject still follows the recorded conversation\", \"expected\": \"conversation\", \"actual\": \"conversation\", \"detail\": \"The subject text is not used as an identifier.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"standalone_email\", \"label\": \"Standalone email price waits for Josh\", \"expected\": \"needs_review\", \"actual\": \"needs_review\", \"detail\": \"Exact job facts identify the bid, but the price is not automatic.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"ambiguous_bid\", \"label\": \"Email that could fit two bids waits for Josh\", \"expected\": \"needs_review\", \"actual\": \"needs_review\", \"detail\": \"The matcher refuses to choose between multiple open requests.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"ambiguous_bid\", \"label\": \"Ambiguous email can be assigned after inbox processing\", \"expected\": true, \"actual\": true, \"detail\": \"The production assignment transaction resolves a processed review email to one exact request.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"ambiguous_bid\", \"label\": \"Interrupted assignment can retry the same exact bid\", \"expected\": true, \"actual\": true, \"detail\": \"A stopped assignment can resume only after its two-minute safety lease expires.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"ambiguous_bid\", \"label\": \"A second live worker cannot price the same email\", \"expected\": true, \"actual\": true, \"detail\": \"The active assignment token blocks a second click or browser from running at the same time.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"ambiguous_bid\", \"label\": \"An expired worker cannot write after a retry takes over\", \"expected\": true, \"actual\": true, \"detail\": \"The replacement token removes partial rows and fences every later write from the old worker.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"ambiguous_bid\", \"label\": \"Cancelling during assignment releases the email without keeping prices\", \"expected\": true, \"actual\": true, \"detail\": \"The selected bid is rejected, partial price rows are removed, and the other possible bid stays available.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"materials_changed\", \"label\": \"Changing bid materials during assignment makes the request stale\", \"expected\": true, \"actual\": true, \"detail\": \"The final locked check rejects the changed bid and keeps the email available for any other exact candidate.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"broken_attachment\", \"label\": \"A no-price email cannot reopen a cancelled request\", \"expected\": true, \"actual\": true, \"detail\": \"Deferred parsing keeps the assignment lock and leaves terminal request states untouched.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"ambiguous_bid\", \"label\": \"A stopped price read removes partial rows and keeps the candidate\", \"expected\": true, \"actual\": true, \"detail\": \"An unexpected parser or storage failure returns the email to review with no hidden price changes.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"broken_attachment\", \"label\": \"A rolled-back assignment removes its uncommitted job file\", \"expected\": true, \"actual\": true, \"detail\": \"The durable file cleanup runs after the database rollback so orphaned vendor files are not left on the bid.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"ambiguous_bid\", \"label\": \"Unrelated email from a known vendor is ignored\", \"expected\": \"ignored\", \"actual\": \"ignored\", \"detail\": \"A vendor address alone is not enough to create review work.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"partial_quote\", \"label\": \"Partial quote leaves only missing materials open\", \"expected\": 1, \"actual\": 1, \"detail\": \"The fake attachment contains one of two requested materials.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"changed_price\", \"label\": \"Existing price is never silently replaced\", \"expected\": \"needs_review\", \"actual\": \"needs_review\", \"detail\": \"The real safety evaluator sees a current bid price.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"wrong_unit\", \"label\": \"Wrong unit waits for Josh\", \"expected\": \"needs_review\", \"actual\": \"needs_review\", \"detail\": \"The quoted unit and requested unit must be exactly equal.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"wrong_unit\", \"label\": \"BOX cannot silently equal CTN\", \"expected\": \"needs_review\", \"actual\": \"needs_review\", \"detail\": \"Packaging aliases are shown to Josh instead of being treated as exact.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"duplicate_reply\", \"label\": \"The same Outlook message is stored once\", \"expected\": true, \"actual\": true, \"detail\": \"The deployed SQLite table enforces a unique immutable message ID.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"broken_attachment\", \"label\": \"Unreadable attachment waits for Josh\", \"expected\": \"needs_review\", \"actual\": \"needs_review\", \"detail\": \"The real XLSX parser was given a broken file.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"no_response\", \"label\": \"Exactly two business-day follow-ups are scheduled\", \"expected\": [3, 6], \"actual\": [3, 6], \"detail\": \"Dates are calculated by the production business-day function.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"materials_changed\", \"label\": \"Changed bid cannot auto-price\", \"expected\": \"needs_review\", \"actual\": \"needs_review\", \"detail\": \"A stale locked snapshot always requires review.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"send_failure\", \"label\": \"Uncertain Microsoft delivery is never sent again automatically\", \"expected\": [\"send_failed\", \"send_uncertain\"], \"actual\": [\"send_failed\", \"send_uncertain\"], \"detail\": \"A definite rejection and an uncertain timeout have different states.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"normal_reply\", \"label\": \"Requested quantity is not mistaken for a price\", \"expected\": 0, \"actual\": 0, \"detail\": \"Free-text prices require an explicit dollar sign.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"normal_reply\", \"label\": \"A second fake vendor cannot take the first vendor reply\", \"expected\": 9100001, \"actual\": 9100001, \"detail\": \"Reply headers identify one recorded request even with several vendors.\", \"passed\": true, \"status\": \"pass\"}, {\"scenario\": \"normal_reply\", \"label\": \"Deterministic quote engine imports no OpenAI client\", \"expected\": [], \"actual\": [], \"detail\": \"This checks the module that performs matching, parsing, pricing safety, and follow-up rules.\", \"passed\": true, \"status\": \"pass\"}], \"timeline\": [{\"at\": \"2026-07-27T16:52:29.287146+00:00\", \"event\": \"Isolated simulation started\"}, {\"at\": \"2026-07-27T16:52:29.287146+00:00\", \"event\": \"34/34 production-rule checks passed\"}], \"followups\": [{\"followup_number\": 1, \"scheduled_for\": \"2026-07-30T15:00:00+00:00\", \"status\": \"scheduled\", \"sent_count\": 0}, {\"followup_number\": 2, \"scheduled_for\": \"2026-08-04T15:00:00+00:00\", \"status\": \"scheduled\", \"sent_count\": 0}], \"ai_calls\": 0, \"live_job_fingerprint_before\": \"a876326edca06e83b1c56d509d7fb7714e870515e8d8ca21d91f83ea73640b51\", \"live_job_fingerprint_after\": \"a876326edca06e83b1c56d509d7fb7714e870515e8d8ca21d91f83ea73640b51\", \"live_job_mutated\": false, \"engine_functions\": [\"match_message_to_requests\", \"parse_quote_file_deterministic\", \"evaluate_price_candidate\", \"add_business_days\", \"delivery_failure_status\"]}",
+        "created_at": "2026-07-27T16:52:29.357642+00:00",
+        "updated_at": "2026-07-27T16:52:29.357642+00:00",
+        "snapshot": {
+          "job_id": 44,
+          "live_job_fingerprint": "a876326edca06e83b1c56d509d7fb7714e870515e8d8ca21d91f83ea73640b51",
+          "source_job_snapshot": {
+            "id": 44,
+            "project_name": "Deterministic Quote Harness 69a41ce8",
+            "gc_name": "Harness GC",
+            "address": "123 Harness Street",
+            "city": "Denver",
+            "state": "CO",
+            "zip": "80202"
+          },
+          "source_material_snapshot": [
+            {
+              "id": 248,
+              "item_code": "CPT-TEST-100",
+              "description": "Harness Carpet Tile",
+              "unit": "SY",
+              "quantity": 106.0,
+              "vendor": "Harness Quote Vendor 69a41ce8"
+            },
+            {
+              "id": 249,
+              "item_code": "LVT-TEST-200",
+              "description": "Harness LVT",
+              "unit": "SF",
+              "quantity": 210.0,
+              "vendor": "Harness Quote Vendor 69a41ce8"
+            }
+          ],
+          "isolated_materials": [
+            {
+              "id": 248,
+              "job_id": 44,
+              "item_code": "CPT-TEST-100",
+              "description": "Harness Carpet Tile",
+              "material_type": "carpet_tile",
+              "installed_qty": 101.0,
+              "unit": "SY",
+              "waste_pct": 0.0,
+              "order_qty": 106.0,
+              "vendor": "Simulation Vendor One",
+              "unit_price": 0,
+              "extended_cost": 0.0,
+              "fixture_count": 0,
+              "labor_rate_lf": 0.0,
+              "labor_catalog": null,
+              "ai_confidence": 1.0,
+              "quote_status": null,
+              "price_source": null,
+              "freight_per_unit": null,
+              "freight_source": null,
+              "tack_strip_lf": 0.0,
+              "seam_tape_lf": 0.0,
+              "pad_sy": 0.0,
+              "area_type": "unit",
+              "is_mosaic": 0,
+              "is_penny_hex": 0,
+              "crack_isolation_sf": 0.0,
+              "weld_rod_lf": 0.0,
+              "quote_source_hash": null,
+              "quote_file_name": null
+            },
+            {
+              "id": 249,
+              "job_id": 44,
+              "item_code": "LVT-TEST-200",
+              "description": "Harness LVT",
+              "material_type": "lvt",
+              "installed_qty": 200.0,
+              "unit": "SF",
+              "waste_pct": 0.0,
+              "order_qty": 210.0,
+              "vendor": "Simulation Vendor One",
+              "unit_price": 0,
+              "extended_cost": 0.0,
+              "fixture_count": 0,
+              "labor_rate_lf": 0.0,
+              "labor_catalog": null,
+              "ai_confidence": 1.0,
+              "quote_status": null,
+              "price_source": null,
+              "freight_per_unit": null,
+              "freight_source": null,
+              "tack_strip_lf": 0.0,
+              "seam_tape_lf": 0.0,
+              "pad_sy": 0.0,
+              "area_type": "unit",
+              "is_mosaic": 0,
+              "is_penny_hex": 0,
+              "crack_isolation_sf": 0.0,
+              "weld_rod_lf": 0.0,
+              "quote_source_hash": null,
+              "quote_file_name": null
+            }
+          ],
+          "fake_request": {
+            "id": 9100001,
+            "job_id": 44,
+            "vendor_email": "vendor-one@example.test",
+            "contact_email": "vendor-one@example.test",
+            "internet_message_id": "<simulation-request-1@example.test>",
+            "conversation_id": "simulation-conversation-1",
+            "project_name": "Deterministic Quote Harness 69a41ce8",
+            "slug": "deterministic-quote-harness-69a41ce8",
+            "gc_name": "Harness GC",
+            "address": "123 Harness Street",
+            "material_snapshot": [
+              {
+                "id": 248,
+                "item_code": "CPT-TEST-100",
+                "description": "Harness Carpet Tile",
+                "unit": "SY",
+                "quantity": 106.0,
+                "vendor": "Simulation Vendor One"
+              },
+              {
+                "id": 249,
+                "item_code": "LVT-TEST-200",
+                "description": "Harness LVT",
+                "unit": "SF",
+                "quantity": 210.0,
+                "vendor": "Simulation Vendor One"
+              }
+            ]
+          },
+          "fake_vendors": [
+            "vendor-one@example.test",
+            "vendor-two@example.test"
+          ]
+        },
+        "result": {
+          "status": "pass",
+          "checks": [
+            {
+              "scenario": "normal_reply",
+              "label": "Real price transaction saves the price and all proof together",
+              "expected": true,
+              "actual": true,
+              "detail": "Runs the production price-application transaction in an isolated copy of this bid.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "changed_price",
+              "label": "Josh can explicitly choose the quote after the current price changed",
+              "expected": true,
+              "actual": true,
+              "detail": "The current price shown to Josh is checked again inside the locked transaction.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "changed_price",
+              "label": "An old screen cannot overwrite a newer material price",
+              "expected": true,
+              "actual": true,
+              "detail": "A stale expected price is rejected without changing the copied bid.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "changed_price",
+              "label": "Cancelling a request also cancels its pending prices and follow-ups",
+              "expected": true,
+              "actual": true,
+              "detail": "The real cancellation transaction runs against an isolated copy.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "ambiguous_bid",
+              "label": "Removing an email from one bid keeps its other possible bid",
+              "expected": true,
+              "actual": true,
+              "detail": "The real per-bid ignore transaction keeps the other candidate open.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "normal_reply",
+              "label": "Old received requests are treated as complete",
+              "expected": true,
+              "actual": true,
+              "detail": "The production workflow state helper terminalizes the old record before checking drift.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "no_response",
+              "label": "Real follow-up claims happen once at day 3 and day 6",
+              "expected": true,
+              "actual": true,
+              "detail": "Runs the production due-follow-up claim code in the isolated copy.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "no_response",
+              "label": "A last-second quantity or unit change blocks the follow-up",
+              "expected": true,
+              "actual": true,
+              "detail": "The final production send check replays the locked material snapshot.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "normal_reply",
+              "label": "Direct reply can auto-price only the requested exact item",
+              "expected": "ready_to_apply",
+              "actual": "ready_to_apply",
+              "detail": "Uses the real matcher, CSV parser, and price safety evaluator.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "changed_subject",
+              "label": "Changed subject still follows the recorded conversation",
+              "expected": "conversation",
+              "actual": "conversation",
+              "detail": "The subject text is not used as an identifier.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "standalone_email",
+              "label": "Standalone email price waits for Josh",
+              "expected": "needs_review",
+              "actual": "needs_review",
+              "detail": "Exact job facts identify the bid, but the price is not automatic.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "ambiguous_bid",
+              "label": "Email that could fit two bids waits for Josh",
+              "expected": "needs_review",
+              "actual": "needs_review",
+              "detail": "The matcher refuses to choose between multiple open requests.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "ambiguous_bid",
+              "label": "Ambiguous email can be assigned after inbox processing",
+              "expected": true,
+              "actual": true,
+              "detail": "The production assignment transaction resolves a processed review email to one exact request.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "ambiguous_bid",
+              "label": "Interrupted assignment can retry the same exact bid",
+              "expected": true,
+              "actual": true,
+              "detail": "A stopped assignment can resume only after its two-minute safety lease expires.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "ambiguous_bid",
+              "label": "A second live worker cannot price the same email",
+              "expected": true,
+              "actual": true,
+              "detail": "The active assignment token blocks a second click or browser from running at the same time.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "ambiguous_bid",
+              "label": "An expired worker cannot write after a retry takes over",
+              "expected": true,
+              "actual": true,
+              "detail": "The replacement token removes partial rows and fences every later write from the old worker.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "ambiguous_bid",
+              "label": "Cancelling during assignment releases the email without keeping prices",
+              "expected": true,
+              "actual": true,
+              "detail": "The selected bid is rejected, partial price rows are removed, and the other possible bid stays available.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "materials_changed",
+              "label": "Changing bid materials during assignment makes the request stale",
+              "expected": true,
+              "actual": true,
+              "detail": "The final locked check rejects the changed bid and keeps the email available for any other exact candidate.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "broken_attachment",
+              "label": "A no-price email cannot reopen a cancelled request",
+              "expected": true,
+              "actual": true,
+              "detail": "Deferred parsing keeps the assignment lock and leaves terminal request states untouched.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "ambiguous_bid",
+              "label": "A stopped price read removes partial rows and keeps the candidate",
+              "expected": true,
+              "actual": true,
+              "detail": "An unexpected parser or storage failure returns the email to review with no hidden price changes.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "broken_attachment",
+              "label": "A rolled-back assignment removes its uncommitted job file",
+              "expected": true,
+              "actual": true,
+              "detail": "The durable file cleanup runs after the database rollback so orphaned vendor files are not left on the bid.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "ambiguous_bid",
+              "label": "Unrelated email from a known vendor is ignored",
+              "expected": "ignored",
+              "actual": "ignored",
+              "detail": "A vendor address alone is not enough to create review work.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "partial_quote",
+              "label": "Partial quote leaves only missing materials open",
+              "expected": 1,
+              "actual": 1,
+              "detail": "The fake attachment contains one of two requested materials.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "changed_price",
+              "label": "Existing price is never silently replaced",
+              "expected": "needs_review",
+              "actual": "needs_review",
+              "detail": "The real safety evaluator sees a current bid price.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "wrong_unit",
+              "label": "Wrong unit waits for Josh",
+              "expected": "needs_review",
+              "actual": "needs_review",
+              "detail": "The quoted unit and requested unit must be exactly equal.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "wrong_unit",
+              "label": "BOX cannot silently equal CTN",
+              "expected": "needs_review",
+              "actual": "needs_review",
+              "detail": "Packaging aliases are shown to Josh instead of being treated as exact.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "duplicate_reply",
+              "label": "The same Outlook message is stored once",
+              "expected": true,
+              "actual": true,
+              "detail": "The deployed SQLite table enforces a unique immutable message ID.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "broken_attachment",
+              "label": "Unreadable attachment waits for Josh",
+              "expected": "needs_review",
+              "actual": "needs_review",
+              "detail": "The real XLSX parser was given a broken file.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "no_response",
+              "label": "Exactly two business-day follow-ups are scheduled",
+              "expected": [
+                3,
+                6
+              ],
+              "actual": [
+                3,
+                6
+              ],
+              "detail": "Dates are calculated by the production business-day function.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "materials_changed",
+              "label": "Changed bid cannot auto-price",
+              "expected": "needs_review",
+              "actual": "needs_review",
+              "detail": "A stale locked snapshot always requires review.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "send_failure",
+              "label": "Uncertain Microsoft delivery is never sent again automatically",
+              "expected": [
+                "send_failed",
+                "send_uncertain"
+              ],
+              "actual": [
+                "send_failed",
+                "send_uncertain"
+              ],
+              "detail": "A definite rejection and an uncertain timeout have different states.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "normal_reply",
+              "label": "Requested quantity is not mistaken for a price",
+              "expected": 0,
+              "actual": 0,
+              "detail": "Free-text prices require an explicit dollar sign.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "normal_reply",
+              "label": "A second fake vendor cannot take the first vendor reply",
+              "expected": 9100001,
+              "actual": 9100001,
+              "detail": "Reply headers identify one recorded request even with several vendors.",
+              "passed": true,
+              "status": "pass"
+            },
+            {
+              "scenario": "normal_reply",
+              "label": "Deterministic quote engine imports no OpenAI client",
+              "expected": [],
+              "actual": [],
+              "detail": "This checks the module that performs matching, parsing, pricing safety, and follow-up rules.",
+              "passed": true,
+              "status": "pass"
+            }
+          ],
+          "timeline": [
+            {
+              "at": "2026-07-27T16:52:29.287146+00:00",
+              "event": "Isolated simulation started"
+            },
+            {
+              "at": "2026-07-27T16:52:29.287146+00:00",
+              "event": "34/34 production-rule checks passed"
+            }
+          ],
+          "followups": [
+            {
+              "followup_number": 1,
+              "scheduled_for": "2026-07-30T15:00:00+00:00",
+              "status": "scheduled",
+              "sent_count": 0
+            },
+            {
+              "followup_number": 2,
+              "scheduled_for": "2026-08-04T15:00:00+00:00",
+              "status": "scheduled",
+              "sent_count": 0
+            }
+          ],
+          "ai_calls": 0,
+          "live_job_fingerprint_before": "a876326edca06e83b1c56d509d7fb7714e870515e8d8ca21d91f83ea73640b51",
+          "live_job_fingerprint_after": "a876326edca06e83b1c56d509d7fb7714e870515e8d8ca21d91f83ea73640b51",
+          "live_job_mutated": false,
+          "engine_functions": [
+            "match_message_to_requests",
+            "parse_quote_file_deterministic",
+            "evaluate_price_candidate",
+            "add_business_days",
+            "delivery_failure_status"
+          ]
+        }
+      }
+    },
+    {
+      "name": "race_and_legacy_regressions",
+      "passed": true,
+      "details": {
+        "required": [
+          "A last-second quantity or unit change blocks the follow-up",
+          "A no-price email cannot reopen a cancelled request",
+          "A rolled-back assignment removes its uncommitted job file",
+          "A second live worker cannot price the same email",
+          "A stopped price read removes partial rows and keeps the candidate",
+          "Ambiguous email can be assigned after inbox processing",
+          "An expired worker cannot write after a retry takes over",
+          "An old screen cannot overwrite a newer material price",
+          "Cancelling a request also cancels its pending prices and follow-ups",
+          "Cancelling during assignment releases the email without keeping prices",
+          "Changing bid materials during assignment makes the request stale",
+          "Interrupted assignment can retry the same exact bid",
+          "Josh can explicitly choose the quote after the current price changed",
+          "Old received requests are treated as complete",
+          "Removing an email from one bid keeps its other possible bid"
+        ],
+        "passed": [
+          "A last-second quantity or unit change blocks the follow-up",
+          "A no-price email cannot reopen a cancelled request",
+          "A rolled-back assignment removes its uncommitted job file",
+          "A second live worker cannot price the same email",
+          "A stopped price read removes partial rows and keeps the candidate",
+          "Ambiguous email can be assigned after inbox processing",
+          "An expired worker cannot write after a retry takes over",
+          "An old screen cannot overwrite a newer material price",
+          "Cancelling a request also cancels its pending prices and follow-ups",
+          "Cancelling during assignment releases the email without keeping prices",
+          "Changing bid materials during assignment makes the request stale",
+          "Interrupted assignment can retry the same exact bid",
+          "Josh can explicitly choose the quote after the current price changed",
+          "Old received requests are treated as complete",
+          "Removing an email from one bid keeps its other possible bid"
+        ]
+      }
+    },
+    {
+      "name": "simulated_followup",
+      "passed": true,
+      "details": {
+        "timeline": [
+          {
+            "at": "2026-07-27T16:52:29.287146+00:00",
+            "event": "Isolated simulation started"
+          },
+          {
+            "at": "2026-07-27T16:52:29.287146+00:00",
+            "event": "34/34 production-rule checks passed"
+          },
+          {
+            "at": "2026-07-30T15:00:00+00:00",
+            "event": "Advanced simulated business time by 3 day(s)"
+          },
+          {
+            "at": "2026-07-30T15:00:00+00:00",
+            "event": "Follow-up 1 was previewed as due",
+            "status": "scheduled"
+          }
+        ],
+        "stored_status": "pass",
+        "result_status": "pass"
+      }
+    },
+    {
+      "name": "followups_exactly_once",
+      "passed": true,
+      "details": {
+        "followups": [
+          {
+            "followup_number": 1,
+            "scheduled_for": "2026-07-30T15:00:00+00:00",
+            "status": "sent",
+            "sent_count": 1,
+            "sent_at": "2026-07-30T15:00:00+00:00"
+          },
+          {
+            "followup_number": 2,
+            "scheduled_for": "2026-08-04T15:00:00+00:00",
+            "status": "sent",
+            "sent_count": 1,
+            "sent_at": "2026-08-07T15:00:00+00:00"
+          }
+        ]
+      }
+    },
+    {
+      "name": "downloadable_report",
+      "passed": true,
+      "details": {
+        "length": 6793
+      }
+    },
+    {
+      "name": "live_job_unchanged",
+      "passed": true,
+      "details": {
+        "before": "760b99e431710e8c7e09a434edcf5b40bcbcb6568df48128b3f0ed34b4b64b54",
+        "after": "760b99e431710e8c7e09a434edcf5b40bcbcb6568df48128b3f0ed34b4b64b54"
+      }
+    },
+    {
+      "name": "draft_survives_other_workflows",
+      "passed": true,
+      "details": {
+        "group_id": "cfbdfe4cb07d4347b550752b11442bc3",
+        "updated_at": "2026-07-27T16:52:28.841426"
+      }
+    },
+    {
+      "name": "legacy_unsafe_paths_blocked",
+      "passed": true,
+      "details": {
+        "create_status": 410,
+        "clear_status": 409
+      }
+    }
+  ]
+}

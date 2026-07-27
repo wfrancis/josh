@@ -11,7 +11,7 @@ import StepIndicator from './StepIndicator'
 
 import MaterialsTable from './MaterialsTable'
 import ProposalEditor from './ProposalEditor'
-import MaterialQuotes from './MaterialQuotes'
+import BidQuotePlan from './quote/BidQuotePlan'
 import ReproducibilityPanel from './ReproducibilityPanel'
 import ReadinessSummary from './ReadinessSummary'
 import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
@@ -920,9 +920,8 @@ export default function JobDetail() {
                 )}
               </div>
             )}
-            <MaterialQuotes
+            <BidQuotePlan
               job={job}
-              onJobRefresh={() => loadJob({ preserveStep: true })}
               onGoBack={() => setStep('takeoff')}
               onContinue={() => setStep('bid')}
               onCompletionChange={setQuoteWorkflowComplete}

@@ -254,6 +254,238 @@ def run(
                 "details": plan,
             }
         )
+        hub_before = request(base_url, "GET", "/api/material-quotes/bids")
+        initial_bid_summary = next(
+            (
+                bid
+                for bid in hub_before.get("bids") or []
+                if int(bid.get("job_id") or 0) == int(job_id)
+            ),
+            {},
+        )
+        draft_before = request(
+            base_url,
+            "GET",
+            f"/api/jobs/{job_id}/quotes/email-draft",
+        )
+        checks.append(
+            {
+                "name": "hub_lists_unprepared_bid",
+                "passed": initial_bid_summary.get("quote_stage") == "needs_setup"
+                and draft_before.get("draft") is None
+                and (hub_before.get("matching_engine") or {}).get("ai_calls") == 0,
+                "details": initial_bid_summary,
+            }
+        )
+
+        draft_payload = {
+            "source_fingerprint": plan.get("source_fingerprint"),
+            "prepared_by": "Harness Estimator",
+            "groups": [
+                {
+                    "vendor_id": groups[0].get("vendor_id"),
+                    "vendor_name": groups[0].get("vendor_name"),
+                    "vendor_email": groups[0].get("vendor_email"),
+                    "material_ids": [
+                        item.get("id")
+                        for item in groups[0].get("materials_to_send") or []
+                    ],
+                    "subject": groups[0].get("subject"),
+                    "body": groups[0].get("body"),
+                }
+            ],
+        }
+        saved_draft = request(
+            base_url,
+            "PUT",
+            f"/api/jobs/{job_id}/quotes/email-draft",
+            draft_payload,
+        )
+        saved_group = ((saved_draft.get("draft") or {}).get("groups") or [{}])[0]
+        group_id = saved_group.get("group_id")
+        after_draft_save = request(base_url, "GET", f"/api/jobs/{job_id}")
+        requests_after_save = request(
+            base_url,
+            "GET",
+            f"/api/jobs/{job_id}/quote-requests",
+        )
+        checks.append(
+            {
+                "name": "draft_prepares_without_sending",
+                "passed": saved_draft.get("status") == "saved"
+                and saved_group.get("can_send") is True
+                and bool(group_id)
+                and requests_after_save == []
+                and fingerprint_job(after_draft_save) == before_fingerprint
+                and saved_draft.get("ai_calls") == 0,
+                "details": {
+                    "message": saved_draft.get("message"),
+                    "group_id": group_id,
+                    "request_count": len(requests_after_save),
+                },
+            }
+        )
+
+        patched_draft = request(
+            base_url,
+            "PATCH",
+            f"/api/jobs/{job_id}/quotes/email-draft/groups/{group_id}",
+            {
+                "vendor_email": "wbfranci@gmail.com",
+                "subject": f"Harness saved subject {suffix}",
+                "body": f"Harness saved email body {suffix}",
+            },
+        )
+        patched_group = ((patched_draft.get("draft") or {}).get("groups") or [{}])[0]
+        center_locked = request(
+            base_url,
+            "GET",
+            "/api/material-quotes/email-center",
+        )
+        center_draft = next(
+            (
+                draft
+                for draft in center_locked.get("drafts") or []
+                if int(draft.get("job_id") or 0) == int(job_id)
+            ),
+            {},
+        )
+        hub_ready = request(base_url, "GET", "/api/material-quotes/bids")
+        ready_bid_summary = next(
+            (
+                bid
+                for bid in hub_ready.get("bids") or []
+                if int(bid.get("job_id") or 0) == int(job_id)
+            ),
+            {},
+        )
+        checks.append(
+            {
+                "name": "email_center_reads_saved_bid_draft",
+                "passed": patched_group.get("group_id") == group_id
+                and patched_group.get("subject")
+                == f"Harness saved subject {suffix}"
+                and center_locked.get("mailbox_locked") is True
+                and center_locked.get("requests") == []
+                and center_draft.get("ready_group_count") == 1
+                and ready_bid_summary.get("quote_stage") == "ready_to_send"
+                and (center_locked.get("matching_engine") or {}).get("ai_calls") == 0,
+                "details": {
+                    "draft": center_draft,
+                    "bid_summary": ready_bid_summary,
+                },
+            }
+        )
+        disconnected_send = expect_http_status(
+            base_url,
+            "POST",
+            f"/api/jobs/{job_id}/quotes/email-draft/send",
+            401,
+            {},
+        )
+        requests_after_blocked_send = request(
+            base_url,
+            "GET",
+            f"/api/jobs/{job_id}/quote-requests",
+        )
+        checks.append(
+            {
+                "name": "outlook_required_to_send",
+                "passed": disconnected_send["status"] == 401
+                and requests_after_blocked_send == [],
+                "details": disconnected_send,
+            }
+        )
+
+        changed_materials = after_draft_save.get("materials") or []
+        changed_materials[0] = {
+            **changed_materials[0],
+            "installed_qty": float(
+                changed_materials[0].get("installed_qty") or 0
+            )
+            + 1,
+            "order_qty": float(changed_materials[0].get("order_qty") or 0) + 1,
+        }
+        request(
+            base_url,
+            "PUT",
+            f"/api/jobs/{job_id}/materials",
+            {"materials": changed_materials},
+        )
+        stale_draft = request(
+            base_url,
+            "GET",
+            f"/api/jobs/{job_id}/quotes/email-draft",
+        ).get("draft") or {}
+        stale_send = expect_http_status(
+            base_url,
+            "POST",
+            f"/api/jobs/{job_id}/quotes/email-draft/send",
+            409,
+            {},
+        )
+        checks.append(
+            {
+                "name": "material_change_blocks_stale_draft",
+                "passed": stale_draft.get("stale") is True
+                and stale_send["status"] == 409
+                and request(
+                    base_url,
+                    "GET",
+                    f"/api/jobs/{job_id}/quote-requests",
+                )
+                == [],
+                "details": {
+                    "stale": stale_draft.get("stale"),
+                    "send": stale_send,
+                },
+            }
+        )
+
+        refreshed_plan = request(
+            base_url,
+            "GET",
+            f"/api/jobs/{job_id}/quotes/plan",
+        )
+        refreshed_group = (refreshed_plan.get("groups") or [{}])[0]
+        refreshed_save = request(
+            base_url,
+            "PUT",
+            f"/api/jobs/{job_id}/quotes/email-draft",
+            {
+                "source_fingerprint": refreshed_plan.get("source_fingerprint"),
+                "prepared_by": "Harness Estimator",
+                "groups": [
+                    {
+                        "vendor_id": refreshed_group.get("vendor_id"),
+                        "vendor_name": refreshed_group.get("vendor_name"),
+                        "vendor_email": refreshed_group.get("vendor_email"),
+                        "material_ids": [
+                            item.get("id")
+                            for item in refreshed_group.get("materials_to_send") or []
+                        ],
+                        "subject": refreshed_group.get("subject"),
+                        "body": refreshed_group.get("body"),
+                    }
+                ],
+            },
+        )
+        refreshed_saved_group = (
+            (refreshed_save.get("draft") or {}).get("groups") or [{}]
+        )[0]
+        checks.append(
+            {
+                "name": "draft_group_identity_survives_refresh",
+                "passed": refreshed_saved_group.get("group_id") == group_id
+                and (refreshed_save.get("draft") or {}).get("stale") is False,
+                "details": {
+                    "before_group_id": group_id,
+                    "after_group_id": refreshed_saved_group.get("group_id"),
+                },
+            }
+        )
+        before = request(base_url, "GET", f"/api/jobs/{job_id}")
+        before_fingerprint = fingerprint_job(before)
         simulation = request(
             base_url,
             "POST",
@@ -362,6 +594,11 @@ def run(
         )
         after = request(base_url, "GET", f"/api/jobs/{job_id}")
         after_fingerprint = fingerprint_job(after)
+        persisted_draft = request(
+            base_url,
+            "GET",
+            f"/api/jobs/{job_id}/quotes/email-draft",
+        ).get("draft") or {}
         checks.append(
             {
                 "name": "live_job_unchanged",
@@ -369,6 +606,22 @@ def run(
                 "details": {
                     "before": before_fingerprint,
                     "after": after_fingerprint,
+                },
+            }
+        )
+        checks.append(
+            {
+                "name": "draft_survives_other_workflows",
+                "passed": persisted_draft.get("stale") is False
+                and (
+                    (persisted_draft.get("groups") or [{}])[0].get("group_id")
+                    == group_id
+                ),
+                "details": {
+                    "group_id": (
+                        (persisted_draft.get("groups") or [{}])[0].get("group_id")
+                    ),
+                    "updated_at": persisted_draft.get("updated_at"),
                 },
             }
         )
