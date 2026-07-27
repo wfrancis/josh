@@ -1833,7 +1833,11 @@ def _products_from_rows(rows: list[list[Any]]) -> list[dict]:
         }
         canonical = [value for value in candidate.values() if value]
         values = set(canonical)
-        if canonical.count("unit_price") > 1:
+        possible_unit_prices = sum(
+            value in {"unit_price", "ambiguous_price"}
+            for value in canonical
+        )
+        if possible_unit_prices > 1:
             raise ValueError(
                 "Quote has more than one possible unit-price column."
             )
