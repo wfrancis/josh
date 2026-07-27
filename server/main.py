@@ -1961,7 +1961,13 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
     file_names = [f.filename for f in files if hasattr(f, 'filename')]
     log_activity(db_id, "rfms_uploaded", f"Uploaded {len(file_names)} RFMS file(s), {len(materials)} materials parsed", {"files": file_names, "material_count": len(materials)})
 
-    return {"job_info": rfms_job_info, "materials": materials}
+    updated_job = load_job(db_id) or {}
+    return {
+        "job_id": db_id,
+        "slug": updated_job.get("slug"),
+        "job_info": rfms_job_info,
+        "materials": materials,
+    }
 
 
 def _apply_fob_freight(mat: dict, prod: dict, freight_rates: dict | None = None):

@@ -1260,11 +1260,25 @@ def upload_rfms_fixture(client: Client, job_id: str, fixture: dict[str, Any]) ->
     materials = parsed.get("materials") if isinstance(parsed, dict) else None
     if not materials:
         return [], Check("rfms_upload", "FAIL", "RFMS fixture upload returned no materials", {"response": parsed})
+    response_job_id = str(parsed.get("job_id") or "")
+    response_slug = str(parsed.get("slug") or "")
+    if response_job_id != str(job_id) or not response_slug:
+        return [], Check(
+            "rfms_upload",
+            "FAIL",
+            "RFMS fixture upload did not return a stable job ID and current slug",
+            {"response": parsed},
+        )
     return materials, Check(
         "rfms_upload",
         "PASS",
         f"uploaded synthesized RFMS fixture with {len(materials)} materials",
-        {"filename": filename, "material_codes": [m.get("item_code") for m in materials]},
+        {
+            "filename": filename,
+            "job_id": response_job_id,
+            "slug": response_slug,
+            "material_codes": [m.get("item_code") for m in materials],
+        },
     )
 
 

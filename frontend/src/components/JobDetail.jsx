@@ -167,8 +167,8 @@ export default function JobDetail() {
     setRfmsLoading(true)
     setError(null)
     try {
-      await api.uploadRFMS(jobId, fileList)
-      const updated = await api.getJob(jobId)
+      const upload = await api.uploadRFMS(jobId, fileList)
+      const updated = await api.getJob(upload.job_id || jobId)
       materialsStateRef.current = updated.materials || []
       materialsFingerprintRef.current = updated.materials_source_fingerprint || ''
       materialEditVersionRef.current = 0
@@ -178,6 +178,9 @@ export default function JobDetail() {
       await refreshReadiness(updated.id)
       setRfmsSuccess(true)
       setStagedFiles([])
+      if (updated.slug && updated.slug !== jobId) {
+        navigate(`/jobs/${updated.slug}`, { replace: true })
+      }
       // Stay on takeoff step — user reviews materials here
     } catch (err) {
       setError(err.message)
