@@ -190,7 +190,10 @@ def validate_vendor_ingestion_health(client: "Client") -> Check:
         and (health.get("email_monitor") or {}).get("retry_failed_unread") is True
         and (health.get("email_monitor") or {}).get("idempotency") == "source_hash_database_uniqueness"
         and (health.get("email_monitor") or {}).get("idempotency_verified") is True
-        and (health.get("email_monitor") or {}).get("job_match") == "stable_subject_tag_then_unambiguous_project_match"
+        and (health.get("email_monitor") or {}).get("job_match")
+        == "reply_headers_then_exact_vendor_and_job_facts"
+        and (health.get("email_monitor") or {}).get("requires_subject_tags") is False
+        and (health.get("email_monitor") or {}).get("ai_calls_for_bid_matching") == 0
         and (health.get("email_monitor") or {}).get("parse_failure_policy")
         == "no_pricing_writes_until_every_selected_source_parses"
         and (health.get("pricing_evidence") or {}).get("per_material_source_receipts") is True
@@ -223,6 +226,39 @@ def validate_vendor_ingestion_health(client: "Client") -> Check:
             else "vendor ingestion contract is incomplete"
         ),
         health,
+    )
+
+
+def validate_deterministic_quote_contract(client: "Client") -> Check:
+    try:
+        _, contract, _ = client.request(
+            "GET", "/api/system/deterministic-quote-contract"
+        )
+    except HarnessError as exc:
+        return Check(
+            "deterministic_quote_matching",
+            "FAIL",
+            f"deterministic quote contract unavailable: {exc}",
+        )
+    checks = contract.get("checks") or {}
+    ok = (
+        contract.get("status") == "pass"
+        and contract.get("matching_engine") == "deterministic-v1"
+        and checks.get("direct_reply") is True
+        and checks.get("standalone_exact") is True
+        and checks.get("sender_only_review") is True
+        and checks.get("unrelated_ignored") is True
+        and checks.get("ai_calls") == 0
+    )
+    return Check(
+        "deterministic_quote_matching",
+        "PASS" if ok else "FAIL",
+        (
+            "quote emails match by exact evidence and make zero AI calls"
+            if ok
+            else "deterministic quote matching contract failed"
+        ),
+        contract,
     )
 
 
@@ -2512,6 +2548,7 @@ def main() -> int:
     try:
         checks.append(validate_build_identity(client, args.expected_commit))
         checks.append(validate_vendor_ingestion_health(client))
+        checks.append(validate_deterministic_quote_contract(client))
         checks.append(validate_quote_receipt_recovery_contract(client))
         checks.append(validate_quote_price_conflict_contract(client))
         checks.append(validate_quote_multipass_contract(client))

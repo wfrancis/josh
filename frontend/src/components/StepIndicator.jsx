@@ -2,6 +2,7 @@ import { Check } from 'lucide-react'
 
 const STEPS = [
   { key: 'takeoff', label: 'Takeoff & Pricing' },
+  { key: 'quotes', label: 'Material Quotes' },
   { key: 'bid', label: 'Review & Generate' },
 ]
 
@@ -20,8 +21,13 @@ export default function StepIndicator({ current, onStepClick, completedSteps = [
             <button
               onClick={() => !isDisabled && onStepClick(step.key)}
               disabled={isDisabled}
-              title={isDisabled ? 'All materials must be priced first' : ''}
-              className={`flex items-center gap-1.5 sm:gap-2.5 px-2 sm:px-4 py-2 rounded-xl text-sm font-medium transition-all
+              aria-label={`${i + 1}. ${step.label}${isComplete ? ', complete' : ''}`}
+              title={isDisabled
+                ? step.key === 'quotes'
+                  ? 'Add materials first'
+                  : 'All materials must be priced first'
+                : ''}
+              className={`flex items-center gap-1.5 sm:gap-2.5 px-2 sm:px-4 py-2 rounded-lg text-sm font-medium transition-all
                 ${isDisabled
                   ? 'text-gray-700 cursor-not-allowed'
                   : isActive

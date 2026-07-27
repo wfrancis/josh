@@ -164,6 +164,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS vendor_prices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_name TEXT NOT NULL,
+                item_code TEXT DEFAULT '',
                 unit_price REAL NOT NULL,
                 vendor_id INTEGER,
                 vendor_name TEXT DEFAULT '',
@@ -181,6 +182,11 @@ def init_db() -> None:
                 won_bid INTEGER DEFAULT 0,
                 notes TEXT,
                 source_hash TEXT,
+                verified INTEGER NOT NULL DEFAULT 0,
+                verified_at TEXT,
+                verified_by TEXT DEFAULT '',
+                quote_request_id INTEGER,
+                price_match_id INTEGER,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (vendor_id) REFERENCES vendors(id) ON DELETE SET NULL,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL,
@@ -282,6 +288,146 @@ def init_db() -> None:
                 sent_at TEXT,
                 received_at TEXT,
                 created_at TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS quote_request_materials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                quote_request_id INTEGER NOT NULL,
+                material_id INTEGER,
+                item_code TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                unit TEXT DEFAULT '',
+                quantity REAL DEFAULT 0,
+                vendor_name TEXT DEFAULT '',
+                snapshot_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'requested',
+                quoted_price REAL,
+                source_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                UNIQUE(quote_request_id, material_id),
+                FOREIGN KEY (quote_request_id) REFERENCES quote_requests(id) ON DELETE CASCADE,
+                FOREIGN KEY (material_id) REFERENCES job_materials(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS outlook_connections (
+                email TEXT PRIMARY KEY,
+                microsoft_user_id TEXT NOT NULL,
+                tenant_id TEXT DEFAULT '',
+                encrypted_token_json TEXT NOT NULL,
+                scopes TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'connected',
+                subscription_id TEXT,
+                subscription_expires_at TEXT,
+                last_sync_at TEXT,
+                connected_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS quote_email_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                graph_message_id TEXT NOT NULL UNIQUE,
+                internet_message_id TEXT DEFAULT '',
+                conversation_id TEXT DEFAULT '',
+                mailbox_email TEXT DEFAULT '',
+                direction TEXT NOT NULL,
+                sender_email TEXT DEFAULT '',
+                recipients_json TEXT NOT NULL DEFAULT '[]',
+                subject TEXT DEFAULT '',
+                body_text TEXT DEFAULT '',
+                received_at TEXT,
+                sent_at TEXT,
+                raw_artifact_path TEXT DEFAULT '',
+                raw_hash TEXT DEFAULT '',
+                attachment_manifest_json TEXT NOT NULL DEFAULT '[]',
+                match_status TEXT NOT NULL DEFAULT 'unprocessed',
+                match_method TEXT DEFAULT '',
+                matched_job_id INTEGER,
+                matched_request_id INTEGER,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                processed_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (matched_job_id) REFERENCES jobs(id) ON DELETE SET NULL,
+                FOREIGN KEY (matched_request_id) REFERENCES quote_requests(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS quote_match_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                job_id INTEGER NOT NULL,
+                quote_request_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'candidate',
+                match_method TEXT DEFAULT '',
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                decision TEXT,
+                reviewer_name TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                UNIQUE(message_id, job_id, quote_request_id),
+                FOREIGN KEY (message_id) REFERENCES quote_email_messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY (quote_request_id) REFERENCES quote_requests(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS quote_price_matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER,
+                job_id INTEGER NOT NULL,
+                quote_request_id INTEGER,
+                material_id INTEGER,
+                item_code TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                quote_price REAL NOT NULL,
+                quote_unit TEXT DEFAULT '',
+                material_unit TEXT DEFAULT '',
+                accepted_price_before REAL NOT NULL DEFAULT 0,
+                quantity REAL NOT NULL DEFAULT 0,
+                source_hash TEXT NOT NULL,
+                source_file TEXT DEFAULT '',
+                match_method TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'needs_review',
+                reason TEXT NOT NULL,
+                decision TEXT,
+                reviewer_name TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                UNIQUE(message_id, material_id, source_hash, quote_price, quote_unit),
+                FOREIGN KEY (message_id) REFERENCES quote_email_messages(id) ON DELETE SET NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY (quote_request_id) REFERENCES quote_requests(id) ON DELETE SET NULL,
+                FOREIGN KEY (material_id) REFERENCES job_materials(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS quote_followup_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                quote_request_id INTEGER NOT NULL,
+                followup_number INTEGER NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'scheduled',
+                graph_message_id TEXT DEFAULT '',
+                sent_at TEXT,
+                claimed_at TEXT,
+                send_token TEXT DEFAULT '',
+                body_hash TEXT DEFAULT '',
+                artifact_path TEXT DEFAULT '',
+                artifact_hash TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(quote_request_id, followup_number),
+                FOREIGN KEY (quote_request_id) REFERENCES quote_requests(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS quote_simulation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                scenario TEXT NOT NULL DEFAULT 'all',
+                status TEXT NOT NULL DEFAULT 'running',
+                virtual_now TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
 
@@ -496,12 +642,49 @@ def init_db() -> None:
             ("golden_version_id", "ALTER TABLE golden_job_replays ADD COLUMN golden_version_id INTEGER"),
             ("job_quote_source_hash", "ALTER TABLE job_quotes ADD COLUMN source_hash TEXT"),
             ("vendor_price_source_hash", "ALTER TABLE vendor_prices ADD COLUMN source_hash TEXT"),
+            ("qr_vendor_email", "ALTER TABLE quote_requests ADD COLUMN vendor_email TEXT DEFAULT ''"),
+            ("qr_mailbox_email", "ALTER TABLE quote_requests ADD COLUMN mailbox_email TEXT DEFAULT ''"),
+            ("qr_subject", "ALTER TABLE quote_requests ADD COLUMN subject TEXT DEFAULT ''"),
+            ("qr_snapshot_json", "ALTER TABLE quote_requests ADD COLUMN material_snapshot_json TEXT DEFAULT '[]'"),
+            ("qr_snapshot_hash", "ALTER TABLE quote_requests ADD COLUMN material_snapshot_hash TEXT DEFAULT ''"),
+            ("qr_source_fingerprint", "ALTER TABLE quote_requests ADD COLUMN source_fingerprint TEXT DEFAULT ''"),
+            ("qr_body_hash", "ALTER TABLE quote_requests ADD COLUMN body_hash TEXT DEFAULT ''"),
+            ("qr_approved_at", "ALTER TABLE quote_requests ADD COLUMN approved_at TEXT"),
+            ("qr_approved_by", "ALTER TABLE quote_requests ADD COLUMN approved_by TEXT DEFAULT ''"),
+            ("qr_outlook_message_id", "ALTER TABLE quote_requests ADD COLUMN outlook_message_id TEXT DEFAULT ''"),
+            ("qr_send_token", "ALTER TABLE quote_requests ADD COLUMN send_token TEXT DEFAULT ''"),
+            ("qr_internet_message_id", "ALTER TABLE quote_requests ADD COLUMN internet_message_id TEXT DEFAULT ''"),
+            ("qr_conversation_id", "ALTER TABLE quote_requests ADD COLUMN conversation_id TEXT DEFAULT ''"),
+            ("qr_sent_artifact_path", "ALTER TABLE quote_requests ADD COLUMN sent_artifact_path TEXT DEFAULT ''"),
+            ("qr_sent_artifact_hash", "ALTER TABLE quote_requests ADD COLUMN sent_artifact_hash TEXT DEFAULT ''"),
+            ("qr_cancelled_at", "ALTER TABLE quote_requests ADD COLUMN cancelled_at TEXT"),
+            ("qr_completed_at", "ALTER TABLE quote_requests ADD COLUMN completed_at TEXT"),
+            ("qr_last_error", "ALTER TABLE quote_requests ADD COLUMN last_error TEXT DEFAULT ''"),
+            ("vp_item_code", "ALTER TABLE vendor_prices ADD COLUMN item_code TEXT DEFAULT ''"),
+            ("vp_verified", "ALTER TABLE vendor_prices ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"),
+            ("vp_verified_at", "ALTER TABLE vendor_prices ADD COLUMN verified_at TEXT"),
+            ("vp_verified_by", "ALTER TABLE vendor_prices ADD COLUMN verified_by TEXT DEFAULT ''"),
+            ("vp_quote_request_id", "ALTER TABLE vendor_prices ADD COLUMN quote_request_id INTEGER"),
+            ("vp_price_match_id", "ALTER TABLE vendor_prices ADD COLUMN price_match_id INTEGER"),
+            ("qfe_claimed_at", "ALTER TABLE quote_followup_events ADD COLUMN claimed_at TEXT"),
+            ("qfe_send_token", "ALTER TABLE quote_followup_events ADD COLUMN send_token TEXT DEFAULT ''"),
+            ("qfe_body_hash", "ALTER TABLE quote_followup_events ADD COLUMN body_hash TEXT DEFAULT ''"),
+            ("qfe_artifact_path", "ALTER TABLE quote_followup_events ADD COLUMN artifact_path TEXT DEFAULT ''"),
+            ("qfe_artifact_hash", "ALTER TABLE quote_followup_events ADD COLUMN artifact_hash TEXT DEFAULT ''"),
+            ("qem_mailbox_email", "ALTER TABLE quote_email_messages ADD COLUMN mailbox_email TEXT DEFAULT ''"),
         ]:
             try:
                 conn.execute(sql)
                 conn.commit()
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+        conn.execute(
+            """UPDATE quote_requests
+               SET status='complete',
+                   completed_at=COALESCE(completed_at, received_at, sent_at, created_at)
+               WHERE lower(status)='received'"""
+        )
 
         # Exact duplicates from an interrupted pre-index import carry the same
         # source hash and product identity. Keep the oldest evidence row so the
@@ -551,6 +734,20 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_est_rule_versions_rule ON estimating_rule_versions(rule_id, version DESC)",
             "CREATE INDEX IF NOT EXISTS idx_ruleset_versions_version ON ruleset_versions(version DESC)",
             "CREATE INDEX IF NOT EXISTS idx_golden_replays_version_mode ON golden_job_replays(source_job_id, golden_version_id, mode, created_at DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_quote_request_materials_request ON quote_request_materials(quote_request_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_quote_email_messages_review ON quote_email_messages(match_status, received_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_quote_email_messages_thread ON quote_email_messages(internet_message_id, conversation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_quote_match_candidates_message ON quote_match_candidates(message_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_quote_price_matches_job ON quote_price_matches(job_id, status, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_quote_followups_due ON quote_followup_events(status, scheduled_for)",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_quote_requests_send_token
+               ON quote_requests(send_token)
+               WHERE send_token IS NOT NULL AND send_token != ''""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_quote_followups_send_token
+               ON quote_followup_events(send_token)
+               WHERE send_token IS NOT NULL AND send_token != ''""",
+            "CREATE INDEX IF NOT EXISTS idx_quote_simulations_job ON quote_simulation_runs(job_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_vendor_prices_verified_code ON vendor_prices(verified, item_code, unit, created_at DESC)",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_job_quotes_source_product
                ON job_quotes(job_id, source_hash, COALESCE(product_name, ''), COALESCE(vendor, ''), COALESCE(unit_price, 0), COALESCE(unit, ''))
                WHERE source_hash IS NOT NULL AND source_hash != ''""",
@@ -1095,9 +1292,14 @@ def get_calculation_traces(
         conn.close()
 
 
-def save_quotes(job_id: int, quotes: list[dict]) -> list[int]:
+def save_quotes(
+    job_id: int,
+    quotes: list[dict],
+    conn: sqlite3.Connection | None = None,
+) -> list[int]:
     """Append parsed quote products for a job. Returns list of new quote ids."""
-    conn = _get_conn()
+    owns_connection = conn is None
+    conn = conn or _get_conn()
     try:
         ids = []
         for q in quotes:
@@ -1117,10 +1319,12 @@ def save_quotes(job_id: int, quotes: list[dict]) -> list[int]:
             ))
             if cur.rowcount:
                 ids.append(cur.lastrowid)
-        conn.commit()
+        if owns_connection:
+            conn.commit()
         return ids
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
 
 def update_quote(quote_id: int, data: dict) -> bool:
@@ -2803,9 +3007,14 @@ def get_or_create_vendor(name: str) -> int:
         conn.close()
 
 
-def save_vendor_prices_from_quotes(job_id: int, products: list[dict]) -> int:
+def save_vendor_prices_from_quotes(
+    job_id: int,
+    products: list[dict],
+    conn: sqlite3.Connection | None = None,
+) -> int:
     """Save parsed quote products to vendor_prices. Returns count saved."""
-    conn = _get_conn()
+    owns_connection = conn is None
+    conn = conn or _get_conn()
     try:
         count = 0
         now = datetime.now().isoformat()
@@ -2831,18 +3040,49 @@ def save_vendor_prices_from_quotes(job_id: int, products: list[dict]) -> int:
 
             conn.execute("""
                 INSERT OR IGNORE INTO vendor_prices
-                    (product_name, unit_price, vendor_name, job_id,
+                    (product_name, item_code, unit_price, vendor_name, job_id,
                      product_normalized, unit, freight_per_unit, total_per_unit,
-                     quantity, lead_time, quote_date, file_name, notes, source_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     quantity, lead_time, quote_date, file_name, notes, source_hash,
+                     verified, verified_at, verified_by, quote_request_id,
+                     price_match_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                product_name, unit_price, vendor_name, job_id,
+                product_name, p.get("item_code", ""), unit_price, vendor_name, job_id,
                 product_normalized, p.get("unit", ""), freight, total,
                 p.get("quantity"), p.get("lead_time"),
-                now, p.get("file_name"), p.get("notes"), p.get("_source_hash"), now
+                p.get("quote_date") or now, p.get("file_name"), p.get("notes"),
+                p.get("_source_hash"), int(bool(p.get("verified"))),
+                p.get("verified_at") or (now if p.get("verified") else None),
+                p.get("verified_by", ""), p.get("quote_request_id"),
+                p.get("price_match_id"), now
             ))
             count += int(conn.execute("SELECT changes()").fetchone()[0] or 0)
-        conn.commit()
+            if p.get("verified") and p.get("_source_hash"):
+                conn.execute(
+                    """UPDATE vendor_prices
+                       SET item_code=?, verified=1, verified_at=?,
+                           verified_by=?, quote_request_id=?, price_match_id=?
+                       WHERE job_id=? AND source_hash=?
+                         AND COALESCE(product_name, '')=?
+                         AND COALESCE(vendor_name, '')=?
+                         AND COALESCE(unit_price, 0)=?
+                         AND COALESCE(unit, '')=?""",
+                    (
+                        p.get("item_code", ""),
+                        p.get("verified_at") or now,
+                        p.get("verified_by", ""),
+                        p.get("quote_request_id"),
+                        p.get("price_match_id"),
+                        job_id,
+                        p.get("_source_hash"),
+                        product_name,
+                        vendor_name,
+                        unit_price,
+                        p.get("unit", ""),
+                    ),
+                )
+        if owns_connection:
+            conn.commit()
 
         # Now link vendor_ids (separate pass to avoid nested connections)
         rows = conn.execute(
@@ -2866,11 +3106,13 @@ def save_vendor_prices_from_quotes(job_id: int, products: list[dict]) -> int:
                     vendor_cache[vname] = vcur.lastrowid
             conn.execute("UPDATE vendor_prices SET vendor_id=? WHERE id=?",
                          (vendor_cache[vname], row["id"]))
-        conn.commit()
+        if owns_connection:
+            conn.commit()
 
         return count
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
 
 def create_vendor(data: dict) -> dict:
@@ -2997,7 +3239,9 @@ def get_vendor(vendor_id: int) -> dict | None:
 
         # Quote request history with job names
         quote_requests = conn.execute("""
-            SELECT qr.*, j.project_name AS job_name
+            SELECT qr.id, qr.job_id, qr.vendor_id, qr.vendor_name, qr.status,
+                   qr.material_ids, qr.sent_at, qr.received_at, qr.created_at,
+                   j.project_name AS job_name
             FROM quote_requests qr
             LEFT JOIN jobs j ON qr.job_id = j.id
             WHERE qr.vendor_id=? OR qr.vendor_name LIKE ?
@@ -3089,16 +3333,21 @@ def search_vendor_prices(vendor: str = None, product: str = None, limit: int = 5
         conn.close()
 
 
-def get_price_history(item_code: str = None, product: str = None, exclude_job_id: int = None) -> dict:
+def get_price_history(
+    item_code: str = None,
+    product: str = None,
+    exclude_job_id: int = None,
+    verified_only: bool = False,
+) -> dict:
     """Get historical pricing for a product. Returns {min, max, avg, latest, records}."""
     conn = _get_conn()
     try:
         clauses = []
         params = []
+        normalized_code = _normalize_product(item_code) if item_code else ""
         if item_code:
-            normalized = _normalize_product(item_code)
-            clauses.append("vp.product_normalized LIKE ?")
-            params.append(f"%{normalized}%")
+            clauses.append("(vp.item_code != '' OR vp.product_normalized LIKE ?)")
+            params.append(f"%{normalized_code}%")
         if product:
             normalized = _normalize_product(product)
             clauses.append("vp.product_normalized LIKE ?")
@@ -3106,6 +3355,8 @@ def get_price_history(item_code: str = None, product: str = None, exclude_job_id
         if exclude_job_id:
             clauses.append("vp.job_id != ?")
             params.append(exclude_job_id)
+        if verified_only:
+            clauses.append("vp.verified=1")
         if not clauses:
             return {"min": None, "max": None, "avg": None, "latest": None, "records": []}
 
@@ -3116,9 +3367,20 @@ def get_price_history(item_code: str = None, product: str = None, exclude_job_id
             LEFT JOIN jobs j ON vp.job_id = j.id
             {where}
             ORDER BY vp.created_at DESC
-            LIMIT 20
+            LIMIT 500
         """, params).fetchall()
         records = [dict(r) for r in rows]
+        if normalized_code:
+            records = [
+                record
+                for record in records
+                if _normalize_product(record.get("item_code")) == normalized_code
+                or (
+                    not record.get("item_code")
+                    and normalized_code in str(record.get("product_normalized") or "")
+                )
+            ]
+        records = records[:20]
         if not records:
             return {"min": None, "max": None, "avg": None, "latest": None, "records": []}
 
@@ -3468,16 +3730,30 @@ def get_comments(job_id: int) -> list[dict]:
 
 def create_quote_request(job_id: int, vendor_name: str, material_ids: list,
                          request_text: str = "", vendor_id: int = None,
-                         status: str = "draft", sent_at: str = None) -> dict:
+                         status: str = "draft", sent_at: str = None,
+                         vendor_email: str = "", subject: str = "",
+                         material_snapshot: list | None = None,
+                         material_snapshot_hash: str = "",
+                         source_fingerprint: str = "",
+                         approved_at: str | None = None,
+                         approved_by: str = "") -> dict:
     """Create a quote request record."""
     conn = _get_conn()
     try:
         now = datetime.now().isoformat()
         import json
         cur = conn.execute(
-            """INSERT INTO quote_requests (job_id, vendor_id, vendor_name, status, material_ids, request_text, sent_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (job_id, vendor_id, vendor_name, status, json.dumps(material_ids), request_text, sent_at, now)
+            """INSERT INTO quote_requests
+               (job_id, vendor_id, vendor_name, vendor_email, status, material_ids,
+                material_snapshot_json, material_snapshot_hash, source_fingerprint,
+                subject, request_text, approved_at, approved_by, sent_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                job_id, vendor_id, vendor_name, vendor_email, status,
+                json.dumps(material_ids), json.dumps(material_snapshot or []),
+                material_snapshot_hash, source_fingerprint, subject, request_text,
+                approved_at, approved_by, sent_at, now,
+            )
         )
         conn.commit()
         row = conn.execute("SELECT * FROM quote_requests WHERE id=?", (cur.lastrowid,)).fetchone()
@@ -3502,6 +3778,10 @@ def list_quote_requests(job_id: int) -> list[dict]:
                 d["material_ids"] = json.loads(d["material_ids"])
             except (json.JSONDecodeError, TypeError):
                 d["material_ids"] = []
+            try:
+                d["material_snapshot"] = json.loads(d.get("material_snapshot_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                d["material_snapshot"] = []
             results.append(d)
         return results
     finally:
@@ -3512,7 +3792,15 @@ def update_quote_request(request_id: int, **fields) -> bool:
     """Update a quote request (status, sent_at, received_at, request_text)."""
     conn = _get_conn()
     try:
-        allowed = {"status", "sent_at", "received_at", "request_text", "vendor_name", "vendor_id", "material_ids", "response_file", "response_notes"}
+        allowed = {
+            "status", "sent_at", "received_at", "request_text", "vendor_name",
+            "vendor_id", "vendor_email", "mailbox_email", "subject", "material_ids",
+            "material_snapshot_json", "material_snapshot_hash", "source_fingerprint",
+            "body_hash", "sent_artifact_path", "sent_artifact_hash",
+            "approved_at", "approved_by", "outlook_message_id",
+            "internet_message_id", "conversation_id", "cancelled_at",
+            "completed_at", "last_error", "response_file", "response_notes",
+        }
         updates = []
         values = []
         for k, v in fields.items():

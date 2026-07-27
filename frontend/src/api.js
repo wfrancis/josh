@@ -152,6 +152,63 @@ export const api = {
   // Quotes
   clearQuotes: (jobId) => request('/jobs/' + jobId + '/quotes', { method: 'DELETE' }),
   updateQuote: (quoteId, data) => request('/quotes/' + quoteId, { method: 'PUT', body: JSON.stringify(data) }),
+  getQuoteWorkflow: (jobId) => request(`/jobs/${jobId}/quotes/workflow`),
+  getQuotePlan: (jobId) => request(`/jobs/${jobId}/quotes/plan`),
+  repairQuoteEvidence: async (jobId, files) => {
+    const form = new FormData()
+    files.forEach((file) => form.append('files', file))
+    const response = await fetch(`${BASE}/jobs/${jobId}/quotes/evidence-repair`, {
+      method: 'POST',
+      body: form,
+    })
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ detail: response.statusText }))
+      throw new Error(error.detail || 'Receipt repair failed')
+    }
+    return response.json()
+  },
+  approveAndSendQuotes: (jobId, data) =>
+    request(`/jobs/${jobId}/quotes/approve-and-send`, { method: 'POST', body: JSON.stringify(data) }),
+  getQuoteReview: (jobId) => request(`/jobs/${jobId}/quotes/review`),
+  decideQuoteMatch: (jobId, matchId, data) =>
+    request(`/jobs/${jobId}/quotes/matches/${matchId}/decision`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  retryQuoteRequest: (id) => request(`/quote-requests/${id}/retry`, { method: 'POST' }),
+  cancelQuoteRequest: (id) => request(`/quote-requests/${id}/cancel`, { method: 'POST' }),
+  quoteRequestEvidenceUrl: (id) => `${BASE}/quote-requests/${id}/evidence`,
+  quoteMessageEvidenceUrl: (id) => `${BASE}/quotes/messages/${id}/evidence`,
+  quoteMessageAttachmentUrl: (id, index) =>
+    `${BASE}/quotes/messages/${id}/attachments/${index}`,
+
+  // Outlook quote inbox
+  getOutlookStatus: () => request('/integrations/outlook/status'),
+  outlookConnectUrl: (returnTo = '') =>
+    `${BASE}/integrations/outlook/connect${returnTo ? `?return_to=${encodeURIComponent(returnTo)}` : ''}`,
+  disconnectOutlook: () => request('/integrations/outlook/disconnect', { method: 'POST' }),
+  syncOutlook: () => request('/integrations/outlook/sync', { method: 'POST' }),
+  getQuoteInboxReview: () => request('/quotes/inbox-review'),
+  assignInboxMessage: (id, data) =>
+    request(`/quotes/inbox-review/${id}/assign`, { method: 'POST', body: JSON.stringify(data) }),
+  ignoreInboxMessage: (id, data = {}) =>
+    request(`/quotes/inbox-review/${id}/ignore`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  // Per-bid quote simulator
+  createQuoteSimulation: (jobId, data) =>
+    request(`/jobs/${jobId}/quote-simulator/runs`, { method: 'POST', body: JSON.stringify(data) }),
+  getQuoteSimulation: (jobId, runId) =>
+    request(`/jobs/${jobId}/quote-simulator/runs/${runId}`),
+  quoteSimulationReportUrl: (jobId, runId) =>
+    `${BASE}/jobs/${jobId}/quote-simulator/runs/${runId}/report`,
+  advanceQuoteSimulation: (jobId, runId, data) =>
+    request(`/jobs/${jobId}/quote-simulator/runs/${runId}/advance`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   // Jobs (update)
   updateJob: (jobId, data) => request('/jobs/' + jobId, { method: 'PUT', body: JSON.stringify(data) }),

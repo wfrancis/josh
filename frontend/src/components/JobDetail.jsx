@@ -10,11 +10,8 @@ import { api } from '../api'
 import StepIndicator from './StepIndicator'
 
 import MaterialsTable from './MaterialsTable'
-import BidPreview from './BidPreview'
 import ProposalEditor from './ProposalEditor'
-import QuoteUpload from './QuoteUpload'
-import VendorQuoteFlow from './VendorQuoteFlow'
-import QuoteTracker from './QuoteTracker'
+import MaterialQuotes from './MaterialQuotes'
 import ReproducibilityPanel from './ReproducibilityPanel'
 import ReadinessSummary from './ReadinessSummary'
 import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
@@ -31,7 +28,6 @@ export default function JobDetail() {
   const [rfmsSuccess, setRfmsSuccess] = useState(false)
   const [stagedFiles, setStagedFiles] = useState([])
   const rfmsInputRef = useRef(null)
-  const quoteSectionRef = useRef(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
   const [notesOpen, setNotesOpen] = useState(false)
@@ -39,14 +35,17 @@ export default function JobDetail() {
   const [aiSettings, setAiSettings] = useState(null)
   const [confirmDialog, setConfirmDialog] = useState(null)
   const [isDirty, setIsDirty] = useState(false)
-  const [quotePanel, setQuotePanel] = useState(null) // null | 'request' | 'upload'
-  const [quotePreSelectedIds, setQuotePreSelectedIds] = useState(null)
   const [quoteMaterial, setQuoteMaterial] = useState(null) // single-material quote modal
   const [quoteCopied, setQuoteCopied] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editForm, setEditForm] = useState({})
   const [editSaving, setEditSaving] = useState(false)
   const [quoteRequests, setQuoteRequests] = useState([])
+  const [evidenceRecoveryOpen, setEvidenceRecoveryOpen] = useState(false)
+  const [evidenceRecoveryLoading, setEvidenceRecoveryLoading] = useState(false)
+  const [evidenceRecoveryResult, setEvidenceRecoveryResult] = useState(null)
+  const evidenceInputRef = useRef(null)
+  const [quoteWorkflowComplete, setQuoteWorkflowComplete] = useState(false)
   const [readiness, setReadiness] = useState(null)
   const materialsStateRef = useRef([])
   const materialsFingerprintRef = useRef('')
@@ -66,7 +65,7 @@ export default function JobDetail() {
     }
   }, [jobId])
 
-  const loadJob = async () => {
+  const loadJob = async ({ preserveStep = false } = {}) => {
     try {
       const data = await api.getJob(jobId)
       materialsStateRef.current = data.materials || []
@@ -79,8 +78,12 @@ export default function JobDetail() {
       setNotes(data.notes || '')
       setNotesOpen(!!data.notes)
       if (data.materials?.length > 0) setRfmsSuccess(true)
-      if (data.bundles?.length > 0 || data.bid_data) setStep('bid')
-      else if (data.materials?.length > 0) setStep('takeoff')
+      if (!preserveStep) {
+        const hasMaterials = Boolean(data.materials?.length)
+        const hasUnpricedMaterials = data.materials?.some(material => !Number(material.unit_price))
+        if (hasMaterials && (data.bundles?.length > 0 || data.bid_data) && !hasUnpricedMaterials) setStep('bid')
+        else setStep('takeoff')
+      }
       // Load quote requests for status tracking
       api.listQuoteRequests(data.id).then(setQuoteRequests).catch(console.error)
     } catch (err) {
@@ -301,9 +304,27 @@ export default function JobDetail() {
   }
 
   const openEvidenceRecovery = () => {
-    setStep('takeoff')
-    setQuotePanel('upload')
-    window.setTimeout(() => quoteSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+    setEvidenceRecoveryOpen(true)
+    setEvidenceRecoveryResult(null)
+    setStep('quotes')
+  }
+
+  const handleEvidenceRepair = async (fileList) => {
+    const files = Array.from(fileList || [])
+    if (!files.length) return
+    setEvidenceRecoveryLoading(true)
+    setEvidenceRecoveryResult(null)
+    setError(null)
+    try {
+      const result = await api.repairQuoteEvidence(job.id, files)
+      setEvidenceRecoveryResult(result)
+      await loadJob({ preserveStep: true })
+    } catch (err) {
+      setError(err.message || 'Quote receipts could not be repaired.')
+    } finally {
+      setEvidenceRecoveryLoading(false)
+      if (evidenceInputRef.current) evidenceInputRef.current.value = ''
+    }
   }
 
   const handleResolveVendorConflict = async (conflict, resolution) => {
@@ -327,6 +348,11 @@ export default function JobDetail() {
   const getCompletedSteps = () => {
     const completed = []
     if (job?.materials?.length > 0) completed.push('takeoff')
+    if (
+      job?.materials?.length > 0
+      && job.materials.every(m => Number(m.unit_price) > 0)
+      && quoteWorkflowComplete
+    ) completed.push('quotes')
     if (job?.bundles?.length > 0 || job?.bid_data) completed.push('bid')
     return completed
   }
@@ -591,12 +617,27 @@ export default function JobDetail() {
       <ReproducibilityPanel jobId={jobId} onConfidenceChange={refreshReadiness} />
 
       {/* Stepper */}
-      <div className="glass-card px-3 sm:px-6 py-3 sm:py-4 mb-6 sm:mb-8">
+      <div className="mb-6 rounded-lg border border-white/[0.06] bg-white/[0.03] px-3 py-3 sm:mb-8 sm:px-6 sm:py-4">
         <StepIndicator
           current={step}
-          onStepClick={setStep}
+          onStepClick={async (nextStep) => {
+            if (
+              nextStep !== 'takeoff'
+              && isDirty
+              && !(await saveMaterialsNow({ surfaceError: true }))
+            ) return
+            setStep(nextStep)
+          }}
           completedSteps={getCompletedSteps()}
-          disabledSteps={job.materials?.length > 0 && job.materials.some(m => !m.unit_price || m.unit_price === 0) ? ['bid'] : []}
+          disabledSteps={[
+            ...(!job.materials?.length ? ['quotes', 'bid'] : []),
+            ...(job.materials?.some(m => !Number(m.unit_price)) ? ['bid'] : []),
+            ...(job.materials?.length
+              && job.materials.every(m => Number(m.unit_price) > 0)
+              && !quoteWorkflowComplete
+              ? ['bid']
+              : []),
+          ]}
         />
       </div>
 
@@ -737,77 +778,6 @@ export default function JobDetail() {
             </div>
 
 
-            {/* Vendor Quotes Section — above materials table for discoverability */}
-            {job.materials?.length > 0 && (() => {
-              const unpricedCount = job.materials.filter(m => !m.unit_price || m.unit_price === 0).length
-              const evidenceRecoveryNeeded = Boolean(readiness?.trust_summary?.evidence_recovery_needed)
-              return unpricedCount > 0 || job.quotes?.length > 0 || evidenceRecoveryNeeded ? (
-                <div ref={quoteSectionRef} className="glass-card scroll-mt-20 p-4 sm:p-6 animate-slide-up">
-                  {/* Unpriced banner */}
-                  {unpricedCount > 0 && (
-                    <div className="flex items-center gap-3 px-4 py-3 mb-4 bg-amber-500/10 border border-amber-500/20 rounded-xl">
-                      <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
-                      <span className="text-sm text-amber-300">
-                        <strong>{unpricedCount}</strong> of {job.materials.length} materials need vendor pricing
-                      </span>
-                    </div>
-                  )}
-
-                  {/* Quote Tracker — always visible when requests exist */}
-                  <QuoteTracker job={job} onRefresh={loadJob} onUploadQuote={() => setQuotePanel('upload')} />
-
-                  {/* Action buttons */}
-                  {!quotePanel && (
-                    <div className="flex items-center gap-3">
-                      <button
-                        onClick={() => setQuotePanel('request')}
-                        className="btn-secondary text-sm flex items-center gap-2"
-                      >
-                        <Copy className="w-4 h-4" />
-                        Request Quotes
-                      </button>
-                      <button
-                        onClick={() => setQuotePanel('upload')}
-                        className="btn-secondary text-sm flex items-center gap-2"
-                      >
-                        <Upload className="w-4 h-4" />
-                        Upload Vendor Response
-                      </button>
-                    </div>
-                  )}
-
-                  {/* Quote Upload Panel */}
-                  {quotePanel === 'upload' && (
-                    <div>
-                      <div className="flex items-center justify-between mb-3">
-                        <div>
-                          <h3 className="text-sm font-bold text-white">
-                            {evidenceRecoveryNeeded ? 'Repair Vendor Quote Receipts' : 'Upload Vendor Response'}
-                          </h3>
-                          {evidenceRecoveryNeeded && (
-                            <p className="mt-1 text-xs text-gray-500">Use the original quote files. Existing accepted prices are relinked only on an exact unit-price match.</p>
-                          )}
-                        </div>
-                        <button onClick={() => setQuotePanel(null)}
-                          className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
-                          Close
-                        </button>
-                      </div>
-                      <QuoteUpload
-                        jobId={job.id}
-                        api={api}
-                        existingQuotes={job.quotes || []}
-                        beforeMutation={() => isDirty ? saveMaterialsNow({ surfaceError: true }) : true}
-                        evidenceRecoveryMode={evidenceRecoveryNeeded}
-                        onQuotesParsed={() => loadJob()}
-                        onQuotesCleared={() => loadJob()}
-                      />
-                    </div>
-                  )}
-                </div>
-              ) : null
-            })()}
-
             {/* Materials Table */}
             {job.materials?.length > 0 && (
               <div className="glass-card p-4 sm:p-6 animate-slide-up">
@@ -845,7 +815,13 @@ export default function JobDetail() {
                       setQuoteCopied(false)
                     }}
                     onRequestAllQuotes={() => {
-                      setQuotePanel('request')
+                      if (isDirty) {
+                        saveMaterialsNow({ surfaceError: true }).then((saved) => {
+                          if (saved) setStep('quotes')
+                        })
+                      } else {
+                        setStep('quotes')
+                      }
                     }}
                     onAiEstimate={async (materialIdx) => {
                       try {
@@ -862,25 +838,24 @@ export default function JobDetail() {
               </div>
             )}
 
-            {/* Continue to Bid */}
+            {/* Continue to Material Quotes */}
             {job.materials?.length > 0 && (() => {
               const unpricedCount = job.materials.filter(m => !m.unit_price || m.unit_price === 0).length
               return (
                 <div className="text-center pt-2 animate-fade-in">
                   {unpricedCount > 0 && (
                     <p className="text-xs text-amber-400 mb-2">
-                      All materials must be priced before generating a bid
+                      {unpricedCount} material{unpricedCount === 1 ? '' : 's'} need vendor pricing
                     </p>
                   )}
                   <button
                     onClick={async () => {
                       if (isDirty && !(await handleSavePricing())) return
-                      setStep('bid')
+                      setStep('quotes')
                     }}
                     className="btn-primary"
-                    disabled={unpricedCount > 0}
                   >
-                    Continue to Bid Generation
+                    Continue to Material Quotes
                   </button>
                 </div>
               )
@@ -888,9 +863,71 @@ export default function JobDetail() {
           </div>
         )}
 
+        {step === 'quotes' && (
+          <div className="space-y-6">
+            {evidenceRecoveryOpen && (
+              <div className="glass-card p-4 sm:p-6">
+                <div className="mb-4 flex items-start justify-between gap-4">
+                  <div>
+                    <h2 className="text-sm font-bold text-white">Repair Vendor Quote Receipts</h2>
+                    <p className="mt-1 text-xs text-gray-500">
+                      Upload the original quote file. An accepted price is linked only when the item, unit, and price match exactly.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setEvidenceRecoveryOpen(false)}
+                    className="rounded-md p-1.5 text-gray-500 hover:bg-white/[0.05] hover:text-gray-300"
+                    title="Close receipt repair"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+                <input
+                  ref={evidenceInputRef}
+                  type="file"
+                  multiple
+                  accept=".csv,.xlsx,.pdf,.txt,.eml,.msg"
+                  className="hidden"
+                  onChange={(event) => handleEvidenceRepair(event.target.files)}
+                />
+                <button
+                  type="button"
+                  onClick={() => evidenceInputRef.current?.click()}
+                  disabled={evidenceRecoveryLoading}
+                  className="btn-secondary text-sm"
+                >
+                  {evidenceRecoveryLoading
+                    ? <Loader2 className="h-4 w-4 animate-spin" />
+                    : <Upload className="h-4 w-4" />}
+                  Choose Original Quote Files
+                </button>
+                {evidenceRecoveryResult && (
+                  <div className={`mt-4 rounded-lg border px-4 py-3 text-sm ${
+                    evidenceRecoveryResult.repaired_count > 0
+                      ? 'border-emerald-500/20 bg-emerald-500/[0.06] text-emerald-300'
+                      : 'border-amber-500/20 bg-amber-500/[0.06] text-amber-300'
+                  }`}>
+                    {evidenceRecoveryResult.repaired_count > 0
+                      ? `${evidenceRecoveryResult.repaired_count} receipt${evidenceRecoveryResult.repaired_count === 1 ? '' : 's'} linked. No prices changed.`
+                      : 'No exact receipt matched. No prices changed.'}
+                  </div>
+                )}
+              </div>
+            )}
+            <MaterialQuotes
+              job={job}
+              onJobRefresh={() => loadJob({ preserveStep: true })}
+              onGoBack={() => setStep('takeoff')}
+              onContinue={() => setStep('bid')}
+              onCompletionChange={setQuoteWorkflowComplete}
+            />
+          </div>
+        )}
+
         {step === 'bid' && (
           <div className="glass-card p-4 sm:p-8">
-            <ProposalEditor job={job} api={api} onGoBack={() => setStep('takeoff')} onConfidenceChange={refreshReadiness} />
+            <ProposalEditor job={job} api={api} onGoBack={() => setStep('quotes')} onConfidenceChange={refreshReadiness} />
           </div>
         )}
       </div>
@@ -898,15 +935,6 @@ export default function JobDetail() {
       <ActivityLog jobId={job.id} />
 
       <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
-
-      {/* Vendor Quote Flow Modal — rendered outside animated containers to avoid transform containing block issues */}
-      {quotePanel === 'request' && job && (
-        <VendorQuoteFlow
-          job={job}
-          onClose={() => { setQuotePanel(null); setQuotePreSelectedIds(null) }}
-          onQuoteRequestCreated={() => loadJob()}
-        />
-      )}
 
       {/* Single-material quote request modal */}
       {quoteMaterial && job && (() => {

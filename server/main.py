@@ -16,8 +16,8 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import BackgroundTasks, FastAPI, UploadFile, File, HTTPException, Request, Body
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -84,6 +84,49 @@ from inbox_monitor import InboxMonitor
 from audit_engine import AuditTraceBuilder
 from build_info import build_manifest_for_snapshot, get_build_info
 from readiness import evaluate_job_readiness, is_valid_material_classification, proposal_math_errors
+from quote_automation import (
+    assign_message,
+    build_quote_plan,
+    cancel_request as cancel_automated_quote_request,
+    claim_request_send,
+    create_approved_request,
+    create_simulation_run,
+    decide_price_match,
+    delivery_failure_status,
+    deterministic_contract,
+    get_request as get_automated_quote_request,
+    get_simulation_run,
+    ignore_message,
+    mark_request_accepted,
+    mark_request_send_failed,
+    mark_request_send_uncertain,
+    record_request_send_token,
+    quote_review,
+    quote_workflow,
+    repair_existing_price_evidence,
+    request_send_guard,
+    save_vendor_mapping,
+    simulation_report_markdown,
+    advance_simulation_run,
+)
+from outlook_graph import (
+    SESSION_COOKIE,
+    OutlookAuthenticationError,
+    OutlookConfigurationError,
+    OutlookDeliveryUncertainError,
+    authorization_url as outlook_authorization_url,
+    disconnect as disconnect_outlook,
+    exchange_code as exchange_outlook_code,
+    notification_payload_is_valid,
+    outlook_status,
+    outlook_worker,
+    reconcile_sent_requests,
+    generate_send_token as generate_outlook_send_token,
+    send_mail as send_outlook_mail,
+    sync_inbox_once,
+    verify_oauth_state,
+    verify_session as verify_outlook_session,
+)
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="SI Bid Tool", version="1.0.0")
@@ -685,6 +728,11 @@ _sim_watcher = None  # SimFolderWatcher instance (lazy import to avoid circular)
 def _start_sim_watcher():
     """Start the SimFolderWatcher if vendor quote test mode is enabled."""
     global _sim_watcher
+    if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
+        if _sim_watcher and _sim_watcher.is_running:
+            _sim_watcher.stop()
+        _sim_watcher = None
+        return
     settings = get_settings()
     test_mode = str(settings.get("vendor_quote_test_mode", "false")).lower() == "true"
 
@@ -720,6 +768,11 @@ def _start_inbox_monitor():
     global _inbox_monitor
     import json as _json
     settings = get_settings()
+    if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
+        if _inbox_monitor and _inbox_monitor.is_running:
+            _inbox_monitor.stop()
+        _inbox_monitor = None
+        return
     # Don't start real inbox monitor when in test mode
     if str(settings.get("vendor_quote_test_mode", "false")).lower() == "true":
         if _inbox_monitor and _inbox_monitor.is_running:
@@ -788,6 +841,16 @@ def startup():
     _auto_import_price_books()
     _start_inbox_monitor()
     _start_sim_watcher()
+    outlook_worker.start()
+
+
+@app.on_event("shutdown")
+def shutdown():
+    outlook_worker.stop()
+    if _inbox_monitor and _inbox_monitor.is_running:
+        _inbox_monitor.stop()
+    if _sim_watcher and _sim_watcher.is_running:
+        _sim_watcher.stop()
 
 
 def _auto_import_price_books():
@@ -1093,8 +1156,15 @@ def api_system_vendor_ingestion():
             "idempotency": idempotency["mechanism"],
             "idempotency_verified": idempotency["verified"],
             "idempotency_missing": idempotency["missing"],
-            "job_match": "stable_subject_tag_then_unambiguous_project_match",
+            "job_match": "reply_headers_then_exact_vendor_and_job_facts",
+            "requires_subject_tags": False,
+            "ai_calls_for_bid_matching": 0,
             "parse_failure_policy": "no_pricing_writes_until_every_selected_source_parses",
+        },
+        "deterministic_quote_automation": {
+            **deterministic_contract(),
+            "outlook": outlook_status(),
+            "automatic_price_rule": "direct_reply_exact_item_code_and_unit_only",
         },
         "dropbox_import": {
             "mode": "browser_folder_picker",
@@ -2790,6 +2860,14 @@ def _quote_upload_outcomes(
 @app.post("/api/jobs/{job_id}/upload-quotes")
 async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     """Upload vendor quote files, parse them, return pricing."""
+    if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "Use the Material Quotes tab. In deterministic mode, quote files "
+                "must be linked to recorded email evidence before prices can change."
+            ),
+        )
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
@@ -2946,6 +3024,11 @@ def api_imported_files(job_id: str):
 @app.delete("/api/jobs/{job_id}/quotes")
 def api_clear_quotes(job_id: str):
     """Clear all parsed quotes for a job."""
+    if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
+        raise HTTPException(
+            status_code=409,
+            detail="Deterministic quote evidence cannot be cleared from this legacy route.",
+        )
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
@@ -2958,6 +3041,11 @@ def api_clear_quotes(job_id: str):
 @app.put("/api/quotes/{quote_id}")
 def api_update_quote(quote_id: int, body: dict = Body(...)):
     """Update a single quote entry and re-match against materials."""
+    if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
+        raise HTTPException(
+            status_code=409,
+            detail="Use the Material Quotes review screen to approve or reject a price.",
+        )
     job_id = get_quote_job_id(quote_id)
     if not job_id:
         raise HTTPException(status_code=404, detail="Quote not found")
@@ -3820,6 +3908,7 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
         "result": conflict_probe,
     }
     response["quote_multipass_contract"] = quote_multipass_audit_contract()
+    response["deterministic_quote_contract"] = deterministic_contract()
     transition_cases = {
         "lf_to_sticks": {
             "material_type": "transitions", "price_source": "price_book",
@@ -7257,6 +7346,11 @@ async def api_price_history(item_code: str = None, product: str = None, exclude_
 
 @app.post("/api/jobs/{job_id}/quote-requests")
 async def api_create_quote_request(job_id: str, request: Request):
+    if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
+        raise HTTPException(
+            status_code=410,
+            detail="Use the Material Quotes tab for deterministic quote requests.",
+        )
     db_id = _resolve_job_id(job_id)
     data = await request.json()
     vendor_name = data.get("vendor_name", "").strip()
@@ -7279,11 +7373,36 @@ async def api_create_quote_request(job_id: str, request: Request):
 @app.get("/api/jobs/{job_id}/quote-requests")
 async def api_list_quote_requests(job_id: str):
     db_id = _resolve_job_id(job_id)
-    return list_quote_requests(db_id)
+    safe_fields = {
+        "id",
+        "job_id",
+        "vendor_id",
+        "vendor_name",
+        "status",
+        "material_ids",
+        "sent_at",
+        "received_at",
+        "created_at",
+    }
+    return [
+        {key: value for key, value in quote_request.items() if key in safe_fields}
+        for quote_request in list_quote_requests(db_id)
+    ]
 
 
 @app.put("/api/quote-requests/{request_id}")
 async def api_update_quote_request(request_id: int, request: Request):
+    existing = get_automated_quote_request(request_id)
+    if (
+        existing
+        and existing.get("material_snapshot_hash")
+        and os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower()
+        == "true"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Automated quote evidence is immutable. Use Retry or Cancel.",
+        )
     data = await request.json()
     update_quote_request(request_id, **data)
     return {"ok": True}
@@ -7291,9 +7410,756 @@ async def api_update_quote_request(request_id: int, request: Request):
 
 @app.delete("/api/quote-requests/{request_id}")
 async def api_delete_quote_request(request_id: int):
+    existing = get_automated_quote_request(request_id)
+    if (
+        existing
+        and existing.get("material_snapshot_hash")
+        and os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower()
+        == "true"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Automated quote evidence cannot be deleted. Cancel it instead.",
+        )
     if delete_quote_request(request_id):
         return {"ok": True}
     raise HTTPException(status_code=404, detail="Quote request not found")
+
+
+def _outlook_session_email(request: Request, *, required: bool = True) -> str | None:
+    try:
+        email_address = verify_outlook_session(request.cookies.get(SESSION_COOKIE))
+    except OutlookConfigurationError:
+        email_address = None
+    if required and not email_address:
+        raise HTTPException(
+            status_code=401,
+            detail="Connect and sign in to the approved Microsoft account first.",
+        )
+    return email_address
+
+
+@app.get("/api/jobs/{job_id}/quotes/workflow")
+def api_quote_workflow(job_id: str, request: Request):
+    db_id = _resolve_job_id(job_id)
+    session_email = _outlook_session_email(request, required=False)
+    try:
+        workflow = quote_workflow(
+            db_id,
+            outlook_status(session_email),
+            mailbox_email=session_email,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not session_email:
+        workflow["requests"] = []
+        workflow["review"] = {"messages": [], "price_matches": []}
+        workflow["summary"].update(
+            {
+                "request_count": 0,
+                "needs_matching_count": 0,
+                "price_review_count": 0,
+                "statuses": {},
+            }
+        )
+        workflow["review"]["mailbox_locked"] = True
+    return workflow
+
+
+@app.get("/api/jobs/{job_id}/quotes/plan")
+def api_quote_plan(job_id: str):
+    db_id = _resolve_job_id(job_id)
+    try:
+        return build_quote_plan(db_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/jobs/{job_id}/quotes/evidence-repair")
+async def api_quote_evidence_repair(
+    job_id: str,
+    request: Request,
+    files: list[UploadFile] = File(...),
+):
+    db_id = _resolve_job_id(job_id)
+    if not files:
+        raise HTTPException(status_code=400, detail="Choose at least one quote file.")
+    payloads = []
+    for upload in files[:10]:
+        data = await upload.read(25 * 1024 * 1024 + 1)
+        if len(data) > 25 * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{upload.filename or 'Quote file'} is larger than 25 MB.",
+            )
+        payloads.append((upload.filename or "vendor-quote", data))
+    session_email = _outlook_session_email(request, required=False)
+    job = load_job(db_id) or {}
+    try:
+        result = repair_existing_price_evidence(
+            db_id,
+            payloads,
+            reviewer_name=(
+                session_email
+                or str(job.get("salesperson") or "").strip()
+                or "Estimator"
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    refreshed_job = load_job(db_id)
+    result["readiness"] = (
+        _evaluate_job_readiness(refreshed_job)
+        if refreshed_job
+        else None
+    )
+    return result
+
+
+@app.post("/api/jobs/{job_id}/quotes/approve-and-send")
+async def api_approve_and_send_quotes(job_id: str, request: Request):
+    db_id = _resolve_job_id(job_id)
+    session_email = _outlook_session_email(request)
+    body = await request.json()
+    current_plan = build_quote_plan(db_id)
+    expected_source_fingerprint = str(
+        body.get("source_fingerprint") or ""
+    ).strip()
+    if (
+        not expected_source_fingerprint
+        or expected_source_fingerprint != current_plan["source_fingerprint"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="This quote plan is out of date. Refresh it before sending.",
+        )
+    reviewer_name = str(body.get("reviewer_name") or session_email or "Estimator").strip()
+    groups = body.get("groups")
+    if not isinstance(groups, list) or not groups:
+        groups = [
+            group for group in build_quote_plan(db_id)["groups"] if group.get("can_send")
+        ]
+    if not groups:
+        raise HTTPException(
+            status_code=400,
+            detail="No complete vendor groups are ready to send.",
+        )
+    current_groups = {
+        frozenset(
+            int(item["id"])
+            for item in group.get("materials_to_send") or []
+            if item.get("id") is not None
+        ): str(group.get("request_fingerprint") or "")
+        for group in current_plan.get("groups") or []
+        if group.get("materials_to_send")
+    }
+    for group in groups:
+        requested_ids = set()
+        for item in (
+            group.get("materials_to_send")
+            or group.get("materials")
+            or group.get("material_ids")
+            or []
+        ):
+            value = item.get("id") if isinstance(item, dict) else item
+            try:
+                requested_ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        expected_group_fingerprint = current_groups.get(frozenset(requested_ids))
+        if (
+            not requested_ids
+            or not expected_group_fingerprint
+            or str(group.get("request_fingerprint") or "")
+            != expected_group_fingerprint
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="A vendor group changed. Refresh the quote plan before sending.",
+            )
+
+    results = []
+    for group in groups:
+        quote_request = None
+        accepted_by_microsoft = False
+        material_entries = (
+            group.get("materials_to_send")
+            or group.get("materials")
+            or group.get("material_ids")
+            or []
+        )
+        material_ids = []
+        for item in material_entries:
+            value = item.get("id") if isinstance(item, dict) else item
+            try:
+                material_ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        vendor_name = str(group.get("vendor_name") or "").strip()
+        vendor_email = str(group.get("vendor_email") or "").strip()
+        try:
+            vendor_id = save_vendor_mapping(vendor_name, vendor_email)
+            quote_request = create_approved_request(
+                db_id,
+                vendor_name=vendor_name,
+                vendor_email=vendor_email,
+                vendor_id=vendor_id,
+                material_ids=material_ids,
+                subject=str(group.get("subject") or ""),
+                body=str(group.get("body") or ""),
+                reviewer_name=reviewer_name,
+                mailbox_email=session_email,
+                expected_request_fingerprint=str(
+                    group.get("request_fingerprint") or ""
+                ),
+                expected_source_fingerprint=expected_source_fingerprint,
+            )
+            if not claim_request_send(int(quote_request["id"])):
+                raise ValueError("This quote request is already being sent.")
+            send_token = generate_outlook_send_token()
+            record_request_send_token(
+                int(quote_request["id"]),
+                send_token,
+            )
+            with request_send_guard(int(quote_request["id"])) as sendable:
+                if not sendable:
+                    raise ValueError(
+                        "The bid changed before send. Refresh the quote plan."
+                    )
+                sent = send_outlook_mail(
+                    vendor_email,
+                    quote_request.get("subject") or "",
+                    quote_request.get("request_text") or "",
+                    send_token=send_token,
+                    connection_email=session_email,
+                )
+            accepted_by_microsoft = True
+            quote_request = mark_request_accepted(
+                int(quote_request["id"]),
+                sent_at=datetime.fromisoformat(sent["sent_at"]),
+            )
+            quote_request.pop("send_token", None)
+            log_activity(
+                db_id,
+                "quote_request_sent",
+                f"Quote request sent to {vendor_name} ({vendor_email}) without AI",
+                {
+                    "request_id": quote_request["id"],
+                    "material_ids": material_ids,
+                    "reviewer": reviewer_name,
+                    "matching_engine": "deterministic-v1",
+                },
+            )
+            results.append(
+                {
+                    "status": "accepted",
+                    "vendor_name": vendor_name,
+                    "quote_request": quote_request,
+                    "proof_reconciled": bool(sent.get("proof_reconciled")),
+                }
+            )
+        except OutlookDeliveryUncertainError as exc:
+            request_id = (
+                int(quote_request["id"])
+                if isinstance(quote_request, dict) and quote_request.get("id")
+                else None
+            )
+            if request_id:
+                mark_request_send_uncertain(request_id, str(exc))
+            results.append(
+                {
+                    "status": "uncertain",
+                    "vendor_name": vendor_name or "Unknown",
+                    "error": str(exc),
+                    "request_id": request_id,
+                }
+            )
+        except Exception as exc:
+            request_id = (
+                int(quote_request["id"])
+                if isinstance(quote_request, dict) and quote_request.get("id")
+                else None
+            )
+            if request_id:
+                if accepted_by_microsoft:
+                    mark_request_send_uncertain(request_id, str(exc))
+                else:
+                    mark_request_send_failed(request_id, str(exc))
+            failure_status = delivery_failure_status(
+                microsoft_may_have_accepted=accepted_by_microsoft
+            )
+            results.append(
+                {
+                    "status": (
+                        "uncertain"
+                        if failure_status == "send_uncertain"
+                        else "failed"
+                    ),
+                    "vendor_name": vendor_name or "Unknown",
+                    "error": str(exc),
+                    "request_id": request_id,
+                }
+            )
+        finally:
+            quote_request = None
+    return {
+        "status": (
+            "accepted"
+            if all(item["status"] == "accepted" for item in results)
+            else "partial"
+        ),
+        "results": results,
+        "matching_engine": "deterministic-v1",
+        "ai_calls": 0,
+    }
+
+
+@app.get("/api/jobs/{job_id}/quotes/review")
+def api_job_quote_review(job_id: str, request: Request):
+    session_email = _outlook_session_email(request)
+    return quote_review(_resolve_job_id(job_id), mailbox_email=session_email)
+
+
+@app.post("/api/jobs/{job_id}/quotes/matches/{match_id}/decision")
+async def api_quote_match_decision(
+    job_id: str,
+    match_id: int,
+    request: Request,
+):
+    db_id = _resolve_job_id(job_id)
+    session_email = _outlook_session_email(request)
+    body = await request.json()
+    conn = _get_conn()
+    try:
+        match = conn.execute(
+            """SELECT qpm.job_id, qr.mailbox_email
+               FROM quote_price_matches qpm
+               LEFT JOIN quote_requests qr ON qr.id=qpm.quote_request_id
+               WHERE qpm.id=?""",
+            (match_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not match or int(match["job_id"]) != db_id:
+        raise HTTPException(status_code=404, detail="Price match not found for this bid.")
+    if (
+        str(match["mailbox_email"] or "").strip().lower()
+        != str(session_email or "").strip().lower()
+    ):
+        raise HTTPException(status_code=403, detail="This quote belongs to another mailbox.")
+    try:
+        result = decide_price_match(
+            match_id,
+            decision=str(body.get("decision") or "").strip(),
+            reviewer_name=str(body.get("reviewer_name") or session_email),
+            reason=str(body.get("reason") or "Estimator reviewed the vendor quote."),
+            material_id=body.get("material_id"),
+            expected_material_id=body.get("expected_material_id"),
+            expected_current_price=body.get("expected_current_price"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return result
+
+
+@app.post("/api/quote-requests/{request_id}/retry")
+def api_retry_automated_quote_request(request_id: int, request: Request):
+    session_email = _outlook_session_email(request)
+    quote_request = get_automated_quote_request(request_id)
+    if not quote_request:
+        raise HTTPException(status_code=404, detail="Quote request not found.")
+    if str(quote_request.get("status") or "").lower() in {
+        "complete",
+        "cancelled",
+        "received",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail="This quote request is already finished.",
+        )
+    if (
+        str(quote_request.get("mailbox_email") or "").strip().lower()
+        != str(session_email or "").strip().lower()
+    ):
+        raise HTTPException(status_code=403, detail="This quote request belongs to another mailbox.")
+    if quote_request.get("status") not in {"send_failed", "approved"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Only an approved or failed request can be retried.",
+        )
+    if not claim_request_send(request_id):
+        raise HTTPException(status_code=409, detail="This request is already being sent.")
+    accepted_by_microsoft = False
+    try:
+        send_token = str(quote_request.get("send_token") or "").strip()
+        if not send_token:
+            send_token = generate_outlook_send_token()
+            record_request_send_token(request_id, send_token)
+        with request_send_guard(request_id) as sendable:
+            if not sendable:
+                raise ValueError(
+                    "The bid changed before send. Refresh the quote plan."
+                )
+            result = send_outlook_mail(
+                quote_request.get("vendor_email") or "",
+                quote_request.get("subject") or "",
+                quote_request.get("request_text") or "",
+                send_token=send_token,
+                connection_email=session_email,
+            )
+        accepted_by_microsoft = True
+        updated = mark_request_accepted(
+            request_id,
+            sent_at=datetime.fromisoformat(result["sent_at"]),
+        )
+        updated.pop("send_token", None)
+    except OutlookDeliveryUncertainError as exc:
+        mark_request_send_uncertain(request_id, str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        if accepted_by_microsoft:
+            mark_request_send_uncertain(request_id, str(exc))
+        else:
+            mark_request_send_failed(request_id, str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "status": "accepted",
+        "proof_reconciled": bool(result.get("proof_reconciled")),
+        "quote_request": updated,
+    }
+
+
+@app.post("/api/quote-requests/{request_id}/cancel")
+def api_cancel_automated_quote_request(request_id: int, request: Request):
+    session_email = _outlook_session_email(request)
+    quote_request = get_automated_quote_request(request_id)
+    if not quote_request:
+        raise HTTPException(status_code=404, detail="Quote request not found.")
+    if str(quote_request.get("status") or "").lower() in {
+        "complete",
+        "cancelled",
+        "received",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail="This quote request is already finished.",
+        )
+    if (
+        str(quote_request.get("mailbox_email") or "").strip().lower()
+        != str(session_email or "").strip().lower()
+    ):
+        raise HTTPException(status_code=403, detail="This quote request belongs to another mailbox.")
+    if not cancel_automated_quote_request(request_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This request is complete, cancelled, missing, "
+                "or a follow-up is already being sent. Refresh and try again."
+            ),
+        )
+    return {"status": "cancelled"}
+
+
+def _quote_artifact_response(
+    relative_path: str,
+    expected_hash: str,
+    download_name: str,
+    media_type: str = "application/octet-stream",
+):
+    path = _checked_artifact_path(relative_path)
+    if (
+        not path
+        or not os.path.isfile(path)
+        or not expected_hash
+        or _file_hash(path) != expected_hash
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="This saved quote proof is missing or no longer matches its hash.",
+        )
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=os.path.basename(download_name or path),
+    )
+
+
+@app.get("/api/quote-requests/{request_id}/evidence")
+def api_quote_request_evidence(request_id: int, request: Request):
+    session_email = _outlook_session_email(request)
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT mailbox_email, sent_artifact_path, sent_artifact_hash
+               FROM quote_requests WHERE id=?""",
+            (request_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Quote request not found.")
+    if row["mailbox_email"] and str(row["mailbox_email"]).lower() != session_email.lower():
+        raise HTTPException(status_code=403, detail="This proof belongs to another mailbox.")
+    return _quote_artifact_response(
+        row["sent_artifact_path"] or "",
+        row["sent_artifact_hash"] or "",
+        f"quote-request-{request_id}.eml",
+        "message/rfc822",
+    )
+
+
+@app.get("/api/quotes/messages/{message_id}/evidence")
+def api_quote_message_evidence(message_id: int, request: Request):
+    session_email = _outlook_session_email(request)
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT mailbox_email, raw_artifact_path, raw_hash
+               FROM quote_email_messages WHERE id=?""",
+            (message_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Quote email not found.")
+    if row["mailbox_email"] and str(row["mailbox_email"]).lower() != session_email.lower():
+        raise HTTPException(status_code=403, detail="This proof belongs to another mailbox.")
+    return _quote_artifact_response(
+        row["raw_artifact_path"] or "",
+        row["raw_hash"] or "",
+        f"vendor-email-{message_id}.eml",
+        "message/rfc822",
+    )
+
+
+@app.get("/api/quotes/messages/{message_id}/attachments/{attachment_index}")
+def api_quote_message_attachment(
+    message_id: int,
+    attachment_index: int,
+    request: Request,
+):
+    session_email = _outlook_session_email(request)
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT mailbox_email, attachment_manifest_json
+               FROM quote_email_messages WHERE id=?""",
+            (message_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Quote email not found.")
+    if row["mailbox_email"] and str(row["mailbox_email"]).lower() != session_email.lower():
+        raise HTTPException(status_code=403, detail="This proof belongs to another mailbox.")
+    try:
+        attachments = json.loads(row["attachment_manifest_json"] or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        attachments = []
+    if (
+        not isinstance(attachments, list)
+        or attachment_index < 0
+        or attachment_index >= len(attachments)
+    ):
+        raise HTTPException(status_code=404, detail="Quote attachment not found.")
+    attachment = attachments[attachment_index]
+    return _quote_artifact_response(
+        str(attachment.get("artifact_path") or ""),
+        str(attachment.get("file_hash") or ""),
+        str(attachment.get("file_name") or f"attachment-{attachment_index + 1}"),
+    )
+
+
+@app.get("/api/integrations/outlook/status")
+def api_outlook_status(request: Request):
+    return outlook_status(_outlook_session_email(request, required=False))
+
+
+@app.get("/api/integrations/outlook/connect")
+def api_outlook_connect(request: Request, return_to: str = "/"):
+    redirect_uri = os.environ.get("OUTLOOK_REDIRECT_URI", "").strip() or (
+        str(request.base_url).rstrip("/") + "/api/integrations/outlook/callback"
+    )
+    try:
+        url = outlook_authorization_url(
+            redirect_uri=redirect_uri,
+            return_to=return_to,
+        )
+    except OutlookConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return RedirectResponse(url, status_code=302)
+
+
+@app.get("/api/integrations/outlook/callback")
+def api_outlook_callback(
+    request: Request,
+    code: str = "",
+    state: str = "",
+    error: str = "",
+    error_description: str = "",
+):
+    if error:
+        raise HTTPException(
+            status_code=400,
+            detail=error_description or f"Microsoft sign-in failed: {error}",
+        )
+    try:
+        state_payload = verify_oauth_state(state)
+        result = exchange_outlook_code(
+            code=code,
+            redirect_uri=str(state_payload.get("redirect_uri") or ""),
+        )
+    except (OutlookAuthenticationError, OutlookConfigurationError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return_to = str(state_payload.get("return_to") or "/")
+    separator = "&" if "?" in return_to else "?"
+    response = RedirectResponse(
+        f"{return_to}{separator}outlook=connected",
+        status_code=302,
+    )
+    response.set_cookie(
+        SESSION_COOKIE,
+        result["session"],
+        max_age=12 * 60 * 60,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/integrations/outlook/notifications")
+async def api_outlook_notifications(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    validation_token = request.query_params.get("validationToken")
+    if validation_token:
+        return PlainTextResponse(validation_token)
+    payload = await request.json()
+    if not notification_payload_is_valid(payload):
+        raise HTTPException(status_code=401, detail="Invalid Microsoft notification.")
+    background_tasks.add_task(sync_inbox_once)
+    return JSONResponse(status_code=202, content={"accepted": True})
+
+
+@app.post("/api/integrations/outlook/sync")
+def api_outlook_sync(request: Request):
+    session_email = _outlook_session_email(request)
+    try:
+        reconciliation = reconcile_sent_requests(session_email)
+        result = sync_inbox_once(session_email)
+        result["sent_reconciliation"] = reconciliation
+        return result
+    except (OutlookAuthenticationError, RuntimeError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/integrations/outlook/disconnect")
+def api_outlook_disconnect(request: Request):
+    session_email = _outlook_session_email(request)
+    disconnected = disconnect_outlook(session_email)
+    response = JSONResponse({"disconnected": disconnected})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+@app.get("/api/quotes/inbox-review")
+def api_quote_inbox_review(request: Request):
+    session_email = _outlook_session_email(request)
+    return quote_review(mailbox_email=session_email)
+
+
+@app.post("/api/quotes/inbox-review/{message_id}/assign")
+async def api_assign_quote_message(message_id: int, request: Request):
+    session_email = _outlook_session_email(request)
+    body = await request.json()
+    try:
+        return assign_message(
+            message_id,
+            job_id=int(body.get("job_id")),
+            request_id=int(body.get("request_id")),
+            reviewer_name=str(body.get("reviewer_name") or session_email),
+            mailbox_email=session_email,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/quotes/inbox-review/{message_id}/ignore")
+async def api_ignore_quote_message(message_id: int, request: Request):
+    session_email = _outlook_session_email(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not ignore_message(
+        message_id,
+        session_email,
+        job_id=body.get("job_id"),
+        mailbox_email=session_email,
+    ):
+        raise HTTPException(status_code=404, detail="Message not found.")
+    return {"status": "ignored"}
+
+
+@app.post("/api/jobs/{job_id}/quote-simulator/runs")
+async def api_create_quote_simulation(job_id: str, request: Request):
+    db_id = _resolve_job_id(job_id)
+    body = await request.json()
+    try:
+        return create_simulation_run(db_id, str(body.get("scenario") or "all"))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/jobs/{job_id}/quote-simulator/runs/{run_id}")
+def api_get_quote_simulation(job_id: str, run_id: int):
+    result = get_simulation_run(_resolve_job_id(job_id), run_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Simulation run not found.")
+    return result
+
+
+@app.get("/api/jobs/{job_id}/quote-simulator/runs/{run_id}/report")
+def api_get_quote_simulation_report(job_id: str, run_id: int):
+    db_id = _resolve_job_id(job_id)
+    try:
+        report = simulation_report_markdown(db_id, run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return PlainTextResponse(
+        report,
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="material-quote-simulation-{run_id}.md"'
+            )
+        },
+    )
+
+
+@app.post("/api/jobs/{job_id}/quote-simulator/runs/{run_id}/advance")
+async def api_advance_quote_simulation(
+    job_id: str,
+    run_id: int,
+    request: Request,
+):
+    body = await request.json()
+    try:
+        return advance_simulation_run(
+            _resolve_job_id(job_id),
+            run_id,
+            int(body.get("business_days") or 1),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/system/deterministic-quote-contract")
+def api_deterministic_quote_contract():
+    return deterministic_contract()
 
 
 # ── AI: Vendor Detection & Quote Text ────────────────────────────────────────
@@ -8065,6 +8931,11 @@ async def api_send_quote_email(job_id: str, request: Request):
     In test mode: routes to localhost:2525 (PowerShell relay → Vendor Simulator)
     In production: routes to real SMTP server → real vendor
     """
+    if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
+        raise HTTPException(
+            status_code=410,
+            detail="Legacy SMTP quote sending is disabled. Use Material Quotes.",
+        )
     db_id = _resolve_job_id(job_id)
     if not db_id:
         raise HTTPException(status_code=404, detail="Job not found")
