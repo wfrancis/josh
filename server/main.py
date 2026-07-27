@@ -89,6 +89,7 @@ from quote_automation import (
     build_quote_plan,
     cancel_request as cancel_automated_quote_request,
     claim_request_send,
+    cleanup_orphan_assignment_artifacts,
     create_approved_request,
     create_simulation_run,
     decide_price_match,
@@ -836,6 +837,7 @@ def _start_inbox_monitor():
 @app.on_event("startup")
 def startup():
     init_db()
+    cleanup_orphan_assignment_artifacts()
     _apply_openai_config()
     _seed_company_rates()
     _seed_rules_registry()

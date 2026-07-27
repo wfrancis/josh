@@ -349,6 +349,8 @@ def init_db() -> None:
                 matched_request_id INTEGER,
                 evidence_json TEXT NOT NULL DEFAULT '[]',
                 processed_at TEXT,
+                assignment_token TEXT DEFAULT '',
+                assignment_started_at TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (matched_job_id) REFERENCES jobs(id) ON DELETE SET NULL,
                 FOREIGN KEY (matched_request_id) REFERENCES quote_requests(id) ON DELETE SET NULL
@@ -676,12 +678,15 @@ def init_db() -> None:
             ("qfe_artifact_path", "ALTER TABLE quote_followup_events ADD COLUMN artifact_path TEXT DEFAULT ''"),
             ("qfe_artifact_hash", "ALTER TABLE quote_followup_events ADD COLUMN artifact_hash TEXT DEFAULT ''"),
             ("qem_mailbox_email", "ALTER TABLE quote_email_messages ADD COLUMN mailbox_email TEXT DEFAULT ''"),
+            ("qem_assignment_token", "ALTER TABLE quote_email_messages ADD COLUMN assignment_token TEXT DEFAULT ''"),
+            ("qem_assignment_started_at", "ALTER TABLE quote_email_messages ADD COLUMN assignment_started_at TEXT"),
         ]:
             try:
                 conn.execute(sql)
                 conn.commit()
-            except sqlite3.OperationalError:
-                pass  # Column already exists
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
         conn.execute(
             """UPDATE quote_requests
@@ -689,6 +694,65 @@ def init_db() -> None:
                    completed_at=COALESCE(completed_at, received_at, sent_at, created_at)
                WHERE lower(status)='received'"""
         )
+        # Pre-fence builds could leave review rows behind if a manual email
+        # assignment stopped halfway through. Only unresolved rows are reset.
+        conn.execute(
+            """UPDATE quote_request_materials
+               SET status='requested', quoted_price=NULL,
+                   source_message_id=NULL, resolved_at=NULL
+               WHERE status='needs_review'
+                 AND source_message_id IN (
+                     SELECT qem.id
+                     FROM quote_email_messages qem
+                     WHERE qem.id=quote_request_materials.source_message_id
+                       AND (
+                           qem.match_status!='matched'
+                           OR qem.matched_request_id IS NULL
+                           OR qem.matched_request_id
+                              != quote_request_materials.quote_request_id
+                       )
+                 )"""
+        )
+        conn.execute(
+            """DELETE FROM quote_price_matches
+               WHERE status!='applied'
+                 AND message_id IN (
+                     SELECT qem.id
+                     FROM quote_email_messages qem
+                     WHERE qem.id=quote_price_matches.message_id
+                       AND (
+                           qem.match_status!='matched'
+                           OR qem.matched_job_id IS NULL
+                           OR qem.matched_job_id!=quote_price_matches.job_id
+                           OR qem.matched_request_id IS NULL
+                           OR qem.matched_request_id
+                              != quote_price_matches.quote_request_id
+                       )
+                 )"""
+        )
+        conn.execute(
+            """DELETE FROM quote_price_matches
+               WHERE id NOT IN (
+                   SELECT COALESCE(
+                              MIN(CASE WHEN status='applied' THEN id END),
+                              MIN(CASE WHEN status='needs_review' THEN id END),
+                              MIN(id)
+                          )
+                   FROM quote_price_matches
+                   GROUP BY message_id, quote_request_id,
+                            COALESCE(material_id, -1), source_hash,
+                            quote_price, quote_unit
+               )"""
+        )
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS
+                   idx_quote_price_matches_exact_dedup
+               ON quote_price_matches(
+                   message_id, quote_request_id, COALESCE(material_id, -1),
+                   source_hash, quote_price, quote_unit
+               )"""
+        )
+        conn.commit()
 
         # Exact duplicates from an interrupted pre-index import carry the same
         # source hash and product identity. Keep the oldest evidence row so the

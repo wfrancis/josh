@@ -200,6 +200,7 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
   const [historyLoading, setHistoryLoading] = useState(false)
   const [simulationScenario, setSimulationScenario] = useState('all')
   const [simulation, setSimulation] = useState(null)
+  const [clockNow, setClockNow] = useState(() => Date.now())
 
   const loadLiveData = useCallback(async ({ quiet = false } = {}) => {
     if (!jobId) return
@@ -296,6 +297,14 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
     const messageId = message.id ?? message.message_id
     return messages.findIndex((candidate) => (candidate.id ?? candidate.message_id) === messageId) === index
   })
+  const assigningMessageCount = needsMatching.filter((message) => (
+    message.assignment_in_progress || message.match_status === 'assigning'
+  )).length
+  useEffect(() => {
+    if (!assigningMessageCount) return undefined
+    const timer = window.setInterval(() => setClockNow(Date.now()), 5000)
+    return () => window.clearInterval(timer)
+  }, [assigningMessageCount])
   const outlookConnected = outlook?.session_authenticated !== undefined
     ? Boolean(outlook.session_authenticated)
     : Boolean(outlook?.connected || normalizeStatus(outlook?.status) === 'connected')
@@ -1097,6 +1106,14 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
                     const evidence = asArray(message.evidence || message.evidence_json)
                     const candidates = asArray(message.candidates)
                     const messageAttachments = asArray(message.attachments)
+                    const assignmentInProgress = message.assignment_in_progress
+                      || message.match_status === 'assigning'
+                    const retryAt = Date.parse(message.assignment_retry_at || '')
+                    const assignmentRetryAvailable = assignmentInProgress && (
+                      message.assignment_retry_available
+                      || !Number.isFinite(retryAt)
+                      || clockNow >= retryAt
+                    )
                     const currentCandidates = candidates.filter((candidate) =>
                       String(candidate.job_id) === String(jobId)
                     )
@@ -1111,7 +1128,10 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
                         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
-                              <StatusPill status="needs_matching" label="Needs Matching" />
+                              <StatusPill
+                                status={assignmentInProgress ? 'waiting' : 'needs_matching'}
+                                label={assignmentInProgress ? 'Assigning' : 'Needs Matching'}
+                              />
                               <span className="text-xs text-gray-600">{formatDate(message.received_at)}</span>
                             </div>
                             <h3 className="mt-2 break-words text-sm font-semibold text-white">{message.subject || 'No subject'}</h3>
@@ -1125,7 +1145,7 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
                             )}
                           </div>
                           <div className="flex flex-col items-stretch gap-2 sm:items-end">
-                            {currentCandidates.length > 1 && (
+                            {!assignmentInProgress && currentCandidates.length > 1 && (
                               <select
                                 value={targetRequests[messageId] || ''}
                                 onChange={(event) => setTargetRequests((current) => ({
@@ -1145,6 +1165,12 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
                                 })}
                               </select>
                             )}
+                            {assignmentInProgress && !assignmentRetryAvailable ? (
+                              <div className="inline-flex h-9 items-center gap-2 px-2 text-xs text-gray-400">
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                Checking the quote
+                              </div>
+                            ) : (
                             <div className="flex flex-wrap items-center gap-2">
                             <button
                               type="button"
@@ -1154,8 +1180,9 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
                               className="inline-flex items-center gap-1.5 rounded-lg bg-si-bright px-3 py-2 text-xs font-bold text-white hover:bg-blue-500 disabled:opacity-50"
                             >
                               <Link2 className="h-3.5 w-3.5" />
-                              Assign to This Bid
+                              {assignmentInProgress ? 'Retry Assignment' : 'Assign to This Bid'}
                             </button>
+                            {!assignmentInProgress && (
                             <button
                               type="button"
                               onClick={() => ignoreMessage(message)}
@@ -1164,7 +1191,9 @@ export default function MaterialQuotes({ job, onJobRefresh, onGoBack, onContinue
                               <Ban className="h-3.5 w-3.5" />
                               Ignore
                             </button>
+                            )}
                             </div>
+                            )}
                           </div>
                         </div>
 

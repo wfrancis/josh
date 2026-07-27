@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from email import policy
@@ -58,6 +59,7 @@ OPEN_REQUEST_STATUSES = {
     "send_failed",
 }
 MATCHABLE_REQUEST_STATUSES = OPEN_REQUEST_STATUSES | {"stale"}
+ASSIGNMENT_LEASE_SECONDS = 120
 SIMULATION_SCENARIOS = {
     "all",
     "normal_reply",
@@ -73,6 +75,14 @@ SIMULATION_SCENARIOS = {
     "materials_changed",
     "send_failure",
 }
+
+
+class AssignmentRejectedError(ValueError):
+    """The assignment failed after its review state was safely updated."""
+
+
+class AssignmentLeaseLostError(ValueError):
+    """A newer worker owns this email assignment."""
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_SPREADSHEET_ROWS = 50_000
 GENERIC_EMAIL_DOMAINS = {
@@ -216,12 +226,17 @@ def _write_artifact(
     filename: str,
     job_id: int | None = None,
     artifact_kind: str = "vendor_quote",
+    conn=None,
+    path_token: str = "",
+    record_artifact: bool = True,
 ) -> dict:
     digest = _sha256_bytes(data)
     root = ARTIFACT_ROOT / (str(job_id) if job_id else "shared") / "uploads"
     root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{digest[:12]}_{_safe_name(filename)}"
-    if not path.exists():
+    token = f"{_safe_name(path_token)[:40]}_" if path_token else ""
+    path = root / f"{digest[:12]}_{token}{_safe_name(filename)}"
+    created = not path.exists()
+    if created:
         path.write_bytes(data)
     result = {
         "file_name": filename,
@@ -230,19 +245,29 @@ def _write_artifact(
         "artifact_path": _artifact_relative(path),
         "absolute_path": str(path),
         "artifact_kind": artifact_kind,
+        "created": created,
     }
-    if job_id:
-        record_job_artifact(
-            job_id,
-            artifact_kind,
-            result["artifact_path"],
-            digest,
-            len(data),
-        )
+    if job_id and record_artifact:
+        try:
+            record_job_artifact(
+                job_id,
+                artifact_kind,
+                result["artifact_path"],
+                digest,
+                len(data),
+                conn=conn,
+            )
+        except Exception:
+            if created:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            raise
     return result
 
 
-def _copy_artifact_to_job(manifest: dict, job_id: int) -> dict | None:
+def _manifest_artifact_source(manifest: dict) -> dict | None:
     relative = str(manifest.get("artifact_path") or "")
     try:
         source = (ARTIFACT_ROOT / relative).resolve()
@@ -251,12 +276,129 @@ def _copy_artifact_to_job(manifest: dict, job_id: int) -> dict | None:
         return None
     if not source.is_file():
         return None
+    return {
+        "file_name": str(manifest.get("file_name") or source.name),
+        "file_hash": str(manifest.get("file_hash") or _sha256_bytes(source.read_bytes())),
+        "file_size": int(manifest.get("file_size") or source.stat().st_size),
+        "artifact_path": relative,
+        "absolute_path": str(source),
+        "artifact_kind": str(manifest.get("artifact_kind") or "vendor_quote"),
+    }
+
+
+def _copy_artifact_to_job(
+    manifest: dict,
+    job_id: int,
+    *,
+    conn=None,
+    path_token: str = "",
+    record_artifact: bool = True,
+) -> dict | None:
+    source_manifest = _manifest_artifact_source(manifest)
+    if not source_manifest:
+        return None
+    source = Path(source_manifest["absolute_path"])
     return _write_artifact(
         source.read_bytes(),
-        filename=str(manifest.get("file_name") or source.name),
+        filename=source_manifest["file_name"],
         job_id=job_id,
         artifact_kind="vendor_quote",
+        conn=conn,
+        path_token=path_token,
+        record_artifact=record_artifact,
     )
+
+
+def _stage_assignment_artifacts(
+    parsed_sources: Iterable[dict],
+    *,
+    job_id: int,
+    assignment_token: str,
+) -> tuple[list[dict], list[str]]:
+    staged = []
+    created_paths = []
+    try:
+        for manifest in parsed_sources:
+            copied = _copy_artifact_to_job(
+                manifest,
+                job_id,
+                path_token=f"assign-{assignment_token}",
+                record_artifact=False,
+            )
+            if not copied:
+                raise RuntimeError(
+                    "Could not preserve quote proof: "
+                    f"{manifest.get('file_name') or 'file'}."
+                )
+            staged.append(copied)
+            if copied.get("created"):
+                created_paths.append(str(copied["artifact_path"]))
+        return staged, created_paths
+    except Exception:
+        _remove_uncommitted_artifact_files(created_paths)
+        raise
+
+
+def _remove_uncommitted_artifact_files(artifact_paths: Iterable[str]) -> None:
+    paths = {str(value or "") for value in artifact_paths if str(value or "")}
+    if not paths:
+        return
+    conn = _get_conn()
+    try:
+        referenced = {
+            str(row["artifact_path"])
+            for row in conn.execute(
+                f"""SELECT artifact_path FROM job_artifacts
+                    WHERE artifact_path IN ({",".join("?" for _ in paths)})""",
+                tuple(paths),
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    for relative in paths - referenced:
+        try:
+            path = (ARTIFACT_ROOT / relative).resolve()
+            path.relative_to(ARTIFACT_ROOT)
+            if path.is_file():
+                path.unlink()
+        except (OSError, ValueError):
+            continue
+
+
+def cleanup_orphan_assignment_artifacts() -> dict:
+    pattern = re.compile(r"^[0-9a-f]{12}_assign-[0-9a-f]{32}_")
+    candidates = [
+        path
+        for path in ARTIFACT_ROOT.glob("*/uploads/*")
+        if path.is_file() and pattern.match(path.name)
+    ]
+    if not candidates:
+        return {"checked": 0, "removed": 0}
+    conn = _get_conn()
+    removed = 0
+    try:
+        for path in candidates:
+            try:
+                relative = _artifact_relative(path)
+            except (OSError, ValueError):
+                continue
+            referenced = conn.execute(
+                """SELECT 1 FROM job_artifacts WHERE artifact_path=?
+                   UNION ALL
+                   SELECT 1 FROM imported_files WHERE artifact_path=?
+                   LIMIT 1""",
+                (relative, relative),
+            ).fetchone()
+            if referenced:
+                continue
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+    finally:
+        conn.close()
+    return {"checked": len(candidates), "removed": removed}
 
 
 def _material_snapshot(materials: Iterable[dict]) -> list[dict]:
@@ -1318,7 +1460,7 @@ def quote_review(
             SELECT qem.*, j.project_name AS matched_job_name
             FROM quote_email_messages qem
             LEFT JOIN jobs j ON j.id=qem.matched_job_id
-            WHERE qem.match_status='needs_review'
+            WHERE qem.match_status IN ('needs_review','assigning')
         """
         message_params: list[Any] = []
         if mailbox_email:
@@ -1339,6 +1481,21 @@ def quote_review(
             dict(row) for row in conn.execute(message_sql, tuple(message_params))
         ]
         for message in messages:
+            assigning = str(message.get("match_status") or "") == "assigning"
+            started_at = _parse_iso(message.get("assignment_started_at"))
+            retry_at = (
+                started_at + timedelta(seconds=ASSIGNMENT_LEASE_SECONDS)
+                if assigning and started_at
+                else None
+            )
+            message["assignment_in_progress"] = assigning
+            message["assignment_retry_at"] = (
+                retry_at.isoformat() if retry_at else None
+            )
+            message["assignment_retry_available"] = bool(
+                assigning and (retry_at is None or retry_at <= utc_now())
+            )
+            message.pop("assignment_token", None)
             message["evidence"] = _json_loads(message.get("evidence_json"), [])
             message["attachments"] = _json_loads(
                 message.get("attachment_manifest_json"), []
@@ -1367,8 +1524,17 @@ def quote_review(
             FROM quote_price_matches qpm
             JOIN jobs j ON j.id=qpm.job_id
             JOIN quote_requests qr ON qr.id=qpm.quote_request_id
+            LEFT JOIN quote_email_messages qem ON qem.id=qpm.message_id
             LEFT JOIN job_materials jm ON jm.id=qpm.material_id
             WHERE qpm.status='needs_review'
+              AND (
+                  qpm.message_id IS NULL
+                  OR (
+                      qem.match_status='matched'
+                      AND qem.matched_job_id=qpm.job_id
+                      AND qem.matched_request_id=qpm.quote_request_id
+                  )
+              )
               AND lower(qr.status) NOT IN ('cancelled','complete','received','stale')
         """
         price_params: list[Any] = []
@@ -1704,7 +1870,34 @@ def match_message_to_requests(message: dict, requests: list[dict]) -> dict:
     }
 
 
-def _persist_message(message: dict, match: dict) -> tuple[int, bool]:
+def _stored_message_match(conn, row) -> dict:
+    return {
+        "status": str(row["match_status"] or ""),
+        "job_id": row["matched_job_id"],
+        "request_id": row["matched_request_id"],
+        "method": str(row["match_method"] or ""),
+        "evidence": _json_loads(row["evidence_json"], []),
+        "candidates": [
+            {
+                "job_id": candidate["job_id"],
+                "request_id": candidate["quote_request_id"],
+                "evidence": _json_loads(candidate["evidence_json"], []),
+            }
+            for candidate in conn.execute(
+                """SELECT job_id, quote_request_id, evidence_json
+                   FROM quote_match_candidates
+                   WHERE message_id=? AND status='candidate'
+                   ORDER BY id""",
+                (row["id"],),
+            ).fetchall()
+        ],
+    }
+
+
+def _persist_message(
+    message: dict,
+    match: dict,
+) -> tuple[int, bool, dict]:
     graph_id = str(message.get("graph_message_id") or "").strip()
     if not graph_id:
         raise ValueError("graph_message_id is required")
@@ -1741,12 +1934,19 @@ def _persist_message(message: dict, match: dict) -> tuple[int, bool]:
         )
     conn = _get_conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT id, processed_at FROM quote_email_messages WHERE graph_message_id=?",
+            "SELECT * FROM quote_email_messages WHERE graph_message_id=?",
             (graph_id,),
         ).fetchone()
         if existing:
-            return int(existing["id"]), bool(existing["processed_at"])
+            result = (
+                int(existing["id"]),
+                bool(existing["processed_at"]),
+                _stored_message_match(conn, existing),
+            )
+            conn.commit()
+            return result
         now = iso_now()
         cursor = conn.execute(
             """INSERT INTO quote_email_messages
@@ -1804,7 +2004,10 @@ def _persist_message(message: dict, match: dict) -> tuple[int, bool]:
                 ),
             )
         conn.commit()
-        return message_id, False
+        return message_id, False, match
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -2436,6 +2639,23 @@ def evaluate_price_candidate(
     }
 
 
+def _require_assignment_owner(
+    conn,
+    *,
+    message_id: int,
+    assignment_token: str,
+) -> None:
+    row = conn.execute(
+        """SELECT 1 FROM quote_email_messages
+           WHERE id=? AND match_status='assigning' AND assignment_token=?""",
+        (message_id, assignment_token),
+    ).fetchone()
+    if not row:
+        raise AssignmentLeaseLostError(
+            "A newer worker owns this email assignment. Refresh and try again."
+        )
+
+
 def _record_price_match(
     *,
     message_id: int,
@@ -2446,11 +2666,40 @@ def _record_price_match(
     match_method: str,
     status: str,
     reason: str,
+    assignment_token: str | None = None,
+    conn=None,
 ) -> int:
     now = iso_now()
     material = material or {}
-    conn = _get_conn()
+    owns_connection = conn is None
+    conn = conn or _get_conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        if assignment_token:
+            _require_assignment_owner(
+                conn,
+                message_id=message_id,
+                assignment_token=assignment_token,
+            )
+        existing = conn.execute(
+            """SELECT id FROM quote_price_matches
+               WHERE message_id=? AND quote_request_id=?
+                 AND material_id IS ? AND source_hash=?
+                 AND quote_price=? AND quote_unit=?""",
+            (
+                message_id,
+                request["id"],
+                material.get("id"),
+                source["file_hash"],
+                float(product.get("unit_price") or 0),
+                _exact_unit_text(
+                    product.get("source_unit") or product.get("unit")
+                ),
+            ),
+        ).fetchone()
+        if existing:
+            conn.commit()
+            return int(existing["id"])
         cursor = conn.execute(
             """INSERT OR IGNORE INTO quote_price_matches
                (message_id, job_id, quote_request_id, material_id, item_code,
@@ -2478,24 +2727,18 @@ def _record_price_match(
                 now,
             ),
         )
+        if cursor.rowcount != 1:
+            raise ValueError(
+                "This email price is already linked to another quote request."
+            )
         conn.commit()
-        if cursor.lastrowid:
-            return int(cursor.lastrowid)
-        row = conn.execute(
-            """SELECT id FROM quote_price_matches
-               WHERE message_id=? AND material_id IS ? AND source_hash=?
-                 AND quote_price=? AND quote_unit=?""",
-            (
-                message_id,
-                material.get("id"),
-                source["file_hash"],
-                float(product.get("unit_price") or 0),
-                _exact_unit_text(product.get("source_unit") or product.get("unit")),
-            ),
-        ).fetchone()
-        return int(row["id"]) if row else 0
+        return int(cursor.lastrowid or 0)
+    except Exception:
+        conn.rollback()
+        raise
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
 
 def _apply_exact_price(
@@ -2814,7 +3057,95 @@ def _message_price_decision(
     return str(evaluation["status"]), str(evaluation["reason"])
 
 
-def _price_products_for_message(message_id: int, request: dict, match_method: str) -> dict:
+def _store_no_price_result(
+    conn,
+    *,
+    message_id: int,
+    request_id: int,
+    evidence_json: str,
+    defer_request_state: bool,
+    assignment_token: str | None = None,
+) -> None:
+    if defer_request_state:
+        if not assignment_token:
+            raise ValueError("Deferred pricing requires an assignment token.")
+        _require_assignment_owner(
+            conn,
+            message_id=message_id,
+            assignment_token=assignment_token,
+        )
+        updated = conn.execute(
+            """UPDATE quote_email_messages
+               SET evidence_json=?
+               WHERE id=? AND match_status='assigning'
+                 AND assignment_token=?""",
+            (evidence_json, message_id, assignment_token),
+        )
+        if updated.rowcount != 1:
+            raise AssignmentLeaseLostError(
+                "A newer worker owns this email assignment. Refresh and try again."
+            )
+        return
+    conn.execute(
+        """UPDATE quote_email_messages
+           SET match_status='needs_review', evidence_json=?
+           WHERE id=?""",
+        (evidence_json, message_id),
+    )
+    conn.execute(
+        """UPDATE quote_requests SET status='needs_review'
+           WHERE id=? AND status NOT IN
+               ('complete','cancelled','received','stale')""",
+        (request_id,),
+    )
+
+
+def _mark_material_for_price_review(
+    *,
+    message_id: int,
+    request_id: int,
+    material_id: int,
+    assignment_token: str | None,
+    conn=None,
+) -> None:
+    owns_connection = conn is None
+    conn = conn or _get_conn()
+    try:
+        if assignment_token:
+            conn.execute("BEGIN IMMEDIATE")
+            _require_assignment_owner(
+                conn,
+                message_id=message_id,
+                assignment_token=assignment_token,
+            )
+        conn.execute(
+            """UPDATE quote_request_materials
+               SET status='needs_review', source_message_id=?
+               WHERE quote_request_id=? AND material_id=?
+                 AND status='requested'""",
+            (message_id, request_id, material_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def _price_products_for_message(
+    message_id: int,
+    request: dict,
+    match_method: str,
+    *,
+    defer_request_state: bool = False,
+    assignment_token: str | None = None,
+) -> dict:
+    if defer_request_state and not assignment_token:
+        raise ValueError("Deferred pricing requires an assignment token.")
+    if defer_request_state and match_method != "manual":
+        raise ValueError("Deferred pricing is allowed only for manual bid assignment.")
     conn = _get_conn()
     try:
         row = conn.execute(
@@ -2844,11 +3175,16 @@ def _price_products_for_message(message_id: int, request: dict, match_method: st
     ]
     sources = []
     for manifest in [raw_manifest, *manifests]:
-        copied = _copy_artifact_to_job(manifest, request["job_id"])
-        if copied:
-            sources.append(copied)
+        source = (
+            _manifest_artifact_source(manifest)
+            if defer_request_state
+            else _copy_artifact_to_job(manifest, request["job_id"])
+        )
+        if source:
+            sources.append(source)
     products_with_source = []
     raw_products_found = False
+    parsed_sources: dict[str, dict] = {}
     for source_index, source in enumerate(sources):
         if source_index > 0 and raw_products_found:
             break
@@ -2869,7 +3205,7 @@ def _price_products_for_message(message_id: int, request: dict, match_method: st
             # A preserved .eml includes its attachments. Do not parse those
             # attachments a second time and create duplicate price candidates.
             raw_products_found = True
-        if products:
+        if products and not defer_request_state:
             record_imported_file(
                 request["job_id"],
                 source["file_name"],
@@ -2879,6 +3215,17 @@ def _price_products_for_message(message_id: int, request: dict, match_method: st
                 artifact_path=source["artifact_path"],
                 artifact_kind="vendor_quote",
             )
+        if products:
+            parsed_sources[source["file_hash"]] = {
+                key: source[key]
+                for key in (
+                    "file_name",
+                    "file_hash",
+                    "file_size",
+                    "artifact_path",
+                    "artifact_kind",
+                )
+            }
         for product in products:
             product["vendor"] = product.get("vendor") or request.get("vendor_name") or ""
             product["file_name"] = source["file_name"]
@@ -2916,6 +3263,7 @@ def _price_products_for_message(message_id: int, request: dict, match_method: st
             ),
             status=status,
             reason=reason,
+            assignment_token=assignment_token,
         )
         if status == "ready_to_apply" and match_id:
             applied_ok = _apply_exact_price(
@@ -2937,64 +3285,56 @@ def _price_products_for_message(message_id: int, request: dict, match_method: st
                            WHERE id=? AND status='ready_to_apply'""",
                         (match_id,),
                     )
-                    if material:
-                        conn.execute(
-                            """UPDATE quote_request_materials
-                               SET status='needs_review', source_message_id=?
-                               WHERE quote_request_id=? AND material_id=?
-                                 AND status='requested'""",
-                            (message_id, request["id"], material["id"]),
-                        )
                     conn.commit()
                 finally:
                     conn.close()
+                if material:
+                    _mark_material_for_price_review(
+                        message_id=message_id,
+                        request_id=int(request["id"]),
+                        material_id=int(material["id"]),
+                        assignment_token=assignment_token,
+                    )
         else:
             needs_review += 1
             if material:
-                conn = _get_conn()
-                try:
-                    conn.execute(
-                        """UPDATE quote_request_materials
-                           SET status='needs_review', source_message_id=?
-                           WHERE quote_request_id=? AND material_id=?
-                             AND status='requested'""",
-                        (message_id, request["id"], material["id"]),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
+                _mark_material_for_price_review(
+                    message_id=message_id,
+                    request_id=int(request["id"]),
+                    material_id=int(material["id"]),
+                    assignment_token=assignment_token,
+                )
     if not products_with_source:
+        no_price_evidence = [
+            *parse_errors,
+            {
+                "type": "parse_failure",
+                "value": (
+                    "No explicit price rows were found. "
+                    "Free-text prices must include a dollar sign."
+                ),
+            },
+        ]
+        evidence = [
+            *_json_loads(message.get("evidence_json"), []),
+            *no_price_evidence,
+        ]
         conn = _get_conn()
         try:
-            conn.execute(
-                """UPDATE quote_email_messages
-                   SET match_status='needs_review',
-                       evidence_json=?
-                   WHERE id=?""",
-                (
-                    json.dumps(
-                        [
-                            *parse_errors,
-                            {
-                                "type": "parse_failure",
-                                "value": (
-                                    "No explicit price rows were found. "
-                                    "Free-text prices must include a dollar sign."
-                                ),
-                            },
-                        ]
-                    ),
-                    message_id,
-                ),
-            )
-            conn.execute(
-                "UPDATE quote_requests SET status='needs_review' WHERE id=?",
-                (request["id"],),
+            if defer_request_state:
+                conn.execute("BEGIN IMMEDIATE")
+            _store_no_price_result(
+                conn,
+                message_id=message_id,
+                request_id=int(request["id"]),
+                evidence_json=json.dumps(evidence),
+                defer_request_state=defer_request_state,
+                assignment_token=assignment_token,
             )
             conn.commit()
         finally:
             conn.close()
-    elif needs_review:
+    elif needs_review and not defer_request_state:
         _refresh_request_completion(int(request["id"]))
         conn = _get_conn()
         try:
@@ -3020,12 +3360,13 @@ def _price_products_for_message(message_id: int, request: dict, match_method: st
         "applied": applied,
         "needs_review": needs_review,
         "parse_errors": parse_errors,
+        "parsed_sources": list(parsed_sources.values()),
     }
 
 
 def process_incoming_message(message: dict) -> dict:
     match = match_message_to_requests(message, _open_request_candidates())
-    message_id, already_processed = _persist_message(message, match)
+    message_id, already_processed, match = _persist_message(message, match)
     if already_processed:
         return {"status": "duplicate", "message_id": message_id}
     result = {"status": match["status"], "message_id": message_id, "match": match}
@@ -3082,6 +3423,529 @@ def preview_incoming_match(message: dict) -> dict:
     return match_message_to_requests(message, _open_request_candidates())
 
 
+def _assignment_request_is_current(conn, request: dict) -> tuple[bool, str]:
+    if str(request.get("status") or "").lower() not in OPEN_REQUEST_STATUSES:
+        return False, "That quote request is no longer open."
+    job_row = conn.execute(
+        "SELECT * FROM jobs WHERE id=?",
+        (request["job_id"],),
+    ).fetchone()
+    if not job_row:
+        return False, "That bid no longer exists."
+    materials = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT * FROM job_materials WHERE job_id=? ORDER BY id",
+            (request["job_id"],),
+        ).fetchall()
+    ]
+    request_state = {
+        **request,
+        "material_snapshot": _json_loads(
+            request.get("material_snapshot_json"),
+            [],
+        ),
+    }
+    if not _request_is_stale(
+        request_state,
+        {**dict(job_row), "materials": materials},
+    ):
+        return True, ""
+    conn.execute(
+        """UPDATE quote_requests
+           SET status='stale'
+           WHERE id=? AND status NOT IN ('complete','cancelled','received','stale')""",
+        (request["id"],),
+    )
+    conn.execute(
+        """UPDATE quote_followup_events
+           SET status='cancelled',
+               error='Bid materials changed after approval.'
+           WHERE quote_request_id=? AND status='scheduled'""",
+        (request["id"],),
+    )
+    return False, "That quote request is stale because the bid changed."
+
+
+def _cleanup_assignment_side_effects(
+    conn,
+    *,
+    message_id: int,
+    request_id: int,
+) -> None:
+    conn.execute(
+        """DELETE FROM quote_price_matches
+           WHERE message_id=? AND quote_request_id=?
+             AND status!='applied'""",
+        (message_id, request_id),
+    )
+    conn.execute(
+        """UPDATE quote_request_materials
+           SET status='requested', quoted_price=NULL,
+               source_message_id=NULL, resolved_at=NULL
+           WHERE quote_request_id=? AND source_message_id=?
+             AND status='needs_review'""",
+        (request_id, message_id),
+    )
+
+
+def _assignment_evidence(
+    current: Any,
+    *,
+    evidence_type: str,
+    value: str,
+) -> str:
+    evidence = [
+        item
+        for item in _json_loads(current, [])
+        if not (
+            isinstance(item, dict)
+            and item.get("type") == evidence_type
+        )
+    ]
+    evidence.append({"type": evidence_type, "value": value})
+    return json.dumps(evidence)
+
+
+def _reject_assignment_target(
+    conn,
+    message_id: int,
+    *,
+    job_id: int,
+    request_id: int,
+    reviewer_name: str,
+    decision: str,
+    reason: str,
+    assignment_token: str | None,
+) -> bool:
+    message = conn.execute(
+        """SELECT match_status, assignment_token, evidence_json
+           FROM quote_email_messages WHERE id=?""",
+        (message_id,),
+    ).fetchone()
+    if not message:
+        return False
+    if assignment_token is not None and (
+        str(message["match_status"] or "") != "assigning"
+        or not hmac.compare_digest(
+            str(message["assignment_token"] or ""),
+            assignment_token,
+        )
+    ):
+        return False
+    if assignment_token is None and str(message["match_status"] or "") != "needs_review":
+        return False
+
+    _cleanup_assignment_side_effects(
+        conn,
+        message_id=message_id,
+        request_id=request_id,
+    )
+    now = iso_now()
+    conn.execute(
+        """UPDATE quote_match_candidates
+           SET status='rejected', decision=?, reviewer_name=?, resolved_at=?
+           WHERE message_id=? AND job_id=? AND quote_request_id=?
+             AND status='candidate'""",
+        (
+            decision,
+            reviewer_name,
+            now,
+            message_id,
+            job_id,
+            request_id,
+        ),
+    )
+    remaining = int(
+        conn.execute(
+            """SELECT COUNT(*) FROM quote_match_candidates
+               WHERE message_id=? AND status='candidate'""",
+            (message_id,),
+        ).fetchone()[0]
+    )
+    where = (
+        "id=? AND match_status='assigning' AND assignment_token=?"
+        if assignment_token is not None
+        else "id=? AND match_status='needs_review'"
+    )
+    params: tuple[Any, ...] = (
+        (message_id, assignment_token)
+        if assignment_token is not None
+        else (message_id,)
+    )
+    updated = conn.execute(
+        f"""UPDATE quote_email_messages
+            SET match_status=?, match_method=?,
+                matched_job_id=NULL, matched_request_id=NULL,
+                assignment_token='', assignment_started_at=NULL,
+                evidence_json=?
+            WHERE {where}""",
+        (
+            "needs_review" if remaining else "ignored",
+            "candidate_review" if remaining else decision,
+            _assignment_evidence(
+                message["evidence_json"],
+                evidence_type="assignment_rejected",
+                value=reason,
+            ),
+            *params,
+        ),
+    )
+    return updated.rowcount == 1
+
+
+def _abort_message_assignment(
+    conn,
+    message_id: int,
+    *,
+    request_id: int,
+    assignment_token: str,
+) -> bool:
+    message = conn.execute(
+        """SELECT evidence_json FROM quote_email_messages
+           WHERE id=? AND match_status='assigning' AND assignment_token=?""",
+        (message_id, assignment_token),
+    ).fetchone()
+    if not message:
+        return False
+    _cleanup_assignment_side_effects(
+        conn,
+        message_id=message_id,
+        request_id=request_id,
+    )
+    updated = conn.execute(
+        """UPDATE quote_email_messages
+           SET match_status='needs_review', match_method='candidate_review',
+               matched_job_id=NULL, matched_request_id=NULL,
+               assignment_token='', assignment_started_at=NULL,
+               evidence_json=?
+           WHERE id=? AND match_status='assigning' AND assignment_token=?""",
+        (
+            _assignment_evidence(
+                message["evidence_json"],
+                evidence_type="assignment_retry",
+                value="The assignment stopped safely. No price was kept.",
+            ),
+            message_id,
+            assignment_token,
+        ),
+    )
+    return updated.rowcount == 1
+
+
+def _reserve_message_assignment(
+    conn,
+    message_id: int,
+    *,
+    job_id: int,
+    request_id: int,
+    mailbox_email: str,
+    assignment_token: str,
+) -> dict:
+    if not assignment_token:
+        raise ValueError("A secure assignment token is required.")
+    row = conn.execute(
+        "SELECT * FROM quote_email_messages WHERE id=?",
+        (message_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError("Message not found.")
+    if normalize_email(row["mailbox_email"]) != normalize_email(mailbox_email):
+        raise ValueError("That email belongs to another mailbox.")
+    current_status = str(row["match_status"] or "")
+    reserved_job_id = int(row["matched_job_id"] or 0)
+    reserved_request_id = int(row["matched_request_id"] or 0)
+    if current_status == "assigning":
+        if (
+            reserved_job_id != int(job_id)
+            or reserved_request_id != int(request_id)
+        ):
+            raise ValueError("That email is already being assigned to another bid.")
+        request_row = conn.execute(
+            "SELECT * FROM quote_requests WHERE id=? AND job_id=?",
+            (request_id, job_id),
+        ).fetchone()
+        request = dict(request_row) if request_row else {}
+        request_allowed = bool(
+            request_row
+            and normalize_email(request.get("mailbox_email"))
+            == normalize_email(mailbox_email)
+        )
+        current, current_error = (
+            _assignment_request_is_current(conn, request)
+            if request_allowed
+            else (False, "That quote request is no longer available.")
+        )
+        candidate = conn.execute(
+            """SELECT 1 FROM quote_match_candidates
+               WHERE message_id=? AND job_id=? AND quote_request_id=?
+                 AND status='candidate'""",
+            (message_id, job_id, request_id),
+        ).fetchone()
+        if not current or not candidate:
+            _reject_assignment_target(
+                conn,
+                message_id,
+                job_id=job_id,
+                request_id=request_id,
+                reviewer_name=mailbox_email,
+                decision="request_unavailable_during_assignment",
+                reason=current_error or "That bid is no longer an available match.",
+                assignment_token=str(row["assignment_token"] or ""),
+            )
+            raise AssignmentRejectedError(
+                current_error or "That bid is no longer an available match."
+            )
+        started_at = _parse_iso(row["assignment_started_at"])
+        lease_expired = (
+            started_at is None
+            or utc_now() - started_at
+            >= timedelta(seconds=ASSIGNMENT_LEASE_SECONDS)
+        )
+        if not lease_expired:
+            raise ValueError(
+                "That email assignment is already running. Try again in two minutes."
+            )
+        _cleanup_assignment_side_effects(
+            conn,
+            message_id=message_id,
+            request_id=request_id,
+        )
+        updated = conn.execute(
+            """UPDATE quote_email_messages
+               SET assignment_token=?, assignment_started_at=?
+               WHERE id=? AND match_status='assigning'
+                 AND assignment_token=?""",
+            (
+                assignment_token,
+                iso_now(),
+                message_id,
+                str(row["assignment_token"] or ""),
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("That email assignment changed. Refresh and try again.")
+        return request
+    if current_status != "needs_review":
+        raise ValueError("That email has already been handled.")
+    if (
+        (reserved_job_id or reserved_request_id)
+        and (
+            reserved_job_id != int(job_id)
+            or reserved_request_id != int(request_id)
+        )
+    ):
+        raise ValueError("That email is already being assigned to another bid.")
+
+    candidate = conn.execute(
+        """SELECT 1 FROM quote_match_candidates
+           WHERE message_id=? AND job_id=? AND quote_request_id=?
+             AND status='candidate'""",
+        (message_id, job_id, request_id),
+    ).fetchone()
+    if not candidate:
+        raise ValueError("That bid is not an available match for this email.")
+
+    request_row = conn.execute(
+        "SELECT * FROM quote_requests WHERE id=?",
+        (request_id,),
+    ).fetchone()
+    if not request_row or int(request_row["job_id"]) != int(job_id):
+        _reject_assignment_target(
+            conn,
+            message_id,
+            job_id=job_id,
+            request_id=request_id,
+            reviewer_name=mailbox_email,
+            decision="request_unavailable",
+            reason="That quote request does not belong to this bid.",
+            assignment_token=None,
+        )
+        raise AssignmentRejectedError(
+            "That quote request does not belong to this bid."
+        )
+    request = dict(request_row)
+    if normalize_email(request.get("mailbox_email")) != normalize_email(
+        mailbox_email
+    ):
+        raise ValueError("That quote request belongs to another mailbox.")
+    current, current_error = _assignment_request_is_current(conn, request)
+    if not current:
+        _reject_assignment_target(
+            conn,
+            message_id,
+            job_id=job_id,
+            request_id=request_id,
+            reviewer_name=mailbox_email,
+            decision="request_unavailable",
+            reason=current_error,
+            assignment_token=None,
+        )
+        raise AssignmentRejectedError(current_error)
+
+    updated = conn.execute(
+        """UPDATE quote_email_messages
+           SET match_status='assigning',
+               matched_job_id=?, matched_request_id=?,
+               assignment_token=?, assignment_started_at=?
+           WHERE id=? AND match_status='needs_review'""",
+        (
+            job_id,
+            request_id,
+            assignment_token,
+            iso_now(),
+            message_id,
+        ),
+    )
+    if updated.rowcount != 1:
+        raise ValueError("That email has already been handled.")
+    return request
+
+
+def _finalize_message_assignment(
+    conn,
+    message_id: int,
+    *,
+    job_id: int,
+    request_id: int,
+    reviewer_name: str,
+    assignment_token: str,
+    pricing: dict,
+    staged_sources: Iterable[dict] = (),
+) -> bool:
+    message = conn.execute(
+        """SELECT match_status, matched_job_id, matched_request_id,
+                  evidence_json, assignment_token
+           FROM quote_email_messages WHERE id=?""",
+        (message_id,),
+    ).fetchone()
+    if (
+        not message
+        or int(message["matched_job_id"] or 0) != int(job_id)
+        or int(message["matched_request_id"] or 0) != int(request_id)
+        or str(message["match_status"] or "") != "assigning"
+        or not hmac.compare_digest(
+            str(message["assignment_token"] or ""),
+            assignment_token,
+        )
+    ):
+        raise ValueError("That email has already been handled.")
+
+    request = conn.execute(
+        "SELECT * FROM quote_requests WHERE id=? AND job_id=?",
+        (request_id, job_id),
+    ).fetchone()
+    request_data = dict(request) if request else {}
+    current, current_error = (
+        _assignment_request_is_current(conn, request_data)
+        if request
+        else (False, "That quote request no longer exists.")
+    )
+    if not current:
+        _reject_assignment_target(
+            conn,
+            message_id,
+            job_id=job_id,
+            request_id=request_id,
+            reviewer_name=reviewer_name,
+            decision="request_closed_during_assignment",
+            reason=current_error,
+            assignment_token=assignment_token,
+        )
+        return False
+
+    for copied in staged_sources:
+        record_job_artifact(
+            job_id,
+            "vendor_quote",
+            copied["artifact_path"],
+            copied["file_hash"],
+            copied["file_size"],
+            conn=conn,
+        )
+        record_imported_file(
+            job_id,
+            copied["file_name"],
+            copied["file_hash"],
+            copied["file_size"],
+            source="outlook",
+            artifact_path=copied["artifact_path"],
+            artifact_kind="vendor_quote",
+            conn=conn,
+        )
+
+    now = iso_now()
+    evidence = [
+        item
+        for item in _json_loads(message["evidence_json"], [])
+        if not (
+            isinstance(item, dict)
+            and item.get("type") == "manual_assignment"
+        )
+    ]
+    evidence.append(
+        {"type": "manual_assignment", "value": reviewer_name or "Estimator"}
+    )
+    updated = conn.execute(
+        """UPDATE quote_email_messages
+           SET match_status='matched', match_method='manual',
+               evidence_json=?, assignment_token='',
+               assignment_started_at=NULL
+           WHERE id=? AND matched_job_id=? AND matched_request_id=?
+             AND match_status='assigning' AND assignment_token=?""",
+        (
+            json.dumps(evidence),
+            message_id,
+            job_id,
+            request_id,
+            assignment_token,
+        ),
+    )
+    if updated.rowcount != 1:
+        raise ValueError("That email has already been handled.")
+    conn.execute(
+        """UPDATE quote_match_candidates
+           SET status=CASE WHEN job_id=? AND quote_request_id=?
+                           THEN 'selected' ELSE 'rejected' END,
+               decision='manual_assignment', reviewer_name=?, resolved_at=?
+           WHERE message_id=? AND status='candidate'""",
+        (job_id, request_id, reviewer_name, now, message_id),
+    )
+    needs_review = bool(
+        int(pricing.get("needs_review") or 0)
+        or int(pricing.get("products") or 0) == 0
+        or pricing.get("parse_errors")
+    )
+    if needs_review:
+        conn.execute(
+            """UPDATE quote_requests
+               SET status='needs_review',
+                   received_at=COALESCE(received_at, ?)
+               WHERE id=? AND status IN
+                   ('approved','sending','send_uncertain','sent','waiting',
+                    'overdue','received_partial','needs_review','send_failed')""",
+            (now, request_id),
+        )
+        conn.execute(
+            """UPDATE quote_followup_events
+               SET status='cancelled',
+                   error='Estimator review is required before follow-up.'
+               WHERE quote_request_id=? AND status='scheduled'""",
+            (request_id,),
+        )
+    else:
+        conn.execute(
+            """UPDATE quote_requests
+               SET status='received_partial',
+                   received_at=COALESCE(received_at, ?)
+               WHERE id=? AND status IN
+                   ('approved','sending','send_uncertain','sent','waiting',
+                    'overdue','received_partial','send_failed')""",
+            (now, request_id),
+        )
+    return True
+
+
 def assign_message(
     message_id: int,
     *,
@@ -3090,50 +3954,109 @@ def assign_message(
     reviewer_name: str,
     mailbox_email: str,
 ) -> dict:
-    request = get_request(request_id)
-    if not request or int(request["job_id"]) != int(job_id):
-        raise ValueError("That quote request does not belong to this bid.")
-    if normalize_email(request.get("mailbox_email")) != normalize_email(mailbox_email):
-        raise ValueError("That quote request belongs to another mailbox.")
+    assignment_token = uuid.uuid4().hex
     conn = _get_conn()
     try:
-        row = conn.execute(
-            "SELECT * FROM quote_email_messages WHERE id=?", (message_id,)
-        ).fetchone()
-        if not row:
-            raise ValueError("Message not found.")
-        if normalize_email(row["mailbox_email"]) != normalize_email(mailbox_email):
-            raise ValueError("That email belongs to another mailbox.")
-        if row["match_status"] != "needs_review" or row["processed_at"]:
-            raise ValueError("That email has already been handled.")
-        conn.execute(
-            """UPDATE quote_email_messages
-               SET match_status='matched', match_method='manual',
-                   matched_job_id=?, matched_request_id=?,
-                   evidence_json=?, processed_at=?
-               WHERE id=?""",
-            (
-                job_id,
-                request_id,
-                json.dumps(
-                    [{"type": "manual_assignment", "value": reviewer_name or "Estimator"}]
-                ),
-                iso_now(),
-                message_id,
-            ),
-        )
-        conn.execute(
-            """UPDATE quote_match_candidates
-               SET status=CASE WHEN job_id=? AND quote_request_id=?
-                               THEN 'selected' ELSE 'rejected' END,
-                   decision='manual_assignment', reviewer_name=?, resolved_at=?
-               WHERE message_id=?""",
-            (job_id, request_id, reviewer_name, iso_now(), message_id),
+        conn.execute("BEGIN IMMEDIATE")
+        request = _reserve_message_assignment(
+            conn,
+            message_id,
+            job_id=job_id,
+            request_id=request_id,
+            mailbox_email=mailbox_email,
+            assignment_token=assignment_token,
         )
         conn.commit()
+    except AssignmentRejectedError:
+        conn.commit()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
-    pricing = _price_products_for_message(message_id, request, "manual")
+    try:
+        pricing = _price_products_for_message(
+            message_id,
+            request,
+            "manual",
+            defer_request_state=True,
+            assignment_token=assignment_token,
+        )
+    except Exception:
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _abort_message_assignment(
+                conn,
+                message_id,
+                request_id=request_id,
+                assignment_token=assignment_token,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        finally:
+            conn.close()
+        raise
+    try:
+        staged_sources, created_artifact_paths = _stage_assignment_artifacts(
+            pricing.get("parsed_sources") or [],
+            job_id=job_id,
+            assignment_token=assignment_token,
+        )
+    except Exception:
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _abort_message_assignment(
+                conn,
+                message_id,
+                request_id=request_id,
+                assignment_token=assignment_token,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        finally:
+            conn.close()
+        raise
+    conn = _get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        finalized = _finalize_message_assignment(
+            conn,
+            message_id,
+            job_id=job_id,
+            request_id=request_id,
+            reviewer_name=reviewer_name,
+            assignment_token=assignment_token,
+            pricing=pricing,
+            staged_sources=staged_sources,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        _remove_uncommitted_artifact_files(created_artifact_paths)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _abort_message_assignment(
+                conn,
+                message_id,
+                request_id=request_id,
+                assignment_token=assignment_token,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if not finalized:
+        _remove_uncommitted_artifact_files(created_artifact_paths)
+        raise ValueError(
+            "That quote request changed while the email was being assigned."
+        )
     return {"status": "matched", "message_id": message_id, "pricing": pricing}
 
 
@@ -3158,7 +4081,6 @@ def ignore_message(
             or normalize_email(message["mailbox_email"])
             != normalize_email(mailbox_email)
             or message["match_status"] != "needs_review"
-            or message["processed_at"]
         ):
             conn.rollback()
             return False
@@ -3191,12 +4113,10 @@ def ignore_message(
         conn.execute(
             """UPDATE quote_email_messages
                SET match_status='ignored', match_method='manual_ignore',
-                   evidence_json=?, processed_at=?
-               WHERE id=? AND match_status='needs_review'
-                 AND processed_at IS NULL""",
+                   evidence_json=?
+               WHERE id=? AND match_status='needs_review'""",
             (
                 json.dumps([{"type": "ignored_by", "value": reviewer_name}]),
-                now,
                 message_id,
             ),
         )
@@ -3240,6 +4160,22 @@ def decide_price_match(
         match = dict(row)
         if match["status"] != "needs_review":
             raise ValueError("This price match has already been resolved.")
+        if match.get("message_id"):
+            message = conn.execute(
+                """SELECT match_status, matched_job_id, matched_request_id
+                   FROM quote_email_messages WHERE id=?""",
+                (match["message_id"],),
+            ).fetchone()
+            if (
+                not message
+                or str(message["match_status"] or "") != "matched"
+                or int(message["matched_job_id"] or 0) != int(match["job_id"])
+                or int(message["matched_request_id"] or 0)
+                != int(match["quote_request_id"] or 0)
+            ):
+                raise ValueError(
+                    "This email is still being matched to a bid. Refresh and try again."
+                )
         if (
             expected_material_id is not None
             and int(match.get("material_id") or 0) != int(expected_material_id)
@@ -4001,6 +4937,7 @@ def _simulation_shadow(
     source = _get_conn()
     shadow = sqlite3.connect(":memory:")
     shadow.row_factory = sqlite3.Row
+    shadow.execute("PRAGMA foreign_keys = ON")
     tables = (
         "jobs",
         "job_materials",
@@ -4014,6 +4951,8 @@ def _simulation_shadow(
         "job_quotes",
         "vendor_prices",
         "vendors",
+        "imported_files",
+        "job_artifacts",
     )
     try:
         for table in tables:
@@ -4148,6 +5087,46 @@ def _simulation_shadow(
         )
     shadow.commit()
     return shadow, request_id, match_id
+
+
+def _add_simulation_candidate_request(
+    conn,
+    *,
+    source_job_id: int,
+    source_request_id: int,
+    suffix: int,
+) -> tuple[int, int]:
+    source_job = conn.execute(
+        "SELECT * FROM jobs WHERE id=?",
+        (source_job_id,),
+    ).fetchone()
+    source_request = conn.execute(
+        "SELECT * FROM quote_requests WHERE id=?",
+        (source_request_id,),
+    ).fetchone()
+    if not source_job or not source_request:
+        raise ValueError("Simulation candidate source is missing.")
+
+    other_job = dict(source_job)
+    other_job_id = int(source_job_id) + 10_000_000 + int(suffix)
+    other_job["id"] = other_job_id
+    other_job["project_name"] = f"Other Simulation Bid {suffix}"
+    other_job["slug"] = f"other-simulation-bid-{suffix}"
+    _insert_shadow_row(conn, "jobs", other_job)
+
+    other_request = dict(source_request)
+    other_request_id = int(source_request_id) + int(suffix)
+    other_request["id"] = other_request_id
+    other_request["job_id"] = other_job_id
+    other_request["send_token"] = f"simulation-other-send-{suffix}"
+    other_request["outlook_message_id"] = ""
+    other_request["internet_message_id"] = (
+        f"<simulation-other-request-{suffix}@example.test>"
+    )
+    other_request["conversation_id"] = f"simulation-other-conversation-{suffix}"
+    _insert_shadow_row(conn, "quote_requests", other_request)
+    conn.commit()
+    return other_job_id, other_request_id
 
 
 def _simulation_manual_price_case(
@@ -4641,9 +5620,9 @@ def create_simulation_run(job_id: int, scenario: str = "all") -> dict:
             """INSERT INTO quote_email_messages
                (id, graph_message_id, mailbox_email, direction, sender_email,
                 recipients_json, subject, body_text, attachment_manifest_json,
-                match_status, evidence_json, created_at)
+                match_status, evidence_json, processed_at, created_at)
                VALUES (?, ?, ?, 'inbound', ?, '[]', ?, '', '[]',
-                       'needs_review', '[]', ?)""",
+                       'needs_review', '[]', ?, ?)""",
             (
                 message_id,
                 "simulation-ambiguous-message",
@@ -4651,9 +5630,21 @@ def create_simulation_run(job_id: int, scenario: str = "all") -> dict:
                 "vendor-one@example.test",
                 "Ambiguous simulation quote",
                 virtual_now.isoformat(),
+                virtual_now.isoformat(),
             ),
         )
-        for candidate_job_id in (job_id, job_id + 1):
+        ignore_other_job_id, ignore_other_request_id = (
+            _add_simulation_candidate_request(
+                ignore_shadow,
+                source_job_id=job_id,
+                source_request_id=ignore_request_id,
+                suffix=1,
+            )
+        )
+        for candidate_job_id, candidate_request_id in (
+            (job_id, ignore_request_id),
+            (ignore_other_job_id, ignore_other_request_id),
+        ):
             ignore_shadow.execute(
                 """INSERT INTO quote_match_candidates
                    (message_id, job_id, quote_request_id, status,
@@ -4662,7 +5653,7 @@ def create_simulation_run(job_id: int, scenario: str = "all") -> dict:
                 (
                     message_id,
                     candidate_job_id,
-                    ignore_request_id,
+                    candidate_request_id,
                     virtual_now.isoformat(),
                 ),
             )
@@ -4690,13 +5681,738 @@ def create_simulation_run(job_id: int, scenario: str = "all") -> dict:
         per_bid_ignore_isolated = bool(
             ignored_for_one_bid
             and candidate_states.get(job_id) == "rejected"
-            and candidate_states.get(job_id + 1) == "candidate"
+            and candidate_states.get(ignore_other_job_id) == "candidate"
             and ignored_message
             and ignored_message["match_status"] == "needs_review"
-            and not ignored_message["processed_at"]
+            and bool(ignored_message["processed_at"])
         )
     finally:
         ignore_shadow.close()
+
+    assign_shadow, assign_request_id, assign_match_id = _simulation_shadow(
+        job_id,
+        isolated_materials,
+        virtual_now,
+    )
+    try:
+        assign_message_id = 9_300_002
+        assign_shadow.execute(
+            """INSERT INTO quote_email_messages
+               (id, graph_message_id, mailbox_email, direction, sender_email,
+                recipients_json, subject, body_text, attachment_manifest_json,
+                match_status, evidence_json, processed_at, created_at)
+               VALUES (?, ?, ?, 'inbound', ?, '[]', ?, '', '[]',
+                       'needs_review', '[]', ?, ?)""",
+            (
+                assign_message_id,
+                "simulation-assign-ambiguous-message",
+                "estimator@example.test",
+                "vendor-one@example.test",
+                "Assignable ambiguous simulation quote",
+                virtual_now.isoformat(),
+                virtual_now.isoformat(),
+            ),
+        )
+        assign_other_job_id, assign_other_request_id = (
+            _add_simulation_candidate_request(
+                assign_shadow,
+                source_job_id=job_id,
+                source_request_id=assign_request_id,
+                suffix=2,
+            )
+        )
+        for candidate_job_id, candidate_request_id in (
+            (job_id, assign_request_id),
+            (assign_other_job_id, assign_other_request_id),
+        ):
+            assign_shadow.execute(
+                """INSERT INTO quote_match_candidates
+                   (message_id, job_id, quote_request_id, status,
+                    match_method, evidence_json, created_at)
+                   VALUES (?, ?, ?, 'candidate', 'exact_clues', '[]', ?)""",
+                (
+                    assign_message_id,
+                    candidate_job_id,
+                    candidate_request_id,
+                    virtual_now.isoformat(),
+                ),
+            )
+        assign_shadow.commit()
+        first_assignment_token = uuid.uuid4().hex
+        assign_shadow.execute("BEGIN IMMEDIATE")
+        assigned_request = _reserve_message_assignment(
+            assign_shadow,
+            assign_message_id,
+            job_id=job_id,
+            request_id=assign_request_id,
+            mailbox_email="estimator@example.test",
+            assignment_token=first_assignment_token,
+        )
+        assign_shadow.commit()
+        reserved_message = assign_shadow.execute(
+            """SELECT match_status, matched_job_id, matched_request_id,
+                      assignment_token, processed_at
+               FROM quote_email_messages WHERE id=?""",
+            (assign_message_id,),
+        ).fetchone()
+        assign_shadow.execute(
+            """UPDATE quote_price_matches
+               SET message_id=?, status='needs_review'
+               WHERE id=?""",
+            (assign_message_id, assign_match_id),
+        )
+        assign_shadow.execute(
+            """UPDATE quote_request_materials
+               SET status='needs_review', source_message_id=?
+               WHERE quote_request_id=? AND material_id=?""",
+            (
+                assign_message_id,
+                assign_request_id,
+                isolated_materials[0]["id"],
+            ),
+        )
+        assign_shadow.commit()
+        active_assignment_blocked = False
+        try:
+            assign_shadow.execute("BEGIN IMMEDIATE")
+            _reserve_message_assignment(
+                assign_shadow,
+                assign_message_id,
+                job_id=job_id,
+                request_id=assign_request_id,
+                mailbox_email="estimator@example.test",
+                assignment_token=uuid.uuid4().hex,
+            )
+            assign_shadow.commit()
+        except ValueError:
+            assign_shadow.rollback()
+            active_assignment_blocked = True
+        assign_shadow.execute(
+            """UPDATE quote_email_messages SET assignment_started_at=?
+               WHERE id=?""",
+            (
+                (
+                    virtual_now
+                    - timedelta(seconds=ASSIGNMENT_LEASE_SECONDS + 1)
+                ).isoformat(),
+                assign_message_id,
+            ),
+        )
+        assign_shadow.commit()
+        retry_assignment_token = uuid.uuid4().hex
+        assign_shadow.execute("BEGIN IMMEDIATE")
+        retried_request = _reserve_message_assignment(
+            assign_shadow,
+            assign_message_id,
+            job_id=job_id,
+            request_id=assign_request_id,
+            mailbox_email="estimator@example.test",
+            assignment_token=retry_assignment_token,
+        )
+        assign_shadow.commit()
+        retried_message = assign_shadow.execute(
+            """SELECT assignment_token, assignment_started_at
+               FROM quote_email_messages WHERE id=?""",
+            (assign_message_id,),
+        ).fetchone()
+        old_worker_fenced = False
+        try:
+            _record_price_match(
+                message_id=assign_message_id,
+                request=assigned_request,
+                material=isolated_materials[0],
+                product={
+                    "item_code": isolated_materials[0]["item_code"],
+                    "product_name": isolated_materials[0]["description"],
+                    "unit_price": 4.25,
+                    "unit": isolated_materials[0]["unit"],
+                    "source_unit": isolated_materials[0]["unit"],
+                },
+                source={
+                    "file_hash": _sha256_bytes(b"expired-worker"),
+                    "file_name": "expired-worker.csv",
+                },
+                match_method="review",
+                status="needs_review",
+                reason="Expired worker write must be fenced.",
+                assignment_token=first_assignment_token,
+                conn=assign_shadow,
+            )
+        except AssignmentLeaseLostError:
+            old_worker_fenced = True
+        takeover_cleaned_partial_rows = bool(
+            int(
+                assign_shadow.execute(
+                    """SELECT COUNT(*) FROM quote_price_matches
+                       WHERE message_id=?""",
+                    (assign_message_id,),
+                ).fetchone()[0]
+            )
+            == 0
+            and str(
+                assign_shadow.execute(
+                    """SELECT status FROM quote_request_materials
+                       WHERE quote_request_id=? AND material_id=?""",
+                    (
+                        assign_request_id,
+                        isolated_materials[0]["id"],
+                    ),
+                ).fetchone()["status"]
+            )
+            == "requested"
+        )
+        interrupted_assignment_resumable = bool(
+            active_assignment_blocked
+            and old_worker_fenced
+            and takeover_cleaned_partial_rows
+            and assigned_request
+            and retried_request
+            and reserved_message
+            and reserved_message["match_status"] == "assigning"
+            and int(reserved_message["matched_job_id"]) == job_id
+            and int(reserved_message["matched_request_id"]) == assign_request_id
+            and reserved_message["assignment_token"] == first_assignment_token
+            and retried_message
+            and retried_message["assignment_token"] == retry_assignment_token
+        )
+        assign_shadow.execute("BEGIN IMMEDIATE")
+        assignment_finalized = _finalize_message_assignment(
+            assign_shadow,
+            assign_message_id,
+            job_id=job_id,
+            request_id=assign_request_id,
+            reviewer_name="Simulation",
+            assignment_token=retry_assignment_token,
+            pricing={
+                "products": 0,
+                "applied": 0,
+                "needs_review": 0,
+                "parse_errors": [],
+                "parsed_sources": [],
+            },
+        )
+        assign_shadow.commit()
+        assigned_message = assign_shadow.execute(
+            """SELECT match_status, matched_job_id, matched_request_id,
+                      assignment_token, assignment_started_at, processed_at
+               FROM quote_email_messages WHERE id=?""",
+            (assign_message_id,),
+        ).fetchone()
+        assignment_states = {
+            int(row["job_id"]): str(row["status"])
+            for row in assign_shadow.execute(
+                """SELECT job_id, status FROM quote_match_candidates
+                   WHERE message_id=?""",
+                (assign_message_id,),
+            ).fetchall()
+        }
+        ambiguous_assignment_resolvable = bool(
+            assignment_finalized
+            and assigned_request
+            and int(assigned_request["id"]) == assign_request_id
+            and assigned_message
+            and assigned_message["match_status"] == "matched"
+            and int(assigned_message["matched_job_id"]) == job_id
+            and int(assigned_message["matched_request_id"]) == assign_request_id
+            and not assigned_message["assignment_token"]
+            and assigned_message["assignment_started_at"] is None
+            and assigned_message["processed_at"] == reserved_message["processed_at"]
+            and assignment_states.get(job_id) == "selected"
+            and assignment_states.get(assign_other_job_id) == "rejected"
+        )
+    finally:
+        assign_shadow.close()
+
+    cancel_assign_shadow, cancel_assign_request_id, cancel_assign_match_id = (
+        _simulation_shadow(
+            job_id,
+            isolated_materials,
+            virtual_now,
+        )
+    )
+    try:
+        cancel_assign_message_id = 9_300_003
+        cancel_assign_shadow.execute(
+            """INSERT INTO quote_email_messages
+               (id, graph_message_id, mailbox_email, direction, sender_email,
+                recipients_json, subject, body_text, attachment_manifest_json,
+                match_status, evidence_json, processed_at, created_at)
+               VALUES (?, ?, ?, 'inbound', ?, '[]', ?, '', '[]',
+                       'needs_review', '[]', ?, ?)""",
+            (
+                cancel_assign_message_id,
+                "simulation-cancel-during-assignment",
+                "estimator@example.test",
+                "vendor-one@example.test",
+                "Cancelled assignment simulation quote",
+                virtual_now.isoformat(),
+                virtual_now.isoformat(),
+            ),
+        )
+        cancel_other_job_id, cancel_other_request_id = (
+            _add_simulation_candidate_request(
+                cancel_assign_shadow,
+                source_job_id=job_id,
+                source_request_id=cancel_assign_request_id,
+                suffix=3,
+            )
+        )
+        for candidate_job_id, candidate_request_id in (
+            (job_id, cancel_assign_request_id),
+            (cancel_other_job_id, cancel_other_request_id),
+        ):
+            cancel_assign_shadow.execute(
+                """INSERT INTO quote_match_candidates
+                   (message_id, job_id, quote_request_id, status,
+                    match_method, evidence_json, created_at)
+                   VALUES (?, ?, ?, 'candidate', 'exact_clues', '[]', ?)""",
+                (
+                    cancel_assign_message_id,
+                    candidate_job_id,
+                    candidate_request_id,
+                    virtual_now.isoformat(),
+                ),
+            )
+        cancel_assign_shadow.commit()
+        cancel_assignment_token = uuid.uuid4().hex
+        cancel_assign_shadow.execute("BEGIN IMMEDIATE")
+        _reserve_message_assignment(
+            cancel_assign_shadow,
+            cancel_assign_message_id,
+            job_id=job_id,
+            request_id=cancel_assign_request_id,
+            mailbox_email="estimator@example.test",
+            assignment_token=cancel_assignment_token,
+        )
+        cancel_assign_shadow.commit()
+        cancel_assign_shadow.execute(
+            """UPDATE quote_price_matches
+               SET message_id=?, status='needs_review'
+               WHERE id=?""",
+            (cancel_assign_message_id, cancel_assign_match_id),
+        )
+        cancel_assign_shadow.execute(
+            """UPDATE quote_request_materials
+               SET status='needs_review', source_message_id=?
+               WHERE quote_request_id=? AND material_id=?""",
+            (
+                cancel_assign_message_id,
+                cancel_assign_request_id,
+                isolated_materials[0]["id"],
+            ),
+        )
+        cancel_assign_shadow.commit()
+        cancelled_during_assignment = cancel_request(
+            cancel_assign_request_id,
+            conn=cancel_assign_shadow,
+        )
+        cancel_assign_shadow.execute("BEGIN IMMEDIATE")
+        _store_no_price_result(
+            cancel_assign_shadow,
+            message_id=cancel_assign_message_id,
+            request_id=cancel_assign_request_id,
+            evidence_json='[{"type":"parse_failure","value":"No price"}]',
+            defer_request_state=True,
+            assignment_token=cancel_assignment_token,
+        )
+        deferred_message = cancel_assign_shadow.execute(
+            """SELECT match_status FROM quote_email_messages WHERE id=?""",
+            (cancel_assign_message_id,),
+        ).fetchone()
+        deferred_request = cancel_assign_shadow.execute(
+            "SELECT status FROM quote_requests WHERE id=?",
+            (cancel_assign_request_id,),
+        ).fetchone()
+        no_price_deferred_safe = bool(
+            cancelled_during_assignment
+            and
+            deferred_message
+            and deferred_message["match_status"] == "assigning"
+            and deferred_request
+            and deferred_request["status"] == "cancelled"
+        )
+        cancel_assign_shadow.commit()
+        cancel_assign_shadow.execute("BEGIN IMMEDIATE")
+        cancelled_finalize = _finalize_message_assignment(
+            cancel_assign_shadow,
+            cancel_assign_message_id,
+            job_id=job_id,
+            request_id=cancel_assign_request_id,
+            reviewer_name="Simulation",
+            assignment_token=cancel_assignment_token,
+            pricing={
+                "products": 0,
+                "applied": 0,
+                "needs_review": 0,
+                "parse_errors": [],
+                "parsed_sources": [],
+            },
+        )
+        cancel_assign_shadow.commit()
+        cancel_message = cancel_assign_shadow.execute(
+            """SELECT match_status, assignment_token
+               FROM quote_email_messages WHERE id=?""",
+            (cancel_assign_message_id,),
+        ).fetchone()
+        cancel_candidate_states = {
+            int(row["job_id"]): str(row["status"])
+            for row in cancel_assign_shadow.execute(
+                """SELECT job_id, status FROM quote_match_candidates
+                   WHERE message_id=?""",
+                (cancel_assign_message_id,),
+            ).fetchall()
+        }
+        cancelled_assignment_released = bool(
+            not cancelled_finalize
+            and cancel_message
+            and cancel_message["match_status"] == "needs_review"
+            and not cancel_message["assignment_token"]
+            and cancel_candidate_states.get(job_id) == "rejected"
+            and cancel_candidate_states.get(cancel_other_job_id) == "candidate"
+            and int(
+                cancel_assign_shadow.execute(
+                    """SELECT COUNT(*) FROM quote_price_matches
+                       WHERE message_id=? AND quote_request_id=?""",
+                    (cancel_assign_message_id, cancel_assign_request_id),
+                ).fetchone()[0]
+            )
+            == 0
+            and str(
+                cancel_assign_shadow.execute(
+                    """SELECT status FROM quote_request_materials
+                       WHERE quote_request_id=? AND material_id=?""",
+                    (
+                        cancel_assign_request_id,
+                        isolated_materials[0]["id"],
+                    ),
+                ).fetchone()["status"]
+            )
+            == "requested"
+        )
+    finally:
+        cancel_assign_shadow.close()
+
+    stale_assign_shadow, stale_assign_request_id, _ = _simulation_shadow(
+        job_id,
+        isolated_materials,
+        virtual_now,
+    )
+    try:
+        stale_assign_message_id = 9_300_004
+        stale_assign_shadow.execute(
+            """INSERT INTO quote_email_messages
+               (id, graph_message_id, mailbox_email, direction, sender_email,
+                recipients_json, subject, body_text, attachment_manifest_json,
+                match_status, evidence_json, processed_at, created_at)
+               VALUES (?, ?, ?, 'inbound', ?, '[]', ?, '', '[]',
+                       'needs_review', '[]', ?, ?)""",
+            (
+                stale_assign_message_id,
+                "simulation-stale-during-assignment",
+                "estimator@example.test",
+                "vendor-one@example.test",
+                "Stale assignment simulation quote",
+                virtual_now.isoformat(),
+                virtual_now.isoformat(),
+            ),
+        )
+        stale_other_job_id, stale_other_request_id = (
+            _add_simulation_candidate_request(
+                stale_assign_shadow,
+                source_job_id=job_id,
+                source_request_id=stale_assign_request_id,
+                suffix=4,
+            )
+        )
+        for candidate_job_id, candidate_request_id in (
+            (job_id, stale_assign_request_id),
+            (stale_other_job_id, stale_other_request_id),
+        ):
+            stale_assign_shadow.execute(
+                """INSERT INTO quote_match_candidates
+                   (message_id, job_id, quote_request_id, status,
+                    match_method, evidence_json, created_at)
+                   VALUES (?, ?, ?, 'candidate', 'exact_clues', '[]', ?)""",
+                (
+                    stale_assign_message_id,
+                    candidate_job_id,
+                    candidate_request_id,
+                    virtual_now.isoformat(),
+                ),
+            )
+        stale_assign_shadow.commit()
+        stale_assignment_token = uuid.uuid4().hex
+        stale_assign_shadow.execute("BEGIN IMMEDIATE")
+        _reserve_message_assignment(
+            stale_assign_shadow,
+            stale_assign_message_id,
+            job_id=job_id,
+            request_id=stale_assign_request_id,
+            mailbox_email="estimator@example.test",
+            assignment_token=stale_assignment_token,
+        )
+        stale_assign_shadow.commit()
+        stale_assign_shadow.execute(
+            """UPDATE job_materials
+               SET order_qty=COALESCE(order_qty, installed_qty, 0)+1
+               WHERE id=? AND job_id=?""",
+            (isolated_materials[0]["id"], job_id),
+        )
+        stale_assign_shadow.commit()
+        stale_assign_shadow.execute("BEGIN IMMEDIATE")
+        stale_finalize = _finalize_message_assignment(
+            stale_assign_shadow,
+            stale_assign_message_id,
+            job_id=job_id,
+            request_id=stale_assign_request_id,
+            reviewer_name="Simulation",
+            assignment_token=stale_assignment_token,
+            pricing={
+                "products": 0,
+                "applied": 0,
+                "needs_review": 0,
+                "parse_errors": [],
+                "parsed_sources": [],
+            },
+        )
+        stale_assign_shadow.commit()
+        stale_message = stale_assign_shadow.execute(
+            """SELECT match_status, assignment_token
+               FROM quote_email_messages WHERE id=?""",
+            (stale_assign_message_id,),
+        ).fetchone()
+        stale_request = stale_assign_shadow.execute(
+            "SELECT status FROM quote_requests WHERE id=?",
+            (stale_assign_request_id,),
+        ).fetchone()
+        stale_candidate_states = {
+            int(row["job_id"]): str(row["status"])
+            for row in stale_assign_shadow.execute(
+                """SELECT job_id, status FROM quote_match_candidates
+                   WHERE message_id=?""",
+                (stale_assign_message_id,),
+            ).fetchall()
+        }
+        stale_assignment_released = bool(
+            not stale_finalize
+            and stale_message
+            and stale_message["match_status"] == "needs_review"
+            and not stale_message["assignment_token"]
+            and stale_request
+            and stale_request["status"] == "stale"
+            and stale_candidate_states.get(job_id) == "rejected"
+            and stale_candidate_states.get(stale_other_job_id) == "candidate"
+        )
+    finally:
+        stale_assign_shadow.close()
+
+    abort_assign_shadow, abort_assign_request_id, abort_assign_match_id = (
+        _simulation_shadow(
+            job_id,
+            isolated_materials,
+            virtual_now,
+        )
+    )
+    try:
+        abort_assign_message_id = 9_300_005
+        abort_assign_shadow.execute(
+            """INSERT INTO quote_email_messages
+               (id, graph_message_id, mailbox_email, direction, sender_email,
+                recipients_json, subject, body_text, attachment_manifest_json,
+                match_status, evidence_json, processed_at, created_at)
+               VALUES (?, ?, ?, 'inbound', ?, '[]', ?, '', '[]',
+                       'needs_review', '[]', ?, ?)""",
+            (
+                abort_assign_message_id,
+                "simulation-abort-during-assignment",
+                "estimator@example.test",
+                "vendor-one@example.test",
+                "Aborted assignment simulation quote",
+                virtual_now.isoformat(),
+                virtual_now.isoformat(),
+            ),
+        )
+        abort_assign_shadow.execute(
+            """INSERT INTO quote_match_candidates
+               (message_id, job_id, quote_request_id, status,
+                match_method, evidence_json, created_at)
+               VALUES (?, ?, ?, 'candidate', 'exact_clues', '[]', ?)""",
+            (
+                abort_assign_message_id,
+                job_id,
+                abort_assign_request_id,
+                virtual_now.isoformat(),
+            ),
+        )
+        abort_assign_shadow.commit()
+        abort_assignment_token = uuid.uuid4().hex
+        abort_assign_shadow.execute("BEGIN IMMEDIATE")
+        _reserve_message_assignment(
+            abort_assign_shadow,
+            abort_assign_message_id,
+            job_id=job_id,
+            request_id=abort_assign_request_id,
+            mailbox_email="estimator@example.test",
+            assignment_token=abort_assignment_token,
+        )
+        abort_assign_shadow.commit()
+        abort_assign_shadow.execute(
+            """UPDATE quote_price_matches
+               SET message_id=?, status='needs_review'
+               WHERE id=?""",
+            (abort_assign_message_id, abort_assign_match_id),
+        )
+        abort_assign_shadow.execute(
+            """UPDATE quote_request_materials
+               SET status='needs_review', source_message_id=?
+               WHERE quote_request_id=? AND material_id=?""",
+            (
+                abort_assign_message_id,
+                abort_assign_request_id,
+                isolated_materials[0]["id"],
+            ),
+        )
+        abort_assign_shadow.commit()
+        abort_assign_shadow.execute("BEGIN IMMEDIATE")
+        aborted = _abort_message_assignment(
+            abort_assign_shadow,
+            abort_assign_message_id,
+            request_id=abort_assign_request_id,
+            assignment_token=abort_assignment_token,
+        )
+        abort_assign_shadow.commit()
+        abort_message = abort_assign_shadow.execute(
+            """SELECT match_status, assignment_token
+               FROM quote_email_messages WHERE id=?""",
+            (abort_assign_message_id,),
+        ).fetchone()
+        aborted_assignment_clean = bool(
+            aborted
+            and abort_message
+            and abort_message["match_status"] == "needs_review"
+            and not abort_message["assignment_token"]
+            and int(
+                abort_assign_shadow.execute(
+                    """SELECT COUNT(*) FROM quote_price_matches
+                       WHERE message_id=?""",
+                    (abort_assign_message_id,),
+                ).fetchone()[0]
+            )
+            == 0
+            and str(
+                abort_assign_shadow.execute(
+                    """SELECT status FROM quote_request_materials
+                       WHERE quote_request_id=? AND material_id=?""",
+                    (
+                        abort_assign_request_id,
+                        isolated_materials[0]["id"],
+                    ),
+                ).fetchone()["status"]
+            )
+            == "requested"
+            and str(
+                abort_assign_shadow.execute(
+                    """SELECT status FROM quote_match_candidates
+                       WHERE message_id=? AND job_id=?""",
+                    (abort_assign_message_id, job_id),
+                ).fetchone()["status"]
+            )
+            == "candidate"
+        )
+        artifact_test_job = dict(
+            abort_assign_shadow.execute(
+                "SELECT * FROM jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+        )
+        artifact_test_job_id = int(job_id) + 40_000_000
+        artifact_test_job["id"] = artifact_test_job_id
+        artifact_test_job["slug"] = (
+            f"simulation-artifact-rollback-{artifact_test_job_id}"
+        )
+        artifact_test_job["project_name"] = "Simulation Artifact Rollback"
+        _insert_shadow_row(
+            abort_assign_shadow,
+            "jobs",
+            artifact_test_job,
+        )
+        abort_assign_shadow.commit()
+        artifact_source = _write_artifact(
+            f"uncommitted-{uuid.uuid4().hex}".encode("utf-8"),
+            filename="simulation-uncommitted-quote.txt",
+            artifact_kind="simulation",
+        )
+        uncommitted_paths: list[str] = []
+        staged_artifacts: list[dict] = []
+        try:
+            staged_artifacts, uncommitted_paths = (
+                _stage_assignment_artifacts(
+                    [artifact_source],
+                    job_id=artifact_test_job_id,
+                    assignment_token=uuid.uuid4().hex,
+                )
+            )
+            abort_assign_shadow.execute("BEGIN IMMEDIATE")
+            for staged_artifact in staged_artifacts:
+                record_job_artifact(
+                    artifact_test_job_id,
+                    "vendor_quote",
+                    staged_artifact["artifact_path"],
+                    staged_artifact["file_hash"],
+                    staged_artifact["file_size"],
+                    conn=abort_assign_shadow,
+                )
+                record_imported_file(
+                    artifact_test_job_id,
+                    staged_artifact["file_name"],
+                    staged_artifact["file_hash"],
+                    staged_artifact["file_size"],
+                    source="outlook",
+                    artifact_path=staged_artifact["artifact_path"],
+                    artifact_kind="vendor_quote",
+                    conn=abort_assign_shadow,
+                )
+            receipts_written_before_rollback = bool(
+                abort_assign_shadow.execute(
+                    """SELECT 1 FROM job_artifacts
+                       WHERE job_id=?""",
+                    (artifact_test_job_id,),
+                ).fetchone()
+                and abort_assign_shadow.execute(
+                    """SELECT 1 FROM imported_files
+                       WHERE job_id=?""",
+                    (artifact_test_job_id,),
+                ).fetchone()
+            )
+            abort_assign_shadow.rollback()
+            _remove_uncommitted_artifact_files(uncommitted_paths)
+            artifact_rollback_clean = bool(
+                receipts_written_before_rollback
+                and staged_artifacts
+                and uncommitted_paths
+                and not (
+                    ARTIFACT_ROOT
+                    / str(staged_artifacts[0]["artifact_path"])
+                ).is_file()
+                and not abort_assign_shadow.execute(
+                    """SELECT 1 FROM job_artifacts
+                       WHERE job_id=?""",
+                    (artifact_test_job_id,),
+                ).fetchone()
+                and not abort_assign_shadow.execute(
+                    """SELECT 1 FROM imported_files
+                       WHERE job_id=?""",
+                    (artifact_test_job_id,),
+                ).fetchone()
+            )
+        finally:
+            abort_assign_shadow.rollback()
+            try:
+                Path(artifact_source["absolute_path"]).unlink()
+            except OSError:
+                pass
+    finally:
+        abort_assign_shadow.close()
 
     legacy_received_state = _request_workflow_state(
         {
@@ -4843,6 +6559,69 @@ def create_simulation_run(job_id: int, scenario: str = "all") -> dict:
             "needs_review",
             ambiguous_match.get("status"),
             "The matcher refuses to choose between multiple open requests.",
+        ),
+        _simulation_result(
+            "ambiguous_bid",
+            "Ambiguous email can be assigned after inbox processing",
+            True,
+            ambiguous_assignment_resolvable,
+            "The production assignment transaction resolves a processed review email to one exact request.",
+        ),
+        _simulation_result(
+            "ambiguous_bid",
+            "Interrupted assignment can retry the same exact bid",
+            True,
+            interrupted_assignment_resumable,
+            "A stopped assignment can resume only after its two-minute safety lease expires.",
+        ),
+        _simulation_result(
+            "ambiguous_bid",
+            "A second live worker cannot price the same email",
+            True,
+            active_assignment_blocked,
+            "The active assignment token blocks a second click or browser from running at the same time.",
+        ),
+        _simulation_result(
+            "ambiguous_bid",
+            "An expired worker cannot write after a retry takes over",
+            True,
+            bool(old_worker_fenced and takeover_cleaned_partial_rows),
+            "The replacement token removes partial rows and fences every later write from the old worker.",
+        ),
+        _simulation_result(
+            "ambiguous_bid",
+            "Cancelling during assignment releases the email without keeping prices",
+            True,
+            cancelled_assignment_released,
+            "The selected bid is rejected, partial price rows are removed, and the other possible bid stays available.",
+        ),
+        _simulation_result(
+            "materials_changed",
+            "Changing bid materials during assignment makes the request stale",
+            True,
+            stale_assignment_released,
+            "The final locked check rejects the changed bid and keeps the email available for any other exact candidate.",
+        ),
+        _simulation_result(
+            "broken_attachment",
+            "A no-price email cannot reopen a cancelled request",
+            True,
+            no_price_deferred_safe,
+            "Deferred parsing keeps the assignment lock and leaves terminal request states untouched.",
+        ),
+        _simulation_result(
+            "ambiguous_bid",
+            "A stopped price read removes partial rows and keeps the candidate",
+            True,
+            aborted_assignment_clean,
+            "An unexpected parser or storage failure returns the email to review with no hidden price changes.",
+        ),
+        _simulation_result(
+            "broken_attachment",
+            "A rolled-back assignment removes its uncommitted job file",
+            True,
+            artifact_rollback_clean,
+            "The durable file cleanup runs after the database rollback so orphaned vendor files are not left on the bid.",
         ),
         _simulation_result(
             "ambiguous_bid",
