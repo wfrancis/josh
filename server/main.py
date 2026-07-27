@@ -128,10 +128,9 @@ from outlook_graph import (
     notification_payload_is_valid,
     outlook_status,
     outlook_worker,
-    reconcile_sent_requests,
     generate_send_token as generate_outlook_send_token,
     send_mail as send_outlook_mail,
-    sync_inbox_once,
+    sync_outlook_once,
     verify_oauth_state,
     verify_session as verify_outlook_session,
 )
@@ -8429,7 +8428,7 @@ async def api_outlook_notifications(
     payload = await request.json()
     if not notification_payload_is_valid(payload):
         raise HTTPException(status_code=401, detail="Invalid Microsoft notification.")
-    background_tasks.add_task(sync_inbox_once)
+    background_tasks.add_task(sync_outlook_once)
     return JSONResponse(status_code=202, content={"accepted": True})
 
 
@@ -8437,10 +8436,7 @@ async def api_outlook_notifications(
 def api_outlook_sync(request: Request):
     session_email = _outlook_session_email(request)
     try:
-        reconciliation = reconcile_sent_requests(session_email)
-        result = sync_inbox_once(session_email)
-        result["sent_reconciliation"] = reconciliation
-        return result
+        return sync_outlook_once(session_email)
     except (OutlookAuthenticationError, RuntimeError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

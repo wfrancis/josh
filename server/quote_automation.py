@@ -2551,6 +2551,47 @@ def _persist_message(
             (graph_id,),
         ).fetchone()
         if existing:
+            existing_status = str(existing["match_status"] or "")
+            existing_method = str(existing["match_method"] or "")
+            can_upgrade_match = (
+                match.get("status") == "matched"
+                and existing_status in {"ignored", "needs_review"}
+                and existing_method not in {"manual", "manual_ignore"}
+            )
+            if can_upgrade_match:
+                now = iso_now()
+                evidence = list(match.get("evidence") or [])
+                evidence.append(
+                    {
+                        "type": "automatic_rematch",
+                        "value": "Sent email proof became available.",
+                    }
+                )
+                match = {**match, "evidence": evidence}
+                conn.execute(
+                    """UPDATE quote_email_messages
+                       SET match_status='matched', match_method=?,
+                           matched_job_id=?, matched_request_id=?,
+                           evidence_json=?, processed_at=NULL
+                       WHERE id=?""",
+                    (
+                        match.get("method") or "",
+                        match.get("job_id"),
+                        match.get("request_id"),
+                        json.dumps(evidence),
+                        existing["id"],
+                    ),
+                )
+                conn.execute(
+                    """UPDATE quote_match_candidates
+                       SET status='resolved',
+                           decision='automatic_receipt_match',
+                           reviewer_name='System', resolved_at=?
+                       WHERE message_id=? AND status='candidate'""",
+                    (now, existing["id"]),
+                )
+                conn.commit()
+                return int(existing["id"]), False, match
             result = (
                 int(existing["id"]),
                 bool(existing["processed_at"]),

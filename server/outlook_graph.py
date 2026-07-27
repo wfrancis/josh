@@ -1192,6 +1192,14 @@ def reconcile_sent_requests(connection_email: str | None = None) -> dict:
     }
 
 
+def sync_outlook_once(connection_email: str | None = None) -> dict:
+    """Reconcile sent receipts before matching incoming vendor replies."""
+    reconciliation = reconcile_sent_requests(connection_email)
+    result = sync_inbox_once(connection_email)
+    result["sent_reconciliation"] = reconciliation
+    return result
+
+
 def send_due_followups(connection_email: str | None = None) -> dict:
     sent = 0
     failed = 0
