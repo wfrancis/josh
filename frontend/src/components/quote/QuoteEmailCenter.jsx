@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import {
   AlertTriangle,
@@ -11,6 +12,7 @@ import {
   Send,
   Trash2,
   Unplug,
+  X,
 } from 'lucide-react'
 import { api } from '../../api'
 import NeedsMatching from './NeedsMatching'
@@ -70,6 +72,7 @@ export default function QuoteEmailCenter() {
   const [notice, setNotice] = useState('')
   const [busyKey, setBusyKey] = useState('')
   const [dirtyGroups, setDirtyGroups] = useState({})
+  const [confirmation, setConfirmation] = useState(null)
 
   const load = useCallback(async ({ quiet = false } = {}) => {
     if (quiet) setRefreshing(true)
@@ -143,7 +146,7 @@ export default function QuoteEmailCenter() {
     }
   }
 
-  const sendDraft = async (draft) => {
+  const requestSendDraft = (draft) => {
     const dirty = asArray(draft.groups).some(
       (group) => dirtyGroups[`${draft.job_id}:${group.group_id}`],
     )
@@ -156,10 +159,16 @@ export default function QuoteEmailCenter() {
       setError('Fix at least one vendor email before sending.')
       return
     }
-    const confirmed = window.confirm(
-      `Send ${ready.length} vendor email${ready.length === 1 ? '' : 's'} for ${draft.project_name}?`,
-    )
-    if (!confirmed) return
+    setConfirmation({
+      action: 'send',
+      draft,
+      title: 'Send vendor emails?',
+      message: `Send ${ready.length} vendor email${ready.length === 1 ? '' : 's'} for ${draft.project_name}?`,
+      confirmLabel: ready.length === 1 ? 'Send Email' : 'Send Emails',
+    })
+  }
+
+  const sendDraft = async (draft) => {
     setBusyKey(`send:${draft.job_id}`)
     setError('')
     setNotice('')
@@ -180,8 +189,18 @@ export default function QuoteEmailCenter() {
     }
   }
 
+  const requestDeleteDraft = (draft) => {
+    setConfirmation({
+      action: 'delete',
+      draft,
+      title: 'Delete saved draft?',
+      message: `Delete the saved email draft for ${draft.project_name}? No email will be sent.`,
+      confirmLabel: 'Delete Draft',
+      destructive: true,
+    })
+  }
+
   const deleteDraft = async (draft) => {
-    if (!window.confirm(`Delete the saved email draft for ${draft.project_name}?`)) return
     setBusyKey(`delete:${draft.job_id}`)
     setError('')
     try {
@@ -209,8 +228,17 @@ export default function QuoteEmailCenter() {
     }
   }
 
+  const requestDisconnectOutlook = () => {
+    setConfirmation({
+      action: 'disconnect',
+      title: 'Disconnect Outlook?',
+      message: 'Email drafts and saved quote evidence will stay in the bid tool.',
+      confirmLabel: 'Disconnect',
+      destructive: true,
+    })
+  }
+
   const disconnectOutlook = async () => {
-    if (!window.confirm('Disconnect Outlook from this browser?')) return
     setBusyKey('disconnect')
     setError('')
     try {
@@ -222,6 +250,14 @@ export default function QuoteEmailCenter() {
     } finally {
       setBusyKey('')
     }
+  }
+
+  const runConfirmedAction = () => {
+    const pending = confirmation
+    setConfirmation(null)
+    if (pending?.action === 'send') sendDraft(pending.draft)
+    if (pending?.action === 'delete') deleteDraft(pending.draft)
+    if (pending?.action === 'disconnect') disconnectOutlook()
   }
 
   const drafts = asArray(center.drafts).filter(
@@ -300,7 +336,7 @@ export default function QuoteEmailCenter() {
                 </button>
                 <button
                   type="button"
-                  onClick={disconnectOutlook}
+                  onClick={requestDisconnectOutlook}
                   disabled={busyKey === 'disconnect'}
                   className="inline-flex items-center gap-2 rounded-md px-3 py-2 text-xs font-semibold text-gray-500 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"
                 >
@@ -418,7 +454,7 @@ export default function QuoteEmailCenter() {
                       </div>
                       <button
                         type="button"
-                        onClick={() => deleteDraft(draft)}
+                        onClick={() => requestDeleteDraft(draft)}
                         disabled={busyKey === `delete:${draft.job_id}`}
                         title="Delete saved draft"
                         className="inline-flex items-center gap-1.5 self-start rounded-md px-2.5 py-1.5 text-xs text-gray-500 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40 sm:self-center"
@@ -538,7 +574,7 @@ export default function QuoteEmailCenter() {
                       </p>
                       <button
                         type="button"
-                        onClick={() => sendDraft(draft)}
+                        onClick={() => requestSendDraft(draft)}
                         disabled={
                           !outlookConnected
                           || draft.stale
@@ -644,6 +680,61 @@ export default function QuoteEmailCenter() {
         jobs={asArray(center.jobs)}
         defaultJobId={jobFilter}
       />
+
+      {confirmation && createPortal(
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 p-3 sm:p-6"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="quote-confirmation-title"
+          onClick={() => setConfirmation(null)}
+        >
+          <div
+            className="w-full max-w-md overflow-hidden rounded-lg border border-white/[0.12] bg-[#111827] shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start gap-3 border-b border-white/[0.08] px-4 py-4 sm:px-5">
+              <div className="min-w-0 flex-1">
+                <h2 id="quote-confirmation-title" className="text-base font-bold text-white">
+                  {confirmation.title}
+                </h2>
+                <p className="mt-1 text-sm leading-6 text-gray-400">
+                  {confirmation.message}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setConfirmation(null)}
+                className="rounded-md p-2 text-gray-500 hover:bg-white/[0.06] hover:text-white"
+                title="Close confirmation"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="flex justify-end gap-2 px-4 py-3 sm:px-5">
+              <button
+                type="button"
+                onClick={() => setConfirmation(null)}
+                className="rounded-md border border-white/[0.1] px-4 py-2.5 text-sm font-semibold text-gray-300 hover:bg-white/[0.05]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={runConfirmedAction}
+                className={`rounded-md px-4 py-2.5 text-sm font-bold text-white ${
+                  confirmation.destructive
+                    ? 'bg-red-600 hover:bg-red-500'
+                    : 'bg-si-orange hover:bg-orange-500'
+                }`}
+              >
+                {confirmation.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
     </div>
   )
 }
