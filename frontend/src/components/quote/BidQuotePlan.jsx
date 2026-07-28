@@ -35,24 +35,41 @@ const groupMaterials = (group) => {
     : asArray(group?.materials).filter((material) => !material.already_requested)
 }
 
+const groupMatchKey = (group) => {
+  const vendorId = String(group?.vendor_id || '').trim()
+  if (vendorId) return `id:${vendorId}`
+  return `name:${String(group?.vendor_name || '').trim().toLowerCase()}`
+}
+
 const prepareGroups = (plan, draft) => {
-  const savedGroups = draft && !draft.stale ? asArray(draft.groups) : []
+  const savedGroups = asArray(draft?.groups)
+  const useSavedGroups = Boolean(draft && !draft.stale)
   const covered = new Set(
-    savedGroups.flatMap((group) => asArray(group.material_ids).map(String)),
+    useSavedGroups
+      ? savedGroups.flatMap((group) => asArray(group.material_ids).map(String))
+      : [],
   )
-  const groups = savedGroups.map((group) => ({
+  const groups = (useSavedGroups ? savedGroups : []).map((group) => ({
     ...group,
     local_id: group.group_id || makeLocalId(),
     materials: asArray(group.materials),
   }))
+  const staleGroupsByVendor = new Map(
+    savedGroups
+      .filter((group) => groupMatchKey(group) !== 'name:')
+      .map((group) => [groupMatchKey(group), group]),
+  )
   asArray(plan?.groups).forEach((group, index) => {
     const materials = groupMaterials(group).filter(
       (material) => !covered.has(String(material.id)),
     )
     if (!materials.length) return
+    const previous = draft?.stale ? staleGroupsByVendor.get(groupMatchKey(group)) : null
     groups.push({
       ...group,
       local_id: `plan-${index}-${String(group.vendor_name || 'vendor')}`,
+      vendor_name: group.vendor_name || previous?.vendor_name || '',
+      vendor_email: group.vendor_email || previous?.vendor_email || '',
       materials,
     })
   })
@@ -219,7 +236,7 @@ export default function BidQuotePlan({
       const savedDraft = result?.draft || null
       setDraft(savedDraft)
       setGroups(prepareGroups(plan, savedDraft))
-      setNotice(result?.message || 'Draft ready. No email has been sent.')
+      setNotice('Email draft saved. Next, review it before anything is sent.')
     } catch (err) {
       setError(err.message || 'The email draft could not be saved.')
     } finally {
@@ -247,16 +264,38 @@ export default function BidQuotePlan({
       || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(group.vendor_email || '')
     )
   )).length
+  const allMaterialsRequested = materialCount === 0 && requestedMaterials.length > 0
+  const quoteEmailView = allMaterialsRequested
+    ? 'waiting'
+    : (draft?.stale || incompleteGroupCount ? 'needs_you' : 'ready_to_send')
+  const quoteEmailUrl = `/jobs/bids/quote-emails?job=${jobId}&view=${quoteEmailView}`
+  const canReviewEmail = Boolean(draft && !draft.stale && !incompleteGroupCount)
+  const canOpenQuoteEmails = canReviewEmail || allMaterialsRequested
 
   return (
     <div className="space-y-6">
+      <div className="border-b border-white/[0.07] pb-5">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <p className="text-xs font-semibold uppercase text-si-orange">Step 2 of 3</p>
+            <h2 className="mt-1 text-xl font-bold text-white">Quote Emails</h2>
+            <p className="mt-1 text-sm text-gray-500">
+              Check the vendor and materials here. Review and send the email on the next screen.
+            </p>
+          </div>
+          <StatusPill
+            status={allMaterialsRequested ? 'waiting' : (incompleteGroupCount ? 'needs_setup' : 'ready_to_send')}
+            label={allMaterialsRequested ? 'Waiting on vendor' : (incompleteGroupCount ? 'Vendor setup needed' : (canReviewEmail ? 'Ready to review' : 'Ready to save'))}
+          />
+        </div>
+      </div>
+
       <div className="rounded-lg border border-white/[0.08] bg-white/[0.025]">
-        <div className="grid grid-cols-2 divide-x divide-y divide-white/[0.06] sm:grid-cols-4 sm:divide-y-0">
+        <div className="grid grid-cols-3 divide-x divide-white/[0.06]">
           {[
-            ['Needs a price', unpricedCount],
-            ['Ready to prepare', materialCount],
+            ['Materials to price', unpricedCount],
             ['Vendor groups', groups.filter((group) => asArray(group.materials).length).length],
-            ['Already requested', requestedMaterials.length],
+            ['Waiting on vendors', requestedMaterials.length],
           ].map(([label, value]) => (
             <div key={label} className="min-w-0 px-4 py-3">
               <p className="text-xs text-gray-500">{label}</p>
@@ -278,10 +317,10 @@ export default function BidQuotePlan({
             {notice}
           </span>
           <Link
-            to={`/jobs/bids/quote-emails?job=${jobId}&view=ready_to_send`}
+            to={quoteEmailUrl}
             className="inline-flex items-center gap-2 font-semibold text-white hover:text-emerald-200"
           >
-            Open Quote Emails
+            Review Email
             <ArrowRight className="h-4 w-4" />
           </Link>
         </div>
@@ -289,14 +328,14 @@ export default function BidQuotePlan({
       {draft?.stale && (
         <div className="flex items-start gap-2 rounded-lg border border-orange-500/20 bg-orange-500/[0.06] px-4 py-3 text-sm text-orange-300">
           <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
-          This saved draft is old because the bid changed. Save it again before sending.
+          The material list changed. Your vendor contact is kept, but save a fresh email draft before sending.
         </div>
       )}
 
       <section>
         <SectionTitle
           icon={Users}
-          title="Group Materials by Vendor"
+          title="Check vendors and materials"
           count={groups.filter((group) => asArray(group.materials).length).length}
           action={(
             <button
@@ -471,38 +510,46 @@ export default function BidQuotePlan({
       <div className="flex flex-col gap-3 rounded-lg border border-white/[0.08] bg-black/20 p-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <p className="text-sm font-semibold text-white">
-            {materialCount === 0 && requestedMaterials.length > 0
-              ? 'All unpriced materials already have quote requests.'
+            {allMaterialsRequested
+              ? 'All unpriced materials are already waiting on vendors.'
               : incompleteGroupCount
               ? `${incompleteGroupCount} group${incompleteGroupCount === 1 ? '' : 's'} still need a vendor email.`
-              : 'The vendor groups are ready to save.'}
+              : canReviewEmail
+                ? 'The email draft is ready to review.'
+                : 'The vendor groups are ready to save.'}
           </p>
           <p className="mt-1 text-xs text-gray-500">
-            {materialCount === 0 && requestedMaterials.length > 0
-              ? 'Open Quote Emails to check replies and follow-ups.'
-              : 'Saving creates email drafts. It does not send email.'}
+            {allMaterialsRequested
+              ? 'Check vendor replies and follow-ups in Quote Emails.'
+              : incompleteGroupCount
+                ? 'Add the vendor email above, then save the draft.'
+                : 'Saving creates an email draft. It does not send email.'}
           </p>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row">
-          {draft && (
+          {canOpenQuoteEmails && (
             <Link
-              to={`/jobs/bids/quote-emails?job=${jobId}&view=ready_to_send`}
-              className="inline-flex items-center justify-center gap-2 rounded-md border border-white/[0.1] px-4 py-2.5 text-sm font-semibold text-gray-200 hover:bg-white/[0.05]"
+              to={quoteEmailUrl}
+              className="inline-flex items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-500"
             >
               <Mail className="h-4 w-4" />
-              Open Quote Emails
+              {allMaterialsRequested ? 'Check Quote Emails' : 'Review Email'}
             </Link>
           )}
           <button
             type="button"
             onClick={saveDraft}
-            disabled={saving || materialCount === 0}
-            className="inline-flex items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-500 disabled:cursor-not-allowed disabled:opacity-40"
+            disabled={saving || materialCount === 0 || incompleteGroupCount > 0}
+            className={`inline-flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-bold disabled:cursor-not-allowed disabled:opacity-40 ${
+              canOpenQuoteEmails
+                ? 'border border-white/[0.1] text-gray-200 hover:bg-white/[0.05]'
+                : 'bg-si-orange text-white hover:bg-orange-500'
+            }`}
           >
             {saving
               ? <Loader2 className="h-4 w-4 animate-spin" />
               : <Save className="h-4 w-4" />}
-            Save to Quote Emails
+            {canReviewEmail ? 'Save Updated Draft' : 'Save Email Draft'}
           </button>
         </div>
       </div>

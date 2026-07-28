@@ -323,7 +323,7 @@ export default function QuoteEmailCenter() {
 
   return (
     <div className="space-y-5">
-      <section className="rounded-lg border border-white/[0.08] bg-white/[0.025]">
+      <section className="border-b border-white/[0.07] pb-4">
         <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
@@ -375,57 +375,65 @@ export default function QuoteEmailCenter() {
         </div>
       </section>
 
-      <section className="rounded-lg border border-white/[0.08] bg-white/[0.025]">
-        <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-end lg:justify-between">
-          <label className="block min-w-0 lg:w-[360px]">
-            <span className="mb-1.5 flex items-center gap-2 text-xs font-semibold text-gray-500">
-              <Briefcase className="h-3.5 w-3.5" />
-              Bid emails
-            </span>
-            <select
-              value={jobFilter}
-              onChange={selectJob}
-              className="w-full rounded-md border border-white/[0.1] bg-[#0D1322] px-3 py-2.5 text-sm font-semibold text-gray-200 outline-none focus:border-blue-400/50"
-            >
-              <option value="">All bids</option>
-              {bidOptions.map((job) => {
-                const location = [job.city, job.state].filter(Boolean).join(', ')
-                const detail = [job.gc_name, location].filter(Boolean).join(' | ')
-                return (
-                  <option key={job.id} value={job.id}>
-                    {job.project_name}{detail ? ` - ${detail}` : ''}
-                  </option>
-                )
-              })}
-            </select>
-          </label>
+      <section className="rounded-lg border border-white/[0.08] bg-white/[0.025] p-4">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold uppercase text-gray-500">
+              {selectedJob ? 'Quote emails for this bid' : 'Quote email inbox'}
+            </p>
+            <h2 className="mt-1 truncate text-lg font-bold text-white">
+              {selectedJob?.project_name || 'All Bids'}
+            </h2>
+            <p className="mt-1 text-sm text-gray-500">
+              {selectedJob
+                ? [selectedJob.gc_name, [selectedJob.city, selectedJob.state].filter(Boolean).join(', ')].filter(Boolean).join(' | ') || 'Selected bid'
+                : 'Choose a bid to work on one email thread at a time.'}
+            </p>
+          </div>
 
-          {selectedJob ? (
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="min-w-0 lg:text-right">
-                <p className="truncate text-sm font-semibold text-white">{selectedJob.project_name}</p>
-                <p className="mt-0.5 text-xs text-gray-500">
-                  {[selectedJob.gc_name, [selectedJob.city, selectedJob.state].filter(Boolean).join(', ')].filter(Boolean).join(' | ') || 'Selected bid'}
-                </p>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+            <label className="block min-w-0 sm:w-[320px]">
+              <span className="mb-1.5 flex items-center gap-2 text-xs font-semibold text-gray-500">
+                <Briefcase className="h-3.5 w-3.5" />
+                {selectedJob ? 'Switch bid' : 'Choose a bid'}
+              </span>
+              <select
+                value={jobFilter}
+                onChange={selectJob}
+                className="w-full rounded-md border border-white/[0.1] bg-[#0D1322] px-3 py-2.5 text-sm font-semibold text-gray-200 outline-none focus:border-blue-400/50"
+              >
+                <option value="">All bids</option>
+                {bidOptions.map((job) => {
+                  const location = [job.city, job.state].filter(Boolean).join(', ')
+                  const detail = [job.gc_name, location].filter(Boolean).join(' | ')
+                  return (
+                    <option key={job.id} value={job.id}>
+                      {job.project_name}{detail ? ` - ${detail}` : ''}
+                    </option>
+                  )
+                })}
+              </select>
+            </label>
+
+            {selectedJob && (
+              <div className="flex gap-2">
+                <Link
+                  to={`/jobs/${selectedJob.slug || selectedJob.id}?step=quotes`}
+                  className="inline-flex min-h-10 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
+                >
+                  Back to Bid
+                  <ArrowRight className="h-3.5 w-3.5" />
+                </Link>
+                <button
+                  type="button"
+                  onClick={clearJobFilter}
+                  className="min-h-10 rounded-md px-3 text-xs font-semibold text-blue-300 hover:bg-blue-500/[0.08] hover:text-white"
+                >
+                  All Bids
+                </button>
               </div>
-              <Link
-                to={`/jobs/${selectedJob.slug || selectedJob.id}?step=quotes`}
-                className="inline-flex min-h-10 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
-              >
-                Open Bid
-                <ArrowRight className="h-3.5 w-3.5" />
-              </Link>
-              <button
-                type="button"
-                onClick={clearJobFilter}
-                className="min-h-10 rounded-md px-3 text-xs font-semibold text-blue-300 hover:bg-blue-500/[0.08] hover:text-white"
-              >
-                All Bids
-              </button>
-            </div>
-          ) : (
-            <p className="text-xs text-gray-500">Showing email work from every bid.</p>
-          )}
+            )}
+          </div>
         </div>
       </section>
 

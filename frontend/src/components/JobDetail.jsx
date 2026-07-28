@@ -3,7 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, Building2, MapPin, User, Percent, Hash,
   Loader2, FileSpreadsheet, Save, AlertTriangle, Trash2,
-  StickyNote, ChevronDown, ChevronUp, Cpu, CheckCircle2, X, Upload, Download, Copy,
+  StickyNote, ChevronDown, ChevronUp, ChevronRight, Cpu, CheckCircle2, X, Upload, Download, Copy,
   Pencil
 } from 'lucide-react'
 import { api } from '../api'
@@ -47,6 +47,7 @@ export default function JobDetail() {
   const evidenceInputRef = useRef(null)
   const [quoteWorkflowComplete, setQuoteWorkflowComplete] = useState(false)
   const [readiness, setReadiness] = useState(null)
+  const [bidChecksOpen, setBidChecksOpen] = useState(false)
   const materialsStateRef = useRef([])
   const materialsFingerprintRef = useRef('')
   const materialEditVersionRef = useRef(0)
@@ -97,6 +98,9 @@ export default function JobDetail() {
 
   useEffect(() => { loadJob() }, [jobId])
   useEffect(() => { api.getSettings().then(setAiSettings).catch(() => {}) }, [])
+  useEffect(() => {
+    if (step === 'bid') setBidChecksOpen(true)
+  }, [step])
 
   const startEditing = () => {
     setEditForm({
@@ -381,9 +385,16 @@ export default function JobDetail() {
 
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-8 py-6 sm:py-8">
+      <nav className="mb-3 flex items-center gap-1 text-xs font-semibold text-gray-500" aria-label="Breadcrumb">
+        <Link to="/jobs" className="hover:text-gray-300">Jobs</Link>
+        <ChevronRight className="h-3.5 w-3.5" />
+        <Link to="/jobs/bids" className="hover:text-gray-300">Bids</Link>
+        <ChevronRight className="h-3.5 w-3.5" />
+        <span className="truncate text-gray-300">{job.project_name}</span>
+      </nav>
       {/* Header */}
       <div className="flex items-start gap-4 mb-8">
-        <button onClick={() => navigate('/')} className="btn-ghost p-2 mt-0.5">
+        <button onClick={() => navigate('/jobs/bids')} className="btn-ghost p-2 mt-0.5" title="Back to Bids">
           <ArrowLeft className="w-5 h-5" />
         </button>
         <div className="flex-1">
@@ -612,14 +623,35 @@ export default function JobDetail() {
         )}
       </div>
 
-      <ReadinessSummary
-        readiness={readiness}
-        onRefresh={() => refreshReadiness(job.id)}
-        onRecoverEvidence={openEvidenceRecovery}
-        onResolveVendorConflict={handleResolveVendorConflict}
-      />
-
-      <ReproducibilityPanel jobId={jobId} onConfidenceChange={refreshReadiness} />
+      <section className="mb-6 border-y border-white/[0.07]">
+        <button
+          type="button"
+          onClick={() => setBidChecksOpen((open) => !open)}
+          aria-expanded={bidChecksOpen}
+          className="flex w-full items-center justify-between gap-4 py-3 text-left"
+        >
+          <div>
+            <p className="text-sm font-bold text-white">Bid checks</p>
+            <p className="mt-0.5 text-xs text-gray-500">
+              {readiness?.blocking_count
+                ? `${readiness.blocking_count} thing${readiness.blocking_count === 1 ? '' : 's'} to finish before this bid can be sent.`
+                : 'Pricing, proposal, PDF, and golden-job checks.'}
+            </p>
+          </div>
+          <ChevronDown className={`h-4 w-4 flex-shrink-0 text-gray-500 transition-transform ${bidChecksOpen ? 'rotate-180' : ''}`} />
+        </button>
+        {bidChecksOpen && (
+          <div className="pt-4">
+            <ReadinessSummary
+              readiness={readiness}
+              onRefresh={() => refreshReadiness(job.id)}
+              onRecoverEvidence={openEvidenceRecovery}
+              onResolveVendorConflict={handleResolveVendorConflict}
+            />
+            <ReproducibilityPanel jobId={jobId} onConfidenceChange={refreshReadiness} />
+          </div>
+        )}
+      </section>
 
       {/* Stepper */}
       <div className="mb-6 rounded-lg border border-white/[0.06] bg-white/[0.03] px-3 py-3 sm:mb-8 sm:px-6 sm:py-4">
@@ -860,7 +892,7 @@ export default function JobDetail() {
                     }}
                     className="btn-primary"
                   >
-                    Continue to Bid Quotes
+                    Set Up Quote Emails
                   </button>
                 </div>
               )

@@ -1265,7 +1265,7 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
         slug = job.get("slug") or str(job_id)
         if stage == "needs_setup":
             next_action = {
-                "label": "Prepare Quotes" if materials else "Open Bid",
+                "label": "Set Up Quote Email" if materials else "Open Bid",
                 "url": (
                     f"/jobs/{slug}?step=quotes"
                     if materials
@@ -1273,7 +1273,7 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
                 ),
             }
         elif stage == "complete":
-            next_action = {"label": "View Bid", "url": f"/jobs/{slug}"}
+            next_action = {"label": "Open Bid", "url": f"/jobs/{slug}"}
         else:
             email_view = {
                 "needs_review": "needs_you",
@@ -1283,10 +1283,10 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
             }[stage]
             next_action = {
                 "label": {
-                    "needs_review": "Review Quote Email",
-                    "overdue": "Check Overdue",
-                    "ready_to_send": "Open Quote Emails",
-                    "waiting": "View Status",
+                    "needs_review": "Review Email",
+                    "overdue": "Check Overdue Email",
+                    "ready_to_send": "Review & Send",
+                    "waiting": "Check Vendor Reply",
                 }[stage],
                 "url": f"/jobs/bids/quote-emails?job={job_id}&view={email_view}",
             }

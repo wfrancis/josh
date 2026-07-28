@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import {
-  Plus, Building2, Briefcase, User, Loader2, ChevronRight,
+  Plus, Building2, Briefcase, User, Loader2, ChevronRight, ArrowRight,
   Search, FolderOpen, Trash2, Copy
 } from 'lucide-react'
 import { api } from '../api'
@@ -91,7 +91,9 @@ export default function AllJobs() {
       <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-extrabold text-white tracking-tight">Jobs</h1>
-          <p className="text-sm text-gray-500 mt-1">{jobs.length} job{jobs.length !== 1 ? 's' : ''} total</p>
+          <p className="text-sm text-gray-500 mt-1">
+            {jobs.length} job{jobs.length !== 1 ? 's' : ''} total · Open a job to work on its bid.
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-3">
           <nav className="flex min-h-10 items-center rounded-lg border border-white/[0.08] bg-white/[0.025] p-1" aria-label="Jobs navigation">
@@ -216,6 +218,14 @@ export default function AllJobs() {
                 </button>
                 <StatusBadge status={status} />
                 {confidenceStatus && <span className="hidden sm:inline-flex"><StatusBadge status={confidenceStatus} /></span>}
+                <Link
+                  to={`/jobs/${job.slug || job.id}`}
+                  onClick={(e) => e.stopPropagation()}
+                  className="hidden min-h-9 items-center gap-1.5 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] md:inline-flex"
+                >
+                  Open Bid
+                  <ArrowRight className="h-3.5 w-3.5" />
+                </Link>
                 <ChevronRight className="w-4 h-4 text-gray-600 hidden sm:block" />
               </div>
             )

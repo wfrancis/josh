@@ -14,9 +14,9 @@ import QuoteEmailCenter from './quote/QuoteEmailCenter'
 import { EmptyState, StatusPill } from './quote/QuoteUi'
 
 const QUOTE_FILTERS = [
-  ['open', 'Open work'],
-  ['attention', 'Needs attention'],
-  ['prepare', 'Prepare'],
+  ['open', 'To Do'],
+  ['attention', 'Needs You'],
+  ['prepare', 'Set Up'],
   ['send', 'Ready to send'],
   ['waiting', 'Waiting'],
   ['complete', 'Complete'],
@@ -29,20 +29,6 @@ const quoteEmailView = (bid) => {
   if (stage === 'ready_to_send') return 'ready_to_send'
   if (stage === 'complete') return 'complete'
   return 'waiting'
-}
-
-const quoteFlow = (bid) => {
-  const stage = String(bid.quote_stage || '')
-  let current = 0
-  if (stage === 'ready_to_send') current = 1
-  if (stage === 'waiting' || stage === 'overdue') current = 2
-  if (stage === 'needs_review') current = 3
-  if (stage === 'complete') current = 4
-
-  return ['Materials', 'Email', 'Reply', 'Price'].map((label, index) => ({
-    label,
-    state: index < current ? 'done' : index === current ? 'current' : 'next',
-  }))
 }
 
 const plural = (count, singular, pluralLabel = `${singular}s`) => (
@@ -96,66 +82,27 @@ const bidEmailDetail = (bid) => {
   return 'No vendor email prepared yet'
 }
 
-function QuoteFlow({ bid }) {
-  return (
-    <ol className="grid grid-cols-4 gap-1" aria-label="Quote progress">
-      {quoteFlow(bid).map((step) => (
-        <li key={step.label} className="min-w-0">
-          <div className="flex items-center gap-1.5">
-            <span
-              className={`h-2 w-2 flex-shrink-0 rounded-full ${
-                step.state === 'done'
-                  ? 'bg-emerald-400'
-                  : step.state === 'current'
-                    ? 'bg-si-orange ring-4 ring-orange-500/10'
-                    : 'bg-gray-700'
-              }`}
-            />
-            <span
-              className={`truncate text-[11px] font-semibold ${
-                step.state === 'current'
-                  ? 'text-white'
-                  : step.state === 'done'
-                    ? 'text-emerald-300'
-                    : 'text-gray-600'
-              }`}
-            >
-              {step.label}
-            </span>
-          </div>
-        </li>
-      ))}
-    </ol>
-  )
-}
-
 function BidQuoteCard({ bid, featured = false }) {
   const emailUrl = `/jobs/bids/quote-emails?job=${bid.job_id}&view=${quoteEmailView(bid)}`
   const emailAction = ['needs_review', 'overdue', 'ready_to_send', 'waiting'].includes(bid.quote_stage)
-  const actionUrl = emailAction ? emailUrl : (bid.next_action?.url || `/jobs/${bid.slug || bid.job_id}`)
-  const { active: activeRequestCount, completed: completedRequestCount } = quoteRequestCounts(bid)
-  const canOpenEmail = (
-    Number(bid.draft_group_count || 0) > 0
-    || activeRequestCount > 0
-    || completedRequestCount > 0
-    || bid.quote_stage === 'needs_review'
-    || bid.quote_stage === 'ready_to_send'
-  )
+  const bidUrl = `/jobs/${bid.slug || bid.job_id}?step=quotes`
+  const actionUrl = emailAction ? emailUrl : (bid.next_action?.url || bidUrl)
   const location = bidLocation(bid)
+  const unpricedCount = Number(bid.unpriced_count || 0)
 
   return (
     <article
-      className={`overflow-hidden rounded-lg border bg-white/[0.02] transition-colors hover:bg-white/[0.035] ${
+      className={`rounded-lg border bg-white/[0.02] transition-colors hover:bg-white/[0.035] ${
         featured
           ? 'border-orange-500/25 shadow-[inset_3px_0_0_0_rgba(249,115,22,0.85)]'
           : 'border-white/[0.08]'
       }`}
     >
-      <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-start lg:justify-between">
+      <div className="flex flex-col gap-4 p-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <Link
-              to={`/jobs/${bid.slug || bid.job_id}?step=quotes`}
+              to={bidUrl}
               className="truncate text-base font-bold text-white hover:text-blue-300"
             >
               {bid.project_name}
@@ -167,39 +114,29 @@ function BidQuoteCard({ bid, featured = false }) {
           <p className="mt-1 text-sm text-gray-400">
             {[bid.gc_name, location].filter(Boolean).join(' | ') || 'No GC or location listed'}
           </p>
-        </div>
-        <StatusPill status={bid.quote_stage} label={bid.quote_stage_label} />
-      </div>
-
-      <div className="grid gap-4 border-t border-white/[0.06] px-4 py-4 xl:grid-cols-[minmax(210px,0.8fr)_minmax(310px,1.25fr)_auto] xl:items-center">
-        <div>
-          <p className="text-xs font-semibold text-gray-500">Quote work</p>
-          <p className="mt-1 text-sm font-semibold text-gray-200">
-            {Number(bid.unpriced_count || 0)
-              ? plural(Number(bid.unpriced_count), 'unpriced material')
-              : 'All materials are priced'}
-          </p>
-          <p className="mt-1 text-xs text-gray-500">
-            {plural(Number(bid.vendor_group_count || 0), 'vendor group')} | {bidEmailDetail(bid)}
-          </p>
+          <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs">
+            <span className={unpricedCount ? 'font-semibold text-orange-300' : 'font-semibold text-emerald-300'}>
+              {unpricedCount ? plural(unpricedCount, 'material needs a price', 'materials need prices') : 'All materials are priced'}
+            </span>
+            <span className="text-gray-500">
+              {plural(Number(bid.vendor_group_count || 0), 'vendor group')} · {bidEmailDetail(bid)}
+            </span>
+          </div>
         </div>
 
-        <QuoteFlow bid={bid} />
-
-        <div className="flex flex-wrap gap-2 xl:justify-end">
-          {canOpenEmail && (
+        <div className="flex flex-wrap items-center gap-2 lg:justify-end">
+          <StatusPill status={bid.quote_stage} label={bid.quote_stage_label} />
+          {emailAction && (
             <Link
-              to={emailUrl}
-              title={`Open quote emails for ${bid.project_name}`}
-              aria-label={`Open quote emails for ${bid.project_name}`}
-              className="inline-flex h-10 w-10 items-center justify-center rounded-md border border-white/[0.1] text-gray-400 hover:border-white/[0.18] hover:bg-white/[0.05] hover:text-white"
+              to={bidUrl}
+              className="inline-flex min-h-10 items-center justify-center rounded-md border border-white/[0.1] px-3 text-sm font-semibold text-gray-300 hover:bg-white/[0.05]"
             >
-              <Mail className="h-4 w-4" />
+              Open Bid
             </Link>
           )}
           <Link
             to={actionUrl}
-            className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-white/[0.1] px-3.5 text-sm font-semibold text-gray-200 hover:border-white/[0.18] hover:bg-white/[0.05]"
+            className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-si-orange px-3.5 text-sm font-bold text-white hover:bg-orange-500"
           >
             {bid.next_action?.label || 'Open Bid'}
             <ArrowRight className="h-4 w-4" />
@@ -293,9 +230,9 @@ function MaterialQuoteBids() {
     <div className="space-y-5">
       <div className="flex flex-col gap-3 border-b border-white/[0.07] pb-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
-          <h2 className="text-sm font-bold text-white">Bid quote queue</h2>
+          <h2 className="text-sm font-bold text-white">Bids needing vendor prices</h2>
           <p className="mt-1 text-xs text-gray-500">
-            Each bid stays with its vendor emails, replies, and price decisions.
+            Choose a bid, then take the one next step shown on the right.
           </p>
         </div>
         <label className="relative w-full lg:max-w-sm">
@@ -368,7 +305,7 @@ function MaterialQuoteBids() {
       <section>
         <div className="mb-3 flex items-center justify-between gap-3">
           <h3 className="text-sm font-bold text-white">
-            {filter === 'open' ? 'Quote queue' : QUOTE_FILTERS.find(([key]) => key === filter)?.[1]}
+            {filter === 'open' ? 'Other bid work' : QUOTE_FILTERS.find(([key]) => key === filter)?.[1]}
           </h3>
           <span className="text-xs font-semibold tabular-nums text-gray-500">
             {queueBids.length} bid{queueBids.length === 1 ? '' : 's'}
@@ -415,7 +352,7 @@ export default function MaterialQuotesHub() {
             <h1 className="text-xl font-bold text-white">{emailOpen ? 'Quote Emails' : 'Bids'}</h1>
           </div>
           <p className="mt-1 text-sm text-gray-500">
-            {emailOpen ? 'Vendor quote requests, replies, and price decisions.' : 'Active bid work and vendor pricing status.'}
+            {emailOpen ? 'Review, send, and track vendor pricing emails.' : 'Choose a bid, then handle its vendor pricing.'}
           </p>
         </div>
         <nav className="flex min-h-10 items-center rounded-lg border border-white/[0.08] bg-white/[0.025] p-1">

@@ -1,8 +1,8 @@
 import { Check } from 'lucide-react'
 
 const STEPS = [
-  { key: 'takeoff', label: 'Takeoff & Pricing' },
-  { key: 'quotes', label: 'Bid Quotes' },
+  { key: 'takeoff', label: 'Bid Setup' },
+  { key: 'quotes', label: 'Quote Emails' },
   { key: 'bid', label: 'Review & Generate' },
 ]
 
