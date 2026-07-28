@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import {
@@ -6,6 +6,8 @@ import {
   ArrowRight,
   Briefcase,
   Check,
+  ChevronDown,
+  ChevronUp,
   Inbox,
   Loader2,
   Mail,
@@ -31,11 +33,11 @@ import {
 } from './QuoteUi'
 
 const FILTERS = [
-  ['needs_you', 'Needs Your Decision'],
-  ['overdue', 'Follow Up Today'],
-  ['ready_to_send', 'Ready for Approval'],
-  ['waiting', 'Waiting on Vendors'],
-  ['complete', 'Done'],
+  ['needs_you', 'Needs Me'],
+  ['overdue', 'Follow Up'],
+  ['ready_to_send', 'Ready'],
+  ['waiting', 'Waiting'],
+  ['complete', 'Closed'],
 ]
 
 const VIEW_DETAILS = {
@@ -56,7 +58,7 @@ const VIEW_DETAILS = {
     description: 'These requests are sent. The tool is watching for replies and follow-ups.',
   },
   complete: {
-    title: 'Done',
+    title: 'Closed',
     description: 'These quote requests no longer need work.',
   },
 }
@@ -101,7 +103,57 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
   const [notice, setNotice] = useState('')
   const [busyKey, setBusyKey] = useState('')
   const [dirtyGroups, setDirtyGroups] = useState({})
+  const [expandedGroups, setExpandedGroups] = useState({})
   const [confirmation, setConfirmation] = useState(null)
+  const dialogRef = useRef(null)
+  const cancelButtonRef = useRef(null)
+  const previouslyFocusedRef = useRef(null)
+  const hasUnsavedChanges = Object.keys(dirtyGroups).length > 0
+
+  useEffect(() => {
+    if (!confirmation) return undefined
+    previouslyFocusedRef.current = document.activeElement
+    const focusDialog = window.requestAnimationFrame(() => {
+      cancelButtonRef.current?.focus()
+    })
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setConfirmation(null)
+        return
+      }
+      if (event.key !== 'Tab') return
+      const focusable = dialogRef.current?.querySelectorAll(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )
+      if (!focusable?.length) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.cancelAnimationFrame(focusDialog)
+      document.removeEventListener('keydown', handleKeyDown)
+      previouslyFocusedRef.current?.focus?.()
+    }
+  }, [confirmation])
+
+  useEffect(() => {
+    if (!hasUnsavedChanges) return undefined
+    const warnBeforeLeaving = (event) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', warnBeforeLeaving)
+    return () => window.removeEventListener('beforeunload', warnBeforeLeaving)
+  }, [hasUnsavedChanges])
 
   const load = useCallback(async ({ quiet = false } = {}) => {
     if (quiet) setRefreshing(true)
@@ -123,24 +175,50 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
     load()
   }, [load])
 
+  const discardUnsavedChanges = (continueAction) => {
+    if (!hasUnsavedChanges) {
+      continueAction()
+      return
+    }
+    setConfirmation({
+      action: 'discard_changes',
+      title: 'Discard unsaved email changes?',
+      message: 'Your edited vendor email has not been saved yet. Leave this screen and lose those changes?',
+      confirmLabel: 'Discard Changes',
+      destructive: true,
+      onConfirm: continueAction,
+    })
+  }
+
   const setFilter = (view) => {
-    const next = new URLSearchParams(location.search)
-    next.set('view', view)
-    navigate(`${basePath}?${next.toString()}`)
+    discardUnsavedChanges(() => {
+      const next = new URLSearchParams(location.search)
+      next.set('view', view)
+      navigate(`${basePath}?${next.toString()}`)
+    })
   }
 
   const clearJobFilter = () => {
-    const next = new URLSearchParams(location.search)
-    next.delete('job')
-    navigate(`${basePath}${next.toString() ? `?${next}` : ''}`)
+    discardUnsavedChanges(() => {
+      const next = new URLSearchParams(location.search)
+      next.delete('job')
+      next.delete('view')
+      navigate(`${basePath}${next.toString() ? `?${next}` : ''}`)
+    })
   }
 
   const selectJob = (event) => {
-    const next = new URLSearchParams(location.search)
     const nextJobId = event.target.value
-    if (nextJobId) next.set('job', nextJobId)
-    else next.delete('job')
-    navigate(`${basePath}${next.toString() ? `?${next}` : ''}`)
+    if (String(nextJobId) === String(jobFilter)) return
+    discardUnsavedChanges(() => {
+      const next = new URLSearchParams(location.search)
+      if (nextJobId) next.set('job', nextJobId)
+      else next.delete('job')
+      // Each bid has its own highest-priority task. Carrying the prior bid's
+      // filter forward can show an empty screen and hide the real work.
+      next.delete('view')
+      navigate(`${basePath}${next.toString() ? `?${next}` : ''}`)
+    })
   }
 
   const updateDraftGroup = (jobId, groupId, field, value) => {
@@ -169,13 +247,50 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
     setError('')
     setNotice('')
     try {
-      await api.updateQuoteEmailDraftGroup(draft.job_id, group.group_id, {
+      const result = await api.updateQuoteEmailDraftGroup(draft.job_id, group.group_id, {
         vendor_email: group.vendor_email,
         subject: group.subject,
         body: group.body,
       })
+      if (result?.draft) {
+        setCenter((current) => ({
+          ...current,
+          drafts: asArray(current.drafts).map((currentDraft) => {
+            if (String(currentDraft.job_id) !== String(draft.job_id)) {
+              return currentDraft
+            }
+            const savedGroups = new Map(
+              asArray(result.draft.groups).map((savedGroup) => [
+                String(savedGroup.group_id),
+                savedGroup,
+              ]),
+            )
+            return {
+              ...currentDraft,
+              ...result.draft,
+              // Keep edits in other open vendor emails. The API returns the
+              // complete saved draft, but only this one group was submitted.
+              groups: asArray(currentDraft.groups).map((currentGroup) => {
+                const currentKey = `${draft.job_id}:${currentGroup.group_id}`
+                if (
+                  String(currentGroup.group_id) !== String(group.group_id)
+                  && dirtyGroups[currentKey]
+                ) {
+                  return currentGroup
+                }
+                return savedGroups.get(String(currentGroup.group_id)) || currentGroup
+              }),
+            }
+          }),
+        }))
+      }
+      setDirtyGroups((current) => {
+        const next = { ...current }
+        delete next[key]
+        return next
+      })
+      setExpandedGroups((current) => ({ ...current, [key]: true }))
       setNotice(`Saved the email for ${draft.project_name}. Nothing was sent.`)
-      await load({ quiet: true })
     } catch (err) {
       setError(err.message || 'The email changes could not be saved.')
     } finally {
@@ -267,14 +382,41 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
     }
   }
 
+  const requestSyncOutlook = () => discardUnsavedChanges(syncOutlook)
+
   const requestDisconnectOutlook = () => {
-    setConfirmation({
+    discardUnsavedChanges(() => setConfirmation({
       action: 'disconnect',
       title: 'Disconnect Outlook?',
       message: 'Email drafts and saved quote evidence will stay in the bid tool.',
       confirmLabel: 'Disconnect',
       destructive: true,
+    }))
+  }
+
+  const requestCancelQuoteRequest = (request) => {
+    setConfirmation({
+      action: 'cancel_request',
+      request,
+      title: 'Stop vendor follow-ups?',
+      message: `This stops automatic follow-ups to ${request.vendor_name || 'this vendor'} for ${request.project_name || 'this bid'}. The email already sent stays saved as proof.`,
+      confirmLabel: 'Stop Follow-ups',
+      destructive: true,
     })
+  }
+
+  const cancelQuoteRequest = async (request) => {
+    setBusyKey(`cancel:${request.id}`)
+    setError('')
+    try {
+      await api.cancelQuoteRequest(request.id)
+      setNotice(`Follow-ups to ${request.vendor_name || 'the vendor'} were stopped. The sent email is still saved as proof.`)
+      await load({ quiet: true })
+    } catch (err) {
+      setError(err.message || 'The vendor follow-ups could not be stopped.')
+    } finally {
+      setBusyKey('')
+    }
   }
 
   const disconnectOutlook = async () => {
@@ -297,6 +439,8 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
     if (pending?.action === 'send') sendDraft(pending.draft)
     if (pending?.action === 'delete') deleteDraft(pending.draft)
     if (pending?.action === 'disconnect') disconnectOutlook()
+    if (pending?.action === 'cancel_request') cancelQuoteRequest(pending.request)
+    if (pending?.action === 'discard_changes') pending.onConfirm?.()
   }
 
   const drafts = asArray(center.drafts).filter(
@@ -376,8 +520,8 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
 
   return (
     <div className="space-y-5">
-      <section className="rounded-lg border border-white/[0.08] bg-white/[0.025] p-4">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+      <section className="rounded-lg border border-white/[0.08] bg-white/[0.025] p-3 sm:p-4">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
           <div className="min-w-0">
             <p className="text-xs font-semibold uppercase text-gray-500">
               {selectedJob ? 'Vendor email work for this bid' : 'Vendor email work'}
@@ -401,7 +545,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
               <select
                 value={jobFilter}
                 onChange={selectJob}
-                className="w-full rounded-md border border-white/[0.1] bg-[#0D1322] px-3 py-2.5 text-sm font-semibold text-gray-200 outline-none focus:border-blue-400/50"
+                className="min-h-11 w-full rounded-md border border-white/[0.1] bg-[#0D1322] px-3 py-2.5 text-sm font-semibold text-gray-200 outline-none focus:border-blue-400/50"
               >
                 <option value="">All bids</option>
                 {bidOptions.map((job) => {
@@ -420,7 +564,12 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
               <div className="flex gap-2">
                 <Link
                   to={`/jobs/${selectedJob.slug || selectedJob.id}?step=quotes`}
-                  className="inline-flex min-h-10 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
+                  onClick={(event) => {
+                    if (!hasUnsavedChanges) return
+                    event.preventDefault()
+                    discardUnsavedChanges(() => navigate(`/jobs/${selectedJob.slug || selectedJob.id}?step=quotes`))
+                  }}
+                  className="inline-flex min-h-11 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
                 >
                   Back to Bid
                   <ArrowRight className="h-3.5 w-3.5" />
@@ -428,7 +577,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                 <button
                   type="button"
                   onClick={clearJobFilter}
-                  className="min-h-10 rounded-md px-3 text-xs font-semibold text-blue-300 hover:bg-blue-500/[0.08] hover:text-white"
+                  className="min-h-11 rounded-md px-3 text-xs font-semibold text-blue-300 hover:bg-blue-500/[0.08] hover:text-white"
                 >
                   All Bids
                 </button>
@@ -436,14 +585,11 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
             )}
           </div>
         </div>
-      </section>
-
-      <section className="border-b border-white/[0.07] pb-4">
-        <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="mt-3 flex flex-col gap-3 border-t border-white/[0.07] pt-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <Mail className="h-4 w-4 text-gray-500" />
-              <h2 className="text-sm font-bold text-white">Outlook</h2>
+              <h2 className="text-sm font-bold text-white">Email</h2>
               <StatusPill
                 status={outlookConnected ? 'connected' : 'needs_setup'}
                 label={outlookConnected ? 'Connected' : 'Not Connected'}
@@ -460,9 +606,9 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
               <>
                 <button
                   type="button"
-                  onClick={syncOutlook}
+                  onClick={requestSyncOutlook}
                   disabled={busyKey === 'sync'}
-                  className="inline-flex items-center gap-2 rounded-md border border-white/[0.1] px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] disabled:opacity-40"
+                  className="inline-flex min-h-11 items-center gap-2 rounded-md border border-white/[0.1] px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] disabled:opacity-40"
                 >
                   <RefreshCw className={`h-3.5 w-3.5 ${busyKey === 'sync' ? 'animate-spin' : ''}`} />
                   Sync
@@ -471,7 +617,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                   type="button"
                   onClick={requestDisconnectOutlook}
                   disabled={busyKey === 'disconnect'}
-                  className="inline-flex items-center gap-2 rounded-md px-3 py-2 text-xs font-semibold text-gray-500 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"
+                  className="inline-flex min-h-11 items-center gap-2 rounded-md px-3 py-2 text-xs font-semibold text-gray-400 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"
                 >
                   <Unplug className="h-3.5 w-3.5" />
                   Disconnect
@@ -480,7 +626,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
             ) : (
               <a
                 href={api.outlookConnectUrl(returnTo)}
-                className="inline-flex items-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-500"
+                className="inline-flex min-h-11 items-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400"
               >
                 <Mail className="h-4 w-4" />
                 Connect Outlook
@@ -491,12 +637,12 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
       </section>
 
       {error && (
-        <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
+        <div role="alert" aria-live="assertive" className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
           {error}
         </div>
       )}
       {notice && (
-        <div role="status" className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-4 py-3 text-sm text-emerald-300">
+        <div role="status" aria-live="polite" className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-4 py-3 text-sm text-emerald-300">
           {notice}
         </div>
       )}
@@ -509,10 +655,11 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
           </div>
           <button
             type="button"
-            onClick={() => load({ quiet: true })}
+            onClick={() => discardUnsavedChanges(() => load({ quiet: true }))}
             disabled={refreshing}
             title="Refresh Quote Email Center"
-            className="inline-flex h-9 w-9 items-center justify-center rounded-md text-gray-500 hover:bg-white/[0.05] hover:text-white disabled:opacity-40"
+            aria-label="Refresh Quote Email Center"
+            className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md text-gray-400 hover:bg-white/[0.05] hover:text-white disabled:opacity-40"
           >
             <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
           </button>
@@ -524,10 +671,11 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
               type="button"
               onClick={() => setFilter(key)}
               aria-pressed={activeFilter === key}
+              aria-label={`${VIEW_DETAILS[key].title}: ${Number(scopedSummary[key] || 0)} items`}
               className={`flex min-h-11 items-center justify-between gap-2 rounded-md px-3 text-sm font-semibold sm:flex-1 sm:justify-start ${
                 activeFilter === key
                   ? 'bg-si-orange text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]'
-                  : 'text-gray-500 hover:bg-white/[0.05] hover:text-gray-200'
+                  : 'text-gray-400 hover:bg-white/[0.05] hover:text-gray-200'
               }`}
             >
               <span className="truncate">{label}</span>
@@ -545,7 +693,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
         <section>
           <SectionTitle
             icon={Send}
-            title={activeFilter === 'ready_to_send' ? 'Emails Ready for Approval' : 'Fix Before Sending'}
+            title={activeFilter === 'ready_to_send' ? 'Emails ready for approval' : 'Needs your decision'}
             count={filteredDrafts.length}
           />
           {filteredDrafts.length ? (
@@ -586,7 +734,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                         onClick={() => requestDeleteDraft(draft)}
                         disabled={busyKey === `delete:${draft.job_id}`}
                         title="Delete saved draft"
-                        className="inline-flex items-center gap-1.5 self-start rounded-md px-2.5 py-1.5 text-xs text-gray-500 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40 sm:self-center"
+                        className="inline-flex min-h-11 items-center gap-1.5 self-start rounded-md px-3 py-2 text-xs text-gray-400 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40 sm:self-center"
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                         Delete Draft
@@ -613,92 +761,126 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                       {asArray(draft.groups).map((group) => {
                         const key = `${draft.job_id}:${group.group_id}`
                         const isDirty = Boolean(dirtyGroups[key])
+                        const contentId = `quote-email-${draft.job_id}-${group.group_id}`
+                        const isExpanded = !draft.stale && (
+                          !group.can_send || isDirty || Boolean(expandedGroups[key])
+                        )
                         return (
                           <div key={group.group_id} className="p-4">
-                            <div className="mb-3 flex flex-wrap items-center gap-2">
-                              <h3 className="text-sm font-semibold text-gray-200">
-                                {group.vendor_name || 'Vendor'}
-                              </h3>
-                              <StatusPill
-                                status={group.can_send ? 'ready_to_send' : 'needs_setup'}
-                                label={group.can_send ? 'Ready' : 'Fix needed'}
-                              />
-                              <span className="text-xs text-gray-600">
-                                {asArray(group.materials).length} material{asArray(group.materials).length === 1 ? '' : 's'}
-                              </span>
+                            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <h3 className="text-sm font-semibold text-gray-200">
+                                    {group.vendor_name || 'Vendor'}
+                                  </h3>
+                                  <StatusPill
+                                    status={draft.stale ? 'stale' : (group.can_send ? 'ready_to_send' : 'needs_setup')}
+                                    label={draft.stale ? 'Update in bid' : (group.can_send ? 'Ready' : 'Fix needed')}
+                                  />
+                                  <span className="text-xs text-gray-500">
+                                    {asArray(group.materials).length} material{asArray(group.materials).length === 1 ? '' : 's'}
+                                  </span>
+                                </div>
+                                <p className="mt-1 truncate text-xs text-gray-400">
+                                  {draft.stale
+                                    ? 'Refresh this email from the bid before sending.'
+                                    : group.vendor_email || 'No recipient saved'}
+                                </p>
+                              </div>
+                              {!draft.stale && (
+                                <button
+                                  type="button"
+                                  onClick={() => setExpandedGroups((current) => ({
+                                    ...current,
+                                    [key]: !isExpanded,
+                                  }))}
+                                  aria-expanded={isExpanded}
+                                  aria-controls={contentId}
+                                  className="inline-flex min-h-11 flex-shrink-0 items-center justify-center gap-1.5 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
+                                >
+                                  {isExpanded
+                                    ? <ChevronUp className="h-3.5 w-3.5" />
+                                    : <ChevronDown className="h-3.5 w-3.5" />}
+                                  {isExpanded ? 'Hide Email' : 'Edit Email'}
+                                </button>
+                              )}
                             </div>
                             {asArray(group.issues).length > 0 && (
-                              <ul className="mb-3 space-y-1 text-xs text-orange-300">
+                              <ul className="mt-3 space-y-1 text-xs text-orange-300">
                                 {asArray(group.issues).map((issue) => (
                                   <li key={issue}>- {issue}</li>
                                 ))}
                               </ul>
                             )}
-                            <div className="grid gap-3">
-                              <label>
-                                <span className="mb-1.5 block text-xs font-semibold text-gray-500">
-                                  Recipient
-                                </span>
-                                <input
-                                  type="email"
-                                  value={group.vendor_email || ''}
-                                  onChange={(event) => updateDraftGroup(
-                                    draft.job_id,
-                                    group.group_id,
-                                    'vendor_email',
-                                    event.target.value,
-                                  )}
-                                  className="w-full rounded-md border border-white/[0.1] bg-black/20 px-3 py-2 text-sm text-gray-200 outline-none focus:border-blue-400/50"
-                                />
-                              </label>
-                              <label>
-                                <span className="mb-1.5 block text-xs font-semibold text-gray-500">
-                                  Subject
-                                </span>
-                                <input
-                                  value={group.subject || ''}
-                                  onChange={(event) => updateDraftGroup(
-                                    draft.job_id,
-                                    group.group_id,
-                                    'subject',
-                                    event.target.value,
-                                  )}
-                                  className="w-full rounded-md border border-white/[0.1] bg-black/20 px-3 py-2 text-sm text-gray-200 outline-none focus:border-blue-400/50"
-                                />
-                              </label>
-                              <label>
-                                <span className="mb-1.5 block text-xs font-semibold text-gray-500">
-                                  Email
-                                </span>
-                                <textarea
-                                  rows={6}
-                                  value={group.body || ''}
-                                  onChange={(event) => updateDraftGroup(
-                                    draft.job_id,
-                                    group.group_id,
-                                    'body',
-                                    event.target.value,
-                                  )}
-                                  className="w-full resize-y rounded-md border border-white/[0.1] bg-black/20 px-3 py-2 text-sm leading-relaxed text-gray-300 outline-none focus:border-blue-400/50"
-                                />
-                              </label>
-                            </div>
-                            <div className="mt-3 flex flex-col gap-2 border-t border-white/[0.05] pt-3 sm:flex-row sm:items-center sm:justify-between">
-                              <div className="min-w-0 text-xs text-gray-500">
-                                {asArray(group.materials).map((material) => materialLabel(material)).join(', ')}
+                            {isExpanded && (
+                              <div id={contentId} className="mt-3">
+                                <div className="grid gap-3">
+                                  <label>
+                                    <span className="mb-1.5 block text-xs font-semibold text-gray-400">
+                                      Recipient
+                                    </span>
+                                    <input
+                                      type="email"
+                                      value={group.vendor_email || ''}
+                                      onChange={(event) => updateDraftGroup(
+                                        draft.job_id,
+                                        group.group_id,
+                                        'vendor_email',
+                                        event.target.value,
+                                      )}
+                                      className="min-h-11 w-full rounded-md border border-white/[0.1] bg-black/20 px-3 py-2 text-sm text-gray-200 outline-none focus:border-blue-400/50"
+                                    />
+                                  </label>
+                                  <label>
+                                    <span className="mb-1.5 block text-xs font-semibold text-gray-400">
+                                      Subject
+                                    </span>
+                                    <input
+                                      value={group.subject || ''}
+                                      onChange={(event) => updateDraftGroup(
+                                        draft.job_id,
+                                        group.group_id,
+                                        'subject',
+                                        event.target.value,
+                                      )}
+                                      className="min-h-11 w-full rounded-md border border-white/[0.1] bg-black/20 px-3 py-2 text-sm text-gray-200 outline-none focus:border-blue-400/50"
+                                    />
+                                  </label>
+                                  <label>
+                                    <span className="mb-1.5 block text-xs font-semibold text-gray-400">
+                                      Email
+                                    </span>
+                                    <textarea
+                                      rows={6}
+                                      value={group.body || ''}
+                                      onChange={(event) => updateDraftGroup(
+                                        draft.job_id,
+                                        group.group_id,
+                                        'body',
+                                        event.target.value,
+                                      )}
+                                      className="w-full resize-y rounded-md border border-white/[0.1] bg-black/20 px-3 py-2 text-sm leading-relaxed text-gray-300 outline-none focus:border-blue-400/50"
+                                    />
+                                  </label>
+                                </div>
+                                <div className="mt-3 flex flex-col gap-2 border-t border-white/[0.05] pt-3 sm:flex-row sm:items-center sm:justify-between">
+                                  <div className="min-w-0 text-xs text-gray-400">
+                                    {asArray(group.materials).map((material) => materialLabel(material)).join(', ')}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => saveGroup(draft, group)}
+                                    disabled={!isDirty || busyKey === `save:${key}`}
+                                    className="inline-flex min-h-11 flex-shrink-0 items-center justify-center gap-2 rounded-md border border-white/[0.1] px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] disabled:opacity-35"
+                                  >
+                                    {busyKey === `save:${key}`
+                                      ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                      : <Save className="h-3.5 w-3.5" />}
+                                    Save Changes
+                                  </button>
+                                </div>
                               </div>
-                              <button
-                                type="button"
-                                onClick={() => saveGroup(draft, group)}
-                                disabled={!isDirty || busyKey === `save:${key}`}
-                                className="inline-flex flex-shrink-0 items-center justify-center gap-2 rounded-md border border-white/[0.1] px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] disabled:opacity-35"
-                              >
-                                {busyKey === `save:${key}`
-                                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                  : <Save className="h-3.5 w-3.5" />}
-                                Save Changes
-                              </button>
-                            </div>
+                            )}
                           </div>
                         )
                       })}
@@ -720,7 +902,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                           || hasDirtyGroup
                           || busyKey === `send:${draft.job_id}`
                         }
-                        className="inline-flex items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-500 disabled:cursor-not-allowed disabled:opacity-35"
+                        className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-35"
                       >
                         {busyKey === `send:${draft.job_id}`
                           ? <Loader2 className="h-4 w-4 animate-spin" />
@@ -754,7 +936,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                 : activeFilter === 'overdue'
                   ? 'Overdue Requests'
                   : activeFilter === 'complete'
-                    ? 'Completed Requests'
+                    ? 'Closed Requests'
                     : 'Requests that need attention'
             }
             count={filteredRequests.length}
@@ -770,6 +952,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
             onRefresh={() => load({ quiet: true })}
             onError={setError}
             onNotice={setNotice}
+            onCancelRequest={requestCancelQuoteRequest}
           />
         </section>
       )}
@@ -823,11 +1006,10 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
           aria-modal="true"
           aria-labelledby="quote-confirmation-title"
           aria-describedby="quote-confirmation-description"
-          onClick={() => setConfirmation(null)}
         >
           <div
+            ref={dialogRef}
             className="max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-lg border border-white/[0.12] bg-[#111827] shadow-2xl"
-            onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-start gap-3 border-b border-white/[0.08] px-4 py-4 sm:px-5">
               <div className="min-w-0 flex-1">
@@ -841,7 +1023,8 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
               <button
                 type="button"
                 onClick={() => setConfirmation(null)}
-                className="rounded-md p-2 text-gray-500 hover:bg-white/[0.06] hover:text-white"
+                aria-label="Close confirmation"
+                className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md text-gray-400 hover:bg-white/[0.06] hover:text-white"
                 title="Close confirmation"
               >
                 <X className="h-4 w-4" />
@@ -880,17 +1063,18 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
               <button
                 type="button"
                 onClick={() => setConfirmation(null)}
-                className="rounded-md border border-white/[0.1] px-4 py-2.5 text-sm font-semibold text-gray-300 hover:bg-white/[0.05]"
+                ref={cancelButtonRef}
+                className="min-h-11 rounded-md border border-white/[0.1] px-4 py-2.5 text-sm font-semibold text-gray-300 hover:bg-white/[0.05]"
               >
                 Cancel
               </button>
               <button
                 type="button"
                 onClick={runConfirmedAction}
-                className={`rounded-md px-4 py-2.5 text-sm font-bold text-white ${
+                className={`min-h-11 rounded-md px-4 py-2.5 text-sm font-bold ${
                   confirmation.destructive
-                    ? 'bg-red-600 hover:bg-red-500'
-                    : 'bg-si-orange hover:bg-orange-500'
+                    ? 'bg-red-600 text-white hover:bg-red-500'
+                    : 'bg-si-orange text-[#0A0F1E] hover:bg-orange-400'
                 }`}
               >
                 {confirmation.confirmLabel}

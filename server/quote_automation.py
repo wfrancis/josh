@@ -1293,7 +1293,14 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
         else:
             stage = "complete"
         slug = job.get("slug") or str(job_id)
-        if stage == "needs_setup":
+        # A stale draft cannot be fixed in Email Center. Take the estimator
+        # directly to the bid where its material list can be refreshed.
+        if draft and draft.get("stale"):
+            next_action = {
+                "label": "Update Quote Email",
+                "url": f"/jobs/{slug}?step=quotes",
+            }
+        elif stage == "needs_setup":
             next_action = {
                 "label": "Set Up Quote Email" if materials else "Open Bid",
                 "url": (

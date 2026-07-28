@@ -23,6 +23,7 @@ export default function QuoteRequestTimeline({
   onRefresh,
   onError,
   onNotice,
+  onCancelRequest,
 }) {
   const [busyId, setBusyId] = useState(null)
   const [expandedMaterials, setExpandedMaterials] = useState({})
@@ -96,7 +97,7 @@ export default function QuoteRequestTimeline({
                     type="button"
                     onClick={() => runRequestAction(request, 'retry')}
                     disabled={busyId === request.id}
-                    className="inline-flex items-center gap-1.5 rounded-md border border-white/[0.1] px-2.5 py-1.5 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] disabled:opacity-50"
+                    className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-white/[0.1] px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] disabled:opacity-50"
                   >
                     {busyId === request.id
                       ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -107,12 +108,17 @@ export default function QuoteRequestTimeline({
                 {canCancel && (
                   <button
                     type="button"
-                    onClick={() => runRequestAction(request, 'cancel')}
+                    onClick={() => (
+                      onCancelRequest
+                        ? onCancelRequest(request)
+                        : runRequestAction(request, 'cancel')
+                    )}
                     disabled={busyId === request.id}
-                    className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-semibold text-gray-500 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-50"
+                    aria-label={`Stop follow-ups with ${request.vendor_name || 'vendor'}`}
+                    className="inline-flex min-h-11 items-center gap-1.5 rounded-md px-3 py-2 text-xs font-semibold text-gray-400 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-50"
                   >
                     <Ban className="h-3.5 w-3.5" />
-                    Cancel
+                    Stop Follow-ups
                   </button>
                 )}
               </div>
@@ -154,7 +160,7 @@ export default function QuoteRequestTimeline({
                       ...current,
                       [request.id]: true,
                     }))}
-                    className="font-semibold text-blue-300 hover:text-blue-200"
+                    className="inline-flex min-h-11 items-center font-semibold text-blue-300 hover:text-blue-200"
                   >
                     Show {hiddenMaterialCount} more material{hiddenMaterialCount === 1 ? '' : 's'}
                   </button>
@@ -168,7 +174,7 @@ export default function QuoteRequestTimeline({
                       ...current,
                       [request.id]: false,
                     }))}
-                    className="font-semibold text-blue-300 hover:text-blue-200"
+                    className="inline-flex min-h-11 items-center font-semibold text-blue-300 hover:text-blue-200"
                   >
                     Show fewer materials
                   </button>

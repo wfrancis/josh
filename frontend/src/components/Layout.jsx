@@ -184,7 +184,12 @@ function NotificationBell() {
 
   return (
     <div className="relative" ref={bellRef}>
-      <button onClick={() => setOpen(!open)} className="relative p-1.5 text-gray-500 hover:text-gray-300 transition-colors">
+      <button
+        onClick={() => setOpen(!open)}
+        aria-label={open ? 'Close notifications' : 'Open notifications'}
+        aria-expanded={open}
+        className="relative inline-flex min-h-11 min-w-11 items-center justify-center text-gray-400 hover:text-gray-200 transition-colors"
+      >
         <Bell className="w-5 h-5" />
         {unreadCount > 0 && (
           <span className="absolute -top-0.5 -right-0.5 w-4 h-4 rounded-full bg-si-orange text-white text-[9px] font-bold flex items-center justify-center">
@@ -276,7 +281,8 @@ export default function Layout({ children }) {
           <aside className="relative w-[280px] h-full bg-[#080C19] border-r border-white/[0.04] flex flex-col animate-slide-in-left">
             <button
               onClick={() => setMobileOpen(false)}
-              className="absolute top-4 right-4 p-2 text-gray-500 hover:text-white"
+              aria-label="Close navigation menu"
+              className="absolute top-4 right-4 inline-flex min-h-11 min-w-11 items-center justify-center text-gray-400 hover:text-white"
             >
               <X className="w-5 h-5" />
             </button>
@@ -289,7 +295,12 @@ export default function Layout({ children }) {
       <main className="flex-1 min-w-0 overflow-y-auto h-screen">
         {/* Mobile header bar */}
         <div className="md:hidden sticky top-0 z-40 flex items-center gap-3 px-4 py-3 bg-[#080C19]/95 backdrop-blur-md border-b border-white/[0.04]">
-          <button onClick={() => setMobileOpen(true)} className="p-1.5 text-gray-400 hover:text-white">
+          <button
+            onClick={() => setMobileOpen(true)}
+            aria-label="Open navigation menu"
+            aria-expanded={mobileOpen}
+            className="inline-flex min-h-11 min-w-11 items-center justify-center text-gray-300 hover:text-white"
+          >
             <Menu className="w-5 h-5" />
           </button>
           <div className="flex items-center gap-2 flex-1">

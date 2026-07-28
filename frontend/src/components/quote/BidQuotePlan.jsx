@@ -314,10 +314,15 @@ export default function BidQuotePlan({
           ? { status: 'ready_to_send', label: 'Ready to review' }
           : { status: 'needs_setup', label: 'Ready to save' }
   const emailCenterAction = allMaterialsRequested
-    ? 'Check Vendor Replies'
+    ? 'View Quote Status'
     : canReviewEmail
       ? 'Review & Send Emails'
       : ''
+  const primaryActionLabel = canOpenQuoteEmails
+    ? emailCenterAction
+    : draft?.stale
+      ? 'Save Fresh Draft'
+      : 'Save & Review Emails'
 
   return (
     <div className="space-y-6">
@@ -335,13 +340,15 @@ export default function BidQuotePlan({
               status={workflowStatus.status}
               label={workflowStatus.label}
             />
-            <Link
-              to={quoteEmailUrl}
-              className="inline-flex min-h-9 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
-            >
-              {emailCenterAction}
-              <ArrowRight className="h-3.5 w-3.5" />
-            </Link>
+            {canOpenQuoteEmails && (
+              <Link
+                to={quoteEmailUrl}
+                className="inline-flex min-h-11 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-200 hover:bg-white/[0.05]"
+              >
+                {emailCenterAction}
+                <ArrowRight className="h-3.5 w-3.5" />
+              </Link>
+            )}
           </div>
         </div>
       </div>
@@ -362,23 +369,25 @@ export default function BidQuotePlan({
       </div>
 
       {error && (
-        <div className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
+        <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
           {error}
         </div>
       )}
       {notice && (
-        <div className="flex flex-col gap-3 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-4 py-3 text-sm text-emerald-300 sm:flex-row sm:items-center sm:justify-between">
+        <div role="status" className="flex flex-col gap-3 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-4 py-3 text-sm text-emerald-300 sm:flex-row sm:items-center sm:justify-between">
           <span className="inline-flex items-center gap-2">
             <CheckCircle2 className="h-4 w-4 flex-shrink-0" />
             {notice}
           </span>
-          <Link
-            to={quoteEmailUrl}
-            className="inline-flex items-center gap-2 font-semibold text-white hover:text-emerald-200"
-          >
-            Review Email
-            <ArrowRight className="h-4 w-4" />
-          </Link>
+          {canOpenQuoteEmails && (
+            <Link
+              to={quoteEmailUrl}
+              className="inline-flex min-h-11 items-center gap-2 font-semibold text-white hover:text-emerald-200"
+            >
+              {emailCenterAction}
+              <ArrowRight className="h-4 w-4" />
+            </Link>
+          )}
         </div>
       )}
       {draft?.stale && (
@@ -397,7 +406,7 @@ export default function BidQuotePlan({
             <button
               type="button"
               onClick={addGroup}
-              className="inline-flex items-center gap-2 rounded-md border border-white/[0.1] px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
+              className="inline-flex min-h-11 items-center gap-2 rounded-md border border-white/[0.1] px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
             >
               <Plus className="h-4 w-4" />
               Add Vendor Group
@@ -428,7 +437,7 @@ export default function BidQuotePlan({
                         value={group.vendor_name || ''}
                         onChange={(event) => updateGroup(group.local_id, 'vendor_name', event.target.value)}
                         placeholder="Vendor name"
-                        className="w-full rounded-md border border-white/[0.1] bg-black/20 px-3 py-2 text-sm text-gray-200 outline-none focus:border-blue-400/50"
+                        className="min-h-11 w-full rounded-md border border-white/[0.1] bg-black/20 px-3 py-2 text-sm text-gray-200 outline-none focus:border-blue-400/50"
                       />
                     </label>
                     <label className="min-w-0">
@@ -440,19 +449,20 @@ export default function BidQuotePlan({
                         value={group.vendor_email || ''}
                         onChange={(event) => updateGroup(group.local_id, 'vendor_email', event.target.value)}
                         placeholder="pricing@vendor.com"
-                        className="w-full rounded-md border border-white/[0.1] bg-black/20 px-3 py-2 text-sm text-gray-200 outline-none focus:border-blue-400/50"
+                        className="min-h-11 w-full rounded-md border border-white/[0.1] bg-black/20 px-3 py-2 text-sm text-gray-200 outline-none focus:border-blue-400/50"
                       />
                     </label>
                     <div className="flex items-center justify-between gap-2 sm:justify-end">
                       <StatusPill
-                        status={groupReady ? 'ready_to_send' : 'needs_setup'}
-                        label={groupReady ? 'Ready' : 'Needs Setup'}
+                        status={draft?.stale ? 'stale' : (groupReady ? 'ready_to_send' : 'needs_setup')}
+                        label={draft?.stale ? 'Save fresh draft' : (groupReady ? 'Ready' : 'Needs Setup')}
                       />
                       <button
                         type="button"
                         onClick={() => removeGroup(group.local_id)}
+                        aria-label="Remove empty vendor group"
                         title="Remove empty vendor group"
-                        className="rounded-md p-2 text-gray-500 hover:bg-red-500/10 hover:text-red-300"
+                        className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md p-2 text-gray-400 hover:bg-red-500/10 hover:text-red-300"
                       >
                         <Trash2 className="h-4 w-4" />
                       </button>
@@ -478,7 +488,7 @@ export default function BidQuotePlan({
                                     ...current,
                                     [material.id]: !current[material.id],
                                   }))}
-                                  className="mt-1 inline-flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300"
+                                  className="mt-1 inline-flex min-h-11 items-center gap-1.5 text-xs text-gray-400 hover:text-gray-300"
                                 >
                                   <History className="h-3.5 w-3.5" />
                                   {history.latest
@@ -498,7 +508,7 @@ export default function BidQuotePlan({
                                     group.local_id,
                                     event.target.value,
                                   )}
-                                  className="w-full rounded-md border border-white/[0.08] bg-[#0D1322] px-3 py-2 text-xs text-gray-300 outline-none focus:border-blue-400/50"
+                                  className="min-h-11 w-full rounded-md border border-white/[0.08] bg-[#0D1322] px-3 py-2 text-xs text-gray-300 outline-none focus:border-blue-400/50"
                                 >
                                   {groups.map((option) => (
                                     <option key={option.local_id} value={option.local_id}>
@@ -591,30 +601,27 @@ export default function BidQuotePlan({
           </p>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row">
-          {canOpenQuoteEmails && (
+          {canOpenQuoteEmails ? (
             <Link
               to={quoteEmailUrl}
-              className="inline-flex items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-500"
+              className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400"
             >
               <Mail className="h-4 w-4" />
               {emailCenterAction}
             </Link>
+          ) : (
+            <button
+              type="button"
+              onClick={() => saveDraft({ openAfterSave: true })}
+              disabled={saving || materialCount === 0 || incompleteGroupCount > 0}
+              className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {saving
+                ? <Loader2 className="h-4 w-4 animate-spin" />
+                : <Save className="h-4 w-4" />}
+              {primaryActionLabel}
+            </button>
           )}
-          <button
-            type="button"
-            onClick={() => saveDraft({ openAfterSave: !canOpenQuoteEmails })}
-            disabled={saving || materialCount === 0 || incompleteGroupCount > 0}
-            className={`inline-flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-bold disabled:cursor-not-allowed disabled:opacity-40 ${
-              canOpenQuoteEmails
-                ? 'border border-white/[0.1] text-gray-200 hover:bg-white/[0.05]'
-                : 'bg-si-orange text-white hover:bg-orange-500'
-            }`}
-          >
-            {saving
-              ? <Loader2 className="h-4 w-4 animate-spin" />
-              : <Save className="h-4 w-4" />}
-            {canReviewEmail ? 'Save Updated Draft' : 'Save & Review Emails'}
-          </button>
         </div>
       </div>
 
@@ -622,7 +629,7 @@ export default function BidQuotePlan({
         <button
           type="button"
           onClick={onGoBack}
-          className="inline-flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium text-gray-400 hover:bg-white/[0.05] hover:text-white"
+          className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium text-gray-400 hover:bg-white/[0.05] hover:text-white"
         >
           <ArrowLeft className="h-4 w-4" />
           Back to Takeoff
@@ -637,7 +644,7 @@ export default function BidQuotePlan({
             type="button"
             onClick={onContinue}
             disabled={!workflowComplete}
-            className="inline-flex items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-500 disabled:cursor-not-allowed disabled:opacity-35"
+          className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-35"
           >
             Review & Generate
             <ArrowRight className="h-4 w-4" />

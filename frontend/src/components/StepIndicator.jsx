@@ -1,9 +1,9 @@
 import { Check } from 'lucide-react'
 
 const STEPS = [
-  { key: 'takeoff', label: 'Bid Setup' },
-  { key: 'quotes', label: 'Get Vendor Prices' },
-  { key: 'bid', label: 'Review & Generate' },
+  { key: 'takeoff', label: 'Bid Setup', shortLabel: 'Setup' },
+  { key: 'quotes', label: 'Get Vendor Prices', shortLabel: 'Prices' },
+  { key: 'bid', label: 'Review & Generate', shortLabel: 'Finish' },
 ]
 
 export default function StepIndicator({ current, onStepClick, completedSteps = [], disabledSteps = [] }) {
@@ -27,7 +27,7 @@ export default function StepIndicator({ current, onStepClick, completedSteps = [
                   ? 'Add materials first'
                   : 'All materials must be priced first'
                 : ''}
-              className={`flex items-center gap-1.5 sm:gap-2.5 px-2 sm:px-4 py-2 rounded-lg text-sm font-medium transition-all
+              className={`flex min-h-11 items-center gap-1.5 sm:gap-2.5 px-2 sm:px-4 py-2 rounded-lg text-sm font-medium transition-all
                 ${isDisabled
                   ? 'text-gray-700 cursor-not-allowed'
                   : isActive
@@ -49,6 +49,7 @@ export default function StepIndicator({ current, onStepClick, completedSteps = [
               >
                 {isComplete && !isActive ? <Check className="w-4 h-4" /> : i + 1}
               </span>
+              <span className="text-[10px] sm:hidden">{step.shortLabel}</span>
               <span className="hidden sm:inline">{step.label}</span>
             </button>
           </div>

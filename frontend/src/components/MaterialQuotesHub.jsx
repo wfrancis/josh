@@ -22,13 +22,14 @@ const QUOTE_FILTERS = [
   ['complete', 'Complete'],
 ]
 
-const quoteEmailView = (bid) => {
-  const stage = String(bid.quote_stage || '')
-  if (stage === 'needs_review') return 'needs_you'
-  if (stage === 'overdue') return 'overdue'
-  if (stage === 'ready_to_send') return 'ready_to_send'
-  if (stage === 'complete') return 'complete'
-  return 'waiting'
+const quoteActionUrl = (bid, emailCenterPath, bidUrl) => {
+  if (bid.draft_stale) return bidUrl
+  const url = String(bid.next_action?.url || '')
+  if (!url) return bidUrl
+  if (emailCenterPath !== '/quote-emails' && url.startsWith('/quote-emails')) {
+    return `${emailCenterPath}${url.slice('/quote-emails'.length)}`
+  }
+  return url
 }
 
 const plural = (count, singular, pluralLabel = `${singular}s`) => (
@@ -83,16 +84,16 @@ const bidEmailDetail = (bid) => {
 }
 
 function BidQuoteCard({ bid, emailCenterPath, featured = false }) {
-  const emailUrl = `${emailCenterPath}?job=${bid.job_id}&view=${quoteEmailView(bid)}`
-  const emailAction = ['needs_review', 'overdue', 'ready_to_send', 'waiting'].includes(bid.quote_stage)
   const bidUrl = `/jobs/${bid.slug || bid.job_id}?step=quotes`
-  const actionUrl = emailAction ? emailUrl : bidUrl
-  const emailActionLabel = {
-    needs_review: 'Fix quote email',
+  const actionUrl = quoteActionUrl(bid, emailCenterPath, bidUrl)
+  const emailActionLabel = bid.draft_stale
+    ? 'Update Quote Email'
+    : {
+    needs_review: 'Review Quote Email',
     overdue: 'Follow up today',
     ready_to_send: 'Review & Send',
-    waiting: 'Check Vendor Reply',
-  }[bid.quote_stage]
+    waiting: 'View Quote Status',
+    }[bid.quote_stage]
   const location = bidLocation(bid)
   const unpricedCount = Number(bid.unpriced_count || 0)
 
@@ -132,17 +133,10 @@ function BidQuoteCard({ bid, emailCenterPath, featured = false }) {
 
         <div className="flex flex-wrap items-center gap-2 lg:justify-end">
           <StatusPill status={bid.quote_stage} label={bid.quote_stage_label} />
-          {emailAction && (
-            <Link
-              to={bidUrl}
-              className="inline-flex min-h-10 items-center justify-center rounded-md border border-white/[0.1] px-3 text-sm font-semibold text-gray-300 hover:bg-white/[0.05]"
-            >
-              Open Bid
-            </Link>
-          )}
           <Link
             to={actionUrl}
-            className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-si-orange px-3.5 text-sm font-bold text-white hover:bg-orange-500"
+            aria-label={`${emailActionLabel || bid.next_action?.label || 'Open Bid'} for ${bid.project_name}`}
+            className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-si-orange px-3.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400"
           >
             {emailActionLabel || bid.next_action?.label || 'Open Bid'}
             <ArrowRight className="h-4 w-4" />
@@ -261,7 +255,8 @@ function MaterialQuoteBids({ emailCenterPath }) {
               type="button"
               onClick={() => setFilter(key)}
               aria-pressed={filter === key}
-              className={`inline-flex min-h-10 items-center justify-center gap-2 rounded-md border-b-2 px-2 text-sm font-semibold md:flex-shrink-0 md:justify-start md:px-3 ${
+              aria-label={`${label}: ${counts[key] || 0} bids`}
+              className={`inline-flex min-h-11 items-center justify-center gap-2 rounded-md border-b-2 px-2 text-sm font-semibold md:flex-shrink-0 md:justify-start md:px-3 ${
                 filter === key
                   ? 'border-si-orange bg-white/[0.05] text-white'
                   : 'border-transparent text-gray-500 hover:bg-white/[0.025] hover:text-gray-300'
@@ -300,9 +295,9 @@ function MaterialQuoteBids({ emailCenterPath }) {
         <section>
           <div className="mb-3 flex items-center gap-2">
             <span className="h-2 w-2 rounded-full bg-si-orange" />
-            <h3 className="text-sm font-bold text-white">Needs your attention</h3>
+            <h3 className="text-sm font-bold text-white">Needs your decision</h3>
             <span className="rounded-md bg-orange-500/10 px-2 py-0.5 text-xs font-semibold text-orange-300">
-              {attentionBids.length}
+              {attentionBids.length} bid{attentionBids.length === 1 ? '' : 's'}
             </span>
           </div>
           <div className="space-y-3">
@@ -343,7 +338,7 @@ export default function MaterialQuotesHub() {
   const fullBidPath = location.pathname.startsWith('/jobs/bids')
   const bidsOpen = location.pathname === '/jobs/bids'
   const emailCenterPath = fullBidPath ? '/jobs/bids/quote-emails' : '/quote-emails'
-  const title = fullBidPath ? (bidsOpen ? 'Bids' : 'Review & Send') : 'Quote Email Center'
+  const title = fullBidPath ? (bidsOpen ? 'Bids' : 'Quote Emails') : 'Quote Email Center'
   const description = fullBidPath
     ? (bidsOpen
       ? 'Choose a bid, prepare vendor pricing, then finish the proposal in the same bid.'
@@ -373,7 +368,7 @@ export default function MaterialQuotesHub() {
             {fullBidPath && !bidsOpen && (
               <>
                 <ChevronRight className="h-3.5 w-3.5" />
-                <span className="text-gray-300">Review & Send</span>
+                <span className="text-gray-300">Quote Emails</span>
               </>
             )}
           </nav>
@@ -386,10 +381,10 @@ export default function MaterialQuotesHub() {
           </p>
         </div>
         {fullBidPath ? (
-          <nav className="flex min-h-10 items-center rounded-lg border border-white/[0.08] bg-white/[0.025] p-1">
+          <nav className="flex min-h-11 items-center rounded-lg border border-white/[0.08] bg-white/[0.025] p-1">
             <Link
               to="/jobs/bids"
-              className={`inline-flex min-h-8 items-center gap-2 rounded-md px-3 text-sm font-semibold ${
+              className={`inline-flex min-h-10 items-center gap-2 rounded-md px-3 text-sm font-semibold ${
                 bidsOpen
                   ? 'bg-white/[0.09] text-white'
                   : 'text-gray-500 hover:text-gray-300'
@@ -400,20 +395,20 @@ export default function MaterialQuotesHub() {
             </Link>
             <Link
               to="/jobs/bids/quote-emails"
-              className={`inline-flex min-h-8 items-center gap-2 rounded-md px-3 text-sm font-semibold ${
+              className={`inline-flex min-h-10 items-center gap-2 rounded-md px-3 text-sm font-semibold ${
                 !bidsOpen
                   ? 'bg-white/[0.09] text-white'
                   : 'text-gray-500 hover:text-gray-300'
               }`}
             >
               <Mail className="h-4 w-4" />
-              Review & Send
+              Quote Emails
             </Link>
           </nav>
         ) : (
           <Link
             to="/jobs/bids"
-            className="inline-flex min-h-10 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-sm font-semibold text-gray-300 hover:bg-white/[0.05]"
+            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-sm font-semibold text-gray-300 hover:bg-white/[0.05]"
           >
             <Briefcase className="h-4 w-4" />
             Browse Bids
