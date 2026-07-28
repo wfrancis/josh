@@ -892,7 +892,7 @@ export default function JobDetail() {
                     }}
                     className="btn-primary"
                   >
-                    Set Up Quote Emails
+                    Get Vendor Prices
                   </button>
                 </div>
               )

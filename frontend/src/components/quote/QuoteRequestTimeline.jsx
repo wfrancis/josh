@@ -25,6 +25,7 @@ export default function QuoteRequestTimeline({
   onNotice,
 }) {
   const [busyId, setBusyId] = useState(null)
+  const [expandedMaterials, setExpandedMaterials] = useState({})
 
   const runRequestAction = async (request, action) => {
     setBusyId(request.id)
@@ -56,6 +57,9 @@ export default function QuoteRequestTimeline({
         const materials = asArray(request.materials)
         const followups = asArray(request.followups)
         const messages = asArray(request.messages)
+        const materialsExpanded = Boolean(expandedMaterials[request.id])
+        const visibleMaterials = materialsExpanded ? materials : materials.slice(0, 3)
+        const hiddenMaterialCount = Math.max(0, materials.length - visibleMaterials.length)
         const canRetry = ['send_failed', 'approved'].includes(status)
         const canCancel = !['complete', 'received', 'cancelled'].includes(status)
         const slug = request.slug || request.job_id
@@ -129,7 +133,7 @@ export default function QuoteRequestTimeline({
             </div>
 
             <div className="divide-y divide-white/[0.05]">
-              {materials.map((material) => (
+              {visibleMaterials.map((material) => (
                 <div
                   key={material.id || material.material_id}
                   className="grid gap-1 px-4 py-2.5 text-xs sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
@@ -142,6 +146,34 @@ export default function QuoteRequestTimeline({
                   </span>
                 </div>
               ))}
+              {hiddenMaterialCount > 0 && (
+                <div className="px-4 py-2.5 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setExpandedMaterials((current) => ({
+                      ...current,
+                      [request.id]: true,
+                    }))}
+                    className="font-semibold text-blue-300 hover:text-blue-200"
+                  >
+                    Show {hiddenMaterialCount} more material{hiddenMaterialCount === 1 ? '' : 's'}
+                  </button>
+                </div>
+              )}
+              {materialsExpanded && materials.length > 3 && (
+                <div className="px-4 py-2.5 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setExpandedMaterials((current) => ({
+                      ...current,
+                      [request.id]: false,
+                    }))}
+                    className="font-semibold text-blue-300 hover:text-blue-200"
+                  >
+                    Show fewer materials
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="border-t border-white/[0.06] p-4">
@@ -157,12 +189,17 @@ export default function QuoteRequestTimeline({
                 ) : (
                   <StatusPill status="waiting" label="Email proof pending" />
                 )}
-                {request.sent_artifact_hash && (
-                  <span className="font-mono text-[10px] text-gray-600">
-                    SHA-256 {request.sent_artifact_hash.slice(0, 12)}
-                  </span>
-                )}
               </div>
+              {request.sent_artifact_hash && (
+                <details className="mt-3 text-xs text-gray-600">
+                  <summary className="cursor-pointer select-none hover:text-gray-400">
+                    Technical details
+                  </summary>
+                  <p className="mt-1 font-mono text-[10px]">
+                    Evidence fingerprint: {request.sent_artifact_hash.slice(0, 12)}
+                  </p>
+                </details>
+              )}
 
               {messages.length > 0 && (
                 <div className="mt-3 space-y-2 border-t border-white/[0.05] pt-3">

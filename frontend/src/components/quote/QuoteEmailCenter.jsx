@@ -31,12 +31,41 @@ import {
 } from './QuoteUi'
 
 const FILTERS = [
-  ['ready_to_send', 'Ready to Send'],
-  ['waiting', 'Waiting'],
-  ['overdue', 'Overdue'],
-  ['needs_you', 'Needs You'],
-  ['complete', 'Complete'],
+  ['needs_you', 'Needs Your Decision'],
+  ['overdue', 'Follow Up Today'],
+  ['ready_to_send', 'Ready for Approval'],
+  ['waiting', 'Waiting on Vendors'],
+  ['complete', 'Done'],
 ]
+
+const VIEW_DETAILS = {
+  needs_you: {
+    title: 'Needs your decision',
+    description: 'Fix a draft, match an unclear reply, or review a vendor price.',
+  },
+  overdue: {
+    title: 'Follow up today',
+    description: 'These vendors are past the expected reply date.',
+  },
+  ready_to_send: {
+    title: 'Ready for approval',
+    description: 'These drafts are ready for one final review before sending.',
+  },
+  waiting: {
+    title: 'Waiting on vendors',
+    description: 'These requests are sent. The tool is watching for replies and follow-ups.',
+  },
+  complete: {
+    title: 'Done',
+    description: 'These quote requests no longer need work.',
+  },
+}
+
+const defaultView = (summary) => (
+  ['needs_you', 'overdue', 'ready_to_send', 'waiting', 'complete']
+    .find((key) => Number(summary?.[key] || 0) > 0)
+  || 'ready_to_send'
+)
 
 const requestBucket = (request) => {
   const status = normalizeStatus(request.status)
@@ -56,10 +85,8 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
     [location.search],
   )
   const jobFilter = params.get('job') || ''
-  const requestedView = normalizeStatus(params.get('view') || 'ready_to_send')
-  const activeFilter = FILTERS.some(([key]) => key === requestedView)
-    ? requestedView
-    : 'ready_to_send'
+  const requestedView = params.get('view')
+  const normalizedRequestedView = requestedView ? normalizeStatus(requestedView) : ''
   const [center, setCenter] = useState({
     drafts: [],
     requests: [],
@@ -172,9 +199,11 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
     setConfirmation({
       action: 'send',
       draft,
-      title: 'Send vendor emails?',
-      message: `Send ${ready.length} vendor email${ready.length === 1 ? '' : 's'} for ${draft.project_name}?`,
-      confirmLabel: ready.length === 1 ? 'Send Email' : 'Send Emails',
+      readyGroups: ready,
+      incompleteGroups: asArray(draft.groups).filter((group) => !group.can_send),
+      title: 'Review quote requests',
+      message: `Nothing has been sent yet. Confirm the vendor requests for ${draft.project_name}.`,
+      confirmLabel: `Send ${ready.length} quote request${ready.length === 1 ? '' : 's'}`,
     })
   }
 
@@ -188,7 +217,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
       })
       const sent = Number(result.sent_group_count || 0)
       setNotice(
-        `${sent} vendor email${sent === 1 ? '' : 's'} sent for ${draft.project_name}.`,
+        `${sent} quote request${sent === 1 ? '' : 's'} sent for ${draft.project_name}.`,
       )
       await load({ quiet: true })
       setFilter(sent ? 'waiting' : 'needs_you')
@@ -286,6 +315,27 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
   const priceMatches = asArray(center.review?.price_matches).filter(
     (match) => !jobFilter || String(match.job_id) === String(jobFilter),
   )
+  // The selected-bid view must describe that bid only. Global totals made it
+  // look like a task existed here when it belonged to another bid.
+  const scopedSummary = {
+    ready_to_send: drafts.reduce(
+      (total, draft) => total + (draft.stale ? 0 : Number(draft.ready_group_count || 0)),
+      0,
+    ),
+    needs_you: drafts.filter((draft) => (
+      draft.stale || Number(draft.needs_setup_count || 0) > 0
+    )).length
+      + requests.filter((request) => requestBucket(request) === 'needs_you').length
+      + messages.length
+      + priceMatches.length,
+    overdue: requests.filter((request) => requestBucket(request) === 'overdue').length,
+    waiting: requests.filter((request) => requestBucket(request) === 'waiting').length,
+    complete: requests.filter((request) => requestBucket(request) === 'complete').length,
+  }
+  const activeFilter = FILTERS.some(([key]) => key === normalizedRequestedView)
+    ? normalizedRequestedView
+    : defaultView(scopedSummary)
+  const activeViewDetails = VIEW_DETAILS[activeFilter] || VIEW_DETAILS.ready_to_send
   const filteredDrafts = drafts.filter((draft) => (
     activeFilter === 'ready_to_send'
       ? Number(draft.ready_group_count || 0) > 0 && !draft.stale
@@ -309,6 +359,11 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
   const outlookConnected = Boolean(
     outlook.session_authenticated ?? outlook.connected,
   )
+  const showRequestTimeline = filteredRequests.length > 0
+    || ['waiting', 'overdue', 'complete'].includes(activeFilter)
+  const showReviewSections = activeFilter === 'needs_you'
+    && !center.mailbox_locked
+    && (messages.length > 0 || priceMatches.length > 0)
   const returnTo = `${location.pathname}${location.search}`
 
   if (loading) {
@@ -325,7 +380,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div className="min-w-0">
             <p className="text-xs font-semibold uppercase text-gray-500">
-              {selectedJob ? 'Quote emails for this bid' : 'Quote email inbox'}
+              {selectedJob ? 'Vendor email work for this bid' : 'Vendor email work'}
             </p>
             <h2 className="mt-1 truncate text-lg font-bold text-white">
               {selectedJob?.project_name || 'All Bids'}
@@ -333,7 +388,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
             <p className="mt-1 text-sm text-gray-500">
               {selectedJob
                 ? [selectedJob.gc_name, [selectedJob.city, selectedJob.state].filter(Boolean).join(', ')].filter(Boolean).join(' | ') || 'Selected bid'
-                : 'Choose a bid to work on one email thread at a time.'}
+                : activeViewDetails.description}
             </p>
           </div>
 
@@ -354,7 +409,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                   const detail = [job.gc_name, location].filter(Boolean).join(' | ')
                   return (
                     <option key={job.id} value={job.id}>
-                      {job.project_name}{detail ? ` - ${detail}` : ''}
+                      {job.project_name} (Bid #{job.id}){detail ? ` - ${detail}` : ''}
                     </option>
                   )
                 })}
@@ -436,50 +491,61 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
       </section>
 
       {error && (
-        <div className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
+        <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
           {error}
         </div>
       )}
       {notice && (
-        <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-4 py-3 text-sm text-emerald-300">
+        <div role="status" className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-4 py-3 text-sm text-emerald-300">
           {notice}
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-1 border-b border-white/[0.07] pb-1 sm:flex sm:pb-0">
-        {FILTERS.map(([key, label]) => (
+      <section className="rounded-lg border border-white/[0.08] bg-white/[0.02] p-2">
+        <div className="flex flex-wrap items-center justify-between gap-3 px-2 pb-2 pt-1">
+          <div>
+            <p className="text-xs font-semibold uppercase text-gray-500">Next up</p>
+            <p className="mt-0.5 text-sm font-semibold text-white">{activeViewDetails.title}</p>
+          </div>
           <button
-            key={key}
             type="button"
-            onClick={() => setFilter(key)}
-            className={`flex min-h-10 items-center justify-between gap-2 rounded-md border-b-2 px-3 text-sm font-semibold sm:flex-shrink-0 sm:justify-start sm:rounded-none ${
-              activeFilter === key
-                ? 'border-si-orange bg-white/[0.05] text-white sm:bg-transparent'
-                : 'border-transparent text-gray-500 hover:text-gray-300'
-            }`}
+            onClick={() => load({ quiet: true })}
+            disabled={refreshing}
+            title="Refresh Quote Email Center"
+            className="inline-flex h-9 w-9 items-center justify-center rounded-md text-gray-500 hover:bg-white/[0.05] hover:text-white disabled:opacity-40"
           >
-            {label}
-            <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[11px] tabular-nums text-gray-400">
-              {Number(center.summary?.[key] || 0)}
-            </span>
+            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
           </button>
-        ))}
-        <button
-          type="button"
-          onClick={() => load({ quiet: true })}
-          disabled={refreshing}
-          title="Refresh Quote Email Center"
-          className="hidden h-10 w-10 items-center justify-center rounded-md text-gray-500 hover:bg-white/[0.04] hover:text-white disabled:opacity-40 sm:ml-auto sm:flex sm:flex-shrink-0 sm:rounded-none"
-        >
-          <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-        </button>
-      </div>
+        </div>
+        <div className="grid grid-cols-2 gap-1 sm:flex">
+          {FILTERS.map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setFilter(key)}
+              aria-pressed={activeFilter === key}
+              className={`flex min-h-11 items-center justify-between gap-2 rounded-md px-3 text-sm font-semibold sm:flex-1 sm:justify-start ${
+                activeFilter === key
+                  ? 'bg-si-orange text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]'
+                  : 'text-gray-500 hover:bg-white/[0.05] hover:text-gray-200'
+              }`}
+            >
+              <span className="truncate">{label}</span>
+              <span className={`rounded-md px-1.5 py-0.5 text-[11px] tabular-nums ${
+                activeFilter === key ? 'bg-black/15 text-white' : 'bg-white/[0.06] text-gray-400'
+              }`}>
+                {Number(scopedSummary[key] || 0)}
+              </span>
+            </button>
+          ))}
+        </div>
+      </section>
 
       {(activeFilter === 'ready_to_send' || activeFilter === 'needs_you') && (
         <section>
           <SectionTitle
             icon={Send}
-            title={activeFilter === 'ready_to_send' ? 'Email Drafts' : 'Drafts Needing Setup'}
+            title={activeFilter === 'ready_to_send' ? 'Emails Ready for Approval' : 'Fix Before Sending'}
             count={filteredDrafts.length}
           />
           {filteredDrafts.length ? (
@@ -506,8 +572,8 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                             status={draft.stale ? 'stale' : (
                               draft.ready_group_count ? 'ready_to_send' : 'needs_setup'
                             )}
-                            label={draft.stale ? 'Bid Changed' : (
-                              `${draft.ready_group_count || 0} Ready`
+                            label={draft.stale ? 'Update needed' : (
+                              `${draft.ready_group_count || 0} ready`
                             )}
                           />
                         </div>
@@ -530,7 +596,16 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                     {draft.stale && (
                       <div className="flex items-start gap-2 border-b border-orange-500/15 bg-orange-500/[0.05] px-4 py-3 text-xs text-orange-300">
                         <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
-                        This bid changed. Open the bid and save a fresh email draft before sending.
+                        <div>
+                          <p>This bid changed. Save a fresh draft before sending.</p>
+                          <Link
+                            to={`/jobs/${draft.slug || draft.job_id}?step=quotes`}
+                            className="mt-2 inline-flex min-h-9 items-center gap-1.5 font-semibold text-orange-200 underline decoration-orange-300/40 underline-offset-4 hover:text-white"
+                          >
+                            Update draft in bid
+                            <ArrowRight className="h-3.5 w-3.5" />
+                          </Link>
+                        </div>
                       </div>
                     )}
 
@@ -546,7 +621,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                               </h3>
                               <StatusPill
                                 status={group.can_send ? 'ready_to_send' : 'needs_setup'}
-                                label={group.can_send ? 'Ready' : 'Needs Setup'}
+                                label={group.can_send ? 'Ready' : 'Fix needed'}
                               />
                               <span className="text-xs text-gray-600">
                                 {asArray(group.materials).length} material{asArray(group.materials).length === 1 ? '' : 's'}
@@ -633,7 +708,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                       <p className="text-xs text-gray-500">
                         {hasDirtyGroup
                           ? 'Save your changes before sending.'
-                          : `${draft.ready_group_count || 0} complete group${draft.ready_group_count === 1 ? '' : 's'} will send. Incomplete groups stay here.`}
+                          : `${draft.ready_group_count || 0} complete group${draft.ready_group_count === 1 ? '' : 's'} will be reviewed. Incomplete groups will not be sent.`}
                       </p>
                       <button
                         type="button"
@@ -650,7 +725,9 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                         {busyKey === `send:${draft.job_id}`
                           ? <Loader2 className="h-4 w-4 animate-spin" />
                           : <Send className="h-4 w-4" />}
-                        Approve & Send
+                        {!outlookConnected
+                          ? 'Connect Outlook to send'
+                          : `Review ${draft.ready_group_count || 0} email${draft.ready_group_count === 1 ? '' : 's'}`}
                       </button>
                     </div>
                   </article>
@@ -661,16 +738,13 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
             <EmptyState>
               {activeFilter === 'ready_to_send'
                 ? 'No saved bid emails are ready to send.'
-                : 'No saved drafts need setup.'}
+                : 'Nothing needs to be fixed before sending.'}
             </EmptyState>
           )}
         </section>
       )}
 
-      {(activeFilter === 'waiting'
-        || activeFilter === 'overdue'
-        || activeFilter === 'complete'
-        || activeFilter === 'needs_you') && (
+      {showRequestTimeline && (
         <section>
           <SectionTitle
             icon={Inbox}
@@ -681,34 +755,34 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                   ? 'Overdue Requests'
                   : activeFilter === 'complete'
                     ? 'Completed Requests'
-                    : 'Requests Needing Help'
+                    : 'Requests that need attention'
             }
             count={filteredRequests.length}
           />
-          {center.mailbox_locked ? (
-            <EmptyState>Connect Outlook to read request and reply history.</EmptyState>
-          ) : (
-            <QuoteRequestTimeline
-              requests={filteredRequests}
-              onRefresh={() => load({ quiet: true })}
-              onError={setError}
-              onNotice={setNotice}
-            />
+          {center.mailbox_locked && filteredRequests.length > 0 && (
+            <div className="mb-3 flex items-start gap-2 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2.5 text-xs leading-5 text-amber-200">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+              <span><strong>Sync paused.</strong> Saved request details and sent-email proof are still here. Connect Outlook to look for new replies.</span>
+            </div>
           )}
+          <QuoteRequestTimeline
+            requests={filteredRequests}
+            onRefresh={() => load({ quiet: true })}
+            onError={setError}
+            onNotice={setNotice}
+          />
         </section>
       )}
 
-      {activeFilter === 'needs_you' && (
+      {showReviewSections && (
         <>
-          <section>
-            <SectionTitle
-              icon={Inbox}
-              title="Needs Matching"
-              count={center.mailbox_locked ? 'Hidden' : messages.length}
-            />
-            {center.mailbox_locked ? (
-              <EmptyState>Connect Outlook to review unmatched replies.</EmptyState>
-            ) : (
+          {messages.length > 0 && (
+            <section>
+              <SectionTitle
+                icon={Inbox}
+                title="Match an Unclear Reply"
+                count={messages.length}
+              />
               <NeedsMatching
                 messages={messages}
                 requests={requests}
@@ -716,17 +790,15 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                 onError={setError}
                 onNotice={setNotice}
               />
-            )}
-          </section>
-          <section>
-            <SectionTitle
-              icon={Check}
-              title="Price Review"
-              count={center.mailbox_locked ? 'Hidden' : priceMatches.length}
-            />
-            {center.mailbox_locked ? (
-              <EmptyState>Connect Outlook to review vendor prices.</EmptyState>
-            ) : (
+            </section>
+          )}
+          {priceMatches.length > 0 && (
+            <section>
+              <SectionTitle
+                icon={Check}
+                title="Review Vendor Prices"
+                count={priceMatches.length}
+              />
               <PriceReview
                 matches={priceMatches}
                 requests={requests}
@@ -734,8 +806,8 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                 onError={setError}
                 onNotice={setNotice}
               />
-            )}
-          </section>
+            </section>
+          )}
         </>
       )}
 
@@ -750,10 +822,11 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
           role="dialog"
           aria-modal="true"
           aria-labelledby="quote-confirmation-title"
+          aria-describedby="quote-confirmation-description"
           onClick={() => setConfirmation(null)}
         >
           <div
-            className="w-full max-w-md overflow-hidden rounded-lg border border-white/[0.12] bg-[#111827] shadow-2xl"
+            className="max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-lg border border-white/[0.12] bg-[#111827] shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-start gap-3 border-b border-white/[0.08] px-4 py-4 sm:px-5">
@@ -761,7 +834,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                 <h2 id="quote-confirmation-title" className="text-base font-bold text-white">
                   {confirmation.title}
                 </h2>
-                <p className="mt-1 text-sm leading-6 text-gray-400">
+                <p id="quote-confirmation-description" className="mt-1 text-sm leading-6 text-gray-400">
                   {confirmation.message}
                 </p>
               </div>
@@ -774,6 +847,35 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                 <X className="h-4 w-4" />
               </button>
             </div>
+            {confirmation.action === 'send' && (
+              <div className="space-y-3 border-b border-white/[0.08] px-4 py-4 sm:px-5">
+                <div className="rounded-md border border-blue-500/20 bg-blue-500/[0.06] px-3 py-2 text-xs text-blue-200">
+                  Sending from {outlook.email || outlook.mailbox_email || 'your connected Outlook account'}.
+                </div>
+                {asArray(confirmation.readyGroups).map((group) => (
+                  <div key={group.group_id} className="rounded-md border border-white/[0.08] bg-black/15 p-3">
+                    <p className="text-sm font-semibold text-white">{group.vendor_name || 'Vendor'}</p>
+                    <p className="mt-0.5 break-all text-xs text-gray-400">{group.vendor_email || 'No recipient'}</p>
+                    <p className="mt-2 break-words text-xs text-gray-400">{group.subject || 'No subject'}</p>
+                    <p className="mt-2 text-xs font-semibold text-gray-300">
+                      {asArray(group.materials).length} material{asArray(group.materials).length === 1 ? '' : 's'}
+                    </p>
+                    <ul className="mt-1.5 space-y-1 text-xs text-gray-500">
+                      {asArray(group.materials).map((material) => (
+                        <li key={material.id || material.item_code}>
+                          {materialLabel(material)} - {Number(material.quantity || 0).toLocaleString()} {material.unit || ''}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+                {asArray(confirmation.incompleteGroups).length > 0 && (
+                  <div className="rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-amber-200">
+                    {confirmation.incompleteGroups.length} incomplete vendor group{confirmation.incompleteGroups.length === 1 ? '' : 's'} will stay unsent until fixed.
+                  </div>
+                )}
+              </div>
+            )}
             <div className="flex justify-end gap-2 px-4 py-3 sm:px-5">
               <button
                 type="button"

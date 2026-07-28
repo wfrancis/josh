@@ -15,6 +15,14 @@ function formatCompact(val) {
   return `$${val.toFixed(0)}`
 }
 
+// Waste is stored as a factor (0.06 means 6%). Older imported records may
+// contain the human percentage (6). Show it safely and normalize on the next
+// explicit material save instead of turning 6% into a frightening 600%.
+function normalizeWasteFactor(value) {
+  const amount = Number(value) || 0
+  return amount > 1 && amount <= 100 ? amount / 100 : amount
+}
+
 const TYPE_LABELS = {
   unit_carpet_no_pattern: 'Carpet', unit_carpet_pattern: 'Carpet (Pattern)',
   unit_lvt: 'LVT', cpt_tile: 'Carpet Tile', corridor_broadloom: 'Broadloom',
@@ -429,7 +437,8 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
       const next = { ...m, ...changes }
       // If order_qty was directly edited, use it; otherwise auto-calculate
       const installedQty = next.installed_qty || 0
-      const wastePct = next.waste_pct || 0
+      const wastePct = normalizeWasteFactor(next.waste_pct)
+      next.waste_pct = wastePct
       const orderQty = ('order_qty' in changes)
         ? (changes.order_qty || 0)
         : installedQty * (1 + wastePct)
@@ -822,7 +831,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   })()}
                   {/* Show qty on mobile since column is hidden */}
                   <div className="md:hidden text-[11px] text-gray-500 mt-0.5">
-                    {formatNumber(m.installed_qty)} {m.unit} · {((m.waste_pct || 0) * 100).toFixed(0)}% waste
+                    {formatNumber(m.installed_qty)} {m.unit} · {(normalizeWasteFactor(m.waste_pct) * 100).toFixed(0)}% waste
                   </div>
                 </td>
                 <td className="py-3 px-2 sm:px-3">
@@ -848,12 +857,12 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                 <td className="hidden lg:table-cell py-3 px-2 sm:px-3 text-right tabular-nums text-gray-500">
                   {editable ? (
                     <EditableCell
-                      value={((m.waste_pct || 0) * 100)}
+                      value={normalizeWasteFactor(m.waste_pct) * 100}
                       type="number"
                       onSave={(val) => updateMaterial(m._origIdx, { waste_pct: val / 100 })}
                     />
                   ) : (
-                    ((m.waste_pct || 0) * 100).toFixed(0)
+                    (normalizeWasteFactor(m.waste_pct) * 100).toFixed(0)
                   )}%
                 </td>
                 <td className="hidden md:table-cell py-3 px-2 sm:px-3 text-right tabular-nums text-gray-300">

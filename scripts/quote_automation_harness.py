@@ -350,6 +350,11 @@ def run(
             ),
             {},
         )
+        center_requests_for_job = [
+            quote_request
+            for quote_request in center_locked.get("requests") or []
+            if int(quote_request.get("job_id") or 0) == int(job_id)
+        ]
         hub_ready = request(base_url, "GET", "/api/material-quotes/bids")
         ready_bid_summary = next(
             (
@@ -366,13 +371,17 @@ def run(
                 and patched_group.get("subject")
                 == f"Harness saved subject {suffix}"
                 and center_locked.get("mailbox_locked") is True
-                and center_locked.get("requests") == []
+                and center_requests_for_job == []
                 and center_draft.get("ready_group_count") == 1
                 and ready_bid_summary.get("quote_stage") == "ready_to_send"
                 and (center_locked.get("matching_engine") or {}).get("ai_calls") == 0,
                 "details": {
                     "draft": center_draft,
                     "bid_summary": ready_bid_summary,
+                    "new_bid_request_count": len(center_requests_for_job),
+                    "saved_requests_from_other_bids": len(
+                        center_locked.get("requests") or []
+                    ),
                 },
             }
         )

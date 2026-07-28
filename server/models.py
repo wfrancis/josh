@@ -958,6 +958,14 @@ def save_materials(
         }
         existing_ids = set(existing_rows)
 
+        def normalized_waste_factor(value) -> float:
+            """Accept either 0.06 or a legacy human-entered 6 for 6%."""
+            try:
+                amount = float(value or 0)
+            except (TypeError, ValueError):
+                return 0.0
+            return amount / 100 if 1 < amount <= 100 else amount
+
         def decision_identity(material: dict) -> tuple:
             try:
                 unit_price = round(float(material.get("unit_price") or 0), 6)
@@ -985,7 +993,7 @@ def save_materials(
             return (
                 material.get("item_code"), material.get("description"),
                 material.get("material_type"), material.get("installed_qty", 0),
-                material.get("unit"), material.get("waste_pct", 0),
+                material.get("unit"), normalized_waste_factor(material.get("waste_pct", 0)),
                 material.get("order_qty", 0), material.get("vendor"),
                 material.get("unit_price", 0), material.get("extended_cost", 0),
                 material.get("ai_confidence"), material.get("quote_status"),

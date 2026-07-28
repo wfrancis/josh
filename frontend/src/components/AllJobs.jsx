@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import {
-  Plus, Building2, Briefcase, Mail, User, Loader2, ChevronRight, ArrowRight,
+  Plus, Building2, Briefcase, Mail, User, Loader2, ArrowRight,
   Search, FolderOpen, Trash2, Copy
 } from 'lucide-react'
 import { api } from '../api'
@@ -175,66 +175,72 @@ export default function AllJobs() {
             const status = getJobStatus(job)
             const confidenceStatus = getJobConfidenceStatus(job)
             return (
-              <div
+              <article
                 key={job.id}
-                onClick={() => navigate(`/jobs/${job.slug || job.id}`)}
-                className="glass-card-hover p-4 flex items-center gap-4 animate-fade-in cursor-pointer"
+                className="glass-card-hover p-3 sm:p-4 animate-fade-in"
                 style={{ animationDelay: `${i * 40}ms` }}
               >
-                <input
-                  type="checkbox"
-                  checked={selected.has(job.id)}
-                  onChange={(e) => toggleSelect(job.id, e)}
-                  onClick={(e) => e.stopPropagation()}
-                  className="accent-si-bright w-4 h-4 rounded flex-shrink-0"
-                />
-                <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-si-navy/40 to-si-navy/20
-                              flex items-center justify-center flex-shrink-0 border border-white/[0.04]">
-                  <Building2 className="w-5 h-5 text-gray-400" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="font-semibold text-white text-[15px]">{job.project_name}</div>
-                  <div className="flex items-center gap-3 mt-1 text-xs text-gray-500">
-                    {job.gc_name && (
-                      <span className="flex items-center gap-1">
-                        <Building2 className="w-3 h-3" />
-                        {job.gc_name}
-                      </span>
-                    )}
-                    {job.salesperson && (
-                      <span className="flex items-center gap-1">
-                        <User className="w-3 h-3" />
-                        {job.salesperson}
-                      </span>
-                    )}
-                    {(job.city || job.state) && (
-                      <span>{[job.city, job.state].filter(Boolean).join(', ')}</span>
-                    )}
-                    <span>{new Date(job.created_at).toLocaleDateString()}</span>
-                  </div>
-                </div>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation()
+                <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3">
+                  <label className="mt-1 flex h-10 w-8 items-center justify-center" aria-label={`Select ${job.project_name}`}>
+                    <input
+                      type="checkbox"
+                      checked={selected.has(job.id)}
+                      onChange={(e) => toggleSelect(job.id, e)}
+                      className="accent-si-bright h-4 w-4 rounded"
+                    />
+                  </label>
+                  <Link
+                    to={`/jobs/${job.slug || job.id}`}
+                    className="flex min-w-0 items-start gap-3 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-si-bright/80"
+                    aria-label={`Open bid: ${job.project_name}`}
+                  >
+                    <div className="mt-0.5 flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-lg border border-white/[0.06] bg-si-navy/30">
+                      <Building2 className="h-5 w-5 text-gray-400" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[15px] font-semibold text-white">{job.project_name}</div>
+                      <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-400">
+                        {job.gc_name && (
+                          <span className="inline-flex min-w-0 items-center gap-1 truncate">
+                            <Building2 className="h-3 w-3 flex-shrink-0" />
+                            {job.gc_name}
+                          </span>
+                        )}
+                        {job.salesperson && (
+                          <span className="inline-flex min-w-0 items-center gap-1 truncate">
+                            <User className="h-3 w-3 flex-shrink-0" />
+                            {job.salesperson}
+                          </span>
+                        )}
+                        {(job.city || job.state) && (
+                          <span>{[job.city, job.state].filter(Boolean).join(', ')}</span>
+                        )}
+                      </div>
+                    </div>
+                  </Link>
+                  <button
+                    onClick={() => {
                     api.duplicateJob(job.id).then(r => navigate(`/jobs/${r.slug || r.id}`))
                   }}
-                  className="p-2 rounded-lg text-gray-600 hover:text-si-bright hover:bg-si-bright/10 transition-colors flex-shrink-0"
-                  title="Duplicate job"
-                >
-                  <Copy className="w-4 h-4" />
-                </button>
-                <StatusBadge status={status} />
-                {confidenceStatus && <span className="hidden sm:inline-flex"><StatusBadge status={confidenceStatus} /></span>}
-                <Link
-                  to={`/jobs/${job.slug || job.id}`}
-                  onClick={(e) => e.stopPropagation()}
-                  className="hidden min-h-9 items-center gap-1.5 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] md:inline-flex"
-                >
-                  Open Bid
-                  <ArrowRight className="h-3.5 w-3.5" />
-                </Link>
-                <ChevronRight className="w-4 h-4 text-gray-600 hidden sm:block" />
-              </div>
+                    className="inline-flex h-10 w-10 items-center justify-center rounded-md text-gray-500 hover:bg-si-bright/10 hover:text-si-bright focus-visible:ring-2 focus-visible:ring-si-bright/80"
+                    title="Duplicate bid"
+                    aria-label={`Duplicate bid: ${job.project_name}`}
+                  >
+                    <Copy className="h-4 w-4" />
+                  </button>
+                </div>
+                <div className="ml-11 mt-3 flex flex-wrap items-center gap-2 sm:ml-[76px]">
+                  <StatusBadge status={status} />
+                  {confidenceStatus && <StatusBadge status={confidenceStatus} />}
+                  <Link
+                    to={`/jobs/${job.slug || job.id}`}
+                    className="ml-auto inline-flex min-h-10 items-center gap-1.5 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-200 hover:bg-white/[0.05] focus-visible:ring-2 focus-visible:ring-si-bright/80"
+                  >
+                    Open Bid
+                    <ArrowRight className="h-3.5 w-3.5" />
+                  </Link>
+                </div>
+              </article>
             )
           })}
         </div>

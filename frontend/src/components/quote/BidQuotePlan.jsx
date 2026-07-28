@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import {
   AlertTriangle,
   ArrowLeft,
@@ -40,6 +40,22 @@ const groupMatchKey = (group) => {
   if (vendorId) return `id:${vendorId}`
   return `name:${String(group?.vendor_name || '').trim().toLowerCase()}`
 }
+
+const groupSignature = (groups) => JSON.stringify(
+  asArray(groups)
+    .map((group) => ({
+      vendor_id: String(group.vendor_id || ''),
+      vendor_name: String(group.vendor_name || '').trim(),
+      vendor_email: String(group.vendor_email || '').trim().toLowerCase(),
+      subject: String(group.subject || '').trim(),
+      body: String(group.body || '').trim(),
+      material_ids: asArray(group.materials)
+        .map((material) => String(material.id || material.material_id || ''))
+        .filter(Boolean)
+        .sort(),
+    }))
+    .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+)
 
 const prepareGroups = (plan, draft) => {
   const savedGroups = asArray(draft?.groups)
@@ -83,6 +99,7 @@ export default function BidQuotePlan({
   onCompletionChange,
 }) {
   const jobId = job?.id
+  const navigate = useNavigate()
   const [plan, setPlan] = useState({})
   const [draft, setDraft] = useState(null)
   const [workflow, setWorkflow] = useState({})
@@ -92,6 +109,7 @@ export default function BidQuotePlan({
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [historyOpen, setHistoryOpen] = useState({})
+  const [savedGroupSignature, setSavedGroupSignature] = useState('')
 
   const load = useCallback(async () => {
     if (!jobId) return
@@ -107,7 +125,9 @@ export default function BidQuotePlan({
       setPlan(planData || {})
       setDraft(savedDraft)
       setWorkflow(workflowData || {})
-      setGroups(prepareGroups(planData, savedDraft))
+      const preparedGroups = prepareGroups(planData, savedDraft)
+      setGroups(preparedGroups)
+      setSavedGroupSignature(groupSignature(preparedGroups))
     } catch (err) {
       setError(err.message || 'Material quote setup could not load.')
     } finally {
@@ -210,7 +230,7 @@ export default function BidQuotePlan({
     })
   }
 
-  const saveDraft = async () => {
+  const saveDraft = async ({ openAfterSave = false } = {}) => {
     const populated = groups.filter((group) => asArray(group.materials).length)
     if (!populated.length) {
       setError('Put at least one material into a vendor group.')
@@ -234,9 +254,16 @@ export default function BidQuotePlan({
         })),
       })
       const savedDraft = result?.draft || null
+      const preparedGroups = prepareGroups(plan, savedDraft)
       setDraft(savedDraft)
-      setGroups(prepareGroups(plan, savedDraft))
-      setNotice('Email draft saved. Next, review it before anything is sent.')
+      setGroups(preparedGroups)
+      setSavedGroupSignature(groupSignature(preparedGroups))
+      setNotice(openAfterSave
+        ? 'Email draft saved. Opening the review screen now. Nothing has been sent.'
+        : 'Email draft saved. Next, review it before anything is sent.')
+      if (openAfterSave) {
+        navigate(`/jobs/bids/quote-emails?job=${jobId}&view=ready_to_send`)
+      }
     } catch (err) {
       setError(err.message || 'The email draft could not be saved.')
     } finally {
@@ -256,6 +283,8 @@ export default function BidQuotePlan({
     (total, group) => total + asArray(group.materials).length,
     0,
   )
+  const hasUnsavedChanges = Boolean(savedGroupSignature)
+    && groupSignature(groups) !== savedGroupSignature
   const incompleteGroupCount = groups.filter((group) => (
     asArray(group.materials).length
     && (
@@ -269,8 +298,26 @@ export default function BidQuotePlan({
     ? 'waiting'
     : (draft?.stale || incompleteGroupCount ? 'needs_you' : 'ready_to_send')
   const quoteEmailUrl = `/jobs/bids/quote-emails?job=${jobId}&view=${quoteEmailView}`
-  const canReviewEmail = Boolean(draft && !draft.stale && !incompleteGroupCount)
+  const canReviewEmail = Boolean(
+    draft && !draft.stale && !incompleteGroupCount && !hasUnsavedChanges,
+  )
   const canOpenQuoteEmails = canReviewEmail || allMaterialsRequested
+  const workflowStatus = allMaterialsRequested
+    ? { status: 'waiting', label: 'Waiting on vendors' }
+    : draft?.stale
+      ? { status: 'stale', label: 'Update draft needed' }
+      : hasUnsavedChanges
+        ? { status: 'needs_setup', label: 'Save draft to continue' }
+      : incompleteGroupCount
+        ? { status: 'needs_setup', label: 'Add vendor email' }
+        : canReviewEmail
+          ? { status: 'ready_to_send', label: 'Ready to review' }
+          : { status: 'needs_setup', label: 'Ready to save' }
+  const emailCenterAction = allMaterialsRequested
+    ? 'Check Vendor Replies'
+    : canReviewEmail
+      ? 'Review & Send Emails'
+      : ''
 
   return (
     <div className="space-y-6">
@@ -278,21 +325,21 @@ export default function BidQuotePlan({
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <p className="text-xs font-semibold uppercase text-si-orange">Step 2 of 3</p>
-            <h2 className="mt-1 text-xl font-bold text-white">Quote Emails</h2>
+            <h2 className="mt-1 text-xl font-bold text-white">Prepare Vendor Requests</h2>
             <p className="mt-1 text-sm text-gray-500">
-              Check the vendor and materials here. Then continue to Quote Emails to review and send this bid's requests.
+              Confirm who will price each material. Save the draft here, then review it before anything is sent.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <StatusPill
-              status={allMaterialsRequested ? 'waiting' : (incompleteGroupCount ? 'needs_setup' : 'ready_to_send')}
-              label={allMaterialsRequested ? 'Waiting on vendor' : (incompleteGroupCount ? 'Vendor setup needed' : (canReviewEmail ? 'Ready to review' : 'Ready to save'))}
+              status={workflowStatus.status}
+              label={workflowStatus.label}
             />
             <Link
               to={quoteEmailUrl}
               className="inline-flex min-h-9 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
             >
-              Continue to Quote Emails
+              {emailCenterAction}
               <ArrowRight className="h-3.5 w-3.5" />
             </Link>
           </div>
@@ -304,7 +351,7 @@ export default function BidQuotePlan({
           {[
             ['Materials to price', unpricedCount],
             ['Vendor groups', groups.filter((group) => asArray(group.materials).length).length],
-            ['Waiting on vendors', requestedMaterials.length],
+            ['Materials already requested', requestedMaterials.length],
           ].map(([label, value]) => (
             <div key={label} className="min-w-0 px-4 py-3">
               <p className="text-xs text-gray-500">{label}</p>
@@ -509,7 +556,7 @@ export default function BidQuotePlan({
                 className="grid gap-2 px-4 py-3 text-sm sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
               >
                 <span className="text-gray-300">{materialLabel(material)}</span>
-                <StatusPill status="waiting" label="In Email Center" />
+                  <StatusPill status="waiting" label="Waiting on vendor" />
               </div>
             ))}
           </div>
@@ -520,16 +567,24 @@ export default function BidQuotePlan({
         <div>
           <p className="text-sm font-semibold text-white">
             {allMaterialsRequested
-              ? 'All unpriced materials are already waiting on vendors.'
+              ? 'Next: check vendor replies.'
+              : draft?.stale
+                ? 'Next: save a fresh email draft.'
+                : hasUnsavedChanges
+                  ? 'Next: save your changes, then review the emails.'
               : incompleteGroupCount
-              ? `${incompleteGroupCount} group${incompleteGroupCount === 1 ? '' : 's'} still need a vendor email.`
+                ? `Next: add an email for ${incompleteGroupCount} vendor group${incompleteGroupCount === 1 ? '' : 's'}.`
               : canReviewEmail
-                ? 'The email draft is ready to review.'
-                : 'The vendor groups are ready to save.'}
+                  ? 'Next: review the email draft.'
+                  : 'Next: save this email draft.'}
           </p>
           <p className="mt-1 text-xs text-gray-500">
             {allMaterialsRequested
               ? 'Check vendor replies and follow-ups in Quote Email Center.'
+              : draft?.stale
+                ? 'The material list changed after the last draft was saved.'
+                : hasUnsavedChanges
+                  ? 'Your vendor setup changed. The older saved draft cannot be sent.'
               : incompleteGroupCount
                 ? 'Add the vendor email above, then save the draft.'
                 : 'Saving creates an email draft. It does not send email.'}
@@ -542,12 +597,12 @@ export default function BidQuotePlan({
               className="inline-flex items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-500"
             >
               <Mail className="h-4 w-4" />
-              Open Quote Email Center
+              {emailCenterAction}
             </Link>
           )}
           <button
             type="button"
-            onClick={saveDraft}
+            onClick={() => saveDraft({ openAfterSave: !canOpenQuoteEmails })}
             disabled={saving || materialCount === 0 || incompleteGroupCount > 0}
             className={`inline-flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-bold disabled:cursor-not-allowed disabled:opacity-40 ${
               canOpenQuoteEmails
@@ -558,7 +613,7 @@ export default function BidQuotePlan({
             {saving
               ? <Loader2 className="h-4 w-4 animate-spin" />
               : <Save className="h-4 w-4" />}
-            {canReviewEmail ? 'Save Updated Draft' : 'Save Email Draft'}
+            {canReviewEmail ? 'Save Updated Draft' : 'Save & Review Emails'}
           </button>
         </div>
       </div>

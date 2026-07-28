@@ -15,9 +15,9 @@ import { EmptyState, StatusPill } from './quote/QuoteUi'
 
 const QUOTE_FILTERS = [
   ['open', 'To Do'],
-  ['attention', 'Needs You'],
-  ['prepare', 'Set Up'],
-  ['send', 'Ready to send'],
+  ['attention', 'Needs your decision'],
+  ['prepare', 'Set up needed'],
+  ['send', 'Ready to review'],
   ['waiting', 'Waiting'],
   ['complete', 'Complete'],
 ]
@@ -88,8 +88,8 @@ function BidQuoteCard({ bid, emailCenterPath, featured = false }) {
   const bidUrl = `/jobs/${bid.slug || bid.job_id}?step=quotes`
   const actionUrl = emailAction ? emailUrl : bidUrl
   const emailActionLabel = {
-    needs_review: 'Review Quote Email',
-    overdue: 'Check Overdue Email',
+    needs_review: 'Fix quote email',
+    overdue: 'Follow up today',
     ready_to_send: 'Review & Send',
     waiting: 'Check Vendor Reply',
   }[bid.quote_stage]
@@ -196,7 +196,7 @@ function MaterialQuoteBids({ emailCenterPath }) {
       attention: byStage(['needs_review', 'overdue']),
       prepare: byStage(['needs_setup']),
       send: byStage(['ready_to_send']),
-      waiting: byStage(['waiting', 'overdue']),
+      waiting: byStage(['waiting']),
       complete: byStage(['complete']),
     }
   }, [data.bids])
@@ -207,7 +207,7 @@ function MaterialQuoteBids({ emailCenterPath }) {
       attention: ['needs_review', 'overdue'],
       prepare: ['needs_setup'],
       send: ['ready_to_send'],
-      waiting: ['waiting', 'overdue'],
+      waiting: ['waiting'],
       complete: ['complete'],
     }
     return bids.filter((bid) => matches[filter].includes(bid.quote_stage))
@@ -260,6 +260,7 @@ function MaterialQuoteBids({ emailCenterPath }) {
               key={key}
               type="button"
               onClick={() => setFilter(key)}
+              aria-pressed={filter === key}
               className={`inline-flex min-h-10 items-center justify-center gap-2 rounded-md border-b-2 px-2 text-sm font-semibold md:flex-shrink-0 md:justify-start md:px-3 ${
                 filter === key
                   ? 'border-si-orange bg-white/[0.05] text-white'
@@ -285,13 +286,13 @@ function MaterialQuoteBids({ emailCenterPath }) {
       </div>
 
       {error && (
-        <div className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
+        <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
           {error}
         </div>
       )}
       {data.mailbox_locked && (
-        <p className="text-xs text-gray-600">
-          Connect Outlook in Quote Email Center to see vendor replies and email status.
+        <p className="text-xs text-gray-400">
+          Outlook is disconnected. Saved vendor requests are still visible; connect Outlook to check for new replies.
         </p>
       )}
 
@@ -342,11 +343,11 @@ export default function MaterialQuotesHub() {
   const fullBidPath = location.pathname.startsWith('/jobs/bids')
   const bidsOpen = location.pathname === '/jobs/bids'
   const emailCenterPath = fullBidPath ? '/jobs/bids/quote-emails' : '/quote-emails'
-  const title = fullBidPath ? (bidsOpen ? 'Bids' : 'Quote Emails') : 'Quote Email Center'
+  const title = fullBidPath ? (bidsOpen ? 'Bids' : 'Review & Send') : 'Quote Email Center'
   const description = fullBidPath
     ? (bidsOpen
       ? 'Choose a bid, prepare vendor pricing, then finish the proposal in the same bid.'
-      : 'Review and send vendor emails for the bid you selected. Return to the bid when pricing is complete.')
+      : 'Review and send vendor requests for the selected bid. Return to the bid when prices are complete.')
     : 'Fast daily inbox for vendor quote emails across every bid.'
 
   return (
@@ -372,7 +373,7 @@ export default function MaterialQuotesHub() {
             {fullBidPath && !bidsOpen && (
               <>
                 <ChevronRight className="h-3.5 w-3.5" />
-                <span className="text-gray-300">Quote Emails</span>
+                <span className="text-gray-300">Review & Send</span>
               </>
             )}
           </nav>
@@ -406,7 +407,7 @@ export default function MaterialQuotesHub() {
               }`}
             >
               <Mail className="h-4 w-4" />
-              Quote Emails
+              Review & Send
             </Link>
           </nav>
         ) : (

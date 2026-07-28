@@ -1045,7 +1045,19 @@ def _all_quote_requests_for_bid_summary() -> list[dict]:
         conn.close()
 
 
-def _email_center_request(request: dict, job: dict) -> dict:
+def _email_center_request(
+    request: dict,
+    job: dict,
+    *,
+    include_messages: bool = True,
+) -> dict:
+    """Build the safe request record used by the Email Center.
+
+    A connected Outlook session is required to expose mailbox replies. The
+    request, its materials, follow-up schedule, and sent-email proof live in
+    the bid database, though, so they remain visible when a user reconnects
+    Outlook later.
+    """
     item = dict(request)
     item["material_snapshot"] = _json_loads(
         item.get("material_snapshot_json"),
@@ -1054,7 +1066,10 @@ def _email_center_request(request: dict, job: dict) -> dict:
     item["material_ids"] = sorted(_request_material_ids(item))
     item["materials"] = _request_materials(int(item["id"]))
     item["followups"] = _followups_for_request(int(item["id"]))
-    item["messages"] = _messages_for_request(int(item["id"]))
+    item["messages"] = (
+        _messages_for_request(int(item["id"])) if include_messages else []
+    )
+    item["mailbox_sync_paused"] = not include_messages
     workflow_state = _request_workflow_state(item, job)
     item["stale"] = workflow_state["stale"]
     item["status"] = workflow_state["status"]
@@ -1081,15 +1096,29 @@ def material_quotes_email_center(
         if draft:
             drafts.append(draft)
     requests = []
+    # A disconnected mailbox pauses reply syncing; it must not erase the
+    # locally recorded request, material snapshot, follow-up schedule, or
+    # sent-email evidence from the estimator's queue.
+    request_rows = (
+        _mailbox_quote_requests(mailbox_email)
+        if mailbox_email
+        else _all_quote_requests_for_bid_summary()
+    )
+    jobs: dict[int, dict] = {}
+    for request in request_rows:
+        job_id = int(request["job_id"])
+        job = jobs.get(job_id)
+        if job is None:
+            job = load_job(job_id) or {}
+            jobs[job_id] = job
+        requests.append(
+            _email_center_request(
+                request,
+                job,
+                include_messages=bool(mailbox_email),
+            )
+        )
     if mailbox_email:
-        jobs: dict[int, dict] = {}
-        for request in _mailbox_quote_requests(mailbox_email):
-            job_id = int(request["job_id"])
-            job = jobs.get(job_id)
-            if job is None:
-                job = load_job(job_id) or {}
-                jobs[job_id] = job
-            requests.append(_email_center_request(request, job))
         review = quote_review(mailbox_email=mailbox_email)
     else:
         review = {"messages": [], "price_matches": [], "mailbox_locked": True}
@@ -1135,6 +1164,7 @@ def material_quotes_email_center(
     return {
         "outlook": outlook or {"configured": False, "connected": False},
         "mailbox_locked": not bool(mailbox_email),
+        "mailbox_sync_paused": not bool(mailbox_email),
         "drafts": drafts,
         "requests": requests,
         "review": review,
@@ -1185,11 +1215,11 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
         price_review_by_job[job_id] = price_review_by_job.get(job_id, 0) + 1
 
     stage_labels = {
-        "needs_review": "Needs Your Review",
+        "needs_review": "Needs your decision",
         "overdue": "Overdue",
-        "ready_to_send": "Ready to Send",
-        "needs_setup": "Needs Setup",
-        "waiting": "Waiting on Vendor",
+        "ready_to_send": "Ready to review",
+        "needs_setup": "Set up needed",
+        "waiting": "Waiting on vendor",
         "complete": "Complete",
     }
     priority = {
