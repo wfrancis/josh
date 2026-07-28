@@ -347,8 +347,10 @@ export default function MaterialQuotesHub() {
 
   return (
     <div className="mx-auto w-full max-w-[1500px] px-4 py-5 sm:px-6 lg:px-8">
-      <div className="mb-5 flex flex-col gap-4 border-b border-white/[0.07] pb-4 sm:flex-row sm:items-end sm:justify-between">
-        <div>
+      <div className={`mb-5 flex flex-col gap-4 border-b border-white/[0.07] pb-4 sm:flex-row sm:items-end sm:justify-between ${
+        fullBidPath ? '' : 'max-sm:flex-row max-sm:items-center max-sm:justify-end max-sm:gap-0'
+      }`}>
+        <div className={fullBidPath ? '' : 'hidden sm:block'}>
           <nav className="flex items-center gap-1 text-xs font-semibold text-gray-500" aria-label="Breadcrumb">
             {fullBidPath ? (
               <>

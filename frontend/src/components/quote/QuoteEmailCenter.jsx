@@ -33,8 +33,8 @@ import {
 } from './QuoteUi'
 
 const FILTERS = [
-  ['needs_you', 'Needs Me'],
-  ['overdue', 'Follow Up'],
+  ['needs_you', 'Needs'],
+  ['overdue', 'Follow'],
   ['ready_to_send', 'Ready'],
   ['waiting', 'Waiting'],
   ['complete', 'Closed'],
@@ -664,7 +664,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
             <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
           </button>
         </div>
-        <div className="grid grid-cols-2 gap-1 sm:flex">
+        <div className="grid grid-cols-5 gap-1 sm:flex">
           {FILTERS.map(([key, label]) => (
             <button
               key={key}
@@ -672,7 +672,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
               onClick={() => setFilter(key)}
               aria-pressed={activeFilter === key}
               aria-label={`${VIEW_DETAILS[key].title}: ${Number(scopedSummary[key] || 0)} items`}
-              className={`flex min-h-11 items-center justify-between gap-2 rounded-md px-3 text-sm font-semibold sm:flex-1 sm:justify-start ${
+              className={`flex min-h-11 min-w-0 items-center justify-between gap-1 rounded-md px-2 text-xs font-semibold sm:flex-1 sm:justify-start sm:gap-2 sm:px-3 sm:text-sm ${
                 activeFilter === key
                   ? 'bg-si-orange text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]'
                   : 'text-gray-400 hover:bg-white/[0.05] hover:text-gray-200'
