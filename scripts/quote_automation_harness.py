@@ -114,15 +114,37 @@ def fingerprint_job(job: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def draft_group_payload(group: dict) -> dict:
+    return {
+        "vendor_id": group.get("vendor_id"),
+        "vendor_name": group.get("vendor_name"),
+        "vendor_email": group.get("vendor_email"),
+        "material_ids": [
+            item.get("id")
+            for item in group.get("materials_to_send") or []
+        ],
+        "subject": group.get("subject"),
+        "body": group.get("body"),
+    }
+
+
 def run(
     base_url: str,
     keep_job: bool,
     expected_commit: str | None = None,
     vendor_email: str = "wbfranci@gmail.com",
+    second_vendor_email: str = "wfrancis@seas.upenn.edu",
 ) -> dict[str, Any]:
+    vendor_email = vendor_email.strip().lower()
+    second_vendor_email = second_vendor_email.strip().lower()
+    if not vendor_email or not second_vendor_email:
+        raise HarnessError("Two vendor email addresses are required.")
+    if vendor_email == second_vendor_email:
+        raise HarnessError("The two test vendors must use different email addresses.")
+
     suffix = uuid.uuid4().hex[:8]
     job_id = None
-    vendor_id = None
+    vendor_ids: list[int] = []
     checks = []
     try:
         build = request(base_url, "GET", "/api/system/build")
@@ -186,17 +208,31 @@ def run(
             }
         )
 
-        vendor = request(
+        first_vendor = request(
             base_url,
             "POST",
             "/api/vendors",
             {
-                "name": f"Harness Quote Vendor {suffix}",
-                "contact_name": "Harness Vendor",
+                "name": f"Harness Gmail Vendor {suffix}",
+                "contact_name": "Harness Gmail Vendor",
                 "contact_email": vendor_email,
             },
         )
-        vendor_id = vendor.get("id")
+        second_vendor = request(
+            base_url,
+            "POST",
+            "/api/vendors",
+            {
+                "name": f"Harness Penn Vendor {suffix}",
+                "contact_name": "Harness Penn Vendor",
+                "contact_email": second_vendor_email,
+            },
+        )
+        vendor_ids = [
+            int(vendor["id"])
+            for vendor in (first_vendor, second_vendor)
+            if vendor.get("id") is not None
+        ]
         created = request(
             base_url,
             "POST",
@@ -225,7 +261,7 @@ def run(
                         "installed_qty": 100,
                         "order_qty": 105,
                         "unit": "SY",
-                        "vendor": vendor["name"],
+                        "vendor": first_vendor["name"],
                         "unit_price": 0,
                         "extended_cost": 0,
                     },
@@ -236,7 +272,7 @@ def run(
                         "installed_qty": 200,
                         "order_qty": 210,
                         "unit": "SF",
-                        "vendor": vendor["name"],
+                        "vendor": second_vendor["name"],
                         "unit_price": 0,
                         "extended_cost": 0,
                     },
@@ -247,13 +283,21 @@ def run(
         before_fingerprint = fingerprint_job(before)
         plan = request(base_url, "GET", f"/api/jobs/{job_id}/quotes/plan")
         groups = plan.get("groups") or []
+        expected_vendor_emails = {vendor_email, second_vendor_email}
+        groups_by_email = {
+            str(group.get("vendor_email") or "").strip().lower(): group
+            for group in groups
+        }
         checks.append(
             {
-                "name": "per_bid_quote_plan",
-                "passed": len(groups) == 1
-                and groups[0].get("can_send") is True
-                and groups[0].get("vendor_email") == vendor_email
-                and len(groups[0].get("materials_to_send") or []) == 2
+                "name": "two_vendor_quote_plan",
+                "passed": len(groups) == 2
+                and set(groups_by_email) == expected_vendor_emails
+                and all(group.get("can_send") is True for group in groups)
+                and all(
+                    len(group.get("materials_to_send") or []) == 1
+                    for group in groups
+                )
                 and (plan.get("matching_engine") or {}).get("ai_calls") == 0,
                 "details": plan,
             }
@@ -285,19 +329,7 @@ def run(
         draft_payload = {
             "source_fingerprint": plan.get("source_fingerprint"),
             "prepared_by": "Harness Estimator",
-            "groups": [
-                {
-                    "vendor_id": groups[0].get("vendor_id"),
-                    "vendor_name": groups[0].get("vendor_name"),
-                    "vendor_email": groups[0].get("vendor_email"),
-                    "material_ids": [
-                        item.get("id")
-                        for item in groups[0].get("materials_to_send") or []
-                    ],
-                    "subject": groups[0].get("subject"),
-                    "body": groups[0].get("body"),
-                }
-            ],
+            "groups": [draft_group_payload(group) for group in groups],
         }
         saved_draft = request(
             base_url,
@@ -305,8 +337,12 @@ def run(
             f"/api/jobs/{job_id}/quotes/email-draft",
             draft_payload,
         )
-        saved_group = ((saved_draft.get("draft") or {}).get("groups") or [{}])[0]
-        group_id = saved_group.get("group_id")
+        saved_groups = (saved_draft.get("draft") or {}).get("groups") or []
+        saved_group_ids = {
+            str(group.get("vendor_email") or "").strip().lower(): group.get("group_id")
+            for group in saved_groups
+        }
+        first_group_id = saved_group_ids.get(vendor_email)
         after_draft_save = request(base_url, "GET", f"/api/jobs/{job_id}")
         requests_after_save = request(
             base_url,
@@ -317,14 +353,16 @@ def run(
             {
                 "name": "draft_prepares_without_sending",
                 "passed": saved_draft.get("status") == "saved"
-                and saved_group.get("can_send") is True
-                and bool(group_id)
+                and len(saved_groups) == 2
+                and set(saved_group_ids) == expected_vendor_emails
+                and all(saved_group_ids.values())
+                and all(group.get("can_send") is True for group in saved_groups)
                 and requests_after_save == []
                 and fingerprint_job(after_draft_save) == before_fingerprint
                 and saved_draft.get("ai_calls") == 0,
                 "details": {
                     "message": saved_draft.get("message"),
-                    "group_id": group_id,
+                    "group_ids": saved_group_ids,
                     "request_count": len(requests_after_save),
                 },
             }
@@ -333,14 +371,17 @@ def run(
         patched_draft = request(
             base_url,
             "PATCH",
-            f"/api/jobs/{job_id}/quotes/email-draft/groups/{group_id}",
+            f"/api/jobs/{job_id}/quotes/email-draft/groups/{first_group_id}",
             {
                 "vendor_email": vendor_email,
                 "subject": f"Harness saved subject {suffix}",
                 "body": f"Harness saved email body {suffix}",
             },
         )
-        patched_group = ((patched_draft.get("draft") or {}).get("groups") or [{}])[0]
+        patched_groups_by_email = {
+            str(group.get("vendor_email") or "").strip().lower(): group
+            for group in (patched_draft.get("draft") or {}).get("groups") or []
+        }
         center_locked = request(
             base_url,
             "GET",
@@ -371,12 +412,17 @@ def run(
         checks.append(
             {
                 "name": "email_center_reads_saved_bid_draft",
-                "passed": patched_group.get("group_id") == group_id
-                and patched_group.get("subject")
+                "passed": patched_groups_by_email.get(vendor_email, {}).get("group_id")
+                == first_group_id
+                and patched_groups_by_email.get(vendor_email, {}).get("subject")
                 == f"Harness saved subject {suffix}"
+                and patched_groups_by_email.get(second_vendor_email, {}).get(
+                    "group_id"
+                )
+                == saved_group_ids.get(second_vendor_email)
                 and center_locked.get("mailbox_locked") is True
                 and center_requests_for_job == []
-                and center_draft.get("ready_group_count") == 1
+                and center_draft.get("ready_group_count") == 2
                 and ready_bid_summary.get("quote_stage") == "ready_to_send"
                 and (center_locked.get("matching_engine") or {}).get("ai_calls") == 0,
                 "details": {
@@ -460,7 +506,7 @@ def run(
             "GET",
             f"/api/jobs/{job_id}/quotes/plan",
         )
-        refreshed_group = (refreshed_plan.get("groups") or [{}])[0]
+        refreshed_groups = refreshed_plan.get("groups") or []
         refreshed_save = request(
             base_url,
             "PUT",
@@ -469,31 +515,23 @@ def run(
                 "source_fingerprint": refreshed_plan.get("source_fingerprint"),
                 "prepared_by": "Harness Estimator",
                 "groups": [
-                    {
-                        "vendor_id": refreshed_group.get("vendor_id"),
-                        "vendor_name": refreshed_group.get("vendor_name"),
-                        "vendor_email": refreshed_group.get("vendor_email"),
-                        "material_ids": [
-                            item.get("id")
-                            for item in refreshed_group.get("materials_to_send") or []
-                        ],
-                        "subject": refreshed_group.get("subject"),
-                        "body": refreshed_group.get("body"),
-                    }
+                    draft_group_payload(group) for group in refreshed_groups
                 ],
             },
         )
-        refreshed_saved_group = (
-            (refreshed_save.get("draft") or {}).get("groups") or [{}]
-        )[0]
+        refreshed_group_ids = {
+            str(group.get("vendor_email") or "").strip().lower(): group.get("group_id")
+            for group in (refreshed_save.get("draft") or {}).get("groups") or []
+        }
         checks.append(
             {
                 "name": "draft_group_identity_survives_refresh",
-                "passed": refreshed_saved_group.get("group_id") == group_id
+                "passed": len(refreshed_groups) == 2
+                and refreshed_group_ids == saved_group_ids
                 and (refreshed_save.get("draft") or {}).get("stale") is False,
                 "details": {
-                    "before_group_id": group_id,
-                    "after_group_id": refreshed_saved_group.get("group_id"),
+                    "before_group_ids": saved_group_ids,
+                    "after_group_ids": refreshed_group_ids,
                 },
             }
         )
@@ -626,14 +664,15 @@ def run(
             {
                 "name": "draft_survives_other_workflows",
                 "passed": persisted_draft.get("stale") is False
-                and (
-                    (persisted_draft.get("groups") or [{}])[0].get("group_id")
-                    == group_id
-                ),
+                and {
+                    str(group.get("vendor_email") or "").strip().lower(): group.get(
+                        "group_id"
+                    )
+                    for group in persisted_draft.get("groups") or []
+                }
+                == saved_group_ids,
                 "details": {
-                    "group_id": (
-                        (persisted_draft.get("groups") or [{}])[0].get("group_id")
-                    ),
+                    "group_ids": saved_group_ids,
                     "updated_at": persisted_draft.get("updated_at"),
                 },
             }
@@ -643,7 +682,7 @@ def run(
             "POST",
             f"/api/jobs/{job_id}/quote-requests",
             410,
-            {"vendor_name": vendor["name"], "material_ids": []},
+            {"vendor_name": first_vendor["name"], "material_ids": []},
         )
         legacy_clear = expect_http_status(
             base_url,
@@ -668,7 +707,7 @@ def run(
                 request(base_url, "DELETE", f"/api/jobs/{job_id}")
             except HarnessError:
                 pass
-        if vendor_id is not None:
+        for vendor_id in vendor_ids:
             try:
                 request(base_url, "DELETE", f"/api/vendors/{vendor_id}")
             except HarnessError:
@@ -694,7 +733,12 @@ def main() -> int:
     parser.add_argument(
         "--vendor-email",
         default="wbfranci@gmail.com",
-        help="Approved staging vendor address used by the disposable test bid.",
+        help="First approved staging vendor address used by the disposable test bid.",
+    )
+    parser.add_argument(
+        "--second-vendor-email",
+        default="wfrancis@seas.upenn.edu",
+        help="Second approved staging vendor address used by the disposable test bid.",
     )
     parser.add_argument("--json-output")
     args = parser.parse_args()
@@ -704,6 +748,7 @@ def main() -> int:
             args.keep_job,
             args.expected_commit,
             args.vendor_email,
+            args.second_vendor_email,
         )
     except HarnessError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
