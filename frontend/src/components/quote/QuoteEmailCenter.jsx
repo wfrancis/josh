@@ -38,8 +38,6 @@ const FILTERS = [
   ['complete', 'Complete'],
 ]
 
-const QUOTE_EMAILS_PATH = '/quote-emails'
-
 const requestBucket = (request) => {
   const status = normalizeStatus(request.status)
   if (status === 'overdue') return 'overdue'
@@ -50,7 +48,7 @@ const requestBucket = (request) => {
   return 'waiting'
 }
 
-export default function QuoteEmailCenter() {
+export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
   const location = useLocation()
   const navigate = useNavigate()
   const params = useMemo(
@@ -101,13 +99,13 @@ export default function QuoteEmailCenter() {
   const setFilter = (view) => {
     const next = new URLSearchParams(location.search)
     next.set('view', view)
-    navigate(`${QUOTE_EMAILS_PATH}?${next.toString()}`)
+    navigate(`${basePath}?${next.toString()}`)
   }
 
   const clearJobFilter = () => {
     const next = new URLSearchParams(location.search)
     next.delete('job')
-    navigate(`${QUOTE_EMAILS_PATH}${next.toString() ? `?${next}` : ''}`)
+    navigate(`${basePath}${next.toString() ? `?${next}` : ''}`)
   }
 
   const selectJob = (event) => {
@@ -115,7 +113,7 @@ export default function QuoteEmailCenter() {
     const nextJobId = event.target.value
     if (nextJobId) next.set('job', nextJobId)
     else next.delete('job')
-    navigate(`${QUOTE_EMAILS_PATH}${next.toString() ? `?${next}` : ''}`)
+    navigate(`${basePath}${next.toString() ? `?${next}` : ''}`)
   }
 
   const updateDraftGroup = (jobId, groupId, field, value) => {

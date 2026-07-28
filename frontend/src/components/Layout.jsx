@@ -127,8 +127,8 @@ function SidebarContent({ location, onNavigate }) {
           Workspace
         </div>
         <NavItem to="/" icon={LayoutDashboard} label="Dashboard" active={location.pathname === '/'} onClick={onNavigate} />
-        <NavItem to="/jobs" icon={FolderOpen} label="Jobs" active={location.pathname === '/jobs' || (location.pathname.startsWith('/jobs/') && !location.pathname.startsWith('/jobs/bids'))} onClick={onNavigate} />
-        <NavItem to="/quote-emails" icon={Mail} label="Quote Email Center" active={location.pathname.startsWith('/quote-emails') || location.pathname.startsWith('/jobs/bids')} onClick={onNavigate} />
+        <NavItem to="/jobs" icon={FolderOpen} label="Jobs" active={location.pathname.startsWith('/jobs')} onClick={onNavigate} />
+        <NavItem to="/quote-emails" icon={Mail} label="Quote Email Center" active={location.pathname.startsWith('/quote-emails')} onClick={onNavigate} />
       </nav>
 
       {/* Bottom section */}

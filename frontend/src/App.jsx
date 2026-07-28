@@ -10,10 +10,9 @@ import VendorContactsPage from './components/VendorContactsPage'
 import RulesRegistryPage from './components/RulesRegistryPage'
 import MaterialQuotesHub from './components/MaterialQuotesHub'
 
-function LegacyQuoteEmailRedirect({ bids = false }) {
+function LegacyRedirect({ to }) {
   const location = useLocation()
-  const destination = bids ? '/quote-emails/bids' : '/quote-emails'
-  return <Navigate replace to={`${destination}${location.search}`} />
+  return <Navigate replace to={`${to}${location.search}`} />
 }
 
 export default function App() {
@@ -23,12 +22,12 @@ export default function App() {
         <Route path="/" element={<Dashboard />} />
         <Route path="/jobs" element={<AllJobs />} />
         <Route path="/quote-emails" element={<MaterialQuotesHub />} />
-        <Route path="/quote-emails/bids" element={<MaterialQuotesHub />} />
-        <Route path="/jobs/bids" element={<LegacyQuoteEmailRedirect bids />} />
-        <Route path="/jobs/bids/quote-emails" element={<LegacyQuoteEmailRedirect />} />
+        <Route path="/quote-emails/bids" element={<LegacyRedirect to="/jobs/bids" />} />
+        <Route path="/jobs/bids" element={<MaterialQuotesHub />} />
+        <Route path="/jobs/bids/quote-emails" element={<MaterialQuotesHub />} />
         <Route path="/jobs/:jobId" element={<JobDetail />} />
-        <Route path="/material-quotes" element={<LegacyQuoteEmailRedirect bids />} />
-        <Route path="/material-quotes/email" element={<LegacyQuoteEmailRedirect />} />
+        <Route path="/material-quotes" element={<LegacyRedirect to="/jobs/bids" />} />
+        <Route path="/material-quotes/email" element={<LegacyRedirect to="/quote-emails" />} />
         <Route path="/pricing-rules" element={<PricingRulesPage />} />
         <Route path="/rules" element={<RulesRegistryPage />} />
         <Route path="/internal-rates" element={<PricingRulesPage />} />

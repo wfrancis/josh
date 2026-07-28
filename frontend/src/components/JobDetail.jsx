@@ -388,11 +388,13 @@ export default function JobDetail() {
       <nav className="mb-3 flex items-center gap-1 text-xs font-semibold text-gray-500" aria-label="Breadcrumb">
         <Link to="/jobs" className="hover:text-gray-300">Jobs</Link>
         <ChevronRight className="h-3.5 w-3.5" />
+        <Link to="/jobs/bids" className="hover:text-gray-300">Bids</Link>
+        <ChevronRight className="h-3.5 w-3.5" />
         <span className="truncate text-gray-300">{job.project_name}</span>
       </nav>
       {/* Header */}
       <div className="flex items-start gap-4 mb-8">
-        <button onClick={() => navigate('/jobs')} className="btn-ghost p-2 mt-0.5" title="Back to Jobs">
+        <button onClick={() => navigate('/jobs/bids')} className="btn-ghost p-2 mt-0.5" title="Back to Bids">
           <ArrowLeft className="w-5 h-5" />
         </button>
         <div className="flex-1">

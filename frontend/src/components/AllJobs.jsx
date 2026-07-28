@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import {
-  Plus, Building2, Mail, User, Loader2, ChevronRight, ArrowRight,
+  Plus, Building2, Briefcase, Mail, User, Loader2, ChevronRight, ArrowRight,
   Search, FolderOpen, Trash2, Copy
 } from 'lucide-react'
 import { api } from '../api'
@@ -103,6 +103,13 @@ export default function AllJobs() {
             >
               <FolderOpen className="h-4 w-4" />
               Jobs
+            </Link>
+            <Link
+              to="/jobs/bids"
+              className="inline-flex min-h-8 items-center gap-2 rounded-md px-3 text-sm font-semibold text-gray-500 hover:text-gray-300"
+            >
+              <Briefcase className="h-4 w-4" />
+              Bids
             </Link>
             <Link
               to="/quote-emails"

@@ -268,7 +268,7 @@ export default function BidQuotePlan({
   const quoteEmailView = allMaterialsRequested
     ? 'waiting'
     : (draft?.stale || incompleteGroupCount ? 'needs_you' : 'ready_to_send')
-  const quoteEmailUrl = `/quote-emails?job=${jobId}&view=${quoteEmailView}`
+  const quoteEmailUrl = `/jobs/bids/quote-emails?job=${jobId}&view=${quoteEmailView}`
   const canReviewEmail = Boolean(draft && !draft.stale && !incompleteGroupCount)
   const canOpenQuoteEmails = canReviewEmail || allMaterialsRequested
 
@@ -280,7 +280,7 @@ export default function BidQuotePlan({
             <p className="text-xs font-semibold uppercase text-si-orange">Step 2 of 3</p>
             <h2 className="mt-1 text-xl font-bold text-white">Quote Emails</h2>
             <p className="mt-1 text-sm text-gray-500">
-              Check the vendor and materials here. Then open Quote Email Center to review and send the email.
+              Check the vendor and materials here. Then continue to Quote Emails to review and send this bid's requests.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -292,7 +292,7 @@ export default function BidQuotePlan({
               to={quoteEmailUrl}
               className="inline-flex min-h-9 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
             >
-              Open Quote Email Center
+              Continue to Quote Emails
               <ArrowRight className="h-3.5 w-3.5" />
             </Link>
           </div>

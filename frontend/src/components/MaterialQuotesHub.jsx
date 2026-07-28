@@ -4,6 +4,7 @@ import {
   ArrowRight,
   Briefcase,
   ChevronRight,
+  FolderOpen,
   Mail,
   RefreshCw,
   Search,
@@ -81,11 +82,17 @@ const bidEmailDetail = (bid) => {
   return 'No vendor email prepared yet'
 }
 
-function BidQuoteCard({ bid, featured = false }) {
-  const emailUrl = `/quote-emails?job=${bid.job_id}&view=${quoteEmailView(bid)}`
+function BidQuoteCard({ bid, emailCenterPath, featured = false }) {
+  const emailUrl = `${emailCenterPath}?job=${bid.job_id}&view=${quoteEmailView(bid)}`
   const emailAction = ['needs_review', 'overdue', 'ready_to_send', 'waiting'].includes(bid.quote_stage)
   const bidUrl = `/jobs/${bid.slug || bid.job_id}?step=quotes`
-  const actionUrl = emailAction ? emailUrl : (bid.next_action?.url || bidUrl)
+  const actionUrl = emailAction ? emailUrl : bidUrl
+  const emailActionLabel = {
+    needs_review: 'Review Quote Email',
+    overdue: 'Check Overdue Email',
+    ready_to_send: 'Review & Send',
+    waiting: 'Check Vendor Reply',
+  }[bid.quote_stage]
   const location = bidLocation(bid)
   const unpricedCount = Number(bid.unpriced_count || 0)
 
@@ -137,7 +144,7 @@ function BidQuoteCard({ bid, featured = false }) {
             to={actionUrl}
             className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-si-orange px-3.5 text-sm font-bold text-white hover:bg-orange-500"
           >
-            {bid.next_action?.label || 'Open Bid'}
+            {emailActionLabel || bid.next_action?.label || 'Open Bid'}
             <ArrowRight className="h-4 w-4" />
           </Link>
         </div>
@@ -146,7 +153,7 @@ function BidQuoteCard({ bid, featured = false }) {
   )
 }
 
-function MaterialQuoteBids() {
+function MaterialQuoteBids({ emailCenterPath }) {
   const [data, setData] = useState({ bids: [], summary: {} })
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -298,7 +305,9 @@ function MaterialQuoteBids() {
             </span>
           </div>
           <div className="space-y-3">
-            {attentionBids.map((bid) => <BidQuoteCard key={bid.job_id} bid={bid} featured />)}
+            {attentionBids.map((bid) => (
+              <BidQuoteCard key={bid.job_id} bid={bid} emailCenterPath={emailCenterPath} featured />
+            ))}
           </div>
         </section>
       )}
@@ -314,7 +323,9 @@ function MaterialQuoteBids() {
         </div>
         {queueBids.length ? (
           <div className="space-y-3">
-            {queueBids.map((bid) => <BidQuoteCard key={bid.job_id} bid={bid} />)}
+            {queueBids.map((bid) => (
+              <BidQuoteCard key={bid.job_id} bid={bid} emailCenterPath={emailCenterPath} />
+            ))}
           </div>
         ) : (
           <EmptyState>
@@ -328,59 +339,91 @@ function MaterialQuoteBids() {
 
 export default function MaterialQuotesHub() {
   const location = useLocation()
-  const bidsOpen = location.pathname === '/quote-emails/bids'
+  const fullBidPath = location.pathname.startsWith('/jobs/bids')
+  const bidsOpen = location.pathname === '/jobs/bids'
+  const emailCenterPath = fullBidPath ? '/jobs/bids/quote-emails' : '/quote-emails'
+  const title = fullBidPath ? (bidsOpen ? 'Bids' : 'Quote Emails') : 'Quote Email Center'
+  const description = fullBidPath
+    ? (bidsOpen
+      ? 'Choose a bid, prepare vendor pricing, then finish the proposal in the same bid.'
+      : 'Review and send vendor emails for the bid you selected. Return to the bid when pricing is complete.')
+    : 'Fast daily inbox for vendor quote emails across every bid.'
 
   return (
     <div className="mx-auto w-full max-w-[1500px] px-4 py-5 sm:px-6 lg:px-8">
       <div className="mb-5 flex flex-col gap-4 border-b border-white/[0.07] pb-4 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <nav className="flex items-center gap-1 text-xs font-semibold text-gray-500" aria-label="Breadcrumb">
-            <Link to="/quote-emails" className="inline-flex items-center gap-1 hover:text-gray-300">
-              <Mail className="h-3.5 w-3.5" />
-              Quote Email Center
-            </Link>
-            {bidsOpen && (
+            {fullBidPath ? (
+              <>
+                <Link to="/jobs" className="inline-flex items-center gap-1 hover:text-gray-300">
+                  <FolderOpen className="h-3.5 w-3.5" />
+                  Jobs
+                </Link>
+                <ChevronRight className="h-3.5 w-3.5" />
+                <Link to="/jobs/bids" className="hover:text-gray-300">Bids</Link>
+              </>
+            ) : (
+              <Link to="/quote-emails" className="inline-flex items-center gap-1 hover:text-gray-300">
+                <Mail className="h-3.5 w-3.5" />
+                Quote Email Center
+              </Link>
+            )}
+            {fullBidPath && !bidsOpen && (
               <>
                 <ChevronRight className="h-3.5 w-3.5" />
-                <span className="text-gray-300">Bids</span>
+                <span className="text-gray-300">Quote Emails</span>
               </>
             )}
           </nav>
           <div className="mt-2 flex items-center gap-2">
             <Mail className="h-5 w-5 text-si-orange" />
-            <h1 className="text-xl font-bold text-white">Quote Email Center</h1>
+            <h1 className="text-xl font-bold text-white">{title}</h1>
           </div>
           <p className="mt-1 text-sm text-gray-500">
-            {bidsOpen ? 'Choose a bid, then prepare its vendor pricing.' : 'Review, send, and track vendor pricing emails across all bids.'}
+            {description}
           </p>
         </div>
-        <nav className="flex min-h-10 items-center rounded-lg border border-white/[0.08] bg-white/[0.025] p-1">
+        {fullBidPath ? (
+          <nav className="flex min-h-10 items-center rounded-lg border border-white/[0.08] bg-white/[0.025] p-1">
+            <Link
+              to="/jobs/bids"
+              className={`inline-flex min-h-8 items-center gap-2 rounded-md px-3 text-sm font-semibold ${
+                bidsOpen
+                  ? 'bg-white/[0.09] text-white'
+                  : 'text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              <Briefcase className="h-4 w-4" />
+              Bids
+            </Link>
+            <Link
+              to="/jobs/bids/quote-emails"
+              className={`inline-flex min-h-8 items-center gap-2 rounded-md px-3 text-sm font-semibold ${
+                !bidsOpen
+                  ? 'bg-white/[0.09] text-white'
+                  : 'text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              <Mail className="h-4 w-4" />
+              Quote Emails
+            </Link>
+          </nav>
+        ) : (
           <Link
-            to="/quote-emails/bids"
-            className={`inline-flex min-h-8 items-center gap-2 rounded-md px-3 text-sm font-semibold ${
-              bidsOpen
-                ? 'bg-white/[0.09] text-white'
-                : 'text-gray-500 hover:text-gray-300'
-            }`}
+            to="/jobs/bids"
+            className="inline-flex min-h-10 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-sm font-semibold text-gray-300 hover:bg-white/[0.05]"
           >
             <Briefcase className="h-4 w-4" />
-            Bids
+            Browse Bids
+            <ArrowRight className="h-4 w-4" />
           </Link>
-          <Link
-            to="/quote-emails"
-            className={`inline-flex min-h-8 items-center gap-2 rounded-md px-3 text-sm font-semibold ${
-              !bidsOpen
-                ? 'bg-white/[0.09] text-white'
-                : 'text-gray-500 hover:text-gray-300'
-            }`}
-          >
-            <Mail className="h-4 w-4" />
-            Email Center
-          </Link>
-        </nav>
+        )}
       </div>
 
-      {bidsOpen ? <MaterialQuoteBids /> : <QuoteEmailCenter />}
+      {bidsOpen
+        ? <MaterialQuoteBids emailCenterPath={emailCenterPath} />
+        : <QuoteEmailCenter basePath={emailCenterPath} />}
     </div>
   )
 }
