@@ -248,7 +248,7 @@ function MaterialQuoteBids() {
       </div>
 
       <div className="flex flex-col gap-2 border-b border-white/[0.07] pb-2 md:flex-row md:items-center">
-        <div className="grid grid-cols-3 gap-1 md:flex md:flex-1">
+        <div className="grid grid-cols-2 gap-1 md:flex md:flex-1">
           {QUOTE_FILTERS.map(([key, label]) => (
             <button
               key={key}
