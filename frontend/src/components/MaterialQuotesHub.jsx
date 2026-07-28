@@ -272,7 +272,7 @@ function MaterialQuoteBids() {
           onClick={() => load({ quiet: true })}
           disabled={refreshing}
           title="Refresh bid quote queue"
-          className="inline-flex h-10 w-10 self-end items-center justify-center rounded-md text-gray-500 hover:bg-white/[0.04] hover:text-white disabled:opacity-40 md:ml-auto md:flex-shrink-0"
+          className="hidden h-10 w-10 items-center justify-center rounded-md text-gray-500 hover:bg-white/[0.04] hover:text-white disabled:opacity-40 md:ml-auto md:inline-flex md:flex-shrink-0"
         >
           <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
         </button>
