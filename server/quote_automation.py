@@ -1245,6 +1245,11 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
             for status, count in status_counts.items()
             if status not in {"complete", "received", "cancelled"}
         )
+        completed_request_count = sum(
+            status_counts.get(status, 0)
+            for status in ("complete", "received")
+        )
+        cancelled_request_count = status_counts.get("cancelled", 0)
         if needs_review_count:
             stage = "needs_review"
         elif status_counts.get("overdue", 0):
@@ -1270,6 +1275,12 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
         elif stage == "complete":
             next_action = {"label": "View Bid", "url": f"/jobs/{slug}"}
         else:
+            email_view = {
+                "needs_review": "needs_you",
+                "overdue": "overdue",
+                "ready_to_send": "ready_to_send",
+                "waiting": "waiting",
+            }[stage]
             next_action = {
                 "label": {
                     "needs_review": "Review Email",
@@ -1277,7 +1288,7 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
                     "ready_to_send": "Open Email Center",
                     "waiting": "View Status",
                 }[stage],
-                "url": f"/material-quotes/email?job={job_id}",
+                "url": f"/material-quotes/email?job={job_id}&view={email_view}",
             }
         vendor_keys = {
             normalize_text(material.get("vendor")) or "unassigned"
@@ -1300,6 +1311,9 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
                 "draft_ready_count": ready_draft_count,
                 "draft_stale": bool(draft and draft.get("stale")),
                 "request_count": len(requests),
+                "active_request_count": open_request_count,
+                "completed_request_count": completed_request_count,
+                "cancelled_request_count": cancelled_request_count,
                 "request_statuses": status_counts,
                 "needs_matching_count": needs_matching,
                 "price_review_count": price_review,

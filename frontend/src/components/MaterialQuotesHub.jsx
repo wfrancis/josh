@@ -51,6 +51,25 @@ const bidLocation = (bid) => (
   [bid.city, bid.state].filter(Boolean).join(', ')
 )
 
+const quoteRequestCounts = (bid) => {
+  const statuses = bid.request_statuses || {}
+  const total = Number(bid.request_count || 0)
+  const completed = Number(
+    bid.completed_request_count
+    ?? (Number(statuses.complete || 0) + Number(statuses.received || 0)),
+  )
+  const cancelled = Number(
+    bid.cancelled_request_count
+    ?? Number(statuses.cancelled || 0),
+  )
+  const active = Number(
+    bid.active_request_count
+    ?? Math.max(0, total - completed - cancelled),
+  )
+
+  return { active, cancelled, completed }
+}
+
 const bidEmailDetail = (bid) => {
   if (Number(bid.needs_matching_count || 0) || Number(bid.price_review_count || 0)) {
     return plural(
@@ -62,8 +81,15 @@ const bidEmailDetail = (bid) => {
   if (Number(bid.draft_group_count || 0)) {
     return plural(Number(bid.draft_group_count), 'saved email draft', 'saved email drafts')
   }
-  if (Number(bid.request_count || 0)) {
-    return plural(Number(bid.request_count), 'vendor email sent', 'vendor emails sent')
+  const { active, completed, cancelled } = quoteRequestCounts(bid)
+  if (active) {
+    return plural(active, 'vendor email sent', 'vendor emails sent')
+  }
+  if (completed) {
+    return plural(completed, 'completed vendor quote', 'completed vendor quotes')
+  }
+  if (cancelled) {
+    return plural(cancelled, 'cancelled quote request', 'cancelled quote requests')
   }
   return 'No vendor email prepared yet'
 }
@@ -104,9 +130,11 @@ function QuoteFlow({ bid }) {
 function BidQuoteCard({ bid, featured = false }) {
   const emailUrl = `/material-quotes/email?job=${bid.job_id}&view=${quoteEmailView(bid)}`
   const actionUrl = bid.next_action?.url || `/jobs/${bid.slug || bid.job_id}`
+  const { active: activeRequestCount, completed: completedRequestCount } = quoteRequestCounts(bid)
   const canOpenEmail = (
     Number(bid.draft_group_count || 0) > 0
-    || Number(bid.request_count || 0) > 0
+    || activeRequestCount > 0
+    || completedRequestCount > 0
     || bid.quote_stage === 'needs_review'
     || bid.quote_stage === 'ready_to_send'
   )
