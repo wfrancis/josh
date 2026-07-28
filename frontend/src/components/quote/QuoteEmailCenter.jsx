@@ -527,27 +527,28 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
               {selectedJob ? 'Vendor email work for this bid' : 'Vendor email work'}
             </p>
             <h2 className="mt-1 truncate text-lg font-bold text-white">
-              {selectedJob?.project_name || 'All Bids'}
+              {selectedJob?.project_name || 'All Vendor Email Work'}
             </h2>
             <p className="mt-1 text-sm text-gray-500">
               {selectedJob
                 ? [selectedJob.gc_name, [selectedJob.city, selectedJob.state].filter(Boolean).join(', ')].filter(Boolean).join(' | ') || 'Selected bid'
-                : activeViewDetails.description}
+                : 'Replies, drafts, and follow-ups across every bid.'}
             </p>
           </div>
 
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+          {selectedJob && (
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
             <label className="block min-w-0 sm:w-[320px]">
               <span className="mb-1.5 flex items-center gap-2 text-xs font-semibold text-gray-500">
                 <Briefcase className="h-3.5 w-3.5" />
-                {selectedJob ? 'Switch bid' : 'Choose a bid'}
+                Switch bid
               </span>
               <select
                 value={jobFilter}
                 onChange={selectJob}
                 className="min-h-11 w-full rounded-md border border-white/[0.1] bg-[#0D1322] px-3 py-2.5 text-sm font-semibold text-gray-200 outline-none focus:border-blue-400/50"
               >
-                <option value="">All bids</option>
+                <option value="">All vendor email work</option>
                 {bidOptions.map((job) => {
                   const location = [job.city, job.state].filter(Boolean).join(', ')
                   const detail = [job.gc_name, location].filter(Boolean).join(' | ')
@@ -560,7 +561,6 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
               </select>
             </label>
 
-            {selectedJob && (
               <div className="flex gap-2">
                 <Link
                   to={`/jobs/${selectedJob.slug || selectedJob.id}?step=quotes`}
@@ -579,11 +579,11 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                   onClick={clearJobFilter}
                   className="min-h-11 rounded-md px-3 text-xs font-semibold text-blue-300 hover:bg-blue-500/[0.08] hover:text-white"
                 >
-                  All Bids
+                  All Email Work
                 </button>
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </div>
         <div className="mt-3 flex flex-col gap-3 border-t border-white/[0.07] pt-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">

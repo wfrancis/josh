@@ -1180,8 +1180,68 @@ def material_quotes_email_center(
     }
 
 
+def _bid_inventory_key(material: dict) -> str:
+    """Return a conservative key for comparing material inventory across bids."""
+    unit = normalize_text(material.get("unit"))
+    item_code = normalize_text(material.get("item_code"))
+    if item_code:
+        return f"code:{item_code}|unit:{unit}"
+    description = normalize_text(material.get("description"))
+    if description:
+        return f"description:{description}|unit:{unit}"
+    return ""
+
+
+def _bid_inventory_label(material: dict) -> str:
+    return str(
+        material.get("item_code")
+        or material.get("description")
+        or "Unnamed material"
+    ).strip()
+
+
+def _latest_timestamp(values: Iterable[Any]) -> str:
+    latest_value = ""
+    latest_date: datetime | None = None
+    for value in values:
+        parsed = _parse_iso(value)
+        if parsed and (latest_date is None or parsed > latest_date):
+            latest_value = str(value)
+            latest_date = parsed
+    return latest_value
+
+
+def _reply_activity_by_job(mailbox_email: str | None) -> dict[int, dict]:
+    """Summarize safely matched inbound vendor replies for the signed-in mailbox."""
+    if not mailbox_email:
+        return {}
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT matched_job_id AS job_id,
+                      COUNT(*) AS response_count,
+                      MAX(COALESCE(received_at, created_at)) AS latest_reply_at
+               FROM quote_email_messages
+               WHERE lower(mailbox_email)=?
+                 AND lower(direction) IN ('incoming', 'inbound')
+                 AND match_status='matched'
+                 AND matched_job_id IS NOT NULL
+               GROUP BY matched_job_id""",
+            (normalize_email(mailbox_email),),
+        ).fetchall()
+        return {
+            int(row["job_id"]): {
+                "response_count": int(row["response_count"] or 0),
+                "latest_reply_at": row["latest_reply_at"] or "",
+            }
+            for row in rows
+        }
+    finally:
+        conn.close()
+
+
 def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
-    """Return compact bid rows sorted by the estimator's next action."""
+    """Return bid rows with quote work, activity, and shared-inventory signals."""
     request_rows = (
         _mailbox_quote_requests(mailbox_email)
         if mailbox_email
@@ -1230,10 +1290,36 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
         "waiting": 4,
         "complete": 5,
     }
-    bids = []
-    for summary in list_jobs():
+    job_records = [
+        (summary, load_job(int(summary["id"])) or {})
+        for summary in list_jobs()
+    ]
+    inventory_by_key: dict[str, list[dict]] = {}
+    inventory_by_job: dict[int, dict[str, dict]] = {}
+    for summary, job in job_records:
         job_id = int(summary["id"])
-        job = load_job(job_id) or {}
+        material_keys: dict[str, dict] = {}
+        for material in job.get("materials") or []:
+            if material.get("deleted") or material.get("is_deleted"):
+                continue
+            key = _bid_inventory_key(material)
+            if key:
+                material_keys.setdefault(key, material)
+        inventory_by_job[job_id] = material_keys
+        for key, material in material_keys.items():
+            inventory_by_key.setdefault(key, []).append(
+                {
+                    "job_id": job_id,
+                    "slug": job.get("slug") or "",
+                    "project_name": job.get("project_name") or "Untitled Bid",
+                    "label": _bid_inventory_label(material),
+                }
+            )
+
+    reply_activity = _reply_activity_by_job(mailbox_email)
+    bids = []
+    for summary, job in job_records:
+        job_id = int(summary["id"])
         materials = job.get("materials") or []
         unpriced = [
             material
@@ -1331,6 +1417,47 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
             normalize_text(material.get("vendor")) or "unassigned"
             for material in unpriced
         }
+        shared_materials = []
+        shared_bid_ids: set[int] = set()
+        shared_material_count = 0
+        shared_unpriced_count = 0
+        unpriced_keys = {
+            _bid_inventory_key(material)
+            for material in unpriced
+            if _bid_inventory_key(material)
+        }
+        for key, material in inventory_by_job.get(job_id, {}).items():
+            other_bids = [
+                item for item in inventory_by_key.get(key, [])
+                if int(item["job_id"]) != job_id
+            ]
+            if not other_bids:
+                continue
+            shared_material_count += 1
+            other_ids = {int(item["job_id"]) for item in other_bids}
+            shared_bid_ids.update(other_ids)
+            if key in unpriced_keys:
+                shared_unpriced_count += 1
+            if len(shared_materials) < 3:
+                shared_materials.append(
+                    {
+                        "label": _bid_inventory_label(material),
+                        "unit": material.get("unit") or "",
+                        "other_bid_count": len(other_ids),
+                        "other_bids": other_bids[:3],
+                    }
+                )
+        activity_values = [job.get("created_at") or summary.get("created_at")]
+        if draft:
+            activity_values.append(draft.get("updated_at"))
+        for request in requests:
+            activity_values.extend(
+                request.get(field)
+                for field in ("created_at", "approved_at", "sent_at", "received_at")
+            )
+        reply = reply_activity.get(job_id, {})
+        if reply.get("latest_reply_at"):
+            activity_values.append(reply["latest_reply_at"])
         bids.append(
             {
                 "job_id": job_id,
@@ -1354,14 +1481,19 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
                 "request_statuses": status_counts,
                 "needs_matching_count": needs_matching,
                 "price_review_count": price_review,
+                "created_at": job.get("created_at") or summary.get("created_at") or "",
+                "last_activity_at": _latest_timestamp(activity_values),
+                "response_count": int(reply.get("response_count") or 0),
+                "latest_reply_at": reply.get("latest_reply_at") or "",
+                "replies_available": bool(mailbox_email),
+                "shared_material_count": shared_material_count,
+                "shared_unpriced_material_count": shared_unpriced_count,
+                "shared_bid_count": len(shared_bid_ids),
+                "shared_materials": shared_materials,
                 "quote_stage": stage,
                 "quote_stage_label": stage_labels[stage],
                 "next_action": next_action,
-                "updated_at": (
-                    draft.get("updated_at")
-                    if draft
-                    else job.get("created_at")
-                ),
+                "updated_at": _latest_timestamp(activity_values),
             }
         )
     bids.sort(
