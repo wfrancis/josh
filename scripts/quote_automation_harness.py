@@ -154,8 +154,10 @@ def run(
                 "passed": outlook.get("enabled") is True
                 and outlook.get("configured") is True
                 and outlook.get("mailbox_allowlist_count") == 1
-                and outlook.get("test_recipient_allowlist_count") == 1
-                and outlook.get("test_sender_allowlist_count") == 1
+                and 1 <= int(outlook.get("test_recipient_allowlist_count") or 0)
+                <= int(outlook.get("test_address_allowlist_limit") or 1)
+                and 1 <= int(outlook.get("test_sender_allowlist_count") or 0)
+                <= int(outlook.get("test_address_allowlist_limit") or 1)
                 and (outlook.get("mailbox_recheck") or {}).get(
                     "configured_mailbox_allowed"
                 )

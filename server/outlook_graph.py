@@ -56,6 +56,7 @@ SCOPES = (
 )
 SESSION_COOKIE = "si_outlook_session"
 CORRELATION_HEADER = "x-si-quote-token"
+MAX_STAGING_TEST_ADDRESSES = 5
 
 
 class OutlookConfigurationError(RuntimeError):
@@ -131,10 +132,18 @@ def configuration_status() -> dict:
     if len(config["allowed_emails"]) != 1:
         missing.append("OUTLOOK_ALLOWED_EMAILS (exactly one mailbox)")
     if config["mode"] != "production":
-        if len(config["test_recipients"]) != 1:
-            missing.append("QUOTE_TEST_ALLOWED_RECIPIENTS (exactly one address)")
-        if len(config["test_senders"]) != 1:
-            missing.append("QUOTE_TEST_INBOUND_SENDERS (exactly one address)")
+        recipient_count = len(config["test_recipients"])
+        sender_count = len(config["test_senders"])
+        if not 1 <= recipient_count <= MAX_STAGING_TEST_ADDRESSES:
+            missing.append(
+                "QUOTE_TEST_ALLOWED_RECIPIENTS "
+                f"(1 to {MAX_STAGING_TEST_ADDRESSES} named addresses)"
+            )
+        if not 1 <= sender_count <= MAX_STAGING_TEST_ADDRESSES:
+            missing.append(
+                "QUOTE_TEST_INBOUND_SENDERS "
+                f"(1 to {MAX_STAGING_TEST_ADDRESSES} named addresses)"
+            )
     configured_mailbox = next(iter(config["allowed_emails"]), "")
     replacement_mailbox = (
         f"{configured_mailbox}.replacement"
@@ -149,6 +158,7 @@ def configuration_status() -> dict:
         "mailbox_allowlist_count": len(config["allowed_emails"]),
         "test_recipient_allowlist_count": len(config["test_recipients"]),
         "test_sender_allowlist_count": len(config["test_senders"]),
+        "test_address_allowlist_limit": MAX_STAGING_TEST_ADDRESSES,
         "permissions": ["Mail.Read", "Mail.Send"],
         "can_modify_mail": False,
         "mailbox_recheck": {
