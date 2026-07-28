@@ -609,11 +609,9 @@ export default function MaterialQuotesHub() {
 
   return (
     <div className="mx-auto w-full max-w-[1500px] px-4 py-5 sm:px-6 lg:px-8">
-      <div className={`mb-5 flex flex-col gap-4 border-b border-white/[0.07] pb-4 sm:flex-row sm:items-end sm:justify-between ${
-        fullBidPath ? '' : 'max-sm:flex-row max-sm:items-center max-sm:justify-end max-sm:gap-0'
-      }`}>
-        <div className={fullBidPath ? '' : 'hidden sm:block'}>
-          <nav className="flex items-center gap-1 text-xs font-semibold text-gray-500" aria-label="Breadcrumb">
+      <div className="mb-5 flex flex-col gap-4 border-b border-white/[0.07] pb-4 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <nav className="hidden items-center gap-1 text-xs font-semibold text-gray-500 sm:flex" aria-label="Breadcrumb">
             {fullBidPath ? (
               <>
                 <Link to="/jobs" className="inline-flex items-center gap-1 hover:text-gray-300">
@@ -636,11 +634,11 @@ export default function MaterialQuotesHub() {
               </>
             )}
           </nav>
-          <div className="mt-2 flex items-center gap-2">
+          <div className="flex items-center gap-2 sm:mt-2">
             <Mail className="h-5 w-5 text-si-orange" />
             <h1 className="text-xl font-bold text-white">{title}</h1>
           </div>
-          <p className="mt-1 text-sm text-gray-500">
+          <p className="mt-1 hidden text-sm text-gray-500 sm:block">
             {description}
           </p>
         </div>
