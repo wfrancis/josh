@@ -323,58 +323,6 @@ export default function QuoteEmailCenter() {
 
   return (
     <div className="space-y-5">
-      <section className="border-b border-white/[0.07] pb-4">
-        <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <Mail className="h-4 w-4 text-gray-500" />
-              <h2 className="text-sm font-bold text-white">Outlook</h2>
-              <StatusPill
-                status={outlookConnected ? 'connected' : 'needs_setup'}
-                label={outlookConnected ? 'Connected' : 'Not Connected'}
-              />
-            </div>
-            <p className="mt-1 break-all text-xs text-gray-500">
-              {outlookConnected
-                ? outlook.email || outlook.mailbox_email || 'Microsoft mailbox connected'
-                : 'Connect Outlook to send requests and read vendor replies.'}
-            </p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {outlookConnected ? (
-              <>
-                <button
-                  type="button"
-                  onClick={syncOutlook}
-                  disabled={busyKey === 'sync'}
-                  className="inline-flex items-center gap-2 rounded-md border border-white/[0.1] px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] disabled:opacity-40"
-                >
-                  <RefreshCw className={`h-3.5 w-3.5 ${busyKey === 'sync' ? 'animate-spin' : ''}`} />
-                  Sync
-                </button>
-                <button
-                  type="button"
-                  onClick={requestDisconnectOutlook}
-                  disabled={busyKey === 'disconnect'}
-                  className="inline-flex items-center gap-2 rounded-md px-3 py-2 text-xs font-semibold text-gray-500 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"
-                >
-                  <Unplug className="h-3.5 w-3.5" />
-                  Disconnect
-                </button>
-              </>
-            ) : (
-              <a
-                href={api.outlookConnectUrl(returnTo)}
-                className="inline-flex items-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-500"
-              >
-                <Mail className="h-4 w-4" />
-                Connect Outlook
-              </a>
-            )}
-          </div>
-        </div>
-      </section>
-
       <section className="rounded-lg border border-white/[0.08] bg-white/[0.025] p-4">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div className="min-w-0">
@@ -437,6 +385,58 @@ export default function QuoteEmailCenter() {
         </div>
       </section>
 
+      <section className="border-b border-white/[0.07] pb-4">
+        <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <Mail className="h-4 w-4 text-gray-500" />
+              <h2 className="text-sm font-bold text-white">Outlook</h2>
+              <StatusPill
+                status={outlookConnected ? 'connected' : 'needs_setup'}
+                label={outlookConnected ? 'Connected' : 'Not Connected'}
+              />
+            </div>
+            <p className="mt-1 break-all text-xs text-gray-500">
+              {outlookConnected
+                ? outlook.email || outlook.mailbox_email || 'Microsoft mailbox connected'
+                : 'Connect Outlook to send requests and read vendor replies.'}
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {outlookConnected ? (
+              <>
+                <button
+                  type="button"
+                  onClick={syncOutlook}
+                  disabled={busyKey === 'sync'}
+                  className="inline-flex items-center gap-2 rounded-md border border-white/[0.1] px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] disabled:opacity-40"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${busyKey === 'sync' ? 'animate-spin' : ''}`} />
+                  Sync
+                </button>
+                <button
+                  type="button"
+                  onClick={requestDisconnectOutlook}
+                  disabled={busyKey === 'disconnect'}
+                  className="inline-flex items-center gap-2 rounded-md px-3 py-2 text-xs font-semibold text-gray-500 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"
+                >
+                  <Unplug className="h-3.5 w-3.5" />
+                  Disconnect
+                </button>
+              </>
+            ) : (
+              <a
+                href={api.outlookConnectUrl(returnTo)}
+                className="inline-flex items-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-500"
+              >
+                <Mail className="h-4 w-4" />
+                Connect Outlook
+              </a>
+            )}
+          </div>
+        </div>
+      </section>
+
       {error && (
         <div className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
           {error}
@@ -471,7 +471,7 @@ export default function QuoteEmailCenter() {
           onClick={() => load({ quiet: true })}
           disabled={refreshing}
           title="Refresh Quote Emails"
-          className="flex h-10 w-full items-center justify-center rounded-md text-gray-500 hover:bg-white/[0.04] hover:text-white disabled:opacity-40 sm:ml-auto sm:w-10 sm:flex-shrink-0 sm:rounded-none"
+          className="hidden h-10 w-10 items-center justify-center rounded-md text-gray-500 hover:bg-white/[0.04] hover:text-white disabled:opacity-40 sm:ml-auto sm:flex sm:flex-shrink-0 sm:rounded-none"
         >
           <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
         </button>
