@@ -672,14 +672,14 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
               onClick={() => setFilter(key)}
               aria-pressed={activeFilter === key}
               aria-label={`${VIEW_DETAILS[key].title}: ${Number(scopedSummary[key] || 0)} items`}
-              className={`flex min-h-11 min-w-0 items-center justify-between gap-1 rounded-md px-2 text-xs font-semibold sm:flex-1 sm:justify-start sm:gap-2 sm:px-3 sm:text-sm ${
+              className={`flex min-h-11 min-w-0 items-center justify-center gap-1 rounded-md px-1 text-xs font-semibold sm:flex-1 sm:justify-start sm:gap-2 sm:px-3 sm:text-sm ${
                 activeFilter === key
                   ? 'bg-si-orange text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]'
                   : 'text-gray-400 hover:bg-white/[0.05] hover:text-gray-200'
               }`}
             >
-              <span className="truncate">{label}</span>
-              <span className={`rounded-md px-1.5 py-0.5 text-[11px] tabular-nums ${
+              <span className="whitespace-nowrap">{label}</span>
+              <span className={`hidden rounded-md px-1.5 py-0.5 text-[11px] tabular-nums sm:inline ${
                 activeFilter === key ? 'bg-black/15 text-white' : 'bg-white/[0.06] text-gray-400'
               }`}>
                 {Number(scopedSummary[key] || 0)}
