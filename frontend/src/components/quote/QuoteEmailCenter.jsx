@@ -532,7 +532,7 @@ export default function QuoteEmailCenter() {
                     {draft.stale && (
                       <div className="flex items-start gap-2 border-b border-orange-500/15 bg-orange-500/[0.05] px-4 py-3 text-xs text-orange-300">
                         <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
-                        This bid changed. Open it and save fresh vendor groups before sending.
+                        This bid changed. Open the bid and save a fresh email draft before sending.
                       </div>
                     )}
 
