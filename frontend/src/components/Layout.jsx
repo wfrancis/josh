@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell, Building2, ListChecks } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell, Building2, ListChecks, Mail } from 'lucide-react'
 import { api } from '../api'
 
 function NavItem({ to, icon: Icon, label, active, onClick }) {
@@ -127,7 +127,8 @@ function SidebarContent({ location, onNavigate }) {
           Workspace
         </div>
         <NavItem to="/" icon={LayoutDashboard} label="Dashboard" active={location.pathname === '/'} onClick={onNavigate} />
-        <NavItem to="/jobs" icon={FolderOpen} label="Jobs" active={location.pathname === '/jobs' || location.pathname.startsWith('/jobs/')} onClick={onNavigate} />
+        <NavItem to="/jobs" icon={FolderOpen} label="Jobs" active={location.pathname === '/jobs' || (location.pathname.startsWith('/jobs/') && !location.pathname.startsWith('/jobs/bids'))} onClick={onNavigate} />
+        <NavItem to="/quote-emails" icon={Mail} label="Quote Email Center" active={location.pathname.startsWith('/quote-emails') || location.pathname.startsWith('/jobs/bids')} onClick={onNavigate} />
       </nav>
 
       {/* Bottom section */}
@@ -174,7 +175,7 @@ function NotificationBell() {
       const quoteNotification = String(n.type || n.action || '').toLowerCase().includes('quote')
       navigate(
         quoteNotification
-          ? `/jobs/bids/quote-emails?job=${n.job_id}&view=needs_you`
+          ? `/quote-emails?job=${n.job_id}&view=needs_you`
           : `/jobs/${n.job_id}`,
       )
       setOpen(false)

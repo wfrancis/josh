@@ -1283,12 +1283,12 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
             }[stage]
             next_action = {
                 "label": {
-                    "needs_review": "Review Email",
+                    "needs_review": "Open Email Center",
                     "overdue": "Check Overdue Email",
                     "ready_to_send": "Review & Send",
                     "waiting": "Check Vendor Reply",
                 }[stage],
-                "url": f"/jobs/bids/quote-emails?job={job_id}&view={email_view}",
+                "url": f"/quote-emails?job={job_id}&view={email_view}",
             }
         vendor_keys = {
             normalize_text(material.get("vendor")) or "unassigned"

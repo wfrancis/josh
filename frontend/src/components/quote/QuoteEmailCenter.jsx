@@ -38,7 +38,7 @@ const FILTERS = [
   ['complete', 'Complete'],
 ]
 
-const QUOTE_EMAILS_PATH = '/jobs/bids/quote-emails'
+const QUOTE_EMAILS_PATH = '/quote-emails'
 
 const requestBucket = (request) => {
   const status = normalizeStatus(request.status)
@@ -87,7 +87,7 @@ export default function QuoteEmailCenter() {
       setCenter(data || {})
       setDirtyGroups({})
     } catch (err) {
-      setError(err.message || 'Quote Emails could not load.')
+      setError(err.message || 'Quote Email Center could not load.')
     } finally {
       setLoading(false)
       setRefreshing(false)
@@ -470,7 +470,7 @@ export default function QuoteEmailCenter() {
           type="button"
           onClick={() => load({ quiet: true })}
           disabled={refreshing}
-          title="Refresh Quote Emails"
+          title="Refresh Quote Email Center"
           className="hidden h-10 w-10 items-center justify-center rounded-md text-gray-500 hover:bg-white/[0.04] hover:text-white disabled:opacity-40 sm:ml-auto sm:flex sm:flex-shrink-0 sm:rounded-none"
         >
           <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />

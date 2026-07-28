@@ -268,7 +268,7 @@ export default function BidQuotePlan({
   const quoteEmailView = allMaterialsRequested
     ? 'waiting'
     : (draft?.stale || incompleteGroupCount ? 'needs_you' : 'ready_to_send')
-  const quoteEmailUrl = `/jobs/bids/quote-emails?job=${jobId}&view=${quoteEmailView}`
+  const quoteEmailUrl = `/quote-emails?job=${jobId}&view=${quoteEmailView}`
   const canReviewEmail = Boolean(draft && !draft.stale && !incompleteGroupCount)
   const canOpenQuoteEmails = canReviewEmail || allMaterialsRequested
 
@@ -280,7 +280,7 @@ export default function BidQuotePlan({
             <p className="text-xs font-semibold uppercase text-si-orange">Step 2 of 3</p>
             <h2 className="mt-1 text-xl font-bold text-white">Quote Emails</h2>
             <p className="mt-1 text-sm text-gray-500">
-              Check the vendor and materials here. Review and send the email on the next screen.
+              Check the vendor and materials here. Then open Quote Email Center to review and send the email.
             </p>
           </div>
           <StatusPill
@@ -500,7 +500,7 @@ export default function BidQuotePlan({
                 className="grid gap-2 px-4 py-3 text-sm sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
               >
                 <span className="text-gray-300">{materialLabel(material)}</span>
-                <StatusPill status="waiting" label="In Quote Emails" />
+                <StatusPill status="waiting" label="In Email Center" />
               </div>
             ))}
           </div>
@@ -520,7 +520,7 @@ export default function BidQuotePlan({
           </p>
           <p className="mt-1 text-xs text-gray-500">
             {allMaterialsRequested
-              ? 'Check vendor replies and follow-ups in Quote Emails.'
+              ? 'Check vendor replies and follow-ups in Quote Email Center.'
               : incompleteGroupCount
                 ? 'Add the vendor email above, then save the draft.'
                 : 'Saving creates an email draft. It does not send email.'}
@@ -533,7 +533,7 @@ export default function BidQuotePlan({
               className="inline-flex items-center justify-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-500"
             >
               <Mail className="h-4 w-4" />
-              {allMaterialsRequested ? 'Check Quote Emails' : 'Review Email'}
+              Open Quote Email Center
             </Link>
           )}
           <button
@@ -566,7 +566,7 @@ export default function BidQuotePlan({
         <div className="text-center sm:text-right">
           {!workflowComplete && (
             <p className="mb-2 text-xs text-amber-300">
-              Finish vendor quotes in Quote Emails before Review & Generate.
+              Finish vendor quotes in Quote Email Center before Review & Generate.
             </p>
           )}
           <button
