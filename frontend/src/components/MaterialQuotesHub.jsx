@@ -609,7 +609,11 @@ export default function MaterialQuotesHub() {
 
   return (
     <div className="mx-auto w-full max-w-[1500px] px-4 py-5 sm:px-6 lg:px-8">
-      <div className="mb-5 flex flex-col gap-4 border-b border-white/[0.07] pb-4 sm:flex-row sm:items-end sm:justify-between">
+      <div className={`mb-5 border-b border-white/[0.07] pb-4 ${
+        fullBidPath
+          ? 'flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between'
+          : 'flex items-center justify-between gap-3'
+      }`}>
         <div>
           <nav className="hidden items-center gap-1 text-xs font-semibold text-gray-500 sm:flex" aria-label="Breadcrumb">
             {fullBidPath ? (
@@ -670,11 +674,12 @@ export default function MaterialQuotesHub() {
         ) : (
           <Link
             to="/jobs/bids"
-            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-sm font-semibold text-gray-300 hover:bg-white/[0.05]"
+            className="inline-flex min-h-11 flex-shrink-0 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-sm font-semibold text-gray-300 hover:bg-white/[0.05]"
           >
             <Briefcase className="h-4 w-4" />
-            Browse Bids
-            <ArrowRight className="h-4 w-4" />
+            <span className="sm:hidden">Bids</span>
+            <span className="hidden sm:inline">Browse Bids</span>
+            <ArrowRight className="hidden h-4 w-4 sm:block" />
           </Link>
         )}
       </div>

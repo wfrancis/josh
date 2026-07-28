@@ -13,8 +13,6 @@ import {
   Inbox,
   Loader2,
   Mail,
-  MailCheck,
-  PackageSearch,
   RefreshCw,
   Save,
   Search,
@@ -85,21 +83,23 @@ const requestBucket = (request) => {
 }
 
 const BOARD_FILTERS = [
-  ['all', 'All'],
-  ['needs_me', 'Needs Me'],
-  ['replies', 'Replies In'],
-  ['ready', 'Ready to Send'],
+  ['todo', 'To Do'],
+  ['replies', 'Has Replies'],
   ['waiting', 'Waiting'],
-  ['shared', 'Shared Items'],
-  ['closed', 'Closed'],
+  ['all', 'All Bids'],
+]
+
+const BOARD_MORE_FILTERS = [
+  ['complete', 'Complete'],
+  ['shared', 'Same Materials'],
 ]
 
 const BOARD_SORTS = [
-  ['attention', 'Needs attention first'],
+  ['attention', 'Priority'],
   ['activity', 'Latest activity first'],
+  ['replies', 'Newest reply'],
   ['newest', 'Newest bids first'],
-  ['replies', 'Most vendor replies'],
-  ['vendors', 'Most vendors waiting'],
+  ['project', 'Project A-Z'],
 ]
 
 const BOARD_STAGE_PRIORITY = {
@@ -176,12 +176,11 @@ const needsEstimator = (bid) => (
 
 const boardFilterMatches = (bid, filter) => {
   if (filter === 'all') return true
-  if (filter === 'needs_me') return needsEstimator(bid)
+  if (filter === 'todo') return needsEstimator(bid)
   if (filter === 'replies') return hasReply(bid)
-  if (filter === 'ready') return bid.quote_stage === 'ready_to_send'
   if (filter === 'waiting') return bid.quote_stage === 'waiting'
   if (filter === 'shared') return number(bid.shared_material_count) > 0
-  if (filter === 'closed') return bid.quote_stage === 'complete'
+  if (filter === 'complete') return bid.quote_stage === 'complete'
   return true
 }
 
@@ -201,16 +200,12 @@ const sortBidTiles = (bids, sort) => bids.slice().sort((left, right) => {
   }
   if (sort === 'newest') return dateNumber(right.created_at) - dateNumber(left.created_at)
   if (sort === 'replies') {
-    const difference = (
-      number(right.response_count) + reviewCount(right)
-    ) - (
-      number(left.response_count) + reviewCount(left)
+    return (
+      dateNumber(right.latest_reply_at) - dateNumber(left.latest_reply_at)
+      || number(right.response_count) - number(left.response_count)
     )
-    return difference || dateNumber(right.latest_reply_at) - dateNumber(left.latest_reply_at)
   }
-  if (sort === 'vendors') {
-    return number(right.active_request_count) - number(left.active_request_count)
-  }
+  if (sort === 'project') return String(left.project_name || '').localeCompare(String(right.project_name || ''))
   return (
     number(BOARD_STAGE_PRIORITY[left.quote_stage] ?? 99)
     - number(BOARD_STAGE_PRIORITY[right.quote_stage] ?? 99)
@@ -221,8 +216,16 @@ const sortBidTiles = (bids, sort) => bids.slice().sort((left, right) => {
 
 const quoteWorkAction = (bid, basePath) => {
   const bidUrl = `/jobs/${bid.slug || bid.job_id}?step=quotes`
-  if (bid.draft_stale) return { to: bidUrl, label: 'Update Quote Email' }
-  if (bid.quote_stage === 'needs_setup') return { to: bidUrl, label: 'Set Up Quote Email' }
+  const needsMatching = number(bid.needs_matching_count)
+  const priceReview = number(bid.price_review_count)
+  if (needsMatching) {
+    return { to: `${basePath}?job=${encodeURIComponent(bid.job_id)}&view=needs_you`, label: needsMatching === 1 ? 'Match Email' : 'Match Emails' }
+  }
+  if (priceReview) {
+    return { to: `${basePath}?job=${encodeURIComponent(bid.job_id)}&view=needs_you`, label: priceReview === 1 ? 'Review Price' : 'Review Prices' }
+  }
+  if (bid.draft_stale) return { to: bidUrl, label: 'Update Request' }
+  if (bid.quote_stage === 'needs_setup') return { to: bidUrl, label: 'Set Up Request' }
   if (bid.quote_stage === 'complete') return {
     to: `/jobs/${bid.slug || bid.job_id}`,
     label: 'View Bid',
@@ -237,157 +240,197 @@ const quoteWorkAction = (bid, basePath) => {
     to: `${basePath}?job=${encodeURIComponent(bid.job_id)}&view=${view}`,
     label: {
       needs_review: 'Review Reply',
-      overdue: 'Follow Up',
+      overdue: 'Follow Up Now',
       ready_to_send: 'Review & Send',
-      waiting: 'View Email Status',
+      waiting: 'View Status',
     }[bid.quote_stage] || 'Open Quote Work',
   }
 }
 
-const bidWorkMessage = (bid) => {
-  const reviews = reviewCount(bid)
+const bidActionDetails = (bid) => {
+  const needsMatching = number(bid.needs_matching_count)
+  const priceReview = number(bid.price_review_count)
   const { active, cancelled, completed } = requestCounts(bid)
-  if (reviews) return plural(reviews, 'reply needs review', 'replies need review')
-  if (bid.draft_stale) return 'This bid changed. Update its saved email.'
-  if (bid.quote_stage === 'overdue') return plural(active, 'vendor needs a follow-up', 'vendors need a follow-up')
+  if (needsMatching) return {
+    label: 'Match Email',
+    state: 'action',
+    message: plural(needsMatching, 'vendor reply needs a bid match', 'vendor replies need bid matches'),
+    progress: bid.unpriced_count ? plural(number(bid.unpriced_count), 'material still needs pricing', 'materials still need pricing') : 'All materials are priced',
+  }
+  if (priceReview) return {
+    label: 'Review Prices',
+    state: 'action',
+    message: plural(priceReview, 'quoted price needs your decision', 'quoted prices need your decision'),
+    progress: bid.unpriced_count ? plural(number(bid.unpriced_count), 'material still needs pricing', 'materials still need pricing') : 'All materials are priced',
+  }
+  if (bid.draft_stale) return {
+    label: 'Update Request',
+    state: 'action',
+    message: 'The bid changed after this email was prepared.',
+    progress: 'Refresh the request before it can be sent',
+  }
+  if (bid.quote_stage === 'overdue') return {
+    label: 'Follow Up Now',
+    state: 'action',
+    message: plural(active, 'vendor reply is overdue', 'vendor replies are overdue'),
+    progress: bid.unpriced_count
+      ? plural(number(bid.unpriced_count), 'material still needs pricing', 'materials still need pricing')
+      : 'All materials are priced',
+  }
   if (bid.quote_stage === 'ready_to_send') {
-    return plural(number(bid.draft_ready_count), 'email ready to send', 'emails ready to send')
+    return {
+      label: 'Review & Send',
+      state: 'action',
+      message: plural(number(bid.draft_ready_count), 'vendor email is ready to send', 'vendor emails are ready to send'),
+      progress: bid.unpriced_count
+        ? plural(number(bid.unpriced_count), 'material is included', 'materials are included')
+        : 'All materials are priced',
+    }
   }
   if (bid.quote_stage === 'needs_setup') {
-    return plural(number(bid.unpriced_count), 'material needs a price', 'materials need prices')
+    return {
+      label: 'Set Up Request',
+      state: 'action',
+      message: plural(number(bid.unpriced_count), 'material needs vendor pricing', 'materials need vendor pricing'),
+      progress: bid.vendor_names?.length ? plural(number(bid.vendor_group_count), 'vendor group is ready to set up', 'vendor groups are ready to set up') : 'Choose a vendor before sending',
+    }
   }
-  if (bid.quote_stage === 'waiting') return plural(active, 'vendor is still waiting', 'vendors are still waiting')
-  if (completed) return plural(completed, 'vendor quote is complete', 'vendor quotes are complete')
-  if (cancelled) return plural(cancelled, 'quote request was cancelled', 'quote requests were cancelled')
-  return 'No quote email work is open.'
+  if (bid.quote_stage === 'waiting') return {
+    label: 'Waiting on Vendor',
+    state: 'waiting',
+    message: plural(active, 'vendor is still preparing a quote', 'vendors are still preparing quotes'),
+    progress: bid.unpriced_count ? plural(number(bid.unpriced_count), 'material is still unpriced', 'materials are still unpriced') : 'All materials are priced',
+  }
+  if (completed) return {
+    label: 'Complete',
+    state: 'complete',
+    message: plural(completed, 'vendor quote is complete', 'vendor quotes are complete'),
+    progress: 'No quote email work is open',
+  }
+  if (cancelled) return {
+    label: 'Complete',
+    state: 'complete',
+    message: plural(cancelled, 'quote request was cancelled', 'quote requests were cancelled'),
+    progress: 'No quote email work is open',
+  }
+  return {
+    label: 'Complete',
+    state: 'complete',
+    message: 'No quote email work is open.',
+    progress: bid.unpriced_count ? plural(number(bid.unpriced_count), 'material is still unpriced', 'materials are still unpriced') : 'All materials are priced',
+  }
+}
+
+const boardWorkSummary = (bids) => {
+  const rows = asArray(bids)
+  const matching = rows.reduce((count, bid) => count + number(bid.needs_matching_count), 0)
+  const prices = rows.reduce((count, bid) => count + number(bid.price_review_count), 0)
+  const overdue = rows.filter((bid) => bid.quote_stage === 'overdue').length
+  const stale = rows.filter((bid) => bid.draft_stale).length
+  const ready = rows.filter((bid) => bid.quote_stage === 'ready_to_send').length
+  const setup = rows.filter((bid) => bid.quote_stage === 'needs_setup').length
+  const parts = [
+    matching && plural(matching, 'email to match', 'emails to match'),
+    prices && plural(prices, 'price to review', 'prices to review'),
+    overdue && plural(overdue, 'follow-up due', 'follow-ups due'),
+    stale && plural(stale, 'request to update', 'requests to update'),
+    ready && plural(ready, 'bid ready to send', 'bids ready to send'),
+    setup && plural(setup, 'bid to set up', 'bids to set up'),
+  ].filter(Boolean)
+  return parts.slice(0, 3).join(' · ') || 'No quote email work needs you right now.'
 }
 
 function QuoteEmailBidTile({ bid, basePath }) {
   const action = quoteWorkAction(bid, basePath)
-  const reviews = reviewCount(bid)
-  const { active, cancelled, completed } = requestCounts(bid)
+  const actionDetails = bidActionDetails(bid)
   const vendorNames = asArray(bid.vendor_names).filter(Boolean)
-  const replyCount = number(bid.response_count)
-  const unpricedCount = number(bid.unpriced_count)
-  const sharedCount = number(bid.shared_material_count)
   const location = [bid.city, bid.state].filter(Boolean).join(', ')
-  const emailMetric = reviews
-    ? plural(reviews, 'reply needs review', 'replies need review')
-    : active
-      ? plural(active, 'vendor waiting', 'vendors waiting')
-      : completed
-        ? plural(completed, 'quote complete', 'quotes complete')
-        : cancelled
-          ? plural(cancelled, 'cancelled request', 'cancelled requests')
-          : 'No request sent'
+  const vendorLine = vendorNames.length
+    ? `Vendor: ${vendorNames.slice(0, 2).join(', ')}${vendorNames.length > 2 ? ` +${vendorNames.length - 2}` : ''}`
+    : actionDetails.state === 'action'
+      ? 'Vendor still needs to be chosen'
+      : 'No vendor is listed'
+  const activityLine = number(bid.response_count) && bid.latest_reply_at
+    ? `Last reply ${relativeDate(bid.latest_reply_at)}`
+    : `Updated ${relativeDate(bid.last_activity_at || bid.created_at)}`
+  const actionClass = actionDetails.state === 'action'
+    ? 'bg-si-orange text-[#0A0F1E] group-hover:bg-orange-400'
+    : actionDetails.state === 'waiting'
+      ? 'border border-white/[0.12] text-gray-200 group-hover:border-white/[0.2] group-hover:bg-white/[0.05]'
+      : 'border border-emerald-400/25 text-emerald-200 group-hover:bg-emerald-400/[0.06]'
+  const statusClass = actionDetails.state === 'action'
+    ? 'border-orange-400/30 bg-orange-400/[0.08] text-orange-300'
+    : actionDetails.state === 'waiting'
+      ? 'border-white/[0.12] bg-white/[0.035] text-gray-300'
+      : 'border-emerald-400/30 bg-emerald-400/[0.08] text-emerald-300'
 
   return (
-    <article className="flex min-w-0 flex-col rounded-lg border border-white/[0.08] bg-white/[0.025] p-4 transition-colors hover:border-white/[0.15] hover:bg-white/[0.04]">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <Link
-              to={action.to}
-              className="truncate text-base font-bold text-white hover:text-blue-300"
-            >
-              {bid.project_name || 'Untitled Bid'}
-            </Link>
-            <span className="rounded border border-white/[0.08] bg-black/15 px-1.5 py-0.5 text-[10px] font-semibold text-gray-500">
-              Bid #{bid.job_id}
-            </span>
-          </div>
-          <p className="mt-1 truncate text-sm text-gray-400">
+    <article className="min-w-0">
+      <Link
+        to={action.to}
+        aria-label={`${action.label} for ${bid.project_name || 'this bid'}`}
+        className="group flex min-h-[220px] min-w-0 flex-col rounded-lg border border-white/[0.08] bg-white/[0.025] p-4 transition-colors hover:border-white/[0.16] hover:bg-white/[0.045] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-[#080D18]"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className={`rounded-md border px-2 py-1 text-xs font-bold ${statusClass}`}>
+            {actionDetails.label}
+          </span>
+          <span className="rounded-md border border-white/[0.1] bg-black/15 px-2 py-1 text-xs font-semibold text-gray-400">
+            Bid #{bid.job_id}
+          </span>
+        </div>
+
+        <div className="mt-4 min-w-0">
+          <h3 className="truncate text-lg font-bold text-white group-hover:text-blue-200">
+            {bid.project_name || 'Untitled Bid'}
+          </h3>
+          <p className="mt-1 truncate text-sm text-gray-300">
             {[bid.gc_name, location].filter(Boolean).join(' | ') || 'No GC or location listed'}
           </p>
         </div>
-        <StatusPill status={bid.quote_stage} label={bid.quote_stage_label} />
-      </div>
 
-      <p className="mt-4 min-h-5 text-sm font-semibold text-gray-200">
-        {bidWorkMessage(bid)}
-      </p>
+        <p className="mt-5 text-sm font-semibold leading-6 text-gray-100">
+          {actionDetails.message}
+        </p>
 
-      <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 border-y border-white/[0.07] py-3 text-xs">
-        <div className="min-w-0">
-          <span className="flex items-center gap-1.5 text-gray-500">
-            <PackageSearch className="h-3.5 w-3.5" />
-            Materials
+        <div className="mt-4 border-y border-white/[0.07] py-3 text-xs">
+          <p className="truncate font-semibold text-gray-300">{actionDetails.progress}</p>
+          <p className="mt-1 truncate text-gray-500">{vendorLine}</p>
+        </div>
+
+        <div className="mt-auto flex items-center justify-between gap-3 pt-3">
+          <span className="inline-flex min-w-0 items-center gap-1.5 truncate text-xs text-gray-500">
+            <Clock3 className="h-3.5 w-3.5 flex-shrink-0" />
+            {activityLine}
           </span>
-          <p className={`mt-1 truncate font-semibold ${unpricedCount ? 'text-orange-300' : 'text-emerald-300'}`}>
-            {unpricedCount
-              ? plural(unpricedCount, 'material needs a price', 'materials need prices')
-              : 'All priced'}
-          </p>
-        </div>
-        <div className="min-w-0">
-          <span className="flex items-center gap-1.5 text-gray-500">
-            <Mail className="h-3.5 w-3.5" />
-            Vendor email
+          <span className={`inline-flex min-h-10 flex-shrink-0 items-center gap-2 rounded-md px-3 text-sm font-bold ${actionClass}`}>
+            {action.label}
+            <ArrowRight className="h-4 w-4" />
           </span>
-          <p className={`mt-1 truncate font-semibold ${reviews ? 'text-orange-300' : 'text-gray-300'}`}>
-            {emailMetric}
-          </p>
         </div>
-        {bid.replies_available && (
-          <div className="min-w-0">
-            <span className="flex items-center gap-1.5 text-gray-500">
-              <MailCheck className="h-3.5 w-3.5" />
-              Replies
-            </span>
-            <p className={`mt-1 truncate font-semibold ${replyCount ? 'text-sky-300' : 'text-gray-400'}`}>
-              {replyCount
-                ? `${plural(replyCount, 'reply', 'replies')} ${bid.latest_reply_at ? `· ${relativeDate(bid.latest_reply_at)}` : ''}`
-                : 'No new reply'}
-            </p>
-          </div>
-        )}
-        {sharedCount > 0 && (
-          <div className="min-w-0">
-            <span className="flex items-center gap-1.5 text-gray-500">
-              <Briefcase className="h-3.5 w-3.5" />
-              Shared items
-            </span>
-            <p className="mt-1 truncate font-semibold text-blue-300">
-              {plural(sharedCount, 'match in another bid', 'matches in other bids')}
-            </p>
-          </div>
-        )}
-      </div>
-
-      <div className="mt-3 flex min-w-0 flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0 text-xs text-gray-500">
-          <p className="inline-flex items-center gap-1.5">
-            <Clock3 className="h-3.5 w-3.5" />
-            Updated {relativeDate(bid.last_activity_at || bid.created_at)}
-          </p>
-          {vendorNames.length > 0 && (
-            <p className="mt-1 truncate">Vendors: {vendorNames.slice(0, 2).join(', ')}{vendorNames.length > 2 ? ` +${vendorNames.length - 2}` : ''}</p>
-          )}
-        </div>
-        <Link
-          to={action.to}
-          aria-label={`${action.label} for ${bid.project_name || 'this bid'}`}
-          className="inline-flex min-h-11 flex-shrink-0 items-center gap-2 rounded-md bg-si-orange px-3.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400"
-        >
-          {action.label}
-          <ArrowRight className="h-4 w-4" />
-        </Link>
-      </div>
+      </Link>
     </article>
   )
 }
 
 function QuoteEmailBidBoard({ bids, basePath, onRefresh, refreshing }) {
   const [query, setQuery] = useState('')
-  const [filter, setFilter] = useState('all')
+  const [filter, setFilter] = useState('todo')
   const [sort, setSort] = useState('attention')
   const normalizedQuery = query.trim().toLocaleLowerCase()
   const filterCounts = useMemo(() => Object.fromEntries(
-    BOARD_FILTERS.map(([key]) => [
+    [...BOARD_FILTERS, ...BOARD_MORE_FILTERS].map(([key]) => [
       key,
       asArray(bids).filter((bid) => boardFilterMatches(bid, key)).length,
     ]),
   ), [bids])
+  const nextBid = useMemo(() => sortBidTiles(
+    asArray(bids).filter(needsEstimator),
+    'attention',
+  )[0], [bids])
+  const nextAction = nextBid ? quoteWorkAction(nextBid, basePath) : null
+  const todoCount = filterCounts.todo || 0
+  const selectedMoreFilter = BOARD_MORE_FILTERS.some(([key]) => key === filter) ? filter : ''
   const visibleBids = useMemo(() => sortBidTiles(
     asArray(bids).filter((bid) => (
       boardFilterMatches(bid, filter)
@@ -397,41 +440,54 @@ function QuoteEmailBidBoard({ bids, basePath, onRefresh, refreshing }) {
   ), [bids, filter, normalizedQuery, sort])
 
   return (
-    <section aria-labelledby="quote-email-bid-board-title" className="space-y-3">
-      <div className="flex flex-col gap-3 border-b border-white/[0.08] pb-3 sm:flex-row sm:items-end sm:justify-between">
+    <section aria-labelledby="quote-email-bid-board-title" className="space-y-4">
+      <div className="flex flex-col gap-3 border-b border-white/[0.08] pb-4 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <p className="text-xs font-semibold uppercase text-gray-500">Choose a bid</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Today&apos;s quote work</p>
           <h2 id="quote-email-bid-board-title" className="mt-1 text-lg font-bold text-white">
-            Quote email work by bid
+            {todoCount
+              ? `${todoCount} ${todoCount === 1 ? 'bid needs' : 'bids need'} you`
+              : 'Quote emails are caught up'}
           </h2>
           <p className="mt-1 text-sm text-gray-500">
-            Find the bid first. Open it only when you need to work the emails.
+            {boardWorkSummary(bids)}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={onRefresh}
-          disabled={refreshing}
-          title="Refresh bid email work"
-          aria-label="Refresh bid email work"
-          className="inline-flex min-h-11 min-w-11 items-center justify-center self-start rounded-md border border-white/[0.1] text-gray-400 hover:bg-white/[0.05] hover:text-white disabled:opacity-40 sm:self-auto"
-        >
-          <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-        </button>
+        {nextAction && (
+          <Link
+            to={nextAction.to}
+            className="inline-flex min-h-11 items-center justify-center gap-2 self-start rounded-md bg-si-orange px-3.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400 sm:self-auto"
+          >
+            Start next task
+            <ArrowRight className="h-4 w-4" />
+          </Link>
+        )}
       </div>
 
       <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_250px]">
-        <label className="relative block">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
-          <span className="sr-only">Search quote email bids</span>
-          <input
-            type="search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search bid, GC, vendor, or bid number"
-            className="min-h-11 w-full rounded-md border border-white/[0.1] bg-[#0D1322] py-2 pl-10 pr-3 text-sm text-gray-200 outline-none placeholder:text-gray-600 focus:border-blue-400/50"
-          />
-        </label>
+        <div className="flex gap-2">
+          <label className="relative block min-w-0 flex-1">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+            <span className="sr-only">Search quote email bids</span>
+            <input
+              type="search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search project, GC, vendor, or bid number"
+              className="min-h-11 w-full rounded-md border border-white/[0.1] bg-[#0D1322] py-2 pl-10 pr-3 text-sm text-gray-200 outline-none placeholder:text-gray-600 focus:border-blue-400/50"
+            />
+          </label>
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={refreshing}
+            title="Refresh quote work"
+            aria-label="Refresh quote work"
+            className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md border border-white/[0.1] text-gray-400 hover:bg-white/[0.05] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 disabled:opacity-40"
+          >
+            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
         <label className="relative block">
           <ArrowDownUp className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
           <span className="sr-only">Sort quote email bids</span>
@@ -447,7 +503,9 @@ function QuoteEmailBidBoard({ bids, basePath, onRefresh, refreshing }) {
       </div>
 
       <div className="flex flex-wrap gap-2" role="group" aria-label="Filter quote email bids">
-        {BOARD_FILTERS.map(([key, label]) => (
+        {BOARD_FILTERS.filter(([key]) => (
+          key === 'todo' || key === 'all' || filterCounts[key] > 0 || filter === key
+        )).map(([key, label]) => (
           <button
             key={key}
             type="button"
@@ -467,14 +525,28 @@ function QuoteEmailBidBoard({ bids, basePath, onRefresh, refreshing }) {
             </span>
           </button>
         ))}
+        <label className="relative">
+          <span className="sr-only">More quote email filters</span>
+          <select
+            value={selectedMoreFilter}
+            onChange={(event) => setFilter(event.target.value || 'todo')}
+            className="min-h-10 rounded-md border border-white/[0.1] bg-[#0D1322] px-3 pr-8 text-xs font-semibold text-gray-400 outline-none focus:border-blue-400/50"
+          >
+            <option value="">More filters</option>
+            {BOARD_MORE_FILTERS.map(([key, label]) => (
+              <option key={key} value={key}>{label} ({filterCounts[key] || 0})</option>
+            ))}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-500" />
+        </label>
       </div>
 
       <p aria-live="polite" className="text-xs text-gray-500">
-        {visibleBids.length === 1 ? '1 bid found' : `${visibleBids.length} bids found`}
+        {visibleBids.length === 1 ? '1 bid shown' : `${visibleBids.length} bids shown`}
       </p>
 
       {visibleBids.length ? (
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        <div className="grid gap-3 lg:grid-cols-2 2xl:grid-cols-3">
           {visibleBids.map((bid) => (
             <QuoteEmailBidTile key={bid.job_id} bid={bid} basePath={basePath} />
           ))}
@@ -1053,7 +1125,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
       ) : (
         <section
           aria-label="Email connection"
-          className="flex flex-col gap-3 border-b border-white/[0.08] pb-4 sm:flex-row sm:items-center sm:justify-between"
+          className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.08] pb-3 sm:pb-4"
         >
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
@@ -1064,7 +1136,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
                 label={outlookConnected ? 'Connected' : 'Not Connected'}
               />
             </div>
-            <p className="mt-1 text-xs text-gray-500">
+            <p className="mt-1 hidden text-xs text-gray-500 sm:block">
               {outlookConnected
                 ? outlook.email || outlook.mailbox_email || 'Microsoft mailbox connected'
                 : 'Connect Outlook to send requests and see vendor replies.'}
@@ -1095,7 +1167,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
             ) : (
               <a
                 href={api.outlookConnectUrl(returnTo)}
-                className="inline-flex min-h-11 items-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400"
+                className="inline-flex min-h-10 items-center gap-2 rounded-md bg-si-orange px-3 py-2 text-xs font-bold text-[#0A0F1E] hover:bg-orange-400 sm:min-h-11 sm:px-4 sm:py-2.5 sm:text-sm"
               >
                 <Mail className="h-4 w-4" />
                 Connect Outlook
