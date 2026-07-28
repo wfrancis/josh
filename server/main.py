@@ -3253,7 +3253,7 @@ def api_update_quote(quote_id: int, body: dict = Body(...)):
     if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
         raise HTTPException(
             status_code=409,
-            detail="Use the Material Quotes review screen to approve or reject a price.",
+            detail="Use Quote Emails to approve or reject a price.",
         )
     job_id = get_quote_job_id(quote_id)
     if not job_id:
@@ -7558,7 +7558,7 @@ async def api_create_quote_request(job_id: str, request: Request):
     if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
         raise HTTPException(
             status_code=410,
-            detail="Use the Material Quotes tab for deterministic quote requests.",
+            detail="Use Jobs, then Bids, then Quote Emails for deterministic quote requests.",
         )
     db_id = _resolve_job_id(job_id)
     data = await request.json()
@@ -9319,7 +9319,7 @@ async def api_send_quote_email(job_id: str, request: Request):
     if os.environ.get("QUOTE_AUTOMATION_ENABLED", "false").strip().lower() == "true":
         raise HTTPException(
             status_code=410,
-            detail="Legacy SMTP quote sending is disabled. Use Material Quotes.",
+            detail="Legacy SMTP quote sending is disabled. Use Jobs, then Bids, then Quote Emails.",
         )
     db_id = _resolve_job_id(job_id)
     if not db_id:
