@@ -118,6 +118,7 @@ def run(
     base_url: str,
     keep_job: bool,
     expected_commit: str | None = None,
+    vendor_email: str = "wbfranci@gmail.com",
 ) -> dict[str, Any]:
     suffix = uuid.uuid4().hex[:8]
     job_id = None
@@ -192,7 +193,7 @@ def run(
             {
                 "name": f"Harness Quote Vendor {suffix}",
                 "contact_name": "Harness Vendor",
-                "contact_email": "wbfranci@gmail.com",
+                "contact_email": vendor_email,
             },
         )
         vendor_id = vendor.get("id")
@@ -251,6 +252,7 @@ def run(
                 "name": "per_bid_quote_plan",
                 "passed": len(groups) == 1
                 and groups[0].get("can_send") is True
+                and groups[0].get("vendor_email") == vendor_email
                 and len(groups[0].get("materials_to_send") or []) == 2
                 and (plan.get("matching_engine") or {}).get("ai_calls") == 0,
                 "details": plan,
@@ -333,7 +335,7 @@ def run(
             "PATCH",
             f"/api/jobs/{job_id}/quotes/email-draft/groups/{group_id}",
             {
-                "vendor_email": "wbfranci@gmail.com",
+                "vendor_email": vendor_email,
                 "subject": f"Harness saved subject {suffix}",
                 "body": f"Harness saved email body {suffix}",
             },
@@ -689,10 +691,20 @@ def main() -> int:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--keep-job", action="store_true")
     parser.add_argument("--expected-commit")
+    parser.add_argument(
+        "--vendor-email",
+        default="wbfranci@gmail.com",
+        help="Approved staging vendor address used by the disposable test bid.",
+    )
     parser.add_argument("--json-output")
     args = parser.parse_args()
     try:
-        result = run(args.base_url, args.keep_job, args.expected_commit)
+        result = run(
+            args.base_url,
+            args.keep_job,
+            args.expected_commit,
+            args.vendor_email,
+        )
     except HarnessError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
