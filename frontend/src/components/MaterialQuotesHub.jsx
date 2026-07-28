@@ -247,30 +247,32 @@ function MaterialQuoteBids() {
         </label>
       </div>
 
-      <div className="flex gap-1 overflow-x-auto border-b border-white/[0.07] pb-1">
-        {QUOTE_FILTERS.map(([key, label]) => (
-          <button
-            key={key}
-            type="button"
-            onClick={() => setFilter(key)}
-            className={`inline-flex min-h-10 flex-shrink-0 items-center gap-2 rounded-md border-b-2 px-3 text-sm font-semibold ${
-              filter === key
-                ? 'border-si-orange bg-white/[0.05] text-white'
-                : 'border-transparent text-gray-500 hover:bg-white/[0.025] hover:text-gray-300'
-            }`}
-          >
-            {label}
-            <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[11px] tabular-nums text-gray-400">
-              {counts[key] || 0}
-            </span>
-          </button>
-        ))}
+      <div className="flex flex-col gap-2 border-b border-white/[0.07] pb-2 md:flex-row md:items-center">
+        <div className="grid grid-cols-3 gap-1 md:flex md:flex-1">
+          {QUOTE_FILTERS.map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setFilter(key)}
+              className={`inline-flex min-h-10 items-center justify-center gap-2 rounded-md border-b-2 px-2 text-sm font-semibold md:flex-shrink-0 md:justify-start md:px-3 ${
+                filter === key
+                  ? 'border-si-orange bg-white/[0.05] text-white'
+                  : 'border-transparent text-gray-500 hover:bg-white/[0.025] hover:text-gray-300'
+              }`}
+            >
+              {label}
+              <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[11px] tabular-nums text-gray-400">
+                {counts[key] || 0}
+              </span>
+            </button>
+          ))}
+        </div>
         <button
           type="button"
           onClick={() => load({ quiet: true })}
           disabled={refreshing}
           title="Refresh bid quote queue"
-          className="ml-auto inline-flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-md text-gray-500 hover:bg-white/[0.04] hover:text-white disabled:opacity-40"
+          className="inline-flex h-10 w-10 self-end items-center justify-center rounded-md text-gray-500 hover:bg-white/[0.04] hover:text-white disabled:opacity-40 md:ml-auto md:flex-shrink-0"
         >
           <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
         </button>
