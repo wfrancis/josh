@@ -396,7 +396,7 @@ export default function QuoteEmailCenter() {
                 label={outlookConnected ? 'Connected' : 'Not Connected'}
               />
             </div>
-            <p className="mt-1 break-all text-xs text-gray-500">
+            <p className="mt-1 break-words text-xs text-gray-500">
               {outlookConnected
                 ? outlook.email || outlook.mailbox_email || 'Microsoft mailbox connected'
                 : 'Connect Outlook to send requests and read vendor replies.'}
