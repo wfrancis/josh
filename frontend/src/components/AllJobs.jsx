@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import {
-  Plus, Building2, User, Loader2, ChevronRight,
+  Plus, Building2, Briefcase, User, Loader2, ChevronRight,
   Search, FolderOpen, Trash2, Copy
 } from 'lucide-react'
 import { api } from '../api'
@@ -88,15 +88,33 @@ export default function AllJobs() {
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-8 py-6 sm:py-10">
       {/* Header */}
-      <div className="flex items-center justify-between mb-8">
+      <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl font-extrabold text-white tracking-tight">All Jobs</h1>
+          <h1 className="text-2xl font-extrabold text-white tracking-tight">Jobs</h1>
           <p className="text-sm text-gray-500 mt-1">{jobs.length} job{jobs.length !== 1 ? 's' : ''} total</p>
         </div>
-        <button onClick={() => navigate('/?new=1')} className="btn-primary">
-          <Plus className="w-4 h-4" />
-          New Job
-        </button>
+        <div className="flex flex-wrap items-center gap-3">
+          <nav className="flex min-h-10 items-center rounded-lg border border-white/[0.08] bg-white/[0.025] p-1" aria-label="Jobs navigation">
+            <Link
+              to="/jobs"
+              className="inline-flex min-h-8 items-center gap-2 rounded-md bg-white/[0.09] px-3 text-sm font-semibold text-white"
+            >
+              <FolderOpen className="h-4 w-4" />
+              Jobs
+            </Link>
+            <Link
+              to="/jobs/bids"
+              className="inline-flex min-h-8 items-center gap-2 rounded-md px-3 text-sm font-semibold text-gray-500 hover:text-gray-300"
+            >
+              <Briefcase className="h-4 w-4" />
+              Bids
+            </Link>
+          </nav>
+          <button onClick={() => navigate('/?new=1')} className="btn-primary">
+            <Plus className="w-4 h-4" />
+            New Job
+          </button>
+        </div>
       </div>
 
       {/* Search */}

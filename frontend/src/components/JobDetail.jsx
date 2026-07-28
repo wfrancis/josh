@@ -843,7 +843,7 @@ export default function JobDetail() {
               </div>
             )}
 
-            {/* Continue to Material Quotes */}
+            {/* Continue to bid quotes */}
             {job.materials?.length > 0 && (() => {
               const unpricedCount = job.materials.filter(m => !m.unit_price || m.unit_price === 0).length
               return (
@@ -860,7 +860,7 @@ export default function JobDetail() {
                     }}
                     className="btn-primary"
                   >
-                    Continue to Material Quotes
+                    Continue to Bid Quotes
                   </button>
                 </div>
               )

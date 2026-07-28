@@ -278,10 +278,10 @@ export default function BidQuotePlan({
             {notice}
           </span>
           <Link
-            to={`/material-quotes/email?job=${jobId}`}
+            to={`/jobs/bids/quote-emails?job=${jobId}&view=ready_to_send`}
             className="inline-flex items-center gap-2 font-semibold text-white hover:text-emerald-200"
           >
-            Open Email Center
+            Open Quote Emails
             <ArrowRight className="h-4 w-4" />
           </Link>
         </div>
@@ -461,7 +461,7 @@ export default function BidQuotePlan({
                 className="grid gap-2 px-4 py-3 text-sm sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
               >
                 <span className="text-gray-300">{materialLabel(material)}</span>
-                <StatusPill status="waiting" label="In Email Center" />
+                <StatusPill status="waiting" label="In Quote Emails" />
               </div>
             ))}
           </div>
@@ -479,18 +479,18 @@ export default function BidQuotePlan({
           </p>
           <p className="mt-1 text-xs text-gray-500">
             {materialCount === 0 && requestedMaterials.length > 0
-              ? 'Open Email Center to check replies and follow-ups.'
+              ? 'Open Quote Emails to check replies and follow-ups.'
               : 'Saving creates email drafts. It does not send email.'}
           </p>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row">
           {draft && (
             <Link
-              to={`/material-quotes/email?job=${jobId}`}
+              to={`/jobs/bids/quote-emails?job=${jobId}&view=ready_to_send`}
               className="inline-flex items-center justify-center gap-2 rounded-md border border-white/[0.1] px-4 py-2.5 text-sm font-semibold text-gray-200 hover:bg-white/[0.05]"
             >
               <Mail className="h-4 w-4" />
-              Open Email Center
+              Open Quote Emails
             </Link>
           )}
           <button
@@ -502,7 +502,7 @@ export default function BidQuotePlan({
             {saving
               ? <Loader2 className="h-4 w-4 animate-spin" />
               : <Save className="h-4 w-4" />}
-            Save to Email Center
+            Save to Quote Emails
           </button>
         </div>
       </div>
@@ -519,7 +519,7 @@ export default function BidQuotePlan({
         <div className="text-center sm:text-right">
           {!workflowComplete && (
             <p className="mb-2 text-xs text-amber-300">
-              Finish the material quotes in Email Center before Review & Generate.
+              Finish vendor quotes in Quote Emails before Review & Generate.
             </p>
           )}
           <button

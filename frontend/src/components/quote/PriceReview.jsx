@@ -38,7 +38,7 @@ export default function PriceReview({
       await api.decideQuoteMatch(match.job_id, match.id, {
         decision,
         reviewer_name: 'Estimator',
-        reason: 'Estimator reviewed the vendor quote in Email Center.',
+        reason: 'Estimator reviewed the vendor quote in Quote Emails.',
         material_id: materialId,
         expected_material_id: match.material_id,
         expected_current_price: Number(match.current_price || 0),

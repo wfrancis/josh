@@ -3,6 +3,8 @@ import { Link, useLocation } from 'react-router-dom'
 import {
   ArrowRight,
   Briefcase,
+  ChevronRight,
+  FolderOpen,
   Mail,
   RefreshCw,
   Search,
@@ -128,8 +130,9 @@ function QuoteFlow({ bid }) {
 }
 
 function BidQuoteCard({ bid, featured = false }) {
-  const emailUrl = `/material-quotes/email?job=${bid.job_id}&view=${quoteEmailView(bid)}`
-  const actionUrl = bid.next_action?.url || `/jobs/${bid.slug || bid.job_id}`
+  const emailUrl = `/jobs/bids/quote-emails?job=${bid.job_id}&view=${quoteEmailView(bid)}`
+  const emailAction = ['needs_review', 'overdue', 'ready_to_send', 'waiting'].includes(bid.quote_stage)
+  const actionUrl = emailAction ? emailUrl : (bid.next_action?.url || `/jobs/${bid.slug || bid.job_id}`)
   const { active: activeRequestCount, completed: completedRequestCount } = quoteRequestCounts(bid)
   const canOpenEmail = (
     Number(bid.draft_group_count || 0) > 0
@@ -343,7 +346,7 @@ function MaterialQuoteBids() {
       )}
       {data.mailbox_locked && (
         <p className="text-xs text-gray-600">
-          Connect Outlook in Email Center to see vendor replies and email status.
+          Connect Outlook in Quote Emails to see vendor replies and email status.
         </p>
       )}
 
@@ -387,23 +390,37 @@ function MaterialQuoteBids() {
 
 export default function MaterialQuotesHub() {
   const location = useLocation()
-  const emailOpen = location.pathname === '/material-quotes/email'
+  const emailOpen = location.pathname === '/jobs/bids/quote-emails'
 
   return (
     <div className="mx-auto w-full max-w-[1500px] px-4 py-5 sm:px-6 lg:px-8">
       <div className="mb-5 flex flex-col gap-4 border-b border-white/[0.07] pb-4 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <div className="flex items-center gap-2">
-            <Mail className="h-5 w-5 text-si-orange" />
-            <h1 className="text-xl font-bold text-white">Material Quotes</h1>
+          <nav className="flex items-center gap-1 text-xs font-semibold text-gray-500" aria-label="Breadcrumb">
+            <Link to="/jobs" className="inline-flex items-center gap-1 hover:text-gray-300">
+              <FolderOpen className="h-3.5 w-3.5" />
+              Jobs
+            </Link>
+            <ChevronRight className="h-3.5 w-3.5" />
+            <Link to="/jobs/bids" className="hover:text-gray-300">Bids</Link>
+            {emailOpen && (
+              <>
+                <ChevronRight className="h-3.5 w-3.5" />
+                <span className="text-gray-300">Quote Emails</span>
+              </>
+            )}
+          </nav>
+          <div className="mt-2 flex items-center gap-2">
+            <Briefcase className="h-5 w-5 text-si-orange" />
+            <h1 className="text-xl font-bold text-white">{emailOpen ? 'Quote Emails' : 'Bids'}</h1>
           </div>
           <p className="mt-1 text-sm text-gray-500">
-            Keep each bid, its vendor emails, and its price decisions together.
+            {emailOpen ? 'Vendor quote requests, replies, and price decisions.' : 'Active bid work and vendor pricing status.'}
           </p>
         </div>
         <nav className="flex min-h-10 items-center rounded-lg border border-white/[0.08] bg-white/[0.025] p-1">
           <Link
-            to="/material-quotes"
+            to="/jobs/bids"
             className={`inline-flex min-h-8 items-center gap-2 rounded-md px-3 text-sm font-semibold ${
               !emailOpen
                 ? 'bg-white/[0.09] text-white'
@@ -414,7 +431,7 @@ export default function MaterialQuotesHub() {
             Bids
           </Link>
           <Link
-            to="/material-quotes/email"
+            to="/jobs/bids/quote-emails"
             className={`inline-flex min-h-8 items-center gap-2 rounded-md px-3 text-sm font-semibold ${
               emailOpen
                 ? 'bg-white/[0.09] text-white'
@@ -422,7 +439,7 @@ export default function MaterialQuotesHub() {
             }`}
           >
             <Mail className="h-4 w-4" />
-            Email Center
+            Quote Emails
           </Link>
         </nav>
       </div>
