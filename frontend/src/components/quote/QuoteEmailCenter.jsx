@@ -3,16 +3,21 @@ import { createPortal } from 'react-dom'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import {
   AlertTriangle,
+  ArrowDownUp,
   ArrowRight,
   Briefcase,
   Check,
   ChevronDown,
   ChevronUp,
+  Clock3,
   Inbox,
   Loader2,
   Mail,
+  MailCheck,
+  PackageSearch,
   RefreshCw,
   Save,
+  Search,
   Send,
   Trash2,
   Unplug,
@@ -79,6 +84,410 @@ const requestBucket = (request) => {
   return 'waiting'
 }
 
+const BOARD_FILTERS = [
+  ['all', 'All'],
+  ['needs_me', 'Needs Me'],
+  ['replies', 'Replies In'],
+  ['ready', 'Ready to Send'],
+  ['waiting', 'Waiting'],
+  ['shared', 'Shared Items'],
+  ['closed', 'Closed'],
+]
+
+const BOARD_SORTS = [
+  ['attention', 'Needs attention first'],
+  ['activity', 'Latest activity first'],
+  ['newest', 'Newest bids first'],
+  ['replies', 'Most vendor replies'],
+  ['vendors', 'Most vendors waiting'],
+]
+
+const BOARD_STAGE_PRIORITY = {
+  needs_review: 0,
+  overdue: 1,
+  ready_to_send: 2,
+  needs_setup: 3,
+  waiting: 4,
+  complete: 5,
+}
+
+const number = (value) => Number(value || 0)
+
+const plural = (count, singular, pluralLabel = `${singular}s`) => (
+  `${count} ${count === 1 ? singular : pluralLabel}`
+)
+
+const asDate = (value) => {
+  if (!value) return null
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+const dateNumber = (value) => asDate(value)?.getTime() || 0
+
+const shortDate = (value) => {
+  const date = asDate(value)
+  if (!date) return 'No date'
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: date.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+  }).format(date)
+}
+
+const relativeDate = (value) => {
+  const date = asDate(value)
+  if (!date) return 'No recent activity'
+  const days = Math.floor((Date.now() - date.getTime()) / 86_400_000)
+  if (days <= 0) return 'Today'
+  if (days === 1) return 'Yesterday'
+  if (days < 7) return `${days} days ago`
+  return shortDate(value)
+}
+
+const requestCounts = (bid) => {
+  const statuses = bid.request_statuses || {}
+  const total = number(bid.request_count)
+  const completed = number(
+    bid.completed_request_count
+    ?? (number(statuses.complete) + number(statuses.received)),
+  )
+  const cancelled = number(bid.cancelled_request_count ?? statuses.cancelled)
+  const active = number(
+    bid.active_request_count
+    ?? Math.max(0, total - completed - cancelled),
+  )
+
+  return { active, cancelled, completed }
+}
+
+const reviewCount = (bid) => (
+  number(bid.needs_matching_count) + number(bid.price_review_count)
+)
+
+const hasReply = (bid) => (
+  number(bid.response_count) > 0 || reviewCount(bid) > 0
+)
+
+const needsEstimator = (bid) => (
+  ['needs_review', 'overdue', 'ready_to_send', 'needs_setup'].includes(bid.quote_stage)
+  || Boolean(bid.draft_stale)
+)
+
+const boardFilterMatches = (bid, filter) => {
+  if (filter === 'all') return true
+  if (filter === 'needs_me') return needsEstimator(bid)
+  if (filter === 'replies') return hasReply(bid)
+  if (filter === 'ready') return bid.quote_stage === 'ready_to_send'
+  if (filter === 'waiting') return bid.quote_stage === 'waiting'
+  if (filter === 'shared') return number(bid.shared_material_count) > 0
+  if (filter === 'closed') return bid.quote_stage === 'complete'
+  return true
+}
+
+const bidSearchText = (bid) => [
+  bid.project_name,
+  bid.gc_name,
+  bid.job_id,
+  bid.city,
+  bid.state,
+  bid.salesperson,
+  ...asArray(bid.vendor_names),
+].filter(Boolean).join(' ').toLocaleLowerCase()
+
+const sortBidTiles = (bids, sort) => bids.slice().sort((left, right) => {
+  if (sort === 'activity') {
+    return dateNumber(right.last_activity_at) - dateNumber(left.last_activity_at)
+  }
+  if (sort === 'newest') return dateNumber(right.created_at) - dateNumber(left.created_at)
+  if (sort === 'replies') {
+    const difference = (
+      number(right.response_count) + reviewCount(right)
+    ) - (
+      number(left.response_count) + reviewCount(left)
+    )
+    return difference || dateNumber(right.latest_reply_at) - dateNumber(left.latest_reply_at)
+  }
+  if (sort === 'vendors') {
+    return number(right.active_request_count) - number(left.active_request_count)
+  }
+  return (
+    number(BOARD_STAGE_PRIORITY[left.quote_stage] ?? 99)
+    - number(BOARD_STAGE_PRIORITY[right.quote_stage] ?? 99)
+    || dateNumber(right.last_activity_at) - dateNumber(left.last_activity_at)
+    || String(left.project_name || '').localeCompare(String(right.project_name || ''))
+  )
+})
+
+const quoteWorkAction = (bid, basePath) => {
+  const bidUrl = `/jobs/${bid.slug || bid.job_id}?step=quotes`
+  if (bid.draft_stale) return { to: bidUrl, label: 'Update Quote Email' }
+  if (bid.quote_stage === 'needs_setup') return { to: bidUrl, label: 'Set Up Quote Email' }
+  if (bid.quote_stage === 'complete') return {
+    to: `/jobs/${bid.slug || bid.job_id}`,
+    label: 'View Bid',
+  }
+  const view = {
+    needs_review: 'needs_you',
+    overdue: 'overdue',
+    ready_to_send: 'ready_to_send',
+    waiting: 'waiting',
+  }[bid.quote_stage] || 'needs_you'
+  return {
+    to: `${basePath}?job=${encodeURIComponent(bid.job_id)}&view=${view}`,
+    label: {
+      needs_review: 'Review Reply',
+      overdue: 'Follow Up',
+      ready_to_send: 'Review & Send',
+      waiting: 'View Email Status',
+    }[bid.quote_stage] || 'Open Quote Work',
+  }
+}
+
+const bidWorkMessage = (bid) => {
+  const reviews = reviewCount(bid)
+  const { active, cancelled, completed } = requestCounts(bid)
+  if (reviews) return plural(reviews, 'reply needs review', 'replies need review')
+  if (bid.draft_stale) return 'This bid changed. Update its saved email.'
+  if (bid.quote_stage === 'overdue') return plural(active, 'vendor needs a follow-up', 'vendors need a follow-up')
+  if (bid.quote_stage === 'ready_to_send') {
+    return plural(number(bid.draft_ready_count), 'email ready to send', 'emails ready to send')
+  }
+  if (bid.quote_stage === 'needs_setup') {
+    return plural(number(bid.unpriced_count), 'material needs a price', 'materials need prices')
+  }
+  if (bid.quote_stage === 'waiting') return plural(active, 'vendor is still waiting', 'vendors are still waiting')
+  if (completed) return plural(completed, 'vendor quote is complete', 'vendor quotes are complete')
+  if (cancelled) return plural(cancelled, 'quote request was cancelled', 'quote requests were cancelled')
+  return 'No quote email work is open.'
+}
+
+function QuoteEmailBidTile({ bid, basePath }) {
+  const action = quoteWorkAction(bid, basePath)
+  const reviews = reviewCount(bid)
+  const { active, cancelled, completed } = requestCounts(bid)
+  const vendorNames = asArray(bid.vendor_names).filter(Boolean)
+  const replyCount = number(bid.response_count)
+  const unpricedCount = number(bid.unpriced_count)
+  const sharedCount = number(bid.shared_material_count)
+  const location = [bid.city, bid.state].filter(Boolean).join(', ')
+  const emailMetric = reviews
+    ? plural(reviews, 'reply needs review', 'replies need review')
+    : active
+      ? plural(active, 'vendor waiting', 'vendors waiting')
+      : completed
+        ? plural(completed, 'quote complete', 'quotes complete')
+        : cancelled
+          ? plural(cancelled, 'cancelled request', 'cancelled requests')
+          : 'No request sent'
+
+  return (
+    <article className="flex min-w-0 flex-col rounded-lg border border-white/[0.08] bg-white/[0.025] p-4 transition-colors hover:border-white/[0.15] hover:bg-white/[0.04]">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <Link
+              to={action.to}
+              className="truncate text-base font-bold text-white hover:text-blue-300"
+            >
+              {bid.project_name || 'Untitled Bid'}
+            </Link>
+            <span className="rounded border border-white/[0.08] bg-black/15 px-1.5 py-0.5 text-[10px] font-semibold text-gray-500">
+              Bid #{bid.job_id}
+            </span>
+          </div>
+          <p className="mt-1 truncate text-sm text-gray-400">
+            {[bid.gc_name, location].filter(Boolean).join(' | ') || 'No GC or location listed'}
+          </p>
+        </div>
+        <StatusPill status={bid.quote_stage} label={bid.quote_stage_label} />
+      </div>
+
+      <p className="mt-4 min-h-5 text-sm font-semibold text-gray-200">
+        {bidWorkMessage(bid)}
+      </p>
+
+      <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 border-y border-white/[0.07] py-3 text-xs">
+        <div className="min-w-0">
+          <span className="flex items-center gap-1.5 text-gray-500">
+            <PackageSearch className="h-3.5 w-3.5" />
+            Materials
+          </span>
+          <p className={`mt-1 truncate font-semibold ${unpricedCount ? 'text-orange-300' : 'text-emerald-300'}`}>
+            {unpricedCount
+              ? plural(unpricedCount, 'material needs a price', 'materials need prices')
+              : 'All priced'}
+          </p>
+        </div>
+        <div className="min-w-0">
+          <span className="flex items-center gap-1.5 text-gray-500">
+            <Mail className="h-3.5 w-3.5" />
+            Vendor email
+          </span>
+          <p className={`mt-1 truncate font-semibold ${reviews ? 'text-orange-300' : 'text-gray-300'}`}>
+            {emailMetric}
+          </p>
+        </div>
+        {bid.replies_available && (
+          <div className="min-w-0">
+            <span className="flex items-center gap-1.5 text-gray-500">
+              <MailCheck className="h-3.5 w-3.5" />
+              Replies
+            </span>
+            <p className={`mt-1 truncate font-semibold ${replyCount ? 'text-sky-300' : 'text-gray-400'}`}>
+              {replyCount
+                ? `${plural(replyCount, 'reply', 'replies')} ${bid.latest_reply_at ? `· ${relativeDate(bid.latest_reply_at)}` : ''}`
+                : 'No new reply'}
+            </p>
+          </div>
+        )}
+        {sharedCount > 0 && (
+          <div className="min-w-0">
+            <span className="flex items-center gap-1.5 text-gray-500">
+              <Briefcase className="h-3.5 w-3.5" />
+              Shared items
+            </span>
+            <p className="mt-1 truncate font-semibold text-blue-300">
+              {plural(sharedCount, 'match in another bid', 'matches in other bids')}
+            </p>
+          </div>
+        )}
+      </div>
+
+      <div className="mt-3 flex min-w-0 flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0 text-xs text-gray-500">
+          <p className="inline-flex items-center gap-1.5">
+            <Clock3 className="h-3.5 w-3.5" />
+            Updated {relativeDate(bid.last_activity_at || bid.created_at)}
+          </p>
+          {vendorNames.length > 0 && (
+            <p className="mt-1 truncate">Vendors: {vendorNames.slice(0, 2).join(', ')}{vendorNames.length > 2 ? ` +${vendorNames.length - 2}` : ''}</p>
+          )}
+        </div>
+        <Link
+          to={action.to}
+          aria-label={`${action.label} for ${bid.project_name || 'this bid'}`}
+          className="inline-flex min-h-11 flex-shrink-0 items-center gap-2 rounded-md bg-si-orange px-3.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400"
+        >
+          {action.label}
+          <ArrowRight className="h-4 w-4" />
+        </Link>
+      </div>
+    </article>
+  )
+}
+
+function QuoteEmailBidBoard({ bids, basePath, onRefresh, refreshing }) {
+  const [query, setQuery] = useState('')
+  const [filter, setFilter] = useState('all')
+  const [sort, setSort] = useState('attention')
+  const normalizedQuery = query.trim().toLocaleLowerCase()
+  const filterCounts = useMemo(() => Object.fromEntries(
+    BOARD_FILTERS.map(([key]) => [
+      key,
+      asArray(bids).filter((bid) => boardFilterMatches(bid, key)).length,
+    ]),
+  ), [bids])
+  const visibleBids = useMemo(() => sortBidTiles(
+    asArray(bids).filter((bid) => (
+      boardFilterMatches(bid, filter)
+      && (!normalizedQuery || bidSearchText(bid).includes(normalizedQuery))
+    )),
+    sort,
+  ), [bids, filter, normalizedQuery, sort])
+
+  return (
+    <section aria-labelledby="quote-email-bid-board-title" className="space-y-3">
+      <div className="flex flex-col gap-3 border-b border-white/[0.08] pb-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <p className="text-xs font-semibold uppercase text-gray-500">Choose a bid</p>
+          <h2 id="quote-email-bid-board-title" className="mt-1 text-lg font-bold text-white">
+            Quote email work by bid
+          </h2>
+          <p className="mt-1 text-sm text-gray-500">
+            Find the bid first. Open it only when you need to work the emails.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={refreshing}
+          title="Refresh bid email work"
+          aria-label="Refresh bid email work"
+          className="inline-flex min-h-11 min-w-11 items-center justify-center self-start rounded-md border border-white/[0.1] text-gray-400 hover:bg-white/[0.05] hover:text-white disabled:opacity-40 sm:self-auto"
+        >
+          <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+        </button>
+      </div>
+
+      <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_250px]">
+        <label className="relative block">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+          <span className="sr-only">Search quote email bids</span>
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search bid, GC, vendor, or bid number"
+            className="min-h-11 w-full rounded-md border border-white/[0.1] bg-[#0D1322] py-2 pl-10 pr-3 text-sm text-gray-200 outline-none placeholder:text-gray-600 focus:border-blue-400/50"
+          />
+        </label>
+        <label className="relative block">
+          <ArrowDownUp className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+          <span className="sr-only">Sort quote email bids</span>
+          <select
+            value={sort}
+            onChange={(event) => setSort(event.target.value)}
+            className="min-h-11 w-full appearance-none rounded-md border border-white/[0.1] bg-[#0D1322] py-2 pl-10 pr-8 text-sm font-semibold text-gray-200 outline-none focus:border-blue-400/50"
+          >
+            {BOARD_SORTS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+        </label>
+      </div>
+
+      <div className="flex flex-wrap gap-2" role="group" aria-label="Filter quote email bids">
+        {BOARD_FILTERS.map(([key, label]) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => setFilter(key)}
+            aria-pressed={filter === key}
+            className={`inline-flex min-h-10 items-center gap-1.5 rounded-md border px-3 text-xs font-semibold ${
+              filter === key
+                ? 'border-si-orange bg-si-orange text-[#0A0F1E]'
+                : 'border-white/[0.1] text-gray-400 hover:bg-white/[0.05] hover:text-white'
+            }`}
+          >
+            {label}
+            <span className={`rounded px-1.5 py-0.5 text-[10px] tabular-nums ${
+              filter === key ? 'bg-black/15' : 'bg-white/[0.06]'
+            }`}>
+              {filterCounts[key] || 0}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      <p aria-live="polite" className="text-xs text-gray-500">
+        {visibleBids.length === 1 ? '1 bid found' : `${visibleBids.length} bids found`}
+      </p>
+
+      {visibleBids.length ? (
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {visibleBids.map((bid) => (
+            <QuoteEmailBidTile key={bid.job_id} bid={bid} basePath={basePath} />
+          ))}
+        </div>
+      ) : (
+        <EmptyState>
+          No bids match that search or filter.
+        </EmptyState>
+      )}
+    </section>
+  )
+}
+
 export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
   const location = useLocation()
   const navigate = useNavigate()
@@ -97,6 +506,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
     summary: {},
     outlook: {},
   })
+  const [bidSummaries, setBidSummaries] = useState({ bids: [], summary: {} })
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
@@ -160,8 +570,12 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
     else setLoading(true)
     setError('')
     try {
-      const data = await api.getMaterialQuoteEmailCenter()
+      const [data, summaries] = await Promise.all([
+        api.getMaterialQuoteEmailCenter(),
+        api.getMaterialQuoteBids(),
+      ])
       setCenter(data || {})
+      setBidSummaries(summaries || { bids: [], summary: {} })
       setDirtyGroups({})
     } catch (err) {
       setError(err.message || 'Quote Email Center could not load.')
@@ -520,6 +934,7 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
 
   return (
     <div className="space-y-5">
+      {jobFilter ? (
       <section className="rounded-lg border border-white/[0.08] bg-white/[0.025] p-3 sm:p-4">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
           <div className="min-w-0">
@@ -635,6 +1050,60 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
           </div>
         </div>
       </section>
+      ) : (
+        <section
+          aria-label="Email connection"
+          className="flex flex-col gap-3 border-b border-white/[0.08] pb-4 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <Mail className="h-4 w-4 text-gray-500" />
+              <span className="text-sm font-bold text-white">Email</span>
+              <StatusPill
+                status={outlookConnected ? 'connected' : 'needs_setup'}
+                label={outlookConnected ? 'Connected' : 'Not Connected'}
+              />
+            </div>
+            <p className="mt-1 text-xs text-gray-500">
+              {outlookConnected
+                ? outlook.email || outlook.mailbox_email || 'Microsoft mailbox connected'
+                : 'Connect Outlook to send requests and see vendor replies.'}
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {outlookConnected ? (
+              <>
+                <button
+                  type="button"
+                  onClick={requestSyncOutlook}
+                  disabled={busyKey === 'sync'}
+                  className="inline-flex min-h-11 items-center gap-2 rounded-md border border-white/[0.1] px-3 py-2 text-xs font-semibold text-gray-300 hover:bg-white/[0.05] disabled:opacity-40"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${busyKey === 'sync' ? 'animate-spin' : ''}`} />
+                  Sync
+                </button>
+                <button
+                  type="button"
+                  onClick={requestDisconnectOutlook}
+                  disabled={busyKey === 'disconnect'}
+                  className="inline-flex min-h-11 items-center gap-2 rounded-md px-3 py-2 text-xs font-semibold text-gray-400 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"
+                >
+                  <Unplug className="h-3.5 w-3.5" />
+                  Disconnect
+                </button>
+              </>
+            ) : (
+              <a
+                href={api.outlookConnectUrl(returnTo)}
+                className="inline-flex min-h-11 items-center gap-2 rounded-md bg-si-orange px-4 py-2.5 text-sm font-bold text-[#0A0F1E] hover:bg-orange-400"
+              >
+                <Mail className="h-4 w-4" />
+                Connect Outlook
+              </a>
+            )}
+          </div>
+        </section>
+      )}
 
       {error && (
         <div role="alert" aria-live="assertive" className="rounded-lg border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-sm text-red-300">
@@ -647,6 +1116,8 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
         </div>
       )}
 
+      {jobFilter ? (
+        <>
       <section className="rounded-lg border border-white/[0.08] bg-white/[0.02] p-2">
         <div className="flex flex-wrap items-center justify-between gap-3 px-2 pb-2 pt-1">
           <div>
@@ -998,6 +1469,15 @@ export default function QuoteEmailCenter({ basePath = '/quote-emails' }) {
         jobs={asArray(center.jobs)}
         defaultJobId={jobFilter}
       />
+        </>
+      ) : (
+        <QuoteEmailBidBoard
+          bids={asArray(bidSummaries.bids)}
+          basePath={basePath}
+          onRefresh={() => discardUnsavedChanges(() => load({ quiet: true }))}
+          refreshing={refreshing}
+        />
+      )}
 
       {confirmation && createPortal(
         <div

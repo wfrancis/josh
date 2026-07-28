@@ -1417,6 +1417,21 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
             normalize_text(material.get("vendor")) or "unassigned"
             for material in unpriced
         }
+        draft_groups = draft.get("groups") if draft else []
+        if not isinstance(draft_groups, list):
+            draft_groups = []
+        vendor_names = sorted(
+            {
+                str(vendor).strip()
+                for vendor in (
+                    [material.get("vendor") for material in unpriced]
+                    + [request.get("vendor_name") for request in requests]
+                    + [group.get("vendor_name") for group in draft_groups]
+                )
+                if str(vendor or "").strip()
+            },
+            key=str.lower,
+        )
         shared_materials = []
         shared_bid_ids: set[int] = set()
         shared_material_count = 0
@@ -1471,6 +1486,7 @@ def material_quote_bid_summaries(mailbox_email: str | None = None) -> dict:
                 "unpriced_count": len(unpriced),
                 "unrequested_count": unrequested_count,
                 "vendor_group_count": len(vendor_keys),
+                "vendor_names": vendor_names,
                 "draft_group_count": draft.get("group_count", 0) if draft else 0,
                 "draft_ready_count": ready_draft_count,
                 "draft_stale": bool(draft and draft.get("stale")),
