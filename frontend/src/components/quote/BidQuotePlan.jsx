@@ -283,10 +283,19 @@ export default function BidQuotePlan({
               Check the vendor and materials here. Then open Quote Email Center to review and send the email.
             </p>
           </div>
-          <StatusPill
-            status={allMaterialsRequested ? 'waiting' : (incompleteGroupCount ? 'needs_setup' : 'ready_to_send')}
-            label={allMaterialsRequested ? 'Waiting on vendor' : (incompleteGroupCount ? 'Vendor setup needed' : (canReviewEmail ? 'Ready to review' : 'Ready to save'))}
-          />
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusPill
+              status={allMaterialsRequested ? 'waiting' : (incompleteGroupCount ? 'needs_setup' : 'ready_to_send')}
+              label={allMaterialsRequested ? 'Waiting on vendor' : (incompleteGroupCount ? 'Vendor setup needed' : (canReviewEmail ? 'Ready to review' : 'Ready to save'))}
+            />
+            <Link
+              to={quoteEmailUrl}
+              className="inline-flex min-h-9 items-center gap-2 rounded-md border border-white/[0.1] px-3 text-xs font-semibold text-gray-300 hover:bg-white/[0.05]"
+            >
+              Open Quote Email Center
+              <ArrowRight className="h-3.5 w-3.5" />
+            </Link>
+          </div>
         </div>
       </div>
 
