@@ -430,15 +430,13 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
       // If order_qty was directly edited, use it; otherwise auto-calculate
       const installedQty = next.installed_qty || 0
       const wastePct = next.waste_pct || 0
-      const orderQty = ('order_qty' in changes)
+      // Round once so extended_cost always matches the saved order_qty × unit_price to the cent
+      const orderQty = Math.round((('order_qty' in changes)
         ? (changes.order_qty || 0)
-        : installedQty * (1 + wastePct)
+        : installedQty * (1 + wastePct)) * 100) / 100
       const unitPrice = next.unit_price || 0
-      // If user explicitly set extended_cost (manual price entry), preserve it
       let extendedCost
-      if ('extended_cost' in changes && changes.price_source === 'manual') {
-        extendedCost = changes.extended_cost
-      } else if ((next.price_source === 'price_book' || next.price_source === 'default_rule') &&
+      if ((next.price_source === 'price_book' || next.price_source === 'default_rule') &&
                  (next.material_type || '').toLowerCase() === 'transitions') {
         // Transition piece-based pricing
         const vendor = (next.vendor || '').toLowerCase()
@@ -459,7 +457,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
       }
       return {
         ...next,
-        order_qty: Math.round(orderQty * 100) / 100,
+        order_qty: orderQty,
         extended_cost: extendedCost,
       }
     })
@@ -917,9 +915,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                       priceSource={m.price_source}
                       estimating={estimatingIdx === m._origIdx}
                       onSetUnitPrice={(unitPrice) => {
-                        const orderQty = m.order_qty || m.installed_qty || 1
-                        const extCost = round2(unitPrice * orderQty)
-                        updateMaterial(m._origIdx, { unit_price: unitPrice, extended_cost: extCost, price_source: 'manual' })
+                        updateMaterial(m._origIdx, { unit_price: unitPrice, price_source: 'manual' })
                       }}
                       onRequestQuote={() => onRequestQuote(m)}
                       onAiEstimate={async () => {

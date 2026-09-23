@@ -6,6 +6,7 @@ US Letter size, Standard Interiors branding.
 import os
 from datetime import date, datetime
 from typing import Optional
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
@@ -716,10 +717,10 @@ def generate_proposal_pdf(
 
         # Format description: each line on its own line
         desc_lines = desc_text.strip().split("\n")
-        desc_html = "<br/>".join(line.strip() for line in desc_lines if line.strip())
+        desc_html = "<br/>".join(escape(line.strip()) for line in desc_lines if line.strip())
 
         # Bundle name + price row
-        name_para = Paragraph(f"<b>{bundle_name}</b>", styles["bundle_name"])
+        name_para = Paragraph(f"<b>{escape(bundle_name)}</b>", styles["bundle_name"])
         price_para = Paragraph(f"${total_price:,.2f}", styles["bundle_price"])
 
         # Description below the name
@@ -825,7 +826,7 @@ def generate_proposal_pdf(
         if notes:
             story.append(Paragraph("<b>Notes / Qualifications:</b>", styles["section_heading"]))
             for note in notes:
-                story.append(Paragraph(f"&bull; {note}", styles["notes_body"]))
+                story.append(Paragraph(f"&bull; {escape(str(note))}", styles["notes_body"]))
                 story.append(Spacer(1, 2))
             story.append(Spacer(1, 8))
 
@@ -833,7 +834,7 @@ def generate_proposal_pdf(
         if terms:
             story.append(Paragraph("<b>Terms &amp; Conditions:</b>", styles["section_heading"]))
             for idx, term in enumerate(terms, 1):
-                story.append(Paragraph(f"{idx}. {term}", styles["notes_body"]))
+                story.append(Paragraph(f"{idx}. {escape(str(term))}", styles["notes_body"]))
                 story.append(Spacer(1, 1))
             story.append(Spacer(1, 8))
 
@@ -841,7 +842,7 @@ def generate_proposal_pdf(
         if exclusions:
             story.append(Paragraph("<b>Specific Exclusions:</b>", styles["section_heading"]))
             for idx, exc in enumerate(exclusions, 1):
-                story.append(Paragraph(f"{idx}. {exc}", styles["notes_body"]))
+                story.append(Paragraph(f"{idx}. {escape(str(exc))}", styles["notes_body"]))
                 story.append(Spacer(1, 1))
             story.append(Spacer(1, 8))
 

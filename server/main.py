@@ -6013,6 +6013,17 @@ async def api_save_proposal_bundles(job_id: str, request: Request):
     }
 
 
+def _whole_floats_as_int(value):
+    """Return a copy with whole-number floats as ints (0.0 -> 0) for value comparison."""
+    if isinstance(value, dict):
+        return {key: _whole_floats_as_int(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_whole_floats_as_int(item) for item in value]
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
 def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
     """Reject PDF generation when required header data or current audit is missing."""
     missing = _required_job_field_gaps(job)
@@ -6023,8 +6034,15 @@ def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
         )
 
     saved_proposal = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
-    body_fingerprint = _proposal_source_fingerprint(job, body)
-    if not saved_proposal.get("audit_source_fingerprint") or saved_proposal.get("audit_source_fingerprint") != body_fingerprint:
+    saved_fingerprint = saved_proposal.get("audit_source_fingerprint")
+    # Browsers serialize whole-number floats without ".0", so compare the body
+    # to the saved proposal by value, and require the saved audit to be current.
+    if (
+        not saved_fingerprint
+        or saved_fingerprint != _proposal_source_fingerprint(job, saved_proposal)
+        or _proposal_source_fingerprint(job, _whole_floats_as_int(body))
+        != _proposal_source_fingerprint(job, _whole_floats_as_int(saved_proposal))
+    ):
         raise HTTPException(
             status_code=409,
             detail="Cannot generate PDF because this is not the exact saved and audited proposal. Save it and try again.",
