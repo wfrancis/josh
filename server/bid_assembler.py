@@ -6,6 +6,7 @@ into bundled line items with descriptions and totals.
 import math
 
 from config import BID_TEMPLATES, WASTE_FACTORS, FREIGHT_RATES, EXCLUSIONS_TEMPLATE
+from material_pricing import is_piece_priced_transition, order_qty_holds_sticks, transition_pieces
 
 
 def _load_rates_from_db():
@@ -136,7 +137,26 @@ def assemble_bid(
             order_qty = installed_qty * (1 + waste_pct)
 
         # Material cost
-        material_cost = round(order_qty * unit_price, 2)
+        pricing_qty = order_qty
+        pricing_unit = unit
+        if is_piece_priced_transition(mat):
+            # Rule/price-book transitions are priced per stick (Silver Pin 12',
+            # Schluter 8'2"). Bill the same sticks as PUT /materials and the
+            # materials editor, from the saved order qty: an EA row that stores
+            # sticks bills them, any other row counts sticks from its LF.
+            # Never LF x the stick price.
+            stored_qty = mat.get("order_qty")
+            if stored_qty is not None:
+                order_qty = float(stored_qty or 0)
+            else:
+                order_qty = round(order_qty, 2)
+            pricing_qty = (
+                order_qty
+                if order_qty_holds_sticks(mat)
+                else transition_pieces(order_qty, mat.get("vendor"), mat.get("fixture_count"))
+            )
+            pricing_unit = "EA"
+        material_cost = round(pricing_qty * unit_price, 2)
 
         # Sundry cost (keep itemized detail)
         mat_sundries = sundries_by_mat.get(mat_id, [])
@@ -185,6 +205,8 @@ def assemble_bid(
             "freight_rate": freight_rate,
             "total_price": total_price,
             "order_qty": round(order_qty, 2),
+            "pricing_qty": round(pricing_qty, 2),
+            "pricing_unit": pricing_unit,
         })
 
     # ── GPM (Gross Profit Margin) Distribution ──────────────────────────────

@@ -1,7 +1,40 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react'
 import { Package, Trash2, Search, ChevronUp, ChevronDown, AlertTriangle, Store, Mail, DollarSign, Sparkles, XCircle, Info, Clock, Check } from 'lucide-react'
+import { QUOTE_EMAILS_ENABLED } from '../features'
 
 function round2(val) { return Math.round((val || 0) * 100) / 100 }
+
+// Transition lines priced from a rule or the price book are bought by the piece.
+function isTransitionPiecePricing(m) {
+  return (m.price_source === 'price_book' || m.price_source === 'default_rule') &&
+    (m.material_type || '').toLowerCase() === 'transitions'
+}
+// The old editor reset order_qty to this LF figure on every edit, even on EA lines.
+function orderQtyIsLf(m) {
+  const lf = round2((m.installed_qty || 0) * (1 + (m.waste_pct || 0)))
+  return Math.abs(round2(m.order_qty) - lf) <= 0.01
+}
+// EA transition lines store order_qty in whole sticks (Schluter sticks priced at RFMS
+// upload, or a typed stick price). An EA row whose order_qty equals its LF figure was
+// saved in LF by the old editor, so its sticks are recounted from LF (mirrors the server).
+function isPieceQtyLine(m) {
+  const pieceSource = isTransitionPiecePricing(m) ||
+    (m.price_source === 'manual' && (m.material_type || '').toLowerCase() === 'transitions')
+  return pieceSource && (m.unit || '').toUpperCase() === 'EA' && m.order_qty != null && !orderQtyIsLf(m)
+}
+// Convert a transition's LF to pieces (Silver Pin=12', Schluter=8'2"), mirroring the server.
+function transitionPiecesFromLf(orderQtyLf, vendorName, fixtureCount) {
+  const vendor = (vendorName || '').toLowerCase()
+  const pieceLF = vendor.includes('silver pin') ? 12 : (8 + 2/12)
+  const fc = fixtureCount || 0
+  if (fc > 0 && vendor.includes('schluter')) {
+    const sides = 2
+    const lfPerSide = orderQtyLf / (fc * sides)
+    return fc * sides * Math.ceil(lfPerSide / pieceLF)
+  }
+  return orderQtyLf > 0 ? Math.ceil(orderQtyLf / pieceLF) : 0
+}
+
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
 }
@@ -210,6 +243,8 @@ function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimat
   const menuRef = useRef(null)
   const inputRef = useRef(null)
   const unit = material.unit || ''
+  // A rule/price-book transition price is per piece, so a typed price is per piece too
+  const priceUnit = isTransitionPiecePricing({ ...material, price_source: priceSource }) ? 'EA' : unit
 
   useEffect(() => {
     if (!open) return
@@ -257,7 +292,7 @@ function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimat
           placeholder={material.unit_price > 0 ? String(round2(material.unit_price)) : '0.00'}
           className="editable-cell w-20 text-right text-gray-100"
         />
-        {unit && <span className="text-gray-500 text-[11px]">/{unit}</span>}
+        {priceUnit && <span className="text-gray-500 text-[11px]">/{priceUnit}</span>}
       </div>
     )
   }
@@ -288,22 +323,15 @@ function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimat
             'text-gray-500'
           }`}>
             {material.unit_price > 0 ? (() => {
-              const isTransitionPiece = (priceSource === 'price_book' || priceSource === 'default_rule') &&
-                (material.material_type || '').toLowerCase() === 'transitions'
+              const isTransitionPiece = isTransitionPiecePricing({ ...material, price_source: priceSource })
               if (isTransitionPiece) {
-                const vendor = (material.vendor || '').toLowerCase()
-                const pieceLF = vendor.includes('silver pin') ? 12 : (8 + 2/12) // Silver Pin=12', Schluter=8'2"
-                const orderQty = material.order_qty || material.installed_qty || 0
-                const fc = material.fixture_count || 0
-                let pieces = 0
-                if (fc > 0 && vendor.includes('schluter')) {
-                  const sides = 2
-                  const lfPerSide = orderQty / (fc * sides)
-                  const pcsPerSide = Math.ceil(lfPerSide / pieceLF)
-                  pieces = fc * sides * pcsPerSide
-                } else {
-                  pieces = orderQty > 0 ? Math.ceil(orderQty / pieceLF) : 0
-                }
+                const pieces = isPieceQtyLine({ ...material, price_source: priceSource })
+                  ? round2(material.order_qty || 0)
+                  : transitionPiecesFromLf(
+                    material.order_qty || material.installed_qty || 0,
+                    material.vendor,
+                    material.fixture_count,
+                  )
                 const laborRate = material.labor_rate_lf > 0 ? ` · Labor $${material.labor_rate_lf}/LF` : ''
                 return `$${round2(material.unit_price)}/EA · ${pieces}pc${laborRate}`
               }
@@ -322,9 +350,10 @@ function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimat
       ) : (
         <button
           onClick={() => { setEditValue(''); setEditing(true) }}
+          title="Type the unit price for this line"
           className="text-xs font-medium px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 transition-colors"
         >
-          Need Price
+          Needs price
         </button>
       )}
       {open && !estimating && (
@@ -336,13 +365,15 @@ function PriceActionMenu({ material, onRequestQuote, onSetUnitPrice, onAiEstimat
             <DollarSign className="w-3.5 h-3.5 text-emerald-400" />
             Enter Unit Price
           </button>
-          <button
-            onClick={() => { onRequestQuote(material); setOpen(false) }}
-            className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2 text-gray-300"
-          >
-            <Mail className="w-3.5 h-3.5 text-si-bright" />
-            Request Vendor Quote
-          </button>
+          {QUOTE_EMAILS_ENABLED && onRequestQuote && (
+            <button
+              onClick={() => { onRequestQuote(material); setOpen(false) }}
+              className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2 text-gray-300"
+            >
+              <Mail className="w-3.5 h-3.5 text-si-bright" />
+              Request Vendor Quote
+            </button>
+          )}
           <button
             onClick={() => { onAiEstimate(); setOpen(false) }}
             className="w-full text-left px-3 py-2 text-sm hover:bg-white/[0.06] flex items-center gap-2 text-gray-300"
@@ -427,30 +458,49 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
     const updated = materials.map((m, i) => {
       if (i !== idx) return m
       const next = { ...m, ...changes }
+      // A price typed over a rule/price-book transition price is per piece (the row
+      // shows $/EA · N pc), so an LF-stored line switches to whole-stick EA storage
+      // instead of billing LF × the piece price.
+      if (changes.price_source === 'manual' && (changes.unit_price || 0) > 0 &&
+          isTransitionPiecePricing(m) && !isPieceQtyLine(m)) {
+        const pieces = transitionPiecesFromLf(m.order_qty || m.installed_qty || 0, m.vendor, m.fixture_count)
+        return {
+          ...next,
+          unit: 'EA',
+          order_qty: pieces,
+          extended_cost: Math.round(pieces * (next.unit_price || 0) * 100) / 100,
+        }
+      }
       // If order_qty was directly edited, use it; otherwise auto-calculate
       const installedQty = next.installed_qty || 0
       const wastePct = next.waste_pct || 0
+      // A price-only edit keeps a transition's order qty (Schluter sticks) where the bid
+      // assembler bills the stored qty: EA lines and rule/price-book transitions.
+      // Other lines reset to installed × (1 + waste), which is what assemble_bid bills.
+      const priceOnly = 'unit_price' in changes && !('installed_qty' in changes) && !('waste_pct' in changes) &&
+        (next.material_type || '').toLowerCase() === 'transitions' &&
+        ((next.unit || '').toUpperCase() === 'EA' || isTransitionPiecePricing(next))
+      // EA transition lines keep order_qty in pieces; recount pieces only when the LF inputs change.
+      // Sticks vs LF storage is judged on the line before this edit (a new LF can equal the old stick count).
+      const pieceQty = isPieceQtyLine({ ...next, installed_qty: m.installed_qty, waste_pct: m.waste_pct, order_qty: m.order_qty })
+      const lfInputsChanged = 'installed_qty' in changes || 'waste_pct' in changes || 'fixture_count' in changes
       // Round once so extended_cost always matches the saved order_qty × unit_price to the cent
       const orderQty = Math.round((('order_qty' in changes)
         ? (changes.order_qty || 0)
-        : installedQty * (1 + wastePct)) * 100) / 100
+        : (priceOnly || (pieceQty && !lfInputsChanged)) && next.order_qty != null
+          ? next.order_qty
+          : pieceQty
+            ? transitionPiecesFromLf(installedQty * (1 + wastePct), next.vendor, next.fixture_count)
+            : installedQty * (1 + wastePct)) * 100) / 100
       const unitPrice = next.unit_price || 0
       let extendedCost
-      if ((next.price_source === 'price_book' || next.price_source === 'default_rule') &&
-                 (next.material_type || '').toLowerCase() === 'transitions') {
-        // Transition piece-based pricing
-        const vendor = (next.vendor || '').toLowerCase()
-        const pieceLF = vendor.includes('silver pin') ? 12 : (8 + 2/12)
-        const fc = next.fixture_count || 0
-        let pieces = 0
-        if (fc > 0 && vendor.includes('schluter')) {
-          const sides = 2
-          const lfPerSide = orderQty / (fc * sides)
-          const pcsPerSide = Math.ceil(lfPerSide / pieceLF)
-          pieces = fc * sides * pcsPerSide
-        } else {
-          pieces = orderQty > 0 ? Math.ceil(orderQty / pieceLF) : 0
-        }
+      if (isTransitionPiecePricing(next)) {
+        // Transition piece-based pricing (EA lines: order_qty is already the piece count,
+        // unless it equals the line's LF figure, which PUT /materials and the bid
+        // assembler read back as LF)
+        const pieces = pieceQty && !orderQtyIsLf({ ...next, order_qty: orderQty })
+          ? orderQty
+          : transitionPiecesFromLf(orderQty, next.vendor, next.fixture_count)
         extendedCost = Math.round(pieces * unitPrice * 100) / 100
       } else {
         extendedCost = Math.round(orderQty * unitPrice * 100) / 100
@@ -491,6 +541,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
   }
 
   const showDeleteCol = editable
+  const pricingEditable = editable && !!onUpdate
   const colCount = 6
 
 
@@ -642,7 +693,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                 <option key={t} value={t}>{TYPE_LABELS[t] || t}</option>
               ))}
             </select>
-            {onRequestQuote && (
+            {pricingEditable && (
               <label className="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer select-none whitespace-nowrap">
                 <input
                   type="checkbox"
@@ -665,9 +716,9 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
         </div>
       )}
       {/* Status bar: completion + confidence warnings */}
-      {materials.length > 0 && (onRequestQuote || lowConfidenceCount > 0 || (pricedCount < totalCount && onRequestAllQuotes)) && (
+      {materials.length > 0 && (pricingEditable || lowConfidenceCount > 0 || pricedCount < totalCount) && (
         <div className="flex items-center gap-4 mb-3 flex-wrap text-xs">
-          {(onRequestQuote || pricedCount < totalCount) && (
+          {(pricingEditable || pricedCount < totalCount) && (
             <span className={`font-medium ${pricePct >= 1 ? 'text-emerald-400' : pricePct >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}>
               {pricedCount}/{totalCount} priced
             </span>
@@ -678,7 +729,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
               {lowConfidenceCount} material{lowConfidenceCount !== 1 ? 's' : ''} with low AI confidence
             </span>
           )}
-          {pricedCount < totalCount && onRequestAllQuotes && (
+          {pricedCount < totalCount && QUOTE_EMAILS_ENABLED && onRequestAllQuotes && (
             <button
               onClick={onRequestAllQuotes}
               className="flex items-center gap-1 text-si-bright hover:text-si-bright/80 font-medium transition-colors ml-auto"
@@ -686,6 +737,11 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
               <Mail className="w-3.5 h-3.5" />
               Request quotes for all {totalCount - pricedCount} unpriced
             </button>
+          )}
+          {pricedCount < totalCount && pricingEditable && !QUOTE_EMAILS_ENABLED && (
+            <span className="text-gray-500 ml-auto">
+              {totalCount - pricedCount} need a price. Click <span className="text-amber-400">Needs price</span> on the line to type it.
+            </span>
           )}
         </div>
       )}
@@ -720,7 +776,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
               { label: 'Waste', key: 'waste', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Waste factor percentage added to install quantity' },
               { label: 'Order Qty', key: 'order_qty', align: 'right', hide: 'hidden md:table-cell', tooltip: 'Quantity to order (install qty + waste)' },
               { label: 'Fixtures', key: 'fixture_count', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Number of tubs/showers — used for piece count on Schluter transitions' },
-              ...(onRequestQuote ? [{ label: 'Internal Price', key: 'known_price', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Price from your warehouse inventory or past vendor quotes' }] : []),
+              ...(pricingEditable ? [{ label: 'Internal Price', key: 'known_price', align: 'right', hide: 'hidden lg:table-cell', tooltip: 'Price from your warehouse inventory or past vendor quotes' }] : []),
               { label: 'Total', key: 'extended', align: 'right', hide: '', tooltip: 'Your bid price for this line item' },
               // Delete button is now inline in Total cell, no separate column needed
             ].map((col, i) => (
@@ -800,6 +856,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                   )}
                   {/* Quote request status badge */}
                   {(() => {
+                    if (!QUOTE_EMAILS_ENABLED) return null
                     const qs = quoteStatusMap[m.id] || (m.item_code ? quoteStatusMap[`ic:${m.item_code.toLowerCase()}`] : null)
                     if (!qs || hasPrice) return null
                     return (
@@ -879,7 +936,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                     <span className="text-gray-700">—</span>
                   )}
                 </td>
-                {onRequestQuote && (
+                {pricingEditable && (
                   <td className="hidden lg:table-cell py-3 px-2 sm:px-3 text-right tabular-nums text-xs">
                     {m.known_price ? (
                       <button
@@ -907,7 +964,7 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                 <td className="py-3 px-2 sm:px-3 text-right tabular-nums font-medium">
                   <div className="flex items-start justify-end gap-1">
                   <div className="flex-1 text-right">
-                  {onRequestQuote ? (
+                  {pricingEditable ? (
                     <PriceActionMenu
                       material={m}
                       hasPrice={hasPrice}
@@ -915,9 +972,9 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                       priceSource={m.price_source}
                       estimating={estimatingIdx === m._origIdx}
                       onSetUnitPrice={(unitPrice) => {
-                        updateMaterial(m._origIdx, { unit_price: unitPrice, price_source: 'manual' })
+                        updateMaterial(m._origIdx, { unit_price: unitPrice, price_source: 'manual', quote_status: 'manual' })
                       }}
-                      onRequestQuote={() => onRequestQuote(m)}
+                      onRequestQuote={onRequestQuote ? () => onRequestQuote(m) : undefined}
                       onAiEstimate={async () => {
                         if (!onAiEstimate) return
                         setEstimatingIdx(m._origIdx)

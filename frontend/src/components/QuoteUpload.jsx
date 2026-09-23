@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef } from 'react'
 import { FileText, Package, AlertTriangle, CheckCircle2, Trash2, Search, Link2, Check, X, FolderSearch, Loader2 } from 'lucide-react'
 import FileUpload from './FileUpload'
 import ConfirmDialog from './ConfirmDialog'
+import { QUOTE_EMAILS_ENABLED } from '../features'
 
 const DROPBOX_HANDLE_DB = 'si-bid-tool-folders'
 const DROPBOX_HANDLE_STORE = 'directory-handles'
@@ -89,7 +90,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
         receiptItems: result.provenance_repaired_items || [],
         priceItems: result.quote_price_matched_items || [],
       })
-      setLinkedRequests(result.linked_requests || [])
+      setLinkedRequests(QUOTE_EMAILS_ENABLED ? (result.linked_requests || []) : [])
       if (result.file_errors?.length) {
         setError(result.file_errors.map(item => `${item.file}: ${item.error}`).join(' '))
       }
@@ -277,7 +278,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
         receiptItems: result.provenance_repaired_items || [],
         priceItems: result.quote_price_matched_items || [],
       })
-      setLinkedRequests(result.linked_requests || [])
+      setLinkedRequests(QUOTE_EMAILS_ENABLED ? (result.linked_requests || []) : [])
       if (result.file_errors?.length) {
         setError(result.file_errors.map(item => `${item.file}: ${item.error}`).join(' '))
       }

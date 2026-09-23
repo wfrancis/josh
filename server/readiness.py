@@ -289,7 +289,7 @@ def evaluate_job_readiness(
     checks.append(_check(
         "unpriced_materials",
         "fail" if unpriced else "pass",
-        "All active materials have prices." if not unpriced else f"{len(unpriced)} active material(s) need pricing.",
+        "All active materials have prices." if not unpriced else f"{len(unpriced)} active material(s) still need a price. Type the unit price on each \"Needs price\" line in Takeoff & Pricing.",
         unpriced,
     ))
 

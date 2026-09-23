@@ -5,6 +5,7 @@ import {
   AlertTriangle, Mail, Server, Bell, ToggleLeft, ToggleRight
 } from 'lucide-react'
 import { api } from '../api'
+import { QUOTE_EMAILS_ENABLED } from '../features'
 
 export default function SettingsPage() {
   // AI Settings state
@@ -350,7 +351,39 @@ export default function SettingsPage() {
           )}
         </div>
 
+        {/* ── Vendor Quote Files (quote emails off) ───── */}
+        {!QUOTE_EMAILS_ENABLED && (
+          <div className="glass-card p-8">
+            <div className="flex items-start gap-4">
+              <div className="w-11 h-11 rounded-xl bg-blue-500/10 flex items-center justify-center flex-shrink-0">
+                <Mail className="w-5 h-5 text-blue-400" />
+              </div>
+              <div className="flex-1">
+                <h2 className="text-lg font-bold text-white">Vendor Quote Files</h2>
+                <p className="text-sm text-gray-500 mt-1">
+                  Quote emails are turned off. Lines without a configured price get a typed price; uploading a vendor quote file is optional.
+                </p>
+              </div>
+            </div>
+            {vendorHealth && (
+              <div className="mt-6 grid grid-cols-1 gap-3 border-t border-white/[0.06] pt-4 sm:grid-cols-2">
+                <div>
+                  <p className="text-[10px] font-semibold uppercase text-gray-500">AI parser</p>
+                  <p className={vendorHealth.ai_parser?.available ? 'mt-1 text-sm font-semibold text-emerald-300' : 'mt-1 text-sm font-semibold text-red-300'}>
+                    {vendorHealth.ai_parser?.available ? 'Ready' : 'Blocked'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-semibold uppercase text-gray-500">Dropbox files</p>
+                  <p className="mt-1 text-sm font-semibold text-gray-300">EML, MSG, PDF, TXT, CSV, XLSX</p>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* ── Vendor Quote Test Mode ──────────────────── */}
+        {QUOTE_EMAILS_ENABLED && (
         <div className={`glass-card p-8 border-2 ${testMode ? 'border-amber-500/50' : 'border-transparent'}`}>
           <div className="flex items-start gap-4">
             <div className={`w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 ${testMode ? 'bg-amber-500/20' : 'bg-gray-500/10'}`}>
@@ -393,8 +426,10 @@ export default function SettingsPage() {
             </div>
           )}
         </div>
+        )}
 
         {/* ── Quote Email Automation ──────────────────── */}
+        {QUOTE_EMAILS_ENABLED && (
         <div className="glass-card p-8">
           <div className="flex items-start gap-4 mb-6">
             <div className="w-11 h-11 rounded-xl bg-blue-500/10 flex items-center justify-center flex-shrink-0">
@@ -576,6 +611,7 @@ export default function SettingsPage() {
             </button>
           </div>
         </div>
+        )}
 
         {/* ── Internal Rates Link ──────────────────────── */}
         <div className="glass-card p-6">

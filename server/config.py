@@ -4,6 +4,15 @@ All waste factors, sundry coverage rates, freight rates, labor qty rules,
 bid templates, and exclusions.
 """
 
+import os
+
+# ─── Feature Flags ────────────────────────────────────────────────────────────
+# Vendor quote-request emails (AI vendor detection, email drafting/sending,
+# request tracker, inbox monitor). Off by default: unpriced lines get a typed
+# price instead. Set QUOTE_EMAILS_ENABLED=1 to turn them back on.
+QUOTE_EMAILS_ENABLED: bool = os.environ.get("QUOTE_EMAILS_ENABLED", "").strip().lower() in ("1", "true")
+QUOTE_EMAILS_OFF_DETAIL = "Quote emails are turned off. Type the price on the material line instead."
+
 # ─── Waste Factors ────────────────────────────────────────────────────────────
 WASTE_FACTORS: dict[str, float] = {
     "unit_carpet_no_pattern": 0.20,

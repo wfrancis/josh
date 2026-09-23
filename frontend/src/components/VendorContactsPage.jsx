@@ -6,6 +6,7 @@ import {
   Clock, Mail, Phone, TrendingUp, Package, FileText, Send
 } from 'lucide-react'
 import { api } from '../api'
+import { QUOTE_EMAILS_ENABLED } from '../features'
 
 export default function VendorContactsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -211,7 +212,9 @@ export default function VendorContactsPage() {
           Vendor Contacts
         </h1>
         <p className="text-sm text-gray-500 mt-1">
-          Manage your vendor reps — contact info is used when generating quote requests.
+          {QUOTE_EMAILS_ENABLED
+            ? 'Manage your vendor reps — contact info is used when generating quote requests.'
+            : 'Vendor names and contacts for reference.'}
         </p>
       </div>
 
@@ -227,14 +230,16 @@ export default function VendorContactsPage() {
             className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg pl-9 pr-3 py-2 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-si-accent/40"
           />
         </div>
-        <button
-          onClick={handleAiSuggest}
-          disabled={suggesting}
-          className="btn-ghost text-xs px-3 py-2 text-violet-400 hover:text-violet-300 flex items-center gap-1.5"
-        >
-          {suggesting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
-          AI Suggest Contacts
-        </button>
+        {QUOTE_EMAILS_ENABLED && (
+          <button
+            onClick={handleAiSuggest}
+            disabled={suggesting}
+            className="btn-ghost text-xs px-3 py-2 text-violet-400 hover:text-violet-300 flex items-center gap-1.5"
+          >
+            {suggesting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+            AI Suggest Contacts
+          </button>
+        )}
         <button
           onClick={() => setShowAdd(!showAdd)}
           className="btn-ghost text-xs px-3 py-2 text-emerald-400 hover:text-emerald-300 flex items-center gap-1.5"

@@ -15,6 +15,7 @@ import ProposalEditor from './ProposalEditor'
 import QuoteUpload from './QuoteUpload'
 import VendorQuoteFlow from './VendorQuoteFlow'
 import QuoteTracker from './QuoteTracker'
+import { QUOTE_EMAILS_ENABLED } from '../features'
 import ReproducibilityPanel from './ReproducibilityPanel'
 import ReadinessSummary from './ReadinessSummary'
 import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
@@ -32,6 +33,7 @@ export default function JobDetail() {
   const [stagedFiles, setStagedFiles] = useState([])
   const rfmsInputRef = useRef(null)
   const quoteSectionRef = useRef(null)
+  const materialsSectionRef = useRef(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
   const [notesOpen, setNotesOpen] = useState(false)
@@ -82,7 +84,7 @@ export default function JobDetail() {
       if (data.bundles?.length > 0 || data.bid_data) setStep('bid')
       else if (data.materials?.length > 0) setStep('takeoff')
       // Load quote requests for status tracking
-      api.listQuoteRequests(data.id).then(setQuoteRequests).catch(console.error)
+      if (QUOTE_EMAILS_ENABLED) api.listQuoteRequests(data.id).then(setQuoteRequests).catch(console.error)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -298,6 +300,12 @@ export default function JobDetail() {
     clearTimeout(autoSaveRef.current)
     setError(null)
     return saveMaterialsNow({ surfaceError: true })
+  }
+
+  const scrollToUnpricedLine = () => {
+    const unpricedIds = new Set((job?.materials || []).filter(m => !(m.unit_price > 0)).map(m => String(m.id)))
+    const row = [...document.querySelectorAll('tr[data-material-id]')].find(r => unpricedIds.has(r.dataset.materialId))
+    ;(row || materialsSectionRef.current)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
 
   const openEvidenceRecovery = () => {
@@ -594,7 +602,14 @@ export default function JobDetail() {
       <div className="glass-card px-3 sm:px-6 py-3 sm:py-4 mb-6 sm:mb-8">
         <StepIndicator
           current={step}
-          onStepClick={setStep}
+          onStepClick={async (next) => {
+            // Flush a pending autosave so a just-typed price reaches the bid step
+            if (next === 'bid' && (isDirty || materialSavePromiseRef.current)) {
+              clearTimeout(autoSaveRef.current)
+              if (!(await saveMaterialsNow({ surfaceError: true }))) return
+            }
+            setStep(next)
+          }}
           completedSteps={getCompletedSteps()}
           disabledSteps={job.materials?.length > 0 && job.materials.some(m => !m.unit_price || m.unit_price === 0) ? ['bid'] : []}
         />
@@ -748,30 +763,47 @@ export default function JobDetail() {
                     <div className="flex items-center gap-3 px-4 py-3 mb-4 bg-amber-500/10 border border-amber-500/20 rounded-xl">
                       <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
                       <span className="text-sm text-amber-300">
-                        <strong>{unpricedCount}</strong> of {job.materials.length} materials need vendor pricing
+                        {QUOTE_EMAILS_ENABLED ? (
+                          <><strong>{unpricedCount}</strong> of {job.materials.length} materials need vendor pricing</>
+                        ) : (
+                          <><strong>{unpricedCount}</strong> of {job.materials.length} materials have no configured price. Click "Needs price" on each line below and type the unit price.</>
+                        )}
                       </span>
                     </div>
                   )}
 
                   {/* Quote Tracker — always visible when requests exist */}
-                  <QuoteTracker job={job} onRefresh={loadJob} onUploadQuote={() => setQuotePanel('upload')} />
+                  {QUOTE_EMAILS_ENABLED && (
+                    <QuoteTracker job={job} onRefresh={loadJob} onUploadQuote={() => setQuotePanel('upload')} />
+                  )}
 
                   {/* Action buttons */}
                   {!quotePanel && (
-                    <div className="flex items-center gap-3">
-                      <button
-                        onClick={() => setQuotePanel('request')}
-                        className="btn-secondary text-sm flex items-center gap-2"
-                      >
-                        <Copy className="w-4 h-4" />
-                        Request Quotes
-                      </button>
+                    <div className="flex flex-wrap items-center gap-3">
+                      {!QUOTE_EMAILS_ENABLED && unpricedCount > 0 && (
+                        <button
+                          onClick={scrollToUnpricedLine}
+                          className="btn-primary text-sm flex items-center gap-2"
+                        >
+                          <Pencil className="w-4 h-4" />
+                          Type prices
+                        </button>
+                      )}
+                      {QUOTE_EMAILS_ENABLED && (
+                        <button
+                          onClick={() => setQuotePanel('request')}
+                          className="btn-secondary text-sm flex items-center gap-2"
+                        >
+                          <Copy className="w-4 h-4" />
+                          Request Quotes
+                        </button>
+                      )}
                       <button
                         onClick={() => setQuotePanel('upload')}
                         className="btn-secondary text-sm flex items-center gap-2"
                       >
                         <Upload className="w-4 h-4" />
-                        Upload Vendor Response
+                        {QUOTE_EMAILS_ENABLED ? 'Upload Vendor Response' : 'Upload vendor quote (optional)'}
                       </button>
                     </div>
                   )}
@@ -782,7 +814,7 @@ export default function JobDetail() {
                       <div className="flex items-center justify-between mb-3">
                         <div>
                           <h3 className="text-sm font-bold text-white">
-                            {evidenceRecoveryNeeded ? 'Repair Vendor Quote Receipts' : 'Upload Vendor Response'}
+                            {evidenceRecoveryNeeded ? 'Repair Vendor Quote Receipts' : QUOTE_EMAILS_ENABLED ? 'Upload Vendor Response' : 'Upload Vendor Quote (optional)'}
                           </h3>
                           {evidenceRecoveryNeeded && (
                             <p className="mt-1 text-xs text-gray-500">Use the original quote files. Existing accepted prices are relinked only on an exact unit-price match.</p>
@@ -810,7 +842,7 @@ export default function JobDetail() {
 
             {/* Materials Table */}
             {job.materials?.length > 0 && (
-              <div className="glass-card p-4 sm:p-6 animate-slide-up">
+              <div ref={materialsSectionRef} className="glass-card scroll-mt-20 p-4 sm:p-6 animate-slide-up">
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em]">
                     Materials ({job.materials.length})
@@ -838,15 +870,15 @@ export default function JobDetail() {
                   <MaterialsTable
                     materials={job.materials}
                     editable
-                    quoteRequests={quoteRequests}
+                    quoteRequests={QUOTE_EMAILS_ENABLED ? quoteRequests : []}
                     onUpdate={handleMaterialsUpdate}
-                    onRequestQuote={(material) => {
+                    onRequestQuote={QUOTE_EMAILS_ENABLED ? (material) => {
                       setQuoteMaterial(material)
                       setQuoteCopied(false)
-                    }}
-                    onRequestAllQuotes={() => {
+                    } : undefined}
+                    onRequestAllQuotes={QUOTE_EMAILS_ENABLED ? () => {
                       setQuotePanel('request')
-                    }}
+                    } : undefined}
                     onAiEstimate={async (materialIdx) => {
                       try {
                         if (isDirty && !(await saveMaterialsNow({ surfaceError: true }))) return
@@ -869,7 +901,9 @@ export default function JobDetail() {
                 <div className="text-center pt-2 animate-fade-in">
                   {unpricedCount > 0 && (
                     <p className="text-xs text-amber-400 mb-2">
-                      All materials must be priced before generating a bid
+                      {QUOTE_EMAILS_ENABLED
+                        ? 'All materials must be priced before generating a bid'
+                        : 'Type a price on every "Needs price" line before generating the bid'}
                     </p>
                   )}
                   <button
@@ -900,7 +934,7 @@ export default function JobDetail() {
       <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
 
       {/* Vendor Quote Flow Modal — rendered outside animated containers to avoid transform containing block issues */}
-      {quotePanel === 'request' && job && (
+      {QUOTE_EMAILS_ENABLED && quotePanel === 'request' && job && (
         <VendorQuoteFlow
           job={job}
           onClose={() => { setQuotePanel(null); setQuotePreSelectedIds(null) }}
@@ -909,7 +943,7 @@ export default function JobDetail() {
       )}
 
       {/* Single-material quote request modal */}
-      {quoteMaterial && job && (() => {
+      {QUOTE_EMAILS_ENABLED && quoteMaterial && job && (() => {
         const m = quoteMaterial
         const qty = Math.round((m.installed_qty || m.order_qty || 0) * 100) / 100
         const desc = [m.item_code, m.description].filter(Boolean).join(' - ')

@@ -248,6 +248,7 @@ export default function ReadinessSummary({ readiness, onRefresh, onRecoverEviden
           title={trust.replay_status ? `Replay status: ${trust.replay_status}` : undefined}
         />
         <Metric label="Manual overrides" value={String(trust.manual_override_count || 0)} />
+        <Metric label="Typed prices" value={String(trust.manual_price_count || 0)} />
         <Metric label="Unknown materials" value={String(trust.unknown_material_count || 0)} />
         <Metric label="Low confidence" value={String(trust.low_confidence_material_count || 0)} />
       </div>

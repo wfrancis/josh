@@ -68,7 +68,13 @@ from bid_assembler import assemble_bid
 from pdf_generator import generate_bid_pdf, generate_proposal_pdf
 from proposal_bundler import generate_proposal_data
 from proposal_totals import effective_bundle_total, normalize_proposal_totals
-from material_pricing import material_pricing_context
+from material_pricing import (
+    is_piece_priced_transition,
+    material_pricing_context,
+    order_qty_holds_sticks as _shared_order_qty_holds_sticks,
+    order_qty_is_lf as _shared_order_qty_is_lf,
+    transition_pieces as _shared_transition_pieces,
+)
 from quote_evidence import find_verified_quote_price_conflicts, normalize_quote_unit
 from reproducibility import (
     DEFAULT_TOLERANCE,
@@ -78,6 +84,7 @@ from reproducibility import (
     replay_golden_job,
 )
 from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE, STAIR_SUNDRY_KITS
+from config import QUOTE_EMAILS_ENABLED, QUOTE_EMAILS_OFF_DETAIL
 from email_agent import compose_quote_request, send_email, generate_quote_request_text
 from ai_client import chat_complete, get_provider_info
 from inbox_monitor import InboxMonitor
@@ -693,7 +700,7 @@ def _start_sim_watcher():
         _sim_watcher.stop()
         _sim_watcher = None
 
-    if not test_mode:
+    if not QUOTE_EMAILS_ENABLED or not test_mode:
         return
 
     from sim_email import SimFolderWatcher
@@ -720,8 +727,8 @@ def _start_inbox_monitor():
     global _inbox_monitor
     import json as _json
     settings = get_settings()
-    # Don't start real inbox monitor when in test mode
-    if str(settings.get("vendor_quote_test_mode", "false")).lower() == "true":
+    # Don't start real inbox monitor when quote emails are off or in test mode
+    if not QUOTE_EMAILS_ENABLED or str(settings.get("vendor_quote_test_mode", "false")).lower() == "true":
         if _inbox_monitor and _inbox_monitor.is_running:
             _inbox_monitor.stop()
         _inbox_monitor = None
@@ -1049,8 +1056,8 @@ def api_system_vendor_ingestion():
     settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     provider = get_provider_info(api_key)
-    test_mode = str(settings.get("vendor_quote_test_mode", "false")).lower() == "true"
-    automation_enabled = str(settings.get("email_automation_enabled", "false")).lower() == "true"
+    test_mode = QUOTE_EMAILS_ENABLED and str(settings.get("vendor_quote_test_mode", "false")).lower() == "true"
+    automation_enabled = QUOTE_EMAILS_ENABLED and str(settings.get("email_automation_enabled", "false")).lower() == "true"
     monitor_running = bool(_inbox_monitor and _inbox_monitor.is_running)
     simulator_running = bool(_sim_watcher and _sim_watcher.is_running)
     idempotency = _vendor_import_idempotency_status()
@@ -1085,6 +1092,7 @@ def api_system_vendor_ingestion():
             "image_only_pdf_vision": True,
         },
         "email_monitor": {
+            "quote_emails_enabled": QUOTE_EMAILS_ENABLED,
             "enabled": automation_enabled,
             "running": monitor_running,
             "simulator_running": simulator_running,
@@ -1818,6 +1826,32 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
     # Load price list for auto-pricing
     _price_list = get_price_list_entries()
 
+    # The merge keeps unit_price/vendor but drops price_source, quote_status and
+    # fixture_count. For a transition priced by the stick (transition rule, price
+    # book, or a typed stick price on an EA line) that would bill the new LF times
+    # the stick price, so find the line it came from to keep stick pricing.
+    prior_piece_lines: dict[str, dict] = {}
+    prior_code_counts: dict[str, int] = {}
+    for em in existing_materials:
+        code = str(em.get("item_code") or "").strip()
+        if code:
+            prior_code_counts[code] = prior_code_counts.get(code, 0) + 1
+    for em in existing_materials:
+        code = str(em.get("item_code") or "").strip()
+        if not code or prior_code_counts[code] != 1:
+            continue
+        if (em.get("material_type") or "").strip().lower() != "transitions":
+            continue
+        if (_as_number(em.get("unit_price")) or 0) <= 0:
+            continue
+        source = str(em.get("price_source") or "").strip().lower()
+        ea_sticks = (
+            str(em.get("unit") or "").strip().upper() == "EA"
+            and not _order_qty_is_lf(em, em.get("order_qty"))
+        )
+        if source in ("price_book", "default_rule") or (source == "manual" and ea_sticks):
+            prior_piece_lines[code] = em
+
     # Apply waste factors to the final merged list
     materials = []
     for m in merged_raw:
@@ -1830,6 +1864,14 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         unit_price = m.get("unit_price", 0)
         vendor = m.get("vendor", "")
         price_source = m.get("price_source")
+        prior = prior_piece_lines.get(str(m.get("item_code") or "").strip())
+        if not (
+            prior
+            and not price_source
+            and (material_type or "").strip().lower() == "transitions"
+            and abs((_as_number(unit_price) or 0) - (_as_number(prior.get("unit_price")) or 0)) <= 0.005
+        ):
+            prior = None
         if not unit_price and _price_list:
             matched = _match_price_list(m, _price_list)
             if matched:
@@ -1856,19 +1898,38 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         # Set quote_status for unpriced materials
         quote_status = m.get("quote_status")
         if not unit_price and not quote_status:
-            quote_status = "needs_quote"
+            quote_status = "needs_quote" if QUOTE_EMAILS_ENABLED else "needs_price"
+
+        unit = unit_override or m.get("unit")
+        pricing_qty = round(order_qty, 2)
+        carried = {}
+        if prior:
+            # Keep stick pricing on the new LF (same rule as api_update_materials).
+            price_source = prior.get("price_source")
+            quote_status = prior.get("quote_status")
+            vendor = vendor or prior.get("vendor") or ""
+            carried = {
+                "fixture_count": prior.get("fixture_count") or 0,
+                "labor_rate_lf": prior.get("labor_rate_lf") or 0,
+                "labor_catalog": prior.get("labor_catalog"),
+            }
+            pricing_qty = _transition_pieces(order_qty, vendor, carried["fixture_count"])
+            unit = prior.get("unit") or unit
+            if str(unit or "").strip().upper() == "EA":
+                order_qty = pricing_qty
 
         materials.append({
+            **carried,
             "item_code": m.get("item_code"),
             "description": m.get("description"),
             "material_type": material_type,
             "installed_qty": round(installed_qty, 2),
-            "unit": unit_override or m.get("unit"),
+            "unit": unit,
             "waste_pct": waste_pct,
             "order_qty": round(order_qty, 2),
             "vendor": vendor,
             "unit_price": unit_price,
-            "extended_cost": round(unit_price * round(order_qty, 2), 2),
+            "extended_cost": round(unit_price * pricing_qty, 2),
             "ai_confidence": m.get("ai_confidence"),
             "quote_status": quote_status,
             "price_source": price_source,
@@ -1880,6 +1941,24 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             "is_penny_hex": m.get("is_penny_hex", False),
             "crack_isolation_sf": m.get("crack_isolation_sf", 0),
         })
+
+    # With quote emails off, apply the configured transition rules and the
+    # Schluter price book now, so only lines with no configured price are left
+    # for the estimator to type. Deterministic matches only: an AI-picked price
+    # is not a configured price, so those lines stay "Needs price".
+    # With quote emails on, the original quote-first order is kept (vendor
+    # quote, then transition defaults, then price book at quote upload).
+    if not QUOTE_EMAILS_ENABLED:
+        unpriced_transitions = [
+            i for i, m in enumerate(materials)
+            if (m.get("material_type") or "").lower() == "transitions"
+            and (_as_number(m.get("unit_price")) or 0) <= 0
+        ]
+        if unpriced_transitions:
+            _apply_transition_defaults(materials, unpriced_transitions)
+            still_unpriced = [i for i in unpriced_transitions if (_as_number(materials[i].get("unit_price")) or 0) <= 0]
+            if still_unpriced:
+                _price_book_match(materials, still_unpriced, allow_ai=False)
 
     material_ids = save_materials(db_id, materials)
 
@@ -2028,13 +2107,24 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
     }
     allowed_provenance_hashes = (verified_quote_hashes | current_quote_hashes) - {""}
 
+    def _configured_transition_default(mat: dict) -> bool:
+        """With quote emails off, transition rules / price book are applied at RFMS
+        upload. A matching vendor quote still replaces them, as it did when those
+        defaults only ran after the quote phases below."""
+        return (
+            not QUOTE_EMAILS_ENABLED
+            and (mat.get("material_type") or "").strip().lower() == "transitions"
+            and str(mat.get("quote_status") or "").strip().lower() == "price_book"
+            and str(mat.get("price_source") or "").strip().lower() in {"default_rule", "price_book"}
+        )
+
     for mat_idx, mat in enumerate(materials):
         existing_price = _as_number(mat.get("unit_price")) or 0
         provenance_only = (
             existing_price > 0
             and str(mat.get("price_source") or "").strip().lower() == "vendor_quote"
         )
-        if existing_price > 0 and not provenance_only:
+        if existing_price > 0 and not provenance_only and not _configured_transition_default(mat):
             continue
         item_code = (mat.get("item_code") or "").strip().lower()
         description = (mat.get("description") or "").strip().lower()
@@ -2213,8 +2303,16 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
     # Phase 4: Price book matching for remaining unpriced materials
     # Check if any unpriced materials match a vendor price book (e.g. Schluter transitions)
     still_unpriced2 = [i for i, m in enumerate(materials) if i not in matched_mat_indices and (not m.get("unit_price") or m["unit_price"] == 0)]
+    if not QUOTE_EMAILS_ENABLED:
+        # Same as RFMS upload with quote emails off: deterministic price-book
+        # matches on transitions only. An AI-picked price is not a configured
+        # price, so those lines stay "Needs price" for the estimator to type.
+        still_unpriced2 = [
+            i for i in still_unpriced2
+            if (materials[i].get("material_type") or "").strip().lower() == "transitions"
+        ]
     if still_unpriced2:
-        pb_matched = _price_book_match(materials, still_unpriced2)
+        pb_matched = _price_book_match(materials, still_unpriced2, allow_ai=QUOTE_EMAILS_ENABLED)
         if pb_matched > 0:
             matched += pb_matched
             updated = True
@@ -2386,7 +2484,7 @@ def _apply_transition_defaults(materials: list[dict], unpriced_indices: list[int
             continue
 
         description = (mat.get("description") or "").lower()
-        order_qty_lf = mat.get("order_qty", 0)
+        order_qty_lf = _transition_order_lf(mat)
         fixture_count = mat.get("fixture_count", 0) or 0
 
         # Check each rule
@@ -2408,6 +2506,7 @@ def _apply_transition_defaults(materials: list[dict], unpriced_indices: list[int
                 mat["price_source"] = rule["price_source"]
                 mat["quote_status"] = "price_book"
                 mat["extended_cost"] = round(pieces * price_per_piece, 2)
+                _store_transition_sticks(mat, pieces)
 
                 # Set labor rate
                 labor_rate = rule["labor_rate_lf"]
@@ -2428,6 +2527,7 @@ def _apply_transition_defaults(materials: list[dict], unpriced_indices: list[int
                 mat["price_source"] = rule["price_source"]
                 mat["quote_status"] = "price_book"
                 mat["extended_cost"] = round(pieces * rule["price_per_piece"], 2)
+                _store_transition_sticks(mat, pieces)
                 mat["labor_rate_lf"] = rule["labor_rate_lf"]
                 mat["labor_catalog"] = rule["labor_catalog"]
                 matched += 1
@@ -2460,10 +2560,50 @@ def _calc_schluter_pieces(order_qty_lf: float, fixture_count: int, piece_lf: flo
         return math.ceil(order_qty_lf / piece_lf)
 
 
-def _price_book_match(materials: list[dict], unpriced_indices: list[int]) -> int:
+def _transition_pieces(order_qty_lf: float, vendor: str | None, fixture_count) -> int:
+    """Whole sticks for a piece-priced transition line (Silver Pin=12', Schluter=8'2").
+    Same rule as the materials editor's transitionPiecesFromLf; shared with the
+    bid assembler, proposal waste re-apply and audits via material_pricing."""
+    return _shared_transition_pieces(order_qty_lf, vendor, fixture_count)
+
+
+def _order_qty_is_lf(mat: dict, order_qty) -> bool:
+    """True when order_qty equals the line's LF figure, installed_qty x (1 + waste_pct).
+    The old editor reset order_qty to that LF value on every edit, even on EA
+    transition lines, so on an EA line such a value is LF, not a stick count."""
+    return _shared_order_qty_is_lf(mat, order_qty)
+
+
+def _transition_order_lf(mat: dict) -> float:
+    """LF to count sticks from when a configured stick price is applied.
+    An EA transition row that already stores sticks (e.g. one whose price was
+    cleared) keeps its LF only as installed_qty x (1 + waste_pct); any other
+    row keeps LF in order_qty."""
+    if (
+        (mat.get("material_type") or "").strip().lower() == "transitions"
+        and _shared_order_qty_holds_sticks(mat)
+    ):
+        installed_qty = _as_number(mat.get("installed_qty")) or 0
+        waste_pct = _as_number(mat.get("waste_pct")) or 0
+        return round(installed_qty * (1 + waste_pct), 2)
+    return _as_number(mat.get("order_qty")) or 0
+
+
+def _store_transition_sticks(mat: dict, pieces) -> None:
+    """An EA transition row stores the sticks it is billed for as its order_qty,
+    as PUT /materials, the bid assembler and the materials editor expect."""
+    if (
+        (mat.get("material_type") or "").strip().lower() == "transitions"
+        and str(mat.get("unit") or "").strip().upper() == "EA"
+    ):
+        mat["order_qty"] = pieces
+
+
+def _price_book_match(materials: list[dict], unpriced_indices: list[int], allow_ai: bool = True) -> int:
     """Match unpriced materials against vendor price books (e.g. Schluter).
     Only matches when description explicitly contains a Schluter product line name
-    as a whole word AND has additional identifying info (item number, size, etc.)."""
+    as a whole word AND has additional identifying info (item number, size, etc.).
+    allow_ai=False skips the AI fallback, so low-confidence lines stay unpriced."""
     import re as _re
 
     # Known Schluter product lines — only match as whole words to avoid false positives
@@ -2542,7 +2682,7 @@ def _price_book_match(materials: list[dict], unpriced_indices: list[int]) -> int
             import math
             SCHLUTER_PIECE_LF = 8.0 + 2.0 / 12.0  # 8'-2" = 8.1667 LF
             price_per_piece = best_match["net_price"]
-            order_qty_lf = mat.get("order_qty", 0)
+            order_qty_lf = _transition_order_lf(mat)
             fixture_count = mat.get("fixture_count", 0) or 0
             pieces_needed = _calc_schluter_pieces(order_qty_lf, fixture_count, SCHLUTER_PIECE_LF)
             mat["unit_price"] = price_per_piece
@@ -2550,6 +2690,7 @@ def _price_book_match(materials: list[dict], unpriced_indices: list[int]) -> int
             mat["quote_status"] = "price_book"
             mat["price_source"] = "price_book"
             mat["extended_cost"] = round(pieces_needed * price_per_piece, 2)
+            _store_transition_sticks(mat, pieces_needed)
             # Apply labor rate
             is_premium = any(line in description for line in SCHLUTER_PREMIUM_LABOR_LINES)
             mat["labor_rate_lf"] = SCHLUTER_LABOR_RATE_PREMIUM if is_premium else SCHLUTER_LABOR_RATE_DEFAULT
@@ -2560,7 +2701,7 @@ def _price_book_match(materials: list[dict], unpriced_indices: list[int]) -> int
             ai_candidates.append(mat_idx)
 
     # Phase 2: AI matching for remaining Schluter materials
-    if ai_candidates:
+    if ai_candidates and allow_ai:
         ai_matched = _ai_price_book_match(materials, ai_candidates)
         matched += ai_matched
 
@@ -2668,7 +2809,7 @@ Return {{"matches": []}} for any materials you cannot confidently match."""
             import math
             SCHLUTER_PIECE_LF = 8.0 + 2.0 / 12.0  # 8'-2" = 8.1667 LF
             price_per_piece = net_price
-            order_qty_lf = mat.get("order_qty", 0)
+            order_qty_lf = _transition_order_lf(mat)
             fixture_count = mat.get("fixture_count", 0) or 0
             pieces_needed = _calc_schluter_pieces(order_qty_lf, fixture_count, SCHLUTER_PIECE_LF)
             mat["unit_price"] = price_per_piece
@@ -2676,6 +2817,7 @@ Return {{"matches": []}} for any materials you cannot confidently match."""
             mat["quote_status"] = "price_book"
             mat["price_source"] = "price_book"
             mat["extended_cost"] = round(pieces_needed * price_per_piece, 2)
+            _store_transition_sticks(mat, pieces_needed)
             # Apply labor rate
             desc_lower = (mat.get("description") or "").lower()
             is_premium = any(line in desc_lower for line in SCHLUTER_PREMIUM_LABOR_LINES)
@@ -2693,6 +2835,8 @@ Return {{"matches": []}} for any materials you cannot confidently match."""
 def _link_upload_to_requests(job_id: int, products: list[dict]):
     """Detect which open quote requests match uploaded vendor quotes.
     Returns list of matched requests for frontend confirmation."""
+    if not QUOTE_EMAILS_ENABLED:
+        return []
     requests = list_quote_requests(job_id)
     if not requests:
         return []
@@ -3115,6 +3259,7 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
             )
 
         updated = []
+        recounted_transitions = []
         for material in body.materials:
             base = existing.get(material.get("id"), {})
             merged = {**base, **{key: value for key, value in material.items() if value is not None}}
@@ -3131,9 +3276,21 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
             unit_price = merged.get("unit_price", 0)
             if not merged.get("price_source") and (_as_number(unit_price) or 0) <= 0:
                 merged["quote_status"] = None
+            # A typed price replaces the "needs price/quote" marker on the edited line.
+            if (
+                str(merged.get("price_source") or "").strip().lower() == "manual"
+                and (_as_number(unit_price) or 0) > 0
+                and merged.get("quote_status") in ("needs_quote", "needs_price")
+                and (
+                    str(base.get("price_source") or "").strip().lower() != "manual"
+                    or abs((_as_number(base.get("unit_price")) or 0) - (_as_number(unit_price) or 0)) > 0.005
+                )
+            ):
+                merged["quote_status"] = "manual"
+            order_qty_given = "order_qty" in material and material["order_qty"] is not None
             order_qty = (
                 material["order_qty"]
-                if "order_qty" in material and material["order_qty"] is not None
+                if order_qty_given
                 else installed_qty * (1 + waste_pct)
             )
 
@@ -3143,16 +3300,52 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
                 merged.get("price_source") in ("price_book", "default_rule")
                 and (merged.get("material_type") or "").lower() == "transitions"
             ):
-                import math
-                vendor = (merged.get("vendor") or "").lower()
-                stick_lf = 12.0 if "silver pin" in vendor else 8.0 + 2.0 / 12.0
-                fixture_count = merged.get("fixture_count", 0) or 0
-                pieces = (
-                    _calc_schluter_pieces(order_qty, fixture_count, stick_lf)
-                    if vendor == "schluter"
-                    else math.ceil(order_qty / stick_lf) if order_qty > 0 else 0
-                )
+                # EA lines (Schluter sticks priced at RFMS upload) already store
+                # order_qty in pieces; dividing by the stick length again would
+                # under-price the line. Same rule as the EA skip in api_generate_proposal.
+                # An EA row whose order_qty equals its LF figure was saved in LF by
+                # the old editor, so its sticks are recounted from that LF. Storage is
+                # judged on the saved row, as the editor does (a new LF can equal the
+                # old stick count). An incoming order_qty equal to the incoming row's
+                # own LF figure is still LF: every reader (bid assembler, PDF gate,
+                # editor) reads it back as LF, and a client that saved from a stale
+                # copy (autosave re-send after this handler converted a legacy row)
+                # sends exactly that.
+                piece_qty = str(merged.get("unit") or "").strip().upper() == "EA"
+                stored_row = base or merged
+                if (
+                    piece_qty
+                    and order_qty_given
+                    and not _order_qty_is_lf(stored_row, stored_row.get("order_qty"))
+                    and not _order_qty_is_lf(merged, order_qty)
+                ):
+                    pieces = order_qty
+                else:
+                    pieces = _transition_pieces(order_qty, merged.get("vendor"), merged.get("fixture_count", 0))
+                    if piece_qty:
+                        # order_qty was in LF; store the stick count for an EA line
+                        order_qty = pieces
                 extended_cost = pieces * unit_price
+                # Log stored EA rows whose sticks/total the server changed without
+                # the estimator editing that line, so repriced jobs can be reviewed.
+                if (
+                    piece_qty
+                    and base
+                    and abs((_as_number(material.get("order_qty")) or 0) - (_as_number(base.get("order_qty")) or 0)) <= 0.005
+                    and abs((_as_number(unit_price) or 0) - (_as_number(base.get("unit_price")) or 0)) <= 0.005
+                    and (
+                        abs(round(order_qty, 2) - (_as_number(base.get("order_qty")) or 0)) > 0.005
+                        or abs(round(extended_cost, 2) - (_as_number(base.get("extended_cost")) or 0)) > 0.005
+                    )
+                ):
+                    recounted_transitions.append({
+                        "item_code": merged.get("item_code"),
+                        "description": merged.get("description"),
+                        "order_qty_before": base.get("order_qty"),
+                        "order_qty_after": round(order_qty, 2),
+                        "extended_cost_before": base.get("extended_cost"),
+                        "extended_cost_after": round(extended_cost, 2),
+                    })
             else:
                 extended_cost = order_qty * unit_price
 
@@ -3201,6 +3394,14 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
             },
         )
     log_activity(job["id"], "materials_updated", f"Updated pricing for {len(body.materials)} materials")
+    if recounted_transitions:
+        print(f"[materials] Recounted sticks on {len(recounted_transitions)} EA transition line(s): {recounted_transitions}")
+        log_activity(
+            job["id"],
+            "transition_sticks_recounted",
+            f"Recounted Schluter/Silver Pin sticks on {len(recounted_transitions)} saved EA line(s); review the before/after totals",
+            {"lines": recounted_transitions},
+        )
 
     return {
         "materials": response_materials,
@@ -3824,6 +4025,7 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
         "lf_to_sticks": {
             "material_type": "transitions", "price_source": "price_book",
             "vendor": "Schluter", "unit": "EA", "order_qty": 212,
+            "installed_qty": 212, "waste_pct": 0,
             "fixture_count": 0, "unit_price": 7.94, "extended_cost": 206.44,
         },
         "stored_pieces": {
@@ -3834,6 +4036,7 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
         "corrupted": {
             "material_type": "transitions", "price_source": "price_book",
             "vendor": "Schluter", "unit": "EA", "order_qty": 34,
+            "installed_qty": 34, "waste_pct": 0,
             "fixture_count": 0, "unit_price": 9.78, "extended_cost": 40.00,
         },
     }
@@ -4324,11 +4527,15 @@ def _readiness_trust_summary(
         ):
             low_confidence_count += 1
 
+    # Typed prices are the normal path for lines with no configured price,
+    # so they are counted separately from overrides of a vendor quote.
+    manual_price_count = sum(
+        1 for material in active_materials
+        if str(material.get("price_source") or "").strip().lower() == "manual"
+    )
     manual_override_count = sum(
         1 for material in active_materials
-        if str(material.get("price_source") or "").strip().lower() in {
-            "manual", "vendor_quote_override",
-        }
+        if str(material.get("price_source") or "").strip().lower() == "vendor_quote_override"
     )
     for bundle in (proposal.get("bundles") or []):
         if not isinstance(bundle, dict):
@@ -4462,6 +4669,7 @@ def _readiness_trust_summary(
         "replay_status": (latest_replay or {}).get("status"),
         "largest_deltas": largest_deltas,
         "manual_override_count": manual_override_count,
+        "manual_price_count": manual_price_count,
         "unknown_material_count": unknown_count,
         "low_confidence_material_count": low_confidence_count,
         "labor_catalog_count": len(get_labor_catalog_entries()),
@@ -5184,7 +5392,7 @@ def _validate_bid_job_ready(job: dict) -> None:
         suffix = "..." if len(unpriced) > 5 else ""
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot generate bid PDF until all materials have prices. Missing: {sample}{suffix}",
+            detail=f"Cannot generate bid PDF until all materials have prices. Type the price on the material line for: {sample}{suffix}",
         )
 
     unknown = [
@@ -5257,6 +5465,14 @@ def _record_bid_audit(job_id: int, bid_data: dict) -> dict:
                     "waste_pct": bundle.get("waste_pct"),
                 })
                 formula = "order_qty * unit_price"
+                if (
+                    bundle.get("pricing_qty") is not None
+                    and abs(_money(bundle.get("pricing_qty")) - _money(bundle.get("order_qty"))) > 0.005
+                ):
+                    # Stick-priced transition: sticks counted from the LF order qty
+                    inputs["pricing_qty"] = _money(bundle.get("pricing_qty"))
+                    inputs["pricing_unit"] = bundle.get("pricing_unit")
+                    formula = "pricing_qty * unit_price"
             elif field == "freight_cost":
                 inputs.update({
                     "order_qty": _money(bundle.get("order_qty")),
@@ -6104,7 +6320,7 @@ def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
         if unknown:
             issues.append(f"classify {', '.join(str(item) for item in unknown[:5])}")
         if unpriced:
-            issues.append(f"price {', '.join(str(item) for item in unpriced[:5])}")
+            issues.append(f"type a price for {', '.join(str(item) for item in unpriced[:5])}")
         raise HTTPException(status_code=409, detail=f"Cannot generate PDF until active materials are ready: {'; '.join(issues)}.")
 
     arithmetic_errors = proposal_math_errors(body)
@@ -6463,7 +6679,24 @@ def api_generate_proposal(job_id: str):
         installed_qty = mat.get("installed_qty", 0) or 0
         mat["waste_pct"] = new_waste
         mat["order_qty"] = round(installed_qty * (1 + new_waste), 2)
-        mat["extended_cost"] = round(mat["order_qty"] * (mat.get("unit_price", 0) or 0), 2)
+        unit_price = mat.get("unit_price", 0) or 0
+        if is_piece_priced_transition(mat):
+            # Rule/price-book transitions are priced per stick; this (non-EA) row
+            # keeps order_qty in LF, so bill the sticks for the new LF, never LF x stick price.
+            pieces = _transition_pieces(mat["order_qty"], mat.get("vendor"), mat.get("fixture_count", 0))
+            mat["extended_cost"] = round(pieces * unit_price, 2)
+            cost_formula = "transition_pieces(order_qty, vendor, fixture_count) * unit_price"
+            cost_inputs = {
+                "order_qty": mat["order_qty"],
+                "vendor": mat.get("vendor") or "",
+                "fixture_count": mat.get("fixture_count", 0) or 0,
+                "piece_count": pieces,
+                "unit_price": unit_price,
+            }
+        else:
+            mat["extended_cost"] = round(mat["order_qty"] * unit_price, 2)
+            cost_formula = "order_qty * unit_price"
+            cost_inputs = {"order_qty": mat["order_qty"], "unit_price": unit_price}
         trace.record(
             entity_type="material",
             entity_id=mat.get("id"),
@@ -6480,8 +6713,8 @@ def api_generate_proposal(job_id: str):
             entity_id=mat.get("id"),
             entity_key=mat.get("item_code"),
             output_field="extended_cost",
-            formula="order_qty * unit_price",
-            inputs={"order_qty": mat["order_qty"], "unit_price": mat.get("unit_price", 0) or 0},
+            formula=cost_formula,
+            inputs=cost_inputs,
             result=mat["extended_cost"],
             rule_id=f"material:{mtype}:extended_cost",
             source=mat.get("price_source") or "waste_factors",
@@ -7139,6 +7372,7 @@ def api_get_settings():
         "ai_provider": provider["provider"],
         "ai_available": provider["available"],
         "vendor_quote_test_mode": settings.get("vendor_quote_test_mode", "false"),
+        "quote_emails_enabled": QUOTE_EMAILS_ENABLED,
     }
 
 
@@ -7273,8 +7507,15 @@ async def api_price_history(item_code: str = None, product: str = None, exclude_
 
 # ── Quote Requests ───────────────────────────────────────────────────────────
 
+def _require_quote_emails():
+    """Reject quote-email endpoints while QUOTE_EMAILS_ENABLED is off."""
+    if not QUOTE_EMAILS_ENABLED:
+        raise HTTPException(status_code=410, detail=QUOTE_EMAILS_OFF_DETAIL)
+
+
 @app.post("/api/jobs/{job_id}/quote-requests")
 async def api_create_quote_request(job_id: str, request: Request):
+    _require_quote_emails()
     db_id = _resolve_job_id(job_id)
     data = await request.json()
     vendor_name = data.get("vendor_name", "").strip()
@@ -7302,6 +7543,7 @@ async def api_list_quote_requests(job_id: str):
 
 @app.put("/api/quote-requests/{request_id}")
 async def api_update_quote_request(request_id: int, request: Request):
+    _require_quote_emails()
     data = await request.json()
     update_quote_request(request_id, **data)
     return {"ok": True}
@@ -7309,6 +7551,7 @@ async def api_update_quote_request(request_id: int, request: Request):
 
 @app.delete("/api/quote-requests/{request_id}")
 async def api_delete_quote_request(request_id: int):
+    _require_quote_emails()
     if delete_quote_request(request_id):
         return {"ok": True}
     raise HTTPException(status_code=404, detail="Quote request not found")
@@ -7477,6 +7720,7 @@ async def api_detect_vendors(job_id: str):
     5. VALIDATE: Cross-check AI results — reject if evidence doesn't appear in description
     6. RETRY: Focused single-item AI call for any conflicts
     """
+    _require_quote_emails()
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
@@ -7718,6 +7962,7 @@ async def api_detect_vendors(job_id: str):
 @app.post("/api/jobs/{job_id}/generate-quote-text")
 async def api_generate_quote_text(job_id: str, request: Request):
     """Use AI to generate professional quote request text for a vendor."""
+    _require_quote_emails()
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
@@ -7827,6 +8072,7 @@ Write a clean, professional email body. Requirements:
 @app.post("/api/jobs/{job_id}/suggest-vendors")
 async def api_suggest_vendors(job_id: str, request: Request):
     """AI suggests which vendor to contact for unassigned materials based on history."""
+    _require_quote_emails()
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
@@ -7926,6 +8172,7 @@ If you cannot suggest a vendor, omit that material from the array."""
 @app.post("/api/vendors/suggest-contacts")
 async def api_suggest_vendor_contacts(request: Request):
     """Use AI to suggest contact info for vendors."""
+    _require_quote_emails()
     data = await request.json()
     vendor_names = data.get("vendor_names", [])
     if not vendor_names:
@@ -8068,11 +8315,12 @@ def api_import_schluter():
 def api_sim_status():
     """Check if vendor quote test mode is active."""
     settings = get_settings()
-    test_mode = str(settings.get("vendor_quote_test_mode", "false")).lower() == "true"
+    test_mode = QUOTE_EMAILS_ENABLED and str(settings.get("vendor_quote_test_mode", "false")).lower() == "true"
     watcher_active = _sim_watcher is not None and _sim_watcher.is_running if _sim_watcher else False
     return {
         "test_mode": test_mode,
         "watcher_active": watcher_active,
+        "quote_emails_enabled": QUOTE_EMAILS_ENABLED,
     }
 
 
@@ -8083,6 +8331,7 @@ async def api_send_quote_email(job_id: str, request: Request):
     In test mode: routes to localhost:2525 (PowerShell relay → Vendor Simulator)
     In production: routes to real SMTP server → real vendor
     """
+    _require_quote_emails()
     db_id = _resolve_job_id(job_id)
     if not db_id:
         raise HTTPException(status_code=404, detail="Job not found")

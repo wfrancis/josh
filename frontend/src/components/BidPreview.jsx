@@ -76,7 +76,8 @@ function BundleCard({ bundle, index, hasFlag }) {
 
           {/* Material */}
           <DetailSection icon={Package} label="Material" total={bundle.material_cost}>
-            <DetailLine name={bundle.bundle_name} qty={bundle.order_qty} unit={bundle.unit} rate={bundle.unit_price} cost={bundle.material_cost} />
+            {/* Stick-priced transitions bill pricing_qty sticks (EA), not the LF order qty */}
+            <DetailLine name={bundle.bundle_name} qty={bundle.pricing_qty ?? bundle.order_qty} unit={bundle.pricing_unit || bundle.unit} rate={bundle.unit_price} cost={bundle.material_cost} />
           </DetailSection>
 
           {/* Sundries */}

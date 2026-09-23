@@ -11,6 +11,7 @@ from typing import Any
 
 from audit_engine import AuditTraceBuilder
 from labor_calc import calculate_labor_for_materials
+from material_pricing import is_piece_priced_transition, transition_pieces
 from proposal_bundler import generate_proposal_data
 from proposal_totals import effective_bundle_total, normalize_proposal_totals
 from sundry_calc import calculate_sundries_for_materials
@@ -221,7 +222,23 @@ def _apply_waste_rules(materials: list[dict], waste_factors: dict, trace: AuditT
         installed_qty = _num(mat.get("installed_qty"))
         mat["waste_pct"] = float(new_waste)
         mat["order_qty"] = round(installed_qty * (1 + float(new_waste)), 2)
-        mat["extended_cost"] = round(mat["order_qty"] * _num(mat.get("unit_price")), 2)
+        unit_price = _num(mat.get("unit_price"))
+        if is_piece_priced_transition(mat):
+            # Same as api_generate_proposal: bill sticks for the new LF on rule/price-book transitions.
+            pieces = transition_pieces(mat["order_qty"], mat.get("vendor"), mat.get("fixture_count", 0))
+            mat["extended_cost"] = round(pieces * unit_price, 2)
+            cost_formula = "transition_pieces(order_qty, vendor, fixture_count) * unit_price"
+            cost_inputs = {
+                "order_qty": mat["order_qty"],
+                "vendor": mat.get("vendor") or "",
+                "fixture_count": mat.get("fixture_count", 0) or 0,
+                "piece_count": pieces,
+                "unit_price": unit_price,
+            }
+        else:
+            mat["extended_cost"] = round(mat["order_qty"] * unit_price, 2)
+            cost_formula = "order_qty * unit_price"
+            cost_inputs = {"order_qty": mat["order_qty"], "unit_price": unit_price}
         trace.record(
             entity_type="material",
             entity_id=mat.get("id"),
@@ -238,8 +255,8 @@ def _apply_waste_rules(materials: list[dict], waste_factors: dict, trace: AuditT
             entity_id=mat.get("id"),
             entity_key=mat.get("item_code"),
             output_field="extended_cost",
-            formula="order_qty * unit_price",
-            inputs={"order_qty": mat["order_qty"], "unit_price": _num(mat.get("unit_price"))},
+            formula=cost_formula,
+            inputs=cost_inputs,
             result=mat["extended_cost"],
             rule_id=f"material:{material_type}:extended_cost",
             source="golden_replay",
