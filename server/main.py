@@ -2,6 +2,7 @@
 FastAPI application for the Standard Interiors Bid Tool.
 """
 
+import asyncio
 import copy
 import csv
 import hashlib
@@ -13,7 +14,8 @@ import re
 import shutil
 import sqlite3
 import tempfile
-from datetime import datetime, timezone
+import time
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Optional
 
@@ -22,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from models import (
     init_db, save_job, load_job, list_jobs, delete_job,
@@ -56,6 +59,19 @@ from models import (
     save_golden_replay, list_golden_replays_for_job, list_golden_replays_for_version,
     get_latest_golden_replay_for_version,
     JOB_ESTIMATE_HEADER_FIELDS,
+    seed_default_users, authenticate_user, create_session, get_session_user,
+    delete_session, list_online_users, set_current_user, reset_current_user,
+    SESSION_LIFETIME_DAYS,
+    list_bid_tracker_jobs, get_bid_tracker_job, list_bid_events, save_bid_tracking,
+    get_latest_job_artifact,
+)
+from bid_tracker import (
+    BID_STATUSES, DECIDED_BID_STATUSES, FIELD_LABELS as BID_FIELD_LABELS,
+    MAX_FUTURE_SENT_DAYS, MAX_NOTE_LENGTH, MAX_REASON_LENGTH, MAX_SHORT_TEXT_LENGTH,
+    POSTABLE_BID_EVENT_TYPES,
+    clean_sent_to, clean_text, clean_tracking_fields, decorate_bid_row,
+    effective_bid_status, parse_date, parse_money, resolve_today,
+    status_change_updates, summarize_bids,
 )
 from rfms_parser import infer_material_type_fallback, label_uploaded_lines, merge_reupload_materials, parse_rfms
 from quote_parser import (
@@ -97,6 +113,47 @@ from readiness import evaluate_job_readiness, is_valid_material_classification, 
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="SI Bid Tool", version="1.0.0")
+
+SESSION_COOKIE = "si_session"
+# The only /api paths that work without logging in.
+PUBLIC_API_PATHS = frozenset({"/api/auth/login", "/api/auth/me", "/api/system/build"})
+
+
+class RequireLoginMiddleware:
+    """Every /api/* request needs a logged-in user, except PUBLIC_API_PATHS.
+
+    One plain ASGI middleware guards all API routes (including ones added
+    later), while the React app and its static files stay public. The user is
+    available to handlers as ``request.state.user`` and to ``log_activity``
+    through ``models.get_current_user()``.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path") or ""
+        if scope["type"] != "http" or not (path == "/api" or path.startswith("/api/")):
+            await self.app(scope, receive, send)
+            return
+
+        token = Request(scope).cookies.get(SESSION_COOKIE)
+        user = await run_in_threadpool(get_session_user, token) if token else None
+        if user is None and path not in PUBLIC_API_PATHS:
+            response = JSONResponse(status_code=401, content={"detail": "Please log in."})
+            await response(scope, receive, send)
+            return
+
+        scope["state"] = {**(scope.get("state") or {}), "user": user}
+        context_token = set_current_user(user)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_current_user(context_token)
+
+
+# Added before CORS so CORS stays the outer layer and still answers preflights.
+app.add_middleware(RequireLoginMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -792,6 +849,8 @@ def _start_inbox_monitor():
 @app.on_event("startup")
 def startup():
     init_db()
+    if seed_default_users():
+        print("[seed] Created the shared 'test' login")
     _apply_openai_config()
     _seed_company_rates()
     _seed_rules_registry()
@@ -1000,6 +1059,150 @@ def _ruleset_with_engine_contract(ruleset: dict | None) -> dict | None:
     result["engine_fingerprint"] = build.get("engine_fingerprint")
     result["config_fingerprint"] = build.get("config_fingerprint")
     return result
+
+
+# ── Log in / log out ─────────────────────────────────────────────────────────
+
+LOGIN_FAILURE_DELAY_SECONDS = 1.0
+# PINs are short, so guessing is capped: after this many tries in the window a
+# username (or one network address) gets "too many tries" without the PIN
+# being checked. The per-address cap is higher because an office shares one.
+LOGIN_TRY_WINDOW_SECONDS = 15 * 60
+LOGIN_MAX_TRIES_PER_USERNAME = 5
+LOGIN_MAX_TRIES_PER_ADDRESS = 20
+LOGIN_MAX_PIN_CHECKS_AT_ONCE = 2    # each PIN check is deliberately slow CPU work
+LOGIN_TOO_MANY_TRIES = "Too many wrong tries. Wait a few minutes, then try again."
+
+# key ("user:<name>" / "ip:<address>") -> monotonic times of recent tries.
+# Only touched from the event loop, so no lock is needed. Kept in memory: the
+# app runs as one process, and a restart simply resets the counts.
+_login_tries: dict[str, list[float]] = {}
+_pin_check_gate: tuple | None = None   # (event loop, semaphore)
+
+
+def _login_try_keys(username: str, request: Request) -> tuple[str, str]:
+    # Fly's proxy sets Fly-Client-IP to the real caller address.
+    address = request.headers.get("fly-client-ip") or (request.client.host if request.client else "")
+    return (
+        "user:" + (username or "").strip().lower()[:64],
+        "ip:" + ((address or "").strip()[:64] or "unknown"),
+    )
+
+
+def _recent_login_tries(key: str, now: float) -> list[float]:
+    tries = [t for t in _login_tries.get(key, ()) if now - t < LOGIN_TRY_WINDOW_SECONDS]
+    if tries:
+        _login_tries[key] = tries
+    else:
+        _login_tries.pop(key, None)
+    return tries
+
+
+def _prune_login_tries(now: float) -> None:
+    if len(_login_tries) > 5000:
+        for key in list(_login_tries):
+            _recent_login_tries(key, now)
+
+
+def _pin_check_semaphore() -> asyncio.Semaphore:
+    """Cap how many slow PIN checks run at once so logins can't hog the CPU."""
+    global _pin_check_gate
+    loop = asyncio.get_running_loop()
+    if _pin_check_gate is None or _pin_check_gate[0] is not loop:
+        _pin_check_gate = (loop, asyncio.Semaphore(LOGIN_MAX_PIN_CHECKS_AT_ONCE))
+    return _pin_check_gate[1]
+
+
+class LoginRequest(BaseModel):
+    username: str = ""
+    pin: str | int = ""
+
+
+def _request_is_https(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    # Fly terminates HTTPS at its proxy and forwards plain HTTP to the app.
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    return forwarded.split(",")[0].strip().lower() == "https"
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(body: LoginRequest, request: Request):
+    now = time.monotonic()
+    _prune_login_tries(now)
+    user_key, address_key = _login_try_keys(body.username, request)
+    user_tries = _recent_login_tries(user_key, now)
+    address_tries = _recent_login_tries(address_key, now)
+    if len(user_tries) >= LOGIN_MAX_TRIES_PER_USERNAME or len(address_tries) >= LOGIN_MAX_TRIES_PER_ADDRESS:
+        oldest = min(
+            user_tries[0] if len(user_tries) >= LOGIN_MAX_TRIES_PER_USERNAME else now,
+            address_tries[0] if len(address_tries) >= LOGIN_MAX_TRIES_PER_ADDRESS else now,
+        )
+        wait_seconds = max(1, int(LOGIN_TRY_WINDOW_SECONDS - (now - oldest)) + 1)
+        raise HTTPException(status_code=429, detail=LOGIN_TOO_MANY_TRIES,
+                            headers={"Retry-After": str(wait_seconds)})
+    # Count this try before checking the PIN, so a burst of requests sent at
+    # the same moment is capped too.
+    _login_tries.setdefault(user_key, []).append(now)
+    _login_tries.setdefault(address_key, []).append(now)
+
+    async with _pin_check_semaphore():
+        user = await run_in_threadpool(authenticate_user, body.username, body.pin)
+    if not user:
+        # Slow down guessing a little without tying up a worker thread.
+        await asyncio.sleep(LOGIN_FAILURE_DELAY_SECONDS)
+        raise HTTPException(status_code=401, detail="That username and PIN don't match. Try again.")
+    # Right PIN: clear this username's wrong tries and hand back this try's
+    # slot for the address, so people sharing an office connection aren't
+    # held up by each other's successful logins.
+    _login_tries.pop(user_key, None)
+    address_tries = _login_tries.get(address_key)
+    if address_tries and now in address_tries:
+        address_tries.remove(now)
+    old_token = request.cookies.get(SESSION_COOKIE)
+    if old_token:
+        await run_in_threadpool(delete_session, old_token)
+    token = await run_in_threadpool(create_session, user["id"])
+    response = JSONResponse(content=user)
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_LIFETIME_DAYS * 24 * 60 * 60,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=_request_is_https(request),
+    )
+    return response
+
+
+@app.get("/api/auth/me")
+def api_auth_me(request: Request):
+    user = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in.")
+    return user
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout(request: Request):
+    delete_session(request.cookies.get(SESSION_COOKIE))
+    response = JSONResponse(content={"ok": True})
+    response.delete_cookie(
+        SESSION_COOKIE,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=_request_is_https(request),
+    )
+    return response
+
+
+@app.get("/api/auth/online")
+def api_auth_online():
+    """People who used the tool in the last 15 minutes."""
+    return list_online_users()
+
 
 @app.get("/api/system/build")
 def api_system_build():
@@ -1721,6 +1924,281 @@ def api_update_job(job_id: str, body: JobUpdate):
         changed_keys = ", ".join(changes.keys())
         log_activity(job["id"], "job_updated", f"Updated {changed_keys}", {"changes": changes})
     return {"message": "Job updated"}
+
+
+# ── Bid Tracker ──────────────────────────────────────────────────────────────
+# Replaces JobRunner's bid register: status, due date, estimator and follow-ups
+# for every job, plus a history of who did what and when. Nothing is emailed.
+
+
+class BidTrackingUpdate(BaseModel):
+    """Only the fields sent are changed; send "" or null to clear one."""
+    bid_status: Optional[str] = None
+    bid_due_date: Optional[str] = None
+    bid_due_time: Optional[str] = None
+    estimator: Optional[str] = None
+    next_follow_up_date: Optional[str] = None
+    won_lost_reason: Optional[str] = None
+    awarded_amount: Optional[float | str] = None
+    note: Optional[str] = None
+    today: Optional[str] = None  # the person's local date, YYYY-MM-DD
+
+
+class BidEventCreate(BaseModel):
+    event_type: str
+    note: Optional[str] = None
+    sent_to: Optional[str | list[str]] = None      # sent: names / emails
+    gc_name: Optional[str] = None                  # sent: which GC it went to
+    sent_on: Optional[str] = None                  # sent: date sent, default today
+    next_follow_up_date: Optional[str] = None      # sent / follow_up
+    reason: Optional[str] = None                   # won / lost
+    awarded_amount: Optional[float | str] = None   # won / lost
+    today: Optional[str] = None                    # the person's local date
+
+
+def _request_username(request: Request) -> str | None:
+    user = getattr(request.state, "user", None) or {}
+    return user.get("username")
+
+
+def _bid_tracking_payload(db_id: int, today: date) -> dict:
+    row = get_bid_tracker_job(db_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "today": today.isoformat(),
+        "statuses": list(BID_STATUSES),
+        "tracking": decorate_bid_row(row, today),
+        "events": list_bid_events(db_id),
+    }
+
+
+def _current_bid_tracking(db_id: int) -> dict:
+    row = get_bid_tracker_job(db_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return row
+
+
+def _bid_money_text(amount) -> str:
+    return f"${amount:,.2f}" if isinstance(amount, (int, float)) else ""
+
+
+def _bid_send_evidence(db_id: int) -> dict:
+    """Which saved proposal and which printed PDF were current when the bid went out."""
+    evidence: dict = {}
+    job = load_job(db_id) or {}
+    proposal = job.get("proposal_data")
+    if isinstance(proposal, dict) and proposal.get("bundles"):
+        evidence["proposal_revision"] = proposal.get("_server_revision")
+        pdf_total = (proposal.get("pdf_totals") or {}).get("grand_total")
+        if pdf_total is not None:
+            evidence["pdf_total"] = pdf_total
+    pdf = get_latest_job_artifact(db_id, "proposal_pdf")
+    if pdf:
+        evidence["pdf"] = {
+            "file_hash": pdf["file_hash"],
+            "file_size": pdf["file_size"],
+            "created_at": pdf["created_at"],
+        }
+    return evidence
+
+
+@app.get("/api/bid-tracker")
+def api_bid_tracker(today: Optional[str] = None):
+    """Every job as a bid, with due-date / follow-up flags and the summary counts."""
+    local_today = resolve_today(today)
+    bids = [decorate_bid_row(row, local_today) for row in list_bid_tracker_jobs()]
+    return {
+        "today": local_today.isoformat(),
+        "statuses": list(BID_STATUSES),
+        "summary": summarize_bids(bids, local_today),
+        "bids": bids,
+    }
+
+
+@app.get("/api/jobs/{job_id}/bid-tracking")
+def api_get_bid_tracking(job_id: str, today: Optional[str] = None):
+    """One job's bid tracking fields and history."""
+    db_id = _resolve_job_id(job_id)
+    return _bid_tracking_payload(db_id, resolve_today(today))
+
+
+@app.get("/api/jobs/{job_id}/bid-events")
+def api_list_bid_events(job_id: str):
+    """One job's bid history, newest first."""
+    db_id = _resolve_job_id(job_id)
+    return list_bid_events(db_id)
+
+
+@app.patch("/api/jobs/{job_id}/bid-tracking")
+def api_update_bid_tracking(job_id: str, body: BidTrackingUpdate, request: Request):
+    """Change status, due date, estimator or next follow-up; records who changed what."""
+    db_id = _resolve_job_id(job_id)
+    given = body.model_dump(exclude_unset=True)
+    try:
+        today = resolve_today(given.pop("today", None))
+        note = clean_text(given.pop("note", None), MAX_NOTE_LENGTH, "Note")
+        fields = clean_tracking_fields(given)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    current = _current_bid_tracking(db_id)
+    old_status, _ = effective_bid_status(current["bid_status"], current["material_count"])
+    new_status = fields.pop("bid_status", None)
+
+    updates: dict = {}
+    changes: dict = {}
+    for column, value in fields.items():
+        if current.get(column) != value:
+            updates[column] = value
+            changes[column] = {"old": current.get(column), "new": value}
+
+    details: dict = {}
+    if new_status and new_status != old_status:
+        updates["bid_status"] = new_status
+        updates.update(status_change_updates(old_status, new_status, today, fields))
+        details.update({"from": old_status, "to": new_status})
+    elif new_status and current["bid_status"] != new_status:
+        # Confirming the shown default status: store it, nothing to report.
+        updates["bid_status"] = new_status
+    if changes:
+        details["changes"] = changes
+    if note:
+        details["note"] = note
+
+    if details.get("to") == "Sent":
+        # Setting the status to Sent is the same as "Mark as sent": record the
+        # send (today, the GC and the saved bid total) so the tracker shows
+        # when it went out. Other fields changed alongside get their own entry.
+        sent_details = {
+            "sent_to": None,
+            "gc_name": current["gc_name"] or None,
+            "sent_on": today.isoformat(),
+            "bid_total": current["bid_total"],
+            **_bid_send_evidence(db_id),
+            "from": old_status,
+        }
+        if note:
+            sent_details["note"] = note
+        events = [("note", {"changes": changes})] if changes else []
+        events.append(("sent", sent_details))
+    else:
+        events = [("status_change" if "to" in details else "note", details)] if details else []
+    if updates or events:
+        save_bid_tracking(db_id, updates, events, _request_username(request))
+    if details.get("to") == "Sent":
+        total = _bid_money_text(current["bid_total"])
+        gc_text = f" to {current['gc_name']}" if current["gc_name"] else ""
+        log_activity(db_id, "bid_sent",
+                     f"Bid marked as sent{gc_text}" + (f" ({total})" if total else ""),
+                     {"gc_name": current["gc_name"], "bid_total": current["bid_total"],
+                      **({"changes": changes} if changes else {})})
+    elif "to" in details:
+        log_activity(db_id, "bid_status_changed", f"Bid status changed from {old_status} to {new_status}",
+                     {"changes": changes} if changes else None)
+    elif changes:
+        labels = ", ".join(BID_FIELD_LABELS.get(column, column).lower() for column in changes)
+        log_activity(db_id, "bid_tracking_updated", f"Bid tracking updated: {labels}", {"changes": changes})
+    elif note:
+        log_activity(db_id, "bid_note_added", "Bid note added")
+    return _bid_tracking_payload(db_id, today)
+
+
+@app.post("/api/jobs/{job_id}/bid-events")
+def api_add_bid_event(job_id: str, body: BidEventCreate, request: Request):
+    """Log that the bid was sent, a follow-up, a note, or that it was won or lost."""
+    db_id = _resolve_job_id(job_id)
+    event_type = str(body.event_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if event_type not in POSTABLE_BID_EVENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"event_type must be one of: {', '.join(POSTABLE_BID_EVENT_TYPES)}.",
+        )
+    given = body.model_fields_set
+    current = _current_bid_tracking(db_id)
+    old_status, _ = effective_bid_status(current["bid_status"], current["material_count"])
+
+    explicit: dict = {}   # tracking fields this event sets directly
+    details: dict = {}
+    new_status = None
+    try:
+        today = resolve_today(body.today)
+        note = clean_text(body.note, MAX_NOTE_LENGTH, "Note")
+        if event_type == "sent":
+            sent_on = parse_date(body.sent_on, "Sent on") or today.isoformat()
+            if date.fromisoformat(sent_on) > today + timedelta(days=MAX_FUTURE_SENT_DAYS):
+                raise ValueError("Sent on can't be in the future.")
+            details = {
+                "sent_to": clean_sent_to(body.sent_to),
+                "gc_name": clean_text(body.gc_name, MAX_SHORT_TEXT_LENGTH, "GC") or current["gc_name"] or None,
+                "sent_on": sent_on,
+                "bid_total": current["bid_total"],
+                **_bid_send_evidence(db_id),
+            }
+            if "next_follow_up_date" in given:
+                explicit["next_follow_up_date"] = parse_date(body.next_follow_up_date, "Next follow-up")
+                details["next_follow_up_date"] = explicit["next_follow_up_date"]
+            new_status = "Sent"
+        elif event_type == "follow_up":
+            if "next_follow_up_date" in given:
+                explicit["next_follow_up_date"] = parse_date(body.next_follow_up_date, "Next follow-up")
+                details["next_follow_up_date"] = explicit["next_follow_up_date"]
+            if not note and not explicit.get("next_follow_up_date"):
+                raise ValueError("Add a note about the follow-up or a next follow-up date.")
+        elif event_type == "note":
+            if not note:
+                raise ValueError("Type a note first.")
+        else:  # won / lost
+            new_status = "Won" if event_type == "won" else "Lost"
+            reason = clean_text(body.reason, MAX_REASON_LENGTH, "Reason")
+            amount = parse_money(body.awarded_amount, "Awarded amount")
+            if new_status == old_status:
+                # Marked won/lost again (say, to add a note): keep the saved
+                # reason and amount unless a new one was typed.
+                if reason:
+                    explicit["won_lost_reason"] = reason
+                if amount is not None:
+                    explicit["awarded_amount"] = amount
+            else:
+                explicit["won_lost_reason"] = reason
+                explicit["awarded_amount"] = amount
+            details = {
+                "reason": explicit.get("won_lost_reason", current["won_lost_reason"]),
+                "awarded_amount": explicit.get("awarded_amount", current["awarded_amount"]),
+                "bid_total": current["bid_total"],
+            }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if note:
+        details["note"] = note
+    updates = dict(explicit)
+    if new_status:
+        if new_status != old_status:
+            details["from"] = old_status
+            updates.update(status_change_updates(old_status, new_status, today, explicit))
+        if new_status in DECIDED_BID_STATUSES and not current.get("won_lost_at") and "won_lost_at" not in updates:
+            updates["won_lost_at"] = today.isoformat()
+        updates["bid_status"] = new_status
+
+    save_bid_tracking(db_id, updates, [(event_type, details)], _request_username(request))
+
+    if event_type == "sent":
+        who = details.get("sent_to") or details.get("gc_name") or "the GC"
+        total = _bid_money_text(details.get("bid_total"))
+        log_activity(db_id, "bid_sent", f"Bid sent to {who}" + (f" ({total})" if total else ""),
+                     {"sent_to": details.get("sent_to"), "gc_name": details.get("gc_name"),
+                      "bid_total": details.get("bid_total")})
+    elif event_type in ("won", "lost"):
+        amount = _bid_money_text(details.get("awarded_amount"))
+        log_activity(db_id, f"bid_{event_type}", f"Bid {event_type}" + (f" ({amount})" if amount else ""),
+                     {"reason": details.get("reason"), "awarded_amount": details.get("awarded_amount")})
+    elif event_type == "follow_up":
+        log_activity(db_id, "bid_follow_up", "Bid follow-up logged")
+    else:
+        log_activity(db_id, "bid_note_added", "Bid note added")
+    return _bid_tracking_payload(db_id, today)
 
 
 @app.post("/api/jobs/{job_id}/upload-rfms")
@@ -8498,9 +8976,18 @@ if _static_root:
         if full_path.startswith("api/"):
             from fastapi.responses import JSONResponse
             return JSONResponse(status_code=404, content={"detail": "Not found"})
-        # If the file exists in static dir, serve it directly
-        file_path = os.path.join(_static_root, full_path)
-        if full_path and os.path.isfile(file_path):
-            return FileResponse(file_path)
+        # If the file exists in static dir, serve it directly. Resolve the path
+        # first and only serve files that really sit inside the static folder,
+        # so "..", an encoded leading slash or a symlink can't reach the
+        # database or any other file on the server.
+        if full_path:
+            static_root = os.path.realpath(_static_root)
+            try:
+                file_path = os.path.realpath(os.path.join(static_root, full_path))
+                inside_static = os.path.commonpath([static_root, file_path]) == static_root
+            except (ValueError, OSError):  # e.g. a NUL byte in the path
+                inside_static = False
+            if inside_static and os.path.isfile(file_path):
+                return FileResponse(file_path)
         # Otherwise serve index.html for client-side routing
         return FileResponse(os.path.join(_static_root, "index.html"), headers={"Cache-Control": "no-cache, no-store, must-revalidate"})

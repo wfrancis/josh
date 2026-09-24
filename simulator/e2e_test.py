@@ -11,6 +11,7 @@ Requires all 3 services running:
 """
 
 import json
+import os
 import sys
 import time
 import httpx
@@ -18,6 +19,12 @@ import httpx
 BID_TOOL = "http://localhost:8000"
 VENDOR_SIM = "http://localhost:8100"
 TIMEOUT = 120.0
+
+# The Bid Tool needs a login. SI_LOGIN=user:pin overrides the shared test login.
+BID_TOOL_LOGIN = os.environ.get("SI_LOGIN", "test:1234")
+
+# One client for every Bid Tool call so the login cookie is sent each time.
+bid_tool = httpx.Client()
 
 # Test job templates — each iteration uses different materials/vendors
 TEST_JOBS = [
@@ -92,13 +99,21 @@ def log(msg):
     print(f"  {msg}", flush=True)
 
 
+def log_in_to_bid_tool():
+    """Log in so later Bid Tool calls carry the session cookie."""
+    username, _, pin = BID_TOOL_LOGIN.partition(":")
+    r = bid_tool.post(f"{BID_TOOL}/api/auth/login", json={"username": username, "pin": pin}, timeout=10)
+    r.raise_for_status()
+
+
 def check_services():
     """Verify all 3 services are reachable."""
     try:
-        r = httpx.get(f"{BID_TOOL}/api/settings", timeout=5)
+        log_in_to_bid_tool()
+        r = bid_tool.get(f"{BID_TOOL}/api/settings", timeout=5)
         r.raise_for_status()
     except Exception as e:
-        print(f"FAIL: Bid Tool not reachable at {BID_TOOL}: {e}")
+        print(f"FAIL: Bid Tool not reachable (or login failed) at {BID_TOOL}: {e}")
         return False
     try:
         r = httpx.get(f"{VENDOR_SIM}/api/status", timeout=5)
@@ -116,10 +131,10 @@ def check_services():
 def ensure_vendor(v):
     """Create vendor if it doesn't exist (ignore duplicate errors)."""
     try:
-        httpx.post(f"{BID_TOOL}/api/vendors",
-                    json={"name": v["name"], "contact_name": v["contact_name"],
-                          "contact_email": v["contact_email"]},
-                    timeout=10)
+        bid_tool.post(f"{BID_TOOL}/api/vendors",
+                       json={"name": v["name"], "contact_name": v["contact_name"],
+                             "contact_email": v["contact_email"]},
+                       timeout=10)
     except Exception:
         pass
 
@@ -141,10 +156,10 @@ def run_iteration(idx, job_def):
 
     # Step 1: Create job
     log("Creating job...")
-    r = httpx.post(f"{BID_TOOL}/api/jobs",
-                   json={"project_name": job_def["project_name"],
-                         "client_name": job_def["client_name"]},
-                   timeout=10)
+    r = bid_tool.post(f"{BID_TOOL}/api/jobs",
+                      json={"project_name": job_def["project_name"],
+                            "client_name": job_def["client_name"]},
+                      timeout=10)
     if r.status_code != 200:
         log(f"FAIL: Create job returned {r.status_code}: {r.text[:200]}")
         result["steps"]["create_job"] = "FAIL"
@@ -157,9 +172,9 @@ def run_iteration(idx, job_def):
 
     # Step 2: Add materials
     log(f"Adding {len(job_def['materials'])} materials...")
-    r = httpx.put(f"{BID_TOOL}/api/jobs/{job_id}/materials",
-                  json={"materials": job_def["materials"]},
-                  timeout=10)
+    r = bid_tool.put(f"{BID_TOOL}/api/jobs/{job_id}/materials",
+                     json={"materials": job_def["materials"]},
+                     timeout=10)
     if r.status_code != 200:
         log(f"FAIL: Add materials returned {r.status_code}")
         result["steps"]["add_materials"] = "FAIL"
@@ -173,7 +188,7 @@ def run_iteration(idx, job_def):
 
     # Step 4: Detect vendors via AI
     log("Detecting vendors (AI)...")
-    r = httpx.post(f"{BID_TOOL}/api/jobs/{job_id}/detect-vendors", timeout=TIMEOUT)
+    r = bid_tool.post(f"{BID_TOOL}/api/jobs/{job_id}/detect-vendors", timeout=TIMEOUT)
     if r.status_code == 200:
         det = r.json()
         result["steps"]["detect_vendors"] = f"OK ({len(det.get('vendor_groups', []))} groups)"
@@ -186,12 +201,12 @@ def run_iteration(idx, job_def):
     sent_count = 0
     for v in job_def["vendors"]:
         # Generate quote text
-        r = httpx.post(f"{BID_TOOL}/api/jobs/{job_id}/generate-quote-text",
-                       json={"vendor_name": v["name"],
-                             "materials": [m["description"] for m in job_def["materials"]
-                                           if v["name"].lower().split()[0] in m["description"].lower()]
-                             or [m["description"] for m in job_def["materials"][:2]]},
-                       timeout=TIMEOUT)
+        r = bid_tool.post(f"{BID_TOOL}/api/jobs/{job_id}/generate-quote-text",
+                          json={"vendor_name": v["name"],
+                                "materials": [m["description"] for m in job_def["materials"]
+                                              if v["name"].lower().split()[0] in m["description"].lower()]
+                                or [m["description"] for m in job_def["materials"][:2]]},
+                          timeout=TIMEOUT)
         quote_text = ""
         if r.status_code == 200:
             quote_text = r.json().get("text", f"Requesting pricing for {v['name']} products.")
@@ -200,13 +215,13 @@ def run_iteration(idx, job_def):
 
         # Send email via test mode
         mat_ids = [m["id"] for m in job_def["materials"]]
-        r = httpx.post(f"{BID_TOOL}/api/jobs/{job_id}/send-quote-email",
-                       json={"vendor_name": v["name"],
-                             "vendor_email": v["contact_email"],
-                             "subject": f"Request for Pricing — {job_def['project_name']}",
-                             "body": quote_text,
-                             "material_ids": mat_ids},
-                       timeout=30)
+        r = bid_tool.post(f"{BID_TOOL}/api/jobs/{job_id}/send-quote-email",
+                          json={"vendor_name": v["name"],
+                                "vendor_email": v["contact_email"],
+                                "subject": f"Request for Pricing — {job_def['project_name']}",
+                                "body": quote_text,
+                                "material_ids": mat_ids},
+                          timeout=30)
         if r.status_code == 200:
             sent_count += 1
             log(f"  Sent to {v['name']} ({v['contact_email']})")
@@ -267,7 +282,7 @@ def run_iteration(idx, job_def):
     log("Verifying quotes and pricing...")
     quotes = []
     for attempt in range(12):  # 12 * 5s = 60s max
-        r = httpx.get(f"{BID_TOOL}/api/jobs/{job_id}", timeout=10)
+        r = bid_tool.get(f"{BID_TOOL}/api/jobs/{job_id}", timeout=10)
         if r.status_code == 200:
             job_data = r.json()
             quotes = job_data.get("quotes", [])
@@ -310,8 +325,8 @@ def main():
     print("  All services OK\n")
 
     # Ensure test mode is enabled
-    httpx.post(f"{BID_TOOL}/api/settings",
-               json={"vendor_quote_test_mode": "true"}, timeout=10)
+    bid_tool.post(f"{BID_TOOL}/api/settings",
+                  json={"vendor_quote_test_mode": "true"}, timeout=10)
 
     results = []
     for i in range(iterations):

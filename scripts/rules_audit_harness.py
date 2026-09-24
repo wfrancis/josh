@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import http.cookiejar
 import io
 import json
 import os
@@ -30,6 +31,11 @@ from xml.sax.saxutils import escape
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_FIXTURE = os.path.join(ROOT, "test_data", "rules_audit", "josh_lessons_cases.json")
+
+# Every /api call except /api/system/build needs a login. Scripts log in with
+# --login user:pin, else $SI_LOGIN, else the shared "test" login the server
+# creates for now. Pass --login "" to skip logging in.
+DEFAULT_LOGIN = "test:1234"
 
 FORMAL_REGISTRY_ENDPOINTS = [
     "/api/rules/registry",
@@ -489,6 +495,19 @@ class Client:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.headers = headers or {}
+        # Keeps the login cookie (si_session) and sends it on every later call.
+        self.cookies = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
+
+    def login(self, username: str, pin: str) -> dict[str, Any]:
+        """Log in to the bid tool; later requests carry the session cookie."""
+        status, body, raw = self.request(
+            "POST", "/api/auth/login", json_body={"username": username, "pin": pin}, ok_statuses=()
+        )
+        if status != 200:
+            snippet = raw[:300].replace("\n", " ")
+            raise HarnessError(f"log in as {username!r} failed with HTTP {status}: {snippet}")
+        return body or {}
 
     def url(self, path: str) -> str:
         if path.startswith("http://") or path.startswith("https://"):
@@ -514,7 +533,7 @@ class Client:
             req_headers.setdefault("Content-Type", "application/json")
         req = urllib.request.Request(self.url(path), data=data, headers=req_headers, method=method.upper())
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with self.opener.open(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 parsed = self._parse_json(raw)
                 status = resp.getcode()
@@ -842,6 +861,33 @@ def normalize_base_url(value: str) -> str:
     if not value.startswith(("http://", "https://")):
         value = "https://" + value
     return value
+
+
+def add_login_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--login",
+        default=os.environ.get("SI_LOGIN", DEFAULT_LOGIN),
+        help="username:pin to log in with before calling the API "
+             "(default: $SI_LOGIN, else the shared test login). Pass '' to skip.",
+    )
+
+
+def parse_login(value: str | None) -> tuple[str, str] | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if ":" not in text:
+        raise SystemExit(f"Invalid --login {text!r}; expected 'username:pin'")
+    username, pin = text.split(":", 1)
+    return username.strip(), pin.strip()
+
+
+def login_client(client: Client, value: str | None) -> dict[str, Any] | None:
+    """Log the client in when a username:pin was given; returns the user."""
+    credentials = parse_login(value)
+    if not credentials:
+        return None
+    return client.login(*credentials)
 
 
 def parse_headers(items: list[str]) -> dict[str, str]:
@@ -2507,6 +2553,7 @@ def main() -> int:
     parser.add_argument("--keep-job", action="store_true", help="Do not delete the generated test job at the end")
     parser.add_argument("--timeout", type=float, default=180.0, help="HTTP timeout in seconds")
     parser.add_argument("--header", action="append", default=[], help="Extra HTTP header, e.g. 'Authorization: Bearer ...'")
+    add_login_argument(parser)
     parser.add_argument("--json-output", help="Optional path for JSON detail output")
     parser.add_argument("--expected-commit", help="Require /api/system/build to report this exact Git commit")
     parser.add_argument("--allow-missing-audit", action="store_true", help="Downgrade missing audit trace checks to WARN")
@@ -2518,12 +2565,16 @@ def main() -> int:
     args = parser.parse_args()
 
     fixture = load_fixture(args.fixture)
+    parse_login(args.login)  # reject a malformed --login before doing anything
     client = Client(normalize_base_url(args.base_url), args.timeout, parse_headers(args.header))
     checks: list[Check] = []
     job_id = None
     created_job = False
 
     try:
+        user = login_client(client, args.login)
+        if user:
+            checks.append(Check("login", "PASS", f"logged in as {user.get('username')}", user))
         checks.append(validate_build_identity(client, args.expected_commit))
         checks.append(validate_vendor_ingestion_health(client))
         checks.append(validate_quote_receipt_recovery_contract(client))

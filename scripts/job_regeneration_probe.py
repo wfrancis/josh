@@ -16,7 +16,10 @@ from urllib.parse import urlparse
 from rules_audit_harness import (
     Client,
     HarnessError,
+    add_login_argument,
+    login_client,
     normalize_base_url,
+    parse_login,
     proposal_save_payload,
     summarize_proposal,
 )
@@ -494,8 +497,10 @@ def main() -> int:
     parser.add_argument("--expected-commit", help="Exact commit required from /api/system/build")
     parser.add_argument("--timeout", type=float, default=240.0)
     parser.add_argument("--json-output")
+    add_login_argument(parser)
     args = parser.parse_args()
 
+    parse_login(args.login)  # reject a malformed --login before doing anything
     client = Client(normalize_base_url(args.base_url), args.timeout, {})
     result: dict[str, Any] = {
         "base_url": client.base_url,
@@ -511,6 +516,7 @@ def main() -> int:
 
     try:
         result["build"] = require_disposable_staging(client, args.expected_commit)
+        login_client(client, args.login)
         _, source_before, _ = client.request("GET", f"/api/jobs/{args.source_job}")
         source_before_hash = canonical_hash(source_before)
         result["source_before_hash"] = source_before_hash

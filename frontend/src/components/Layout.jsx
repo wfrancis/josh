@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell, Building2, ListChecks } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell, Building2, ListChecks, LogOut, ClipboardList } from 'lucide-react'
 import { api } from '../api'
+import { useAuth } from '../auth'
 import { QUOTE_EMAILS_ENABLED } from '../features'
 
 function NavItem({ to, icon: Icon, label, active, onClick }) {
@@ -21,7 +22,84 @@ function NavItem({ to, icon: Icon, label, active, onClick }) {
   )
 }
 
+const ONLINE_LIST_LIMIT = 6
+
+function OnlineNow({ currentUsername }) {
+  const [people, setPeople] = useState([])
+
+  useEffect(() => {
+    let cancelled = false
+    const load = () => api.getOnlineUsers()
+      .then((list) => { if (!cancelled) setPeople(Array.isArray(list) ? list : []) })
+      .catch(() => {})
+    load()
+    const interval = setInterval(load, 60000) // refresh every minute
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [])
+
+  if (people.length === 0) return null
+  const shown = people.slice(0, ONLINE_LIST_LIMIT)
+  const extra = people.length - shown.length
+
+  return (
+    <div className="px-3 pt-3 pb-1">
+      <div className="flex items-center gap-2 pb-1.5 text-[10px] font-bold text-gray-600 uppercase tracking-[0.15em]">
+        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" />
+        Online now
+      </div>
+      <ul className="space-y-1">
+        {shown.map((person) => {
+          const isYou = person.username?.toLowerCase() === currentUsername?.toLowerCase()
+          const lastSeen = person.last_seen_at ? new Date(person.last_seen_at) : null
+          return (
+            <li
+              key={person.username}
+              className="flex items-center gap-2 text-xs text-gray-400"
+              title={lastSeen ? `Last active ${lastSeen.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : undefined}
+            >
+              <span className="truncate">{person.display_name || person.username}</span>
+              {isYou && <span className="flex-shrink-0 text-gray-600">(you)</span>}
+            </li>
+          )
+        })}
+        {extra > 0 && <li className="text-xs text-gray-600">and {extra} more</li>}
+      </ul>
+    </div>
+  )
+}
+
+function UserBar({ onNavigate }) {
+  const { user, logout } = useAuth()
+  if (!user) return null
+  const name = user.display_name || user.username
+  const initials = name.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join('').toUpperCase()
+
+  return (
+    <div className="mt-2 flex items-center gap-3 px-3 py-2.5 rounded-xl bg-white/[0.03] border border-white/[0.05]">
+      <div className="w-8 h-8 flex-shrink-0 rounded-full bg-si-bright/15 border border-si-bright/20
+                      flex items-center justify-center text-[11px] font-bold text-blue-300">
+        {initials || '?'}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium text-gray-200 truncate">{name}</div>
+        <div className="text-[11px] text-gray-600 truncate">Logged in as {user.username}</div>
+      </div>
+      <button
+        type="button"
+        onClick={() => { onNavigate?.(); logout() }}
+        title="Log out"
+        className="flex-shrink-0 inline-flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs font-medium
+                   text-gray-500 hover:text-gray-200 hover:bg-white/[0.06] transition-colors"
+      >
+        <LogOut className="w-3.5 h-3.5" />
+        Log out
+      </button>
+    </div>
+  )
+}
+
 function SidebarContent({ location, onNavigate }) {
+  const { user } = useAuth()
   const navigate = useNavigate()
   const [searchQuery, setSearchQuery] = useState('')
   const [results, setResults] = useState(null)
@@ -129,6 +207,7 @@ function SidebarContent({ location, onNavigate }) {
         </div>
         <NavItem to="/" icon={LayoutDashboard} label="Dashboard" active={location.pathname === '/'} onClick={onNavigate} />
         <NavItem to="/jobs" icon={FolderOpen} label="All Jobs" active={location.pathname === '/jobs' || location.pathname.startsWith('/jobs/')} onClick={onNavigate} />
+        <NavItem to="/bids" icon={ClipboardList} label="Bid Tracker" active={location.pathname === '/bids'} onClick={onNavigate} />
       </nav>
 
       {/* Bottom section */}
@@ -139,6 +218,8 @@ function SidebarContent({ location, onNavigate }) {
           <NavItem to="/vendor-contacts" icon={Building2} label="Vendor Contacts" active={location.pathname === '/vendor-contacts'} onClick={onNavigate} />
         )}
         <NavItem to="/settings" icon={Settings} label="Settings" active={location.pathname === '/settings'} onClick={onNavigate} />
+        <OnlineNow currentUsername={user?.username} />
+        <UserBar onNavigate={onNavigate} />
         <div className="px-3 pt-2 text-[10px] text-gray-600">
           {build?.tag && build.tag !== 'unknown' ? `${build.tag} · ` : ''}Standard Interiors
           {build?.commit && build.commit !== 'unknown' && <span className="ml-1 font-mono">{String(build.commit).slice(0, 8)}</span>}

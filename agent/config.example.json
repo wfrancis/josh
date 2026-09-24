@@ -5,5 +5,7 @@
   "email_password": "YOUR_APP_PASSWORD_HERE",
   "bid_folder_path": "C:\\Users\\Josh Dann\\Standard Interiors Dropbox\\Personal Folders (1)\\CP\\001-Bid Folder",
   "api_url": "https://si-bid-tool.fly.dev",
+  "api_username": "test",
+  "api_pin": "1234",
   "poll_interval_minutes": 5
 }

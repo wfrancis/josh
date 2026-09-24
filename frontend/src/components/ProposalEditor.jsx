@@ -6,6 +6,7 @@ import {
   Package, FileText, AlertTriangle, ArrowLeft, Combine, Square, CheckSquare, Sparkles
 } from 'lucide-react'
 import AuditTraceButton, { resolveAuditTrace } from './AuditTraceButton'
+import { apiFetch } from '../api'
 
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
@@ -610,7 +611,7 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
   const fetchStairLaborOptions = async () => {
     if (stairLaborOptions.length > 0) { setShowStairLabor(true); return }
     try {
-      const res = await fetch('/api/labor-catalog/stairs').then(r => r.ok ? r.json() : null)
+      const res = await apiFetch('/api/labor-catalog/stairs').then(r => r.ok ? r.json() : null)
       if (res?.entries) { setStairLaborOptions(res.entries); setShowStairLabor(true) }
     } catch (e) { console.error('Failed to fetch stair labor:', e) }
   }
@@ -1361,7 +1362,11 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
 }
 
 /* ─── Main Component ──────────────────────────────────────────────────── */
-export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfidenceChange }) {
+export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfidenceChange, onSaved }) {
+  // Called after each successful save (the page's Bid Tracking card re-reads the
+  // bid total). Kept in a ref so a new callback never re-triggers auto-save.
+  const onSavedRef = useRef(onSaved)
+  onSavedRef.current = onSaved
   const [bundles, setBundles] = useState([])
   const [deletedBundleNames, setDeletedBundleNames] = useState(new Set())
   const [deletedBundleReasons, setDeletedBundleReasons] = useState({})
@@ -1497,7 +1502,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
     setError(null)
     setPdfReady(false)
     try {
-      const res = await fetch(`/api/jobs/${job.id}/proposal/generate`, { method: 'POST' })
+      const res = await apiFetch(`/api/jobs/${job.id}/proposal/generate`, { method: 'POST' })
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }))
         throw new Error(err.detail || 'Failed to generate proposal')
@@ -1742,7 +1747,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
     ;(async () => {
       setLoading(true)
       try {
-        const saved = await fetch(`/api/jobs/${job.id}/proposal/bundles`).then(r => r.ok ? r.json() : null)
+        const saved = await apiFetch(`/api/jobs/${job.id}/proposal/bundles`).then(r => r.ok ? r.json() : null)
         if (cancelled) return
         if (saved && saved.bundles && saved.bundles.length > 0) {
           serverRevisionRef.current = Number(saved._server_revision || 0)
@@ -1784,7 +1789,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
     activeSaveCountRef.current += 1
     setSaving(true)
     try {
-      const res = await fetch(`/api/jobs/${job.id}/proposal/bundles`, {
+      const res = await apiFetch(`/api/jobs/${job.id}/proposal/bundles`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1818,6 +1823,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
         throw new Error(err.detail || 'Auto-save failed')
       }
       const saved = await res.json().catch(() => ({}))
+      onSavedRef.current?.()
       const returnedRevision = Number(saved?.proposal_data?._server_revision)
       if (Number.isFinite(returnedRevision)) {
         serverRevisionRef.current = Math.max(serverRevisionRef.current, returnedRevision)
@@ -1989,7 +1995,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
     setRewriting(true)
     setError(null)
     try {
-      const res = await fetch(`/api/jobs/${job.id}/proposal/rewrite-descriptions`, {
+      const res = await apiFetch(`/api/jobs/${job.id}/proposal/rewrite-descriptions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ bundles }),
@@ -2109,7 +2115,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
       if (!accepted?.bundles) {
         throw new Error('The server did not return the saved proposal state.')
       }
-      const res = await fetch(`/api/jobs/${job.id}/proposal/pdf`, {
+      const res = await apiFetch(`/api/jobs/${job.id}/proposal/pdf`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(accepted),

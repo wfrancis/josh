@@ -157,6 +157,8 @@ def setup_config():
 
     # API
     config["api_url"] = input("SI Bid Tool API URL [https://si-bid-tool.fly.dev]: ").strip() or "https://si-bid-tool.fly.dev"
+    config["api_username"] = input(f"SI Bid Tool username [{DEFAULT_API_USERNAME}]: ").strip() or DEFAULT_API_USERNAME
+    config["api_pin"] = input(f"SI Bid Tool PIN [{DEFAULT_API_PIN}]: ").strip() or DEFAULT_API_PIN
 
     # Poll interval
     config["poll_interval_minutes"] = int(input("Poll interval in minutes [5]: ").strip() or "5")
@@ -272,10 +274,15 @@ def _save_eml_to_correspondence(eml_bytes: bytes, folder: Path, sender_name: str
 
     filepath = corr_folder / f"{safe_name}.eml"
 
-    # Don't overwrite existing files — append a number
+    # Don't overwrite existing files — append a number. The same email saved on
+    # an earlier try (when the bid tool could not be reached) is reused.
     if filepath.exists():
+        if filepath.read_bytes() == eml_bytes:
+            return filepath
         i = 2
         while (corr_folder / f"{safe_name} ({i}).eml").exists():
+            if (corr_folder / f"{safe_name} ({i}).eml").read_bytes() == eml_bytes:
+                return corr_folder / f"{safe_name} ({i}).eml"
             i += 1
         filepath = corr_folder / f"{safe_name} ({i}).eml"
 
@@ -295,26 +302,99 @@ def _extract_pdf_attachments(msg: email.message.Message, folder: Path) -> list[P
         if filename and content_type == "application/pdf":
             safe_name = re.sub(r'[<>:"/\\|?*]', "", filename).strip()
             filepath = corr_folder / safe_name
+            payload = part.get_payload(decode=True)
             if not filepath.exists():
-                filepath.write_bytes(part.get_payload(decode=True))
+                filepath.write_bytes(payload)
                 saved.append(filepath)
+            elif filepath.read_bytes() == payload:
+                saved.append(filepath)  # saved on an earlier try; upload it again
 
     return saved
 
 
 # ── SI Bid Tool API ───────────────────────────────────────────────────────────
+# The bid tool needs a login. The agent logs in with api_username / api_pin
+# from config.json and keeps the session cookie. Until each person has their
+# own login, it falls back to the shared "test" login everyone uses.
+
+DEFAULT_API_USERNAME = "test"
+DEFAULT_API_PIN = "1234"
+
+_api_credentials = {"username": DEFAULT_API_USERNAME, "pin": DEFAULT_API_PIN}
+_api_session: requests.Session | None = None
+
+
+class ApiUnavailable(Exception):
+    """The bid tool could not answer (login failed, server error, no connection).
+
+    Callers leave the email or job untouched so the next poll tries again,
+    instead of marking it handled.
+    """
+
+
+def _configure_api_login(config: dict) -> None:
+    username = str(config.get("api_username") or "").strip()
+    pin = str(config.get("api_pin") or "").strip()
+    if not username or not pin:
+        log.warning("No api_username / api_pin in config.json; using the shared test login.")
+        username, pin = DEFAULT_API_USERNAME, DEFAULT_API_PIN
+    _api_credentials.update(username=username, pin=pin)
+
+
+def _api_log_in(session: requests.Session, api_url: str) -> None:
+    try:
+        resp = session.post(
+            f"{api_url}/api/auth/login",
+            json={"username": _api_credentials["username"], "pin": _api_credentials["pin"]},
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        raise ApiUnavailable(f"could not reach the bid tool to log in: {e}") from e
+    if resp.status_code != 200:
+        raise ApiUnavailable(
+            f"log in as '{_api_credentials['username']}' failed ({resp.status_code}): {resp.text[:200]}. "
+            "Check api_username / api_pin in config.json."
+        )
+
+
+def _api_request(method: str, api_url: str, path: str, **kwargs) -> requests.Response:
+    """Call the bid tool, logging in first and once more if the session ran out.
+
+    Raises ApiUnavailable when it answers "not logged in", a server error, or
+    not at all. Other answers (200, 404, 400, ...) are returned as-is.
+    """
+    global _api_session
+    try:
+        if _api_session is None:
+            session = requests.Session()
+            _api_log_in(session, api_url)
+            _api_session = session
+        resp = _api_session.request(method, f"{api_url}{path}", **kwargs)
+        if resp.status_code == 401:
+            _api_log_in(_api_session, api_url)
+            resp = _api_session.request(method, f"{api_url}{path}", **kwargs)
+    except requests.RequestException as e:
+        raise ApiUnavailable(f"{method} {path} failed: {e}") from e
+    if resp.status_code == 401 or resp.status_code == 429 or resp.status_code >= 500:
+        if resp.status_code == 401:
+            _api_session = None
+        raise ApiUnavailable(f"{method} {path} answered {resp.status_code}: {resp.text[:200]}")
+    return resp
 
 
 def _api_match_job(api_url: str, subject: str) -> dict | None:
     """Call the SI Bid Tool API to match an email subject to a job."""
-    try:
-        resp = requests.get(f"{api_url}/api/jobs/match", params={"q": subject}, timeout=15)
-        if resp.status_code == 200:
+    resp = _api_request("GET", api_url, "/api/jobs/match", params={"q": subject}, timeout=15)
+    if resp.status_code == 200:
+        try:
             data = resp.json()
-            if data.get("job_id"):
-                return data
-    except Exception as e:
-        log.warning(f"API match failed: {e}")
+        except ValueError:
+            log.warning(f"API match returned something that is not JSON: {resp.text[:200]}")
+            return None
+        if data.get("job_id"):
+            return data
+    else:
+        log.warning(f"API match answered {resp.status_code}: {resp.text[:200]}")
     return None
 
 
@@ -327,12 +407,13 @@ def _api_upload_quotes(api_url: str, job_id: int, files: list[Path]) -> dict | N
     for fpath in files:
         try:
             log.info(f"  Uploading: {fpath.name}")
-            with open(fpath, "rb") as fh:
-                resp = requests.post(
-                    f"{api_url}/api/jobs/{job_id}/upload-quotes",
-                    files=[("files", (fpath.name, fh, "application/octet-stream"))],
-                    timeout=180,
-                )
+            # Read the file up front so the upload can be sent again after a re-login.
+            content = fpath.read_bytes()
+            resp = _api_request(
+                "POST", api_url, f"/api/jobs/{job_id}/upload-quotes",
+                files=[("files", (fpath.name, content, "application/octet-stream"))],
+                timeout=180,
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 products = data.get("products", [])
@@ -344,6 +425,8 @@ def _api_upload_quotes(api_url: str, job_id: int, files: list[Path]) -> dict | N
                 log.info(f"  {fpath.name}: {len(products)} products, {matched} matched")
             else:
                 log.error(f"  {fpath.name}: upload failed ({resp.status_code}): {resp.text[:200]}")
+        except ApiUnavailable:
+            raise  # stop here; the caller retries on the next poll
         except Exception as e:
             log.error(f"  {fpath.name}: upload error: {e}")
 
@@ -355,14 +438,14 @@ def _api_upload_quotes(api_url: str, job_id: int, files: list[Path]) -> dict | N
 
 
 def _api_list_jobs(api_url: str) -> list[dict]:
-    """Fetch all jobs from the SI Bid Tool API."""
-    try:
-        resp = requests.get(f"{api_url}/api/jobs", timeout=15)
-        if resp.status_code == 200:
+    """Fetch all jobs from the SI Bid Tool API. Raises ApiUnavailable if it can't answer."""
+    resp = _api_request("GET", api_url, "/api/jobs", timeout=15)
+    if resp.status_code == 200:
+        try:
             return resp.json()
-    except Exception as e:
-        log.warning(f"Failed to fetch jobs: {e}")
-    return []
+        except ValueError:
+            pass
+    raise ApiUnavailable(f"GET /api/jobs answered {resp.status_code}: {resp.text[:200]}")
 
 
 def _fuzzy_match_job(jobs: list[dict], reference: str) -> dict | None:
@@ -430,9 +513,14 @@ def poll_inbox(config: dict):
         uid_list = msg_ids[0].split()
         log.info(f"Found {len(uid_list)} unread emails")
 
-        # Load jobs list for matching
+        # Load jobs list for matching. If the bid tool can't answer, stop before
+        # opening any email so they all stay unread for the next poll.
         api_url = config["api_url"]
-        jobs = _api_list_jobs(api_url)
+        try:
+            jobs = _api_list_jobs(api_url)
+        except ApiUnavailable as e:
+            log.error(f"SI Bid Tool not available ({e}). Leaving emails unread; will try again next poll.")
+            return
         bid_folder = Path(config["bid_folder_path"])
 
         for uid_bytes in uid_list:
@@ -463,58 +551,68 @@ def poll_inbox(config: dict):
             # Extract project reference from subject
             reference = _extract_project_reference(subject)
 
-            # Try API match first, then local fuzzy match
-            matched_job = _api_match_job(api_url, reference)
-            if not matched_job:
-                local_match = _fuzzy_match_job(jobs, reference)
-                if local_match:
-                    matched_job = {
-                        "job_id": local_match["id"],
-                        "project_name": local_match.get("project_name", ""),
-                        "gc_name": local_match.get("gc_name", ""),
-                    }
+            try:
+                # Try API match first, then local fuzzy match
+                matched_job = _api_match_job(api_url, reference)
+                if not matched_job:
+                    local_match = _fuzzy_match_job(jobs, reference)
+                    if local_match:
+                        matched_job = {
+                            "job_id": local_match["id"],
+                            "project_name": local_match.get("project_name", ""),
+                            "gc_name": local_match.get("gc_name", ""),
+                        }
 
-            if not matched_job:
-                log.warning(f"No matching job for: {reference}")
-                _mark_processed(uid, subject, sender_name)
-                continue
+                if not matched_job:
+                    log.warning(f"No matching job for: {reference}")
+                    _mark_processed(uid, subject, sender_name)
+                    continue
 
-            job_id = matched_job["job_id"]
-            project_name = matched_job.get("project_name", "")
-            gc_name = matched_job.get("gc_name", "")
-            log.info(f"Matched to job #{job_id}: {project_name}")
+                job_id = matched_job["job_id"]
+                project_name = matched_job.get("project_name", "")
+                gc_name = matched_job.get("gc_name", "")
+                log.info(f"Matched to job #{job_id}: {project_name}")
 
-            # Save .eml to Dropbox Correspondence folder
-            files_saved = []
-            project_folder = _find_project_folder(bid_folder, project_name, gc_name)
-            if project_folder:
-                eml_path = _save_eml_to_correspondence(raw_email, project_folder, sender_name)
-                files_saved.append(str(eml_path))
-                log.info(f"Saved .eml to {eml_path}")
+                # Save .eml to Dropbox Correspondence folder
+                files_saved = []
+                project_folder = _find_project_folder(bid_folder, project_name, gc_name)
+                if project_folder:
+                    eml_path = _save_eml_to_correspondence(raw_email, project_folder, sender_name)
+                    files_saved.append(str(eml_path))
+                    log.info(f"Saved .eml to {eml_path}")
 
-                # Also extract PDF attachments
-                pdf_paths = _extract_pdf_attachments(msg, project_folder)
-                for p in pdf_paths:
-                    files_saved.append(str(p))
-                    log.info(f"Saved PDF attachment: {p}")
-            else:
-                log.warning(f"No matching bid folder for '{project_name}' — saving .eml to temp")
-                # Save to a temp location and still upload
-                temp_dir = AGENT_DIR / "temp"
-                temp_dir.mkdir(exist_ok=True)
-                eml_path = temp_dir / f"{sender_name}_{uid}.eml"
-                eml_path.write_bytes(raw_email)
-                files_saved.append(str(eml_path))
+                    # Also extract PDF attachments
+                    pdf_paths = _extract_pdf_attachments(msg, project_folder)
+                    for p in pdf_paths:
+                        files_saved.append(str(p))
+                        log.info(f"Saved PDF attachment: {p}")
+                else:
+                    log.warning(f"No matching bid folder for '{project_name}' — saving .eml to temp")
+                    # Save to a temp location and still upload
+                    temp_dir = AGENT_DIR / "temp"
+                    temp_dir.mkdir(exist_ok=True)
+                    eml_path = temp_dir / f"{sender_name}_{uid}.eml"
+                    eml_path.write_bytes(raw_email)
+                    files_saved.append(str(eml_path))
 
-            # Upload to SI Bid Tool API
-            upload_files = [Path(f) for f in files_saved]
-            result = _api_upload_quotes(api_url, job_id, upload_files)
-            if result:
-                product_count = len(result.get("products", []))
-                auto_matched = result.get("auto_matched", 0)
-                log.info(f"Uploaded to job #{job_id}: {product_count} products, {auto_matched} auto-matched")
-            else:
-                log.warning(f"Upload to API failed for job #{job_id}")
+                # Upload to SI Bid Tool API
+                upload_files = [Path(f) for f in files_saved]
+                result = _api_upload_quotes(api_url, job_id, upload_files)
+                if result:
+                    product_count = len(result.get("products", []))
+                    auto_matched = result.get("auto_matched", 0)
+                    log.info(f"Uploaded to job #{job_id}: {product_count} products, {auto_matched} auto-matched")
+                else:
+                    log.warning(f"Upload to API failed for job #{job_id}")
+            except ApiUnavailable as e:
+                # Not handled yet: put the email back to unread, don't mark it
+                # processed, and stop this poll. The next poll tries it again.
+                log.error(f"SI Bid Tool not available ({e}). Leaving '{subject[:60]}' unread; will try again next poll.")
+                try:
+                    conn.store(uid_bytes, "-FLAGS", "\\Seen")
+                except Exception as store_error:
+                    log.warning(f"Could not mark the email unread again: {store_error}")
+                break
 
             # Mark as processed
             _mark_processed(uid, subject, sender_name, job_id, project_name, files_saved)
@@ -540,7 +638,11 @@ def scan_new_jobs(config: dict):
         log.warning(f"Bid folder not found: {bid_folder} — skipping folder scan")
         return
 
-    jobs = _api_list_jobs(api_url)
+    try:
+        jobs = _api_list_jobs(api_url)
+    except ApiUnavailable as e:
+        log.error(f"SI Bid Tool not available ({e}); skipping folder scan until next poll.")
+        return
     if not jobs:
         return
 
@@ -586,8 +688,13 @@ def scan_new_jobs(config: dict):
 
         log.info(f"Job #{job_id}: found {len(quote_files)} quote file(s) — uploading to bid tool")
 
-        # Upload to SI Bid Tool API
-        result = _api_upload_quotes(api_url, job_id, quote_files)
+        # Upload to SI Bid Tool API. If the bid tool can't answer, leave the job
+        # unscanned so the next poll tries it again.
+        try:
+            result = _api_upload_quotes(api_url, job_id, quote_files)
+        except ApiUnavailable as e:
+            log.error(f"Job #{job_id}: SI Bid Tool not available ({e}); will scan again next poll.")
+            return
         if result:
             product_count = len(result.get("products", []))
             auto_matched = result.get("auto_matched", 0)
@@ -618,6 +725,7 @@ def main():
 
     _init_db()
     config = load_config()
+    _configure_api_login(config)
 
     if args.scan_only:
         log.info("Scan-only mode — checking for new jobs with existing quote files")

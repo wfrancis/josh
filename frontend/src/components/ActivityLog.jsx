@@ -17,11 +17,19 @@ const ACTION_COLORS = {
   comment_added: 'bg-gray-400',
   quotes_cleared: 'bg-red-400',
   bid_cleared: 'bg-red-400',
+  bid_sent: 'bg-cyan-400',
+  bid_won: 'bg-emerald-400',
+  bid_lost: 'bg-red-400',
+  bid_status_changed: 'bg-blue-400',
+  bid_tracking_updated: 'bg-amber-400',
+  bid_follow_up: 'bg-amber-400',
+  bid_note_added: 'bg-gray-400',
 }
 
 const FILTER_ACTIONS = {
   uploads: ['rfms_uploaded', 'quotes_uploaded'],
-  updates: ['materials_updated', 'quote_updated', 'notes_updated', 'exclusions_updated', 'job_updated', 'bid_calculated', 'job_created'],
+  updates: ['materials_updated', 'quote_updated', 'notes_updated', 'exclusions_updated', 'job_updated', 'bid_calculated', 'job_created',
+    'bid_sent', 'bid_won', 'bid_lost', 'bid_status_changed', 'bid_tracking_updated', 'bid_follow_up', 'bid_note_added'],
   quotes: ['quotes_uploaded', 'quote_updated'],
   ai: ['ai_estimate'],
   cleared: ['quotes_cleared', 'bid_cleared'],

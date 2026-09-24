@@ -4,11 +4,15 @@ Tables: jobs, job_materials, job_sundries, job_labor, job_bundles.
 """
 
 import sqlite3
+import contextvars
+import hashlib
+import hmac
 import os
 import re
 import io
 import json
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 
@@ -467,6 +471,45 @@ def init_db() -> None:
                 FOREIGN KEY (source_job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_golden_versions_source ON golden_job_versions(source_job_id, version_number DESC);
+
+            -- Sign-in: one row per person. PINs are stored only as salted hashes.
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                display_name TEXT NOT NULL DEFAULT '',
+                pin_hash TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_login_at TEXT,
+                last_seen_at TEXT
+            );
+
+            -- One row per logged-in browser. Only a hash of the cookie token is kept.
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen_at);
+
+            -- Bid tracker history: what happened to each bid, who did it and when.
+            -- details is JSON (sent to, GC, bid total at send time, note, ...).
+            CREATE TABLE IF NOT EXISTS bid_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                username TEXT,
+                details TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_bid_events_job ON bid_events(job_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_bid_events_type ON bid_events(event_type, job_id);
         """)
         conn.commit()
         # Migrations for existing DBs
@@ -488,6 +531,7 @@ def init_db() -> None:
             ("quote_source_hash", "ALTER TABLE job_materials ADD COLUMN quote_source_hash TEXT"),
             ("quote_file_name", "ALTER TABLE job_materials ADD COLUMN quote_file_name TEXT"),
             ("activity_user", "ALTER TABLE job_activity ADD COLUMN user TEXT DEFAULT 'System'"),
+            ("activity_username", "ALTER TABLE job_activity ADD COLUMN username TEXT"),
             ("comment_user", "ALTER TABLE job_comments ADD COLUMN user TEXT DEFAULT 'System'"),
             ("qr_response_file", "ALTER TABLE quote_requests ADD COLUMN response_file TEXT"),
             ("qr_response_notes", "ALTER TABLE quote_requests ADD COLUMN response_notes TEXT"),
@@ -514,6 +558,16 @@ def init_db() -> None:
             ("golden_version_id", "ALTER TABLE golden_job_replays ADD COLUMN golden_version_id INTEGER"),
             ("job_quote_source_hash", "ALTER TABLE job_quotes ADD COLUMN source_hash TEXT"),
             ("vendor_price_source_hash", "ALTER TABLE vendor_prices ADD COLUMN source_hash TEXT"),
+            # Bid tracker. bid_status stays NULL on old jobs; the tracker shows
+            # a default ("Estimating" once materials exist) without rewriting rows.
+            ("bid_status", "ALTER TABLE jobs ADD COLUMN bid_status TEXT"),
+            ("bid_due_date", "ALTER TABLE jobs ADD COLUMN bid_due_date TEXT"),
+            ("bid_due_time", "ALTER TABLE jobs ADD COLUMN bid_due_time TEXT"),
+            ("estimator", "ALTER TABLE jobs ADD COLUMN estimator TEXT"),
+            ("next_follow_up_date", "ALTER TABLE jobs ADD COLUMN next_follow_up_date TEXT"),
+            ("won_lost_at", "ALTER TABLE jobs ADD COLUMN won_lost_at TEXT"),
+            ("won_lost_reason", "ALTER TABLE jobs ADD COLUMN won_lost_reason TEXT"),
+            ("awarded_amount", "ALTER TABLE jobs ADD COLUMN awarded_amount REAL"),
             *[
                 (f"job_{column}", f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
                 for column in JOB_ESTIMATE_HEADER_FIELDS
@@ -3467,15 +3521,25 @@ def mark_notification_read(notification_id: int) -> bool:
 
 # ── Activity Log ─────────────────────────────────────────────────────────────
 
-def log_activity(job_id: int, action: str, summary: str, detail: dict = None, user: str = "System") -> int:
-    """Record an activity event for a job."""
+def log_activity(job_id: int, action: str, summary: str, detail: dict = None, user: str | None = None) -> int:
+    """Record an activity event for a job.
+
+    The logged-in person (set per request by the sign-in middleware) is saved
+    in ``username``; ``user`` is the name shown in the activity list and falls
+    back to their display name, or "System" for background work.
+    """
     import json as _json
+    current = get_current_user()
+    username = current.get("username") if current else None
+    if not user:
+        user = _current_user_label(current)
     conn = _get_conn()
     try:
         detail_str = _json.dumps(detail) if detail else None
         cur = conn.execute(
-            "INSERT INTO job_activity (job_id, action, summary, detail, created_at, user) VALUES (?, ?, ?, ?, ?, ?)",
-            (job_id, action, summary, detail_str, datetime.now().isoformat(), user)
+            "INSERT INTO job_activity (job_id, action, summary, detail, created_at, user, username) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (job_id, action, summary, detail_str, datetime.now().isoformat(), user, username)
         )
         conn.commit()
         return cur.lastrowid
@@ -3508,8 +3572,10 @@ def get_activity(job_id: int, limit: int = 50) -> list[dict]:
 
 # ── Job Comments ─────────────────────────────────────────────────────────────
 
-def add_comment(job_id: int, text: str, user: str = "System") -> dict:
+def add_comment(job_id: int, text: str, user: str | None = None) -> dict:
     """Add a comment to a job. Returns the created comment."""
+    if not user:
+        user = _current_user_label(get_current_user())
     conn = _get_conn()
     try:
         now = datetime.now().isoformat()
@@ -3698,5 +3764,428 @@ def get_price_book_summary() -> list[dict]:
                FROM price_book_items GROUP BY vendor"""
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ── Users & Sessions ─────────────────────────────────────────────────────────
+# Simple username + PIN sign-in so several people can use the tool and the
+# activity log shows who did what. PINs are stored as salted PBKDF2 hashes and
+# session cookies are stored only as SHA-256 hashes of the random token.
+
+PIN_HASH_ITERATIONS = 200_000
+SESSION_LIFETIME_DAYS = 30          # log in again after this many days
+SESSION_TOUCH_SECONDS = 60          # write "last seen" at most once a minute per session
+ONLINE_WINDOW_MINUTES = 15
+MAX_USERNAME_LENGTH = 40
+MAX_PIN_LENGTH = 12
+
+# TEMPORARY shared test account so everyone can get in while real accounts
+# are set up. The login page is pre-filled with the same username and PIN.
+STARTER_USERNAME = "test"
+STARTER_PIN = "1234"
+STARTER_DISPLAY_NAME = "Test User"
+
+# The person making the current request. Set by the sign-in middleware in
+# main.py; background threads (inbox monitor, simulator) leave it empty.
+_current_user: contextvars.ContextVar[dict | None] = contextvars.ContextVar("si_current_user", default=None)
+
+
+def set_current_user(user: dict | None) -> contextvars.Token:
+    return _current_user.set(user)
+
+
+def reset_current_user(token: contextvars.Token) -> None:
+    _current_user.reset(token)
+
+
+def get_current_user() -> dict | None:
+    return _current_user.get()
+
+
+def _current_user_label(user: dict | None) -> str:
+    if not user:
+        return "System"
+    return user.get("display_name") or user.get("username") or "System"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_iso(value: datetime) -> str:
+    # One fixed format so timestamps compare correctly as text in SQL.
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _hash_session_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def hash_pin(pin: str, *, salt: bytes | None = None, iterations: int = PIN_HASH_ITERATIONS) -> str:
+    """Return a salted PBKDF2-SHA256 hash string for a PIN."""
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", str(pin).encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_pin(pin: str, pin_hash: str) -> bool:
+    try:
+        scheme, iterations, salt_hex, digest_hex = (pin_hash or "").split("$")
+        if scheme != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac("sha256", str(pin).encode("utf-8"), bytes.fromhex(salt_hex), int(iterations))
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(digest.hex(), digest_hex)
+
+
+_unknown_user_pin_hash: str | None = None
+
+
+def _spend_pin_check_time(pin: str) -> None:
+    """Hash anyway when the username does not exist, so both failures take as long."""
+    global _unknown_user_pin_hash
+    if _unknown_user_pin_hash is None:
+        _unknown_user_pin_hash = hash_pin(secrets.token_hex(8))
+    verify_pin(pin, _unknown_user_pin_hash)
+
+
+def _public_user(row) -> dict:
+    user = dict(row)
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "display_name": user.get("display_name") or user["username"],
+    }
+
+
+def create_user(username: str, pin: str, display_name: str = "", active: bool = True) -> dict:
+    """Add a person who can log in. PIN must be 4-12 digits."""
+    username = (username or "").strip()
+    pin = str(pin or "")
+    if not username or len(username) > MAX_USERNAME_LENGTH:
+        raise ValueError(f"Username must be 1-{MAX_USERNAME_LENGTH} characters.")
+    if not pin.isdigit() or not (4 <= len(pin) <= MAX_PIN_LENGTH):
+        raise ValueError(f"PIN must be 4-{MAX_PIN_LENGTH} digits.")
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            "INSERT INTO users (username, display_name, pin_hash, active, created_at) VALUES (?, ?, ?, ?, ?)",
+            (username, (display_name or "").strip() or username, hash_pin(pin), 1 if active else 0, _utc_iso(_utc_now())),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
+        return _public_user(row)
+    finally:
+        conn.close()
+
+
+def seed_default_users() -> bool:
+    """Create the TEMPORARY shared test account if it does not exist yet."""
+    conn = _get_conn()
+    try:
+        if conn.execute("SELECT 1 FROM users WHERE username = ?", (STARTER_USERNAME,)).fetchone():
+            return False
+        conn.execute(
+            "INSERT OR IGNORE INTO users (username, display_name, pin_hash, active, created_at) VALUES (?, ?, ?, 1, ?)",
+            (STARTER_USERNAME, STARTER_DISPLAY_NAME, hash_pin(STARTER_PIN), _utc_iso(_utc_now())),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def authenticate_user(username: str, pin: str) -> dict | None:
+    """Return the user when the username and PIN match an active account."""
+    username = (username or "").strip()
+    pin = str(pin or "")
+    if not username or not pin or len(username) > MAX_USERNAME_LENGTH or len(pin) > MAX_PIN_LENGTH:
+        return None
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ? AND active = 1", (username,)
+        ).fetchone()
+        if row is None:
+            _spend_pin_check_time(pin)
+            return None
+        if not verify_pin(pin, row["pin_hash"]):
+            return None
+        now = _utc_iso(_utc_now())
+        conn.execute("UPDATE users SET last_login_at=?, last_seen_at=? WHERE id=?", (now, now, row["id"]))
+        conn.commit()
+        return _public_user(row)
+    finally:
+        conn.close()
+
+
+def create_session(user_id: int) -> str:
+    """Start a session for a user and return the raw token for the cookie."""
+    token = secrets.token_urlsafe(32)
+    now = _utc_now()
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (_utc_iso(now),))
+        conn.execute(
+            "INSERT INTO sessions (token_hash, user_id, created_at, last_seen_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                _hash_session_token(token),
+                user_id,
+                _utc_iso(now),
+                _utc_iso(now),
+                _utc_iso(now + timedelta(days=SESSION_LIFETIME_DAYS)),
+            ),
+        )
+        conn.commit()
+        return token
+    finally:
+        conn.close()
+
+
+def get_session_user(token: str | None) -> dict | None:
+    """Look up the active user for a session token, refreshing "last seen" about once a minute."""
+    if not token or len(token) > 200:
+        return None
+    now = _utc_now()
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT u.id, u.username, u.display_name, s.id AS session_id, s.last_seen_at AS session_seen_at
+               FROM sessions s JOIN users u ON u.id = s.user_id
+               WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1""",
+            (_hash_session_token(token), _utc_iso(now)),
+        ).fetchone()
+        if row is None:
+            return None
+        user = _public_user(row)
+        try:
+            seen = datetime.fromisoformat(row["session_seen_at"])
+        except (TypeError, ValueError):
+            seen = None
+        if seen is None or seen.tzinfo is None or (now - seen).total_seconds() >= SESSION_TOUCH_SECONDS:
+            try:
+                conn.execute("UPDATE sessions SET last_seen_at=? WHERE id=?", (_utc_iso(now), row["session_id"]))
+                conn.execute("UPDATE users SET last_seen_at=? WHERE id=?", (_utc_iso(now), row["id"]))
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # Database busy; "last seen" can wait for the next request.
+        return user
+    finally:
+        conn.close()
+
+
+def delete_session(token: str | None) -> None:
+    if not token:
+        return
+    conn = _get_conn()
+    try:
+        conn.execute("DELETE FROM sessions WHERE token_hash=?", (_hash_session_token(token),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_online_users(window_minutes: int = ONLINE_WINDOW_MINUTES) -> list[dict]:
+    """People with a live session used in the last few minutes, most recent first."""
+    now = _utc_now()
+    cutoff = _utc_iso(now - timedelta(minutes=window_minutes))
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT u.username, u.display_name, MAX(s.last_seen_at) AS last_seen_at
+               FROM sessions s JOIN users u ON u.id = s.user_id
+               WHERE s.last_seen_at >= ? AND s.expires_at > ? AND u.active = 1
+               GROUP BY u.id
+               ORDER BY last_seen_at DESC""",
+            (cutoff, _utc_iso(now)),
+        ).fetchall()
+        return [
+            {
+                "username": r["username"],
+                "display_name": r["display_name"] or r["username"],
+                "last_seen_at": r["last_seen_at"],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+# ── Bid Tracker ──────────────────────────────────────────────────────────────
+# Where each bid stands (status, due date, estimator, follow-ups) plus a
+# history of what happened to it. Status rules and flags live in bid_tracker.py.
+
+BID_TRACKING_COLUMNS: tuple[str, ...] = (
+    "bid_status",
+    "bid_due_date",
+    "bid_due_time",
+    "estimator",
+    "next_follow_up_date",
+    "won_lost_at",
+    "won_lost_reason",
+    "awarded_amount",
+)
+
+
+def _saved_bid_total(proposal_raw, bid_raw) -> float | None:
+    """Grand total of the saved proposal, else of an older generated bid."""
+    proposal = _json_loads_safe(proposal_raw, {})
+    if isinstance(proposal, dict) and proposal.get("bundles"):
+        try:
+            return round(float(proposal.get("grand_total") or 0), 2)
+        except (TypeError, ValueError):
+            return None
+    bid = _json_loads_safe(bid_raw, {})
+    if isinstance(bid, dict) and bid.get("grand_total") is not None:
+        try:
+            return round(float(bid["grand_total"]), 2)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _bid_event_from_row(row) -> dict:
+    event = dict(row)
+    details = _json_loads_safe(event.get("details"), {})
+    event["details"] = details if isinstance(details, dict) else {}
+    event["display_name"] = event.get("display_name") or event.get("username") or "System"
+    return event
+
+
+def _latest_bid_events(conn, event_type: str | None, job_id: int | None) -> dict[int, dict]:
+    """The newest bid event per job (optionally of one type), keyed by job id."""
+    inner_where = []
+    params: list = []
+    if event_type:
+        inner_where.append("event_type = ?")
+        params.append(event_type)
+    if job_id is not None:
+        inner_where.append("job_id = ?")
+        params.append(job_id)
+    where_sql = f"WHERE {' AND '.join(inner_where)}" if inner_where else ""
+    rows = conn.execute(
+        f"""SELECT e.*, u.display_name
+            FROM bid_events e LEFT JOIN users u ON u.username = e.username
+            WHERE e.id IN (SELECT MAX(id) FROM bid_events {where_sql} GROUP BY job_id)""",
+        params,
+    ).fetchall()
+    return {row["job_id"]: _bid_event_from_row(row) for row in rows}
+
+
+def list_bid_tracker_jobs(job_id: int | None = None) -> list[dict]:
+    """Every job's stored bid tracking fields, saved bid total, last send and last change.
+
+    ``bid_status`` is returned as stored (NULL on jobs nobody has tracked yet);
+    ``material_count`` lets the caller pick the default status.
+    """
+    conn = _get_conn()
+    try:
+        where_sql = "WHERE j.id = ?" if job_id is not None else ""
+        rows = conn.execute(
+            f"""SELECT j.id AS job_id, j.slug, j.project_name, j.gc_name, j.salesperson,
+                       j.city, j.state, j.created_at,
+                       j.bid_status, j.bid_due_date, j.bid_due_time, j.estimator,
+                       j.next_follow_up_date, j.won_lost_at, j.won_lost_reason, j.awarded_amount,
+                       j.proposal_data, j.bid_data,
+                       (SELECT COUNT(*) FROM job_materials m WHERE m.job_id = j.id) AS material_count
+                FROM jobs j {where_sql}
+                ORDER BY j.created_at DESC""",
+            (job_id,) if job_id is not None else (),
+        ).fetchall()
+        latest_sent = _latest_bid_events(conn, "sent", job_id)
+        latest_any = _latest_bid_events(conn, None, job_id)
+    finally:
+        conn.close()
+
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["bid_total"] = _saved_bid_total(item.pop("proposal_data", None), item.pop("bid_data", None))
+        sent = latest_sent.get(item["job_id"])
+        if sent:
+            details = sent["details"]
+            item["last_sent_date"] = str(details.get("sent_on") or sent["created_at"] or "")[:10] or None
+            item["last_sent_to"] = details.get("sent_to") or ""
+            item["last_sent_gc"] = details.get("gc_name") or ""
+            item["last_sent_total"] = details.get("bid_total")
+        else:
+            item["last_sent_date"] = None
+            item["last_sent_to"] = ""
+            item["last_sent_gc"] = ""
+            item["last_sent_total"] = None
+        last = latest_any.get(item["job_id"])
+        item["last_updated_at"] = last["created_at"] if last else None
+        item["last_updated_by"] = last["username"] if last else None
+        item["last_updated_by_name"] = last["display_name"] if last else None
+        results.append(item)
+    return results
+
+
+def get_bid_tracker_job(job_id: int) -> dict | None:
+    rows = list_bid_tracker_jobs(job_id)
+    return rows[0] if rows else None
+
+
+def list_bid_events(job_id: int, limit: int | None = None) -> list[dict]:
+    """Bid history for one job, newest first, with each person's display name."""
+    conn = _get_conn()
+    try:
+        sql = """SELECT e.*, u.display_name
+                 FROM bid_events e LEFT JOIN users u ON u.username = e.username
+                 WHERE e.job_id = ?
+                 ORDER BY e.id DESC"""
+        params: list = [job_id]
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [_bid_event_from_row(row) for row in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def save_bid_tracking(
+    job_id: int,
+    updates: dict,
+    events: list[tuple[str, dict]],
+    username: str | None,
+) -> list[int]:
+    """Update a job's bid tracking columns and record history events in one transaction."""
+    unknown = set(updates) - set(BID_TRACKING_COLUMNS)
+    if unknown:
+        raise ValueError(f"Not a bid tracking field: {', '.join(sorted(unknown))}")
+    conn = _get_conn()
+    try:
+        if updates:
+            columns = list(updates)
+            conn.execute(
+                f"UPDATE jobs SET {', '.join(f'{column}=?' for column in columns)} WHERE id=?",
+                [updates[column] for column in columns] + [job_id],
+            )
+        created_at = _utc_iso(_utc_now())
+        event_ids = []
+        for event_type, details in events:
+            cur = conn.execute(
+                "INSERT INTO bid_events (job_id, event_type, created_at, username, details) VALUES (?, ?, ?, ?, ?)",
+                (job_id, event_type, created_at, username, json.dumps(details or {}, default=str)),
+            )
+            event_ids.append(cur.lastrowid)
+        conn.commit()
+        return event_ids
+    finally:
+        conn.close()
+
+
+def get_latest_job_artifact(job_id: int, artifact_kind: str) -> dict | None:
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT artifact_kind, artifact_path, file_hash, file_size, created_at
+               FROM job_artifacts WHERE job_id=? AND artifact_kind=?
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (job_id, artifact_kind),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()

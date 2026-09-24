@@ -21,6 +21,7 @@ import ReadinessSummary from './ReadinessSummary'
 import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
 import ActivityLog from './ActivityLog'
+import BidTrackingCard from './BidTrackingCard'
 
 // Optional fields printed on the customer Estimate PDF header (JobRunner layout).
 // Blank fields print as empty boxes/lines.
@@ -68,6 +69,9 @@ export default function JobDetail() {
   const [editSaving, setEditSaving] = useState(false)
   const [quoteRequests, setQuoteRequests] = useState([])
   const [readiness, setReadiness] = useState(null)
+  // Bumped when the proposal is saved so the Bid Tracking card re-reads the bid total.
+  const [bidTrackingRefresh, setBidTrackingRefresh] = useState(0)
+  const handleProposalSaved = useCallback(() => setBidTrackingRefresh(n => n + 1), [])
   const materialsStateRef = useRef([])
   const materialsFingerprintRef = useRef('')
   const materialEditVersionRef = useRef(0)
@@ -610,6 +614,10 @@ export default function JobDetail() {
         </div>
       </div>
 
+      {/* Bid Tracking: status, due date, estimator, follow-ups, sent / won / lost */}
+      {/* key: a different job gets a fresh card, so nothing half-typed carries over */}
+      <BidTrackingCard key={job.id} jobId={job.id} hasMaterials={job.materials?.length > 0} refreshKey={bidTrackingRefresh} />
+
       {/* Notes */}
       <div className="mb-4">
         <button
@@ -966,7 +974,7 @@ export default function JobDetail() {
 
         {step === 'bid' && (
           <div className="glass-card p-4 sm:p-8">
-            <ProposalEditor job={job} api={api} onGoBack={() => setStep('takeoff')} onConfidenceChange={refreshReadiness} />
+            <ProposalEditor job={job} api={api} onGoBack={() => setStep('takeoff')} onConfidenceChange={refreshReadiness} onSaved={handleProposalSaved} />
           </div>
         )}
       </div>

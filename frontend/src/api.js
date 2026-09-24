@@ -1,7 +1,23 @@
+import { localToday } from './bidTracker';
+
 const BASE = '/api';
 
+// App.jsx registers this so any "not logged in" (401) reply brings up the login screen.
+let authRequiredHandler = null;
+export function setAuthRequiredHandler(handler) {
+  authRequiredHandler = handler;
+}
+
+// fetch() for our own API: sends the login cookie and reports a lost session.
+// Returns the Response as-is so callers keep their own error handling.
+export async function apiFetch(input, init = {}) {
+  const res = await fetch(input, { credentials: 'same-origin', ...init });
+  if (res.status === 401 && authRequiredHandler) authRequiredHandler();
+  return res;
+}
+
 async function request(url, options = {}) {
-  const res = await fetch(`${BASE}${url}`, {
+  const res = await apiFetch(`${BASE}${url}`, {
     headers: { 'Content-Type': 'application/json', ...options.headers },
     ...options,
   });
@@ -12,7 +28,36 @@ async function request(url, options = {}) {
   return res.json();
 }
 
+// Login calls expect 401 as a normal answer, so they skip the login-screen trigger.
+async function authRequest(url, options = {}) {
+  const res = await fetch(`${BASE}${url}`, {
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(typeof data.detail === 'string' ? data.detail : 'Request failed');
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
 export const api = {
+  // Sign-in
+  getCurrentUser: async () => {
+    try {
+      return await authRequest('/auth/me');
+    } catch (err) {
+      if (err.status === 401) return null;
+      throw err;
+    }
+  },
+  login: (username, pin) => authRequest('/auth/login', { method: 'POST', body: JSON.stringify({ username, pin }) }),
+  logout: () => authRequest('/auth/logout', { method: 'POST' }),
+  getOnlineUsers: () => request('/auth/online'),
+
   // Jobs
   listJobs: () => request('/jobs'),
   createJob: (data) => request('/jobs', { method: 'POST', body: JSON.stringify(data) }),
@@ -33,7 +78,7 @@ export const api = {
     console.log('[uploadRFMS] input files:', files, 'valid:', validFiles.length, validFiles.map(f => `${f.name} (${f.size}b)`));
     if (validFiles.length === 0) throw new Error('No valid files selected');
     validFiles.forEach(f => form.append('files', f));
-    const r = await fetch(`${BASE}/jobs/${jobId}/upload-rfms`, { method: 'POST', body: form });
+    const r = await apiFetch(`${BASE}/jobs/${jobId}/upload-rfms`, { method: 'POST', body: form });
     if (!r.ok) {
       const text = await r.text();
       console.error('[uploadRFMS] error:', r.status, text);
@@ -51,7 +96,7 @@ export const api = {
     const validFiles = fileList.filter(f => f instanceof File && f.size > 0);
     if (validFiles.length === 0) throw new Error('No valid files selected');
     validFiles.forEach(f => form.append('files', f));
-    const r = await fetch(`${BASE}/jobs/${jobId}/upload-quotes`, { method: 'POST', body: form });
+    const r = await apiFetch(`${BASE}/jobs/${jobId}/upload-quotes`, { method: 'POST', body: form });
     if (!r.ok) {
       const err = await r.json().catch(() => ({ detail: r.statusText }));
       const msg = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
@@ -140,7 +185,7 @@ export const api = {
   uploadLaborCatalog: (file) => {
     const form = new FormData();
     form.append('file', file);
-    return fetch(`${BASE}/labor-catalog/upload`, { method: 'POST', body: form })
+    return apiFetch(`${BASE}/labor-catalog/upload`, { method: 'POST', body: form })
       .then(r => { if (!r.ok) throw new Error('Upload failed'); return r.json(); });
   },
   updateLaborCatalogEntry: (id, data) => request('/labor-catalog/' + id, { method: 'PUT', body: JSON.stringify(data) }),
@@ -172,7 +217,7 @@ export const api = {
   uploadPriceList: (file) => {
     const form = new FormData();
     form.append('file', file);
-    return fetch(`${BASE}/price-list/upload`, { method: 'POST', body: form })
+    return apiFetch(`${BASE}/price-list/upload`, { method: 'POST', body: form })
       .then(r => { if (!r.ok) throw new Error('Upload failed'); return r.json(); });
   },
   clearPriceList: () => request('/price-list', { method: 'DELETE' }),
@@ -197,7 +242,7 @@ export const api = {
   importVendorPrices: (file) => {
     const form = new FormData();
     form.append('file', file);
-    return fetch(`${BASE}/vendor-prices/import`, { method: 'POST', body: form })
+    return apiFetch(`${BASE}/vendor-prices/import`, { method: 'POST', body: form })
       .then(r => { if (!r.ok) throw new Error('Import failed'); return r.json(); });
   },
   getPriceHistory: (params = {}) => {
@@ -234,4 +279,11 @@ export const api = {
   getActivity: (jobId) => request('/jobs/' + jobId + '/activity'),
   getComments: (jobId) => request('/jobs/' + jobId + '/comments'),
   addComment: (jobId, text) => request('/jobs/' + jobId + '/comments', { method: 'POST', body: JSON.stringify({ text }) }),
+
+  // Bid Tracker. "today" is the browser's date so due/overdue match the person's calendar.
+  getBidTracker: () => request('/bid-tracker?today=' + localToday()),
+  getBidTracking: (jobId) => request(`/jobs/${jobId}/bid-tracking?today=` + localToday()),
+  updateBidTracking: (jobId, data) => request(`/jobs/${jobId}/bid-tracking`, { method: 'PATCH', body: JSON.stringify({ ...data, today: localToday() }) }),
+  addBidEvent: (jobId, data) => request(`/jobs/${jobId}/bid-events`, { method: 'POST', body: JSON.stringify({ ...data, today: localToday() }) }),
+  getBidEvents: (jobId) => request(`/jobs/${jobId}/bid-events`),
 };
