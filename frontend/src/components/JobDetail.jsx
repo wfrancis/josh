@@ -870,7 +870,7 @@ export default function JobDetail() {
                     <Hash className="w-3.5 h-3.5" /> {job.tub_shower_count} total tubs/showers
                   </span>
                 )}
-                {aiSettings && (
+                {user?.is_admin && aiSettings && (
                   <span className="flex items-center gap-1.5">
                     <Cpu className="w-3.5 h-3.5" /> {aiSettings.openai_model} · {aiSettings.multi_pass_count}x
                   </span>
@@ -956,7 +956,15 @@ export default function JobDetail() {
         onAction={handleReadinessAction}
       />
 
-      <ReproducibilityPanel jobId={jobId} onConfidenceChange={refreshReadiness} />
+      {/* Golden-baseline tools are for admins checking the calculator, not for estimators. */}
+      {user?.is_admin && (
+        <details className="glass-card mb-6 px-4 py-3">
+          <summary className="cursor-pointer text-xs text-gray-500">Admin: calculation checks</summary>
+          <div className="mt-3">
+            <ReproducibilityPanel jobId={jobId} onConfidenceChange={refreshReadiness} />
+          </div>
+        </details>
+      )}
 
       {/* Stepper */}
       <div ref={stepsRef} className="glass-card scroll-mt-20 px-3 sm:px-6 py-3 sm:py-4 mb-6 sm:mb-8">
