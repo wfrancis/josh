@@ -46,10 +46,20 @@ JOB_ESTIMATE_HEADER_FIELDS: tuple[str, ...] = (
 )
 
 
+class _Connection(sqlite3.Connection):
+    """A plain sqlite3 connection that can also carry attributes: audit.py
+    queues live-update events on it until the transaction commits."""
+
+
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # Several people save at once: wait up to 15 s for another writer instead
+    # of failing straight away with "database is locked".
+    conn = sqlite3.connect(DB_PATH, timeout=15, factory=_Connection)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 15000")
     conn.execute("PRAGMA foreign_keys = ON")
+    # FULL makes each commit durable even if the machine loses power mid-write.
+    conn.execute("PRAGMA synchronous = FULL")
     return conn
 
 
@@ -57,6 +67,12 @@ def init_db() -> None:
     """Create all tables if they don't exist."""
     conn = _get_conn()
     try:
+        # WAL lets people read while someone else is saving. The setting is
+        # stored in the database file, so turning it on once is enough.
+        # (It adds si_bid.db-wal / -shm files next to the database.)
+        journal_mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        if str(journal_mode).lower() != "wal":
+            print(f"[db] WARNING: couldn't turn on WAL mode; journal_mode is {journal_mode}")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -584,6 +600,12 @@ def init_db() -> None:
             ("awarded_amount", "ALTER TABLE jobs ADD COLUMN awarded_amount REAL"),
             # Admins can add and remove people. Everyone already signed up stays a regular user.
             ("user_is_admin", "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"),
+            # Every saved change to a bid bumps version (job_writes.job_write);
+            # proposal_rev guards proposal saves against overwriting each other.
+            ("job_version", "ALTER TABLE jobs ADD COLUMN version INTEGER NOT NULL DEFAULT 0"),
+            ("job_updated_at", "ALTER TABLE jobs ADD COLUMN updated_at TEXT"),
+            ("job_updated_by", "ALTER TABLE jobs ADD COLUMN updated_by TEXT"),
+            ("job_proposal_rev", "ALTER TABLE jobs ADD COLUMN proposal_rev INTEGER NOT NULL DEFAULT 0"),
             *[
                 (f"job_{column}", f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
                 for column in JOB_ESTIMATE_HEADER_FIELDS
@@ -666,6 +688,11 @@ def init_db() -> None:
             conn.execute("UPDATE jobs SET slug=? WHERE id=?", (slug, row[0]))
         if rows:
             conn.commit()
+
+        # Audit trail: tables and triggers, the one-time copy of the older
+        # history tables, and closing edit groups left open by the last run.
+        import audit
+        audit.init_audit(conn)
     finally:
         conn.close()
 
@@ -910,10 +937,31 @@ def save_materials(
             conn.close()
 
 
-def save_sundries(job_id: int, sundries: list[dict]) -> None:
-    """Save sundry lines for a job."""
-    conn = _get_conn()
+@contextmanager
+def _conn_or_new(conn: sqlite3.Connection | None = None):
+    """The connection to write with: the one given, else the open
+    job_write/entity_write transaction on this thread (a second connection
+    would wait for the write lock that transaction holds), else a new one that
+    is committed and closed at the end of the block."""
+    if conn is not None:
+        yield conn
+        return
+    import audit
+    active = audit.active_write()
+    if active is not None:
+        yield active.conn
+        return
+    own = _get_conn()
     try:
+        yield own
+        own.commit()
+    finally:
+        own.close()
+
+
+def save_sundries(job_id: int, sundries: list[dict], *, conn: sqlite3.Connection | None = None) -> None:
+    """Save sundry lines for a job."""
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM job_sundries WHERE job_id=?", (job_id,))
         for s in sundries:
             conn.execute("""
@@ -926,15 +974,11 @@ def save_sundries(job_id: int, sundries: list[dict]) -> None:
                 s.get("unit_price", 0), s.get("extended_cost", 0),
                 s.get("freight_cost", 0),
             ))
-        conn.commit()
-    finally:
-        conn.close()
 
 
-def save_labor(job_id: int, labor_items: list[dict]) -> None:
+def save_labor(job_id: int, labor_items: list[dict], *, conn: sqlite3.Connection | None = None) -> None:
     """Save labor lines for a job."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM job_labor WHERE job_id=?", (job_id,))
         for l in labor_items:
             conn.execute("""
@@ -946,15 +990,11 @@ def save_labor(job_id: int, labor_items: list[dict]) -> None:
                 l.get("qty", 0), l.get("unit"),
                 l.get("rate", 0), l.get("extended_cost", 0)
             ))
-        conn.commit()
-    finally:
-        conn.close()
 
 
-def save_bundles(job_id: int, bundles: list[dict]) -> None:
+def save_bundles(job_id: int, bundles: list[dict], *, conn: sqlite3.Connection | None = None) -> None:
     """Save bundle lines for a job."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM job_bundles WHERE job_id=?", (job_id,))
         for b in bundles:
             conn.execute("""
@@ -966,9 +1006,6 @@ def save_bundles(job_id: int, bundles: list[dict]) -> None:
                 b.get("installed_qty", 0), b.get("unit"),
                 b.get("total_price", 0)
             ))
-        conn.commit()
-    finally:
-        conn.close()
 
 
 # ── Calculation Audit Trace ─────────────────────────────────────────────────
@@ -1237,10 +1274,9 @@ def get_calculation_traces(
         conn.close()
 
 
-def save_quotes(job_id: int, quotes: list[dict]) -> list[int]:
+def save_quotes(job_id: int, quotes: list[dict], *, conn: sqlite3.Connection | None = None) -> list[int]:
     """Append parsed quote products for a job. Returns list of new quote ids."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         ids = []
         for q in quotes:
             if q.get("error"):
@@ -1259,16 +1295,12 @@ def save_quotes(job_id: int, quotes: list[dict]) -> list[int]:
             ))
             if cur.rowcount:
                 ids.append(cur.lastrowid)
-        conn.commit()
         return ids
-    finally:
-        conn.close()
 
 
-def update_quote(quote_id: int, data: dict) -> bool:
+def update_quote(quote_id: int, data: dict, *, conn: sqlite3.Connection | None = None) -> bool:
     """Update a single quote entry and return success."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         fields = []
         values = []
         for key in ("product_name", "vendor", "unit_price", "unit", "description"):
@@ -1278,11 +1310,8 @@ def update_quote(quote_id: int, data: dict) -> bool:
         if not fields:
             return False
         values.append(quote_id)
-        conn.execute(f"UPDATE job_quotes SET {', '.join(fields)} WHERE id=?", values)
-        conn.commit()
-        return conn.total_changes > 0
-    finally:
-        conn.close()
+        cur = conn.execute(f"UPDATE job_quotes SET {', '.join(fields)} WHERE id=?", values)
+        return cur.rowcount > 0
 
 
 def get_quote_job_id(quote_id: int) -> int | None:
@@ -1295,28 +1324,20 @@ def get_quote_job_id(quote_id: int) -> int | None:
         conn.close()
 
 
-def delete_quotes(job_id: int) -> None:
+def delete_quotes(job_id: int, *, conn: sqlite3.Connection | None = None) -> None:
     """Delete all quotes for a job."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM job_quotes WHERE job_id=?", (job_id,))
-        conn.commit()
-    finally:
-        conn.close()
 
 
-def delete_job(job_ref) -> bool:
+def delete_job(job_ref, *, conn: sqlite3.Connection | None = None) -> bool:
     """Delete a job by ID or slug and all related data (cascading)."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         if isinstance(job_ref, int) or (isinstance(job_ref, str) and job_ref.isdigit()):
             cur = conn.execute("DELETE FROM jobs WHERE id=?", (int(job_ref),))
         else:
             cur = conn.execute("DELETE FROM jobs WHERE slug=?", (job_ref,))
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
 def load_job(job_ref) -> Optional[dict]:
@@ -1393,19 +1414,15 @@ def get_settings() -> dict:
         conn.close()
 
 
-def save_settings(settings: dict) -> None:
+def save_settings(settings: dict, *, conn: sqlite3.Connection | None = None) -> None:
     """Save app settings (upsert)."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         for key, value in settings.items():
             conn.execute(
                 "INSERT INTO app_settings (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, str(value))
             )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def search_all(query: str) -> dict:
@@ -1753,7 +1770,7 @@ def _ensure_rule_history_baseline(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
-def create_rule(rule: dict) -> str:
+def create_rule(rule: dict, *, conn: sqlite3.Connection | None = None) -> str:
     """Create an estimating rule. Returns the rule_id."""
     data = _prepare_rule_values(rule)
     _validate_rule_lifecycle(data)
@@ -1767,8 +1784,7 @@ def create_rule(rule: dict) -> str:
     now = datetime.now().isoformat()
     changed_by = rule.get("changed_by") or "Rules Registry"
     change_note = rule.get("change_note") or "Rule created."
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("""
             INSERT INTO estimating_rules (
                 rule_id, name, category, stage, status, priority,
@@ -1793,10 +1809,7 @@ def create_rule(rule: dict) -> str:
             changed_by=changed_by,
             change_note=change_note,
         )
-        conn.commit()
         return rule_id
-    finally:
-        conn.close()
 
 
 def list_rules(category: str = None, stage: str = None, status: str = None) -> list[dict]:
@@ -1868,14 +1881,14 @@ def update_rule(
     *,
     changed_by: str = "",
     change_note: str = "",
+    conn: sqlite3.Connection | None = None,
 ) -> bool:
     """Patch mutable fields on an estimating rule and save a new version."""
     data = _prepare_rule_values(fields, partial=True)
     if not data:
         return False
 
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         existing = conn.execute("SELECT * FROM estimating_rules WHERE rule_id=?", (rule_id,)).fetchone()
         if not existing:
             return False
@@ -1908,16 +1921,18 @@ def update_rule(
                 changed_by=changed_by or "Rules Registry",
                 change_note=change_note or "Rule updated.",
             )
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
-def archive_rule(rule_id: str, *, changed_by: str = "", change_note: str = "") -> bool:
+def archive_rule(
+    rule_id: str,
+    *,
+    changed_by: str = "",
+    change_note: str = "",
+    conn: sqlite3.Connection | None = None,
+) -> bool:
     """Archive an estimating rule while preserving history for old bids."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         existing = conn.execute("SELECT * FROM estimating_rules WHERE rule_id=?", (rule_id,)).fetchone()
         if not existing:
             return False
@@ -1947,15 +1962,12 @@ def archive_rule(rule_id: str, *, changed_by: str = "", change_note: str = "") -
                 changed_by=changed_by or "Rules Registry",
                 change_note=change_note or "Rule archived.",
             )
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
-def delete_rule(rule_id: str) -> bool:
+def delete_rule(rule_id: str, *, changed_by: str = "", conn: sqlite3.Connection | None = None) -> bool:
     """Archive an estimating rule instead of hard deleting it."""
-    return archive_rule(rule_id)
+    return archive_rule(rule_id, changed_by=changed_by, conn=conn)
 
 
 def get_active_rules(stage: str = None, category: str = None, as_of: str = None) -> list[dict]:
@@ -1987,16 +1999,22 @@ def get_active_rules(stage: str = None, category: str = None, as_of: str = None)
         conn.close()
 
 
-def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
-    """Seed built-in hard rules without overwriting user edits by default."""
+def seed_rules_registry_defaults(
+    overwrite: bool = False,
+    *,
+    changed_by: str = "System",
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Seed built-in hard rules without overwriting user edits by default.
+
+    ``changed_by`` is saved on the rule and rule set versions it writes."""
     from rules_registry import BUILTIN_RULE_CORRECTIONS, DEFAULT_HARD_RULES
 
     inserted = 0
     updated = 0
     contract_backfilled = 0
     corrected = 0
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         for rule in DEFAULT_HARD_RULES:
             seeded_rule = dict(rule)
             seeded_rule.setdefault("implementation_ref", seeded_rule.get("source") or "")
@@ -2057,7 +2075,7 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
                         conn,
                         _rule_from_row(row),
                         "builtin_correction" if correction_applied else "contract_backfill",
-                        "System",
+                        changed_by,
                         correction.get("change_note") if correction_applied else "Added implementation and test references required by the rules contract.",
                     )
                 continue
@@ -2086,7 +2104,7 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
                     conn,
                     _rule_from_row(row),
                     "seed_overwrite",
-                    "System",
+                    changed_by,
                     "Built-in seed overwrote this rule.",
                 )
                 updated += 1
@@ -2114,7 +2132,7 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
                     conn,
                     _rule_from_row(row),
                     "seeded",
-                    "System",
+                    changed_by,
                     "Built-in hard rule seeded.",
                 )
                 inserted += 1
@@ -2134,10 +2152,9 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
             _insert_ruleset_version(
                 conn,
                 change_type=change_type,
-                changed_by="System",
+                changed_by=changed_by,
                 change_note=change_note,
             )
-        conn.commit()
         return {
             "inserted": inserted,
             "updated": updated,
@@ -2145,8 +2162,6 @@ def seed_rules_registry_defaults(overwrite: bool = False) -> dict:
             "corrected": corrected,
             "total": len(DEFAULT_HARD_RULES),
         }
-    finally:
-        conn.close()
 
 
 def list_ruleset_versions(limit: int = 25) -> list[dict]:
@@ -2199,10 +2214,10 @@ def rollback_ruleset_version(
     *,
     changed_by: str = "",
     change_note: str = "",
+    conn: sqlite3.Connection | None = None,
 ) -> int:
     """Restore the registry to a prior ruleset snapshot as a new ruleset version."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         row = conn.execute(
             "SELECT snapshot_json FROM ruleset_versions WHERE version=?",
             (version,),
@@ -2326,18 +2341,14 @@ def rollback_ruleset_version(
             changed_by=actor,
             change_note=note,
         )
-        conn.commit()
         return new_version
-    finally:
-        conn.close()
 
 
 # ── Labor Catalog ────────────────────────────────────────────────────────────
 
-def save_labor_catalog_entries(entries: list[dict]) -> None:
+def save_labor_catalog_entries(entries: list[dict], *, conn: sqlite3.Connection | None = None) -> None:
     """Replace all labor catalog entries."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM labor_catalog")
         for e in entries:
             conn.execute("""
@@ -2349,9 +2360,6 @@ def save_labor_catalog_entries(entries: list[dict]) -> None:
                 e.get("cost", 0), e.get("retail_display", ""),
                 e.get("unit", ""), e.get("gpm_markup", 0)
             ))
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def get_labor_catalog_entries() -> list[dict]:
@@ -2364,10 +2372,9 @@ def get_labor_catalog_entries() -> list[dict]:
         conn.close()
 
 
-def update_labor_catalog_entry(entry_id: int, data: dict) -> bool:
+def update_labor_catalog_entry(entry_id: int, data: dict, *, conn: sqlite3.Connection | None = None) -> bool:
     """Update a single labor catalog entry."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         cur = conn.execute("""
             UPDATE labor_catalog SET labor_type=?, description=?, cost=?, retail_display=?, unit=?, gpm_markup=?
             WHERE id=?
@@ -2377,16 +2384,12 @@ def update_labor_catalog_entry(entry_id: int, data: dict) -> bool:
             data.get("unit", ""), data.get("gpm_markup", 0),
             entry_id
         ))
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
-def insert_labor_catalog_entry(data: dict) -> int:
+def insert_labor_catalog_entry(data: dict, *, conn: sqlite3.Connection | None = None) -> int:
     """Insert a single labor catalog entry; returns new id."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         cur = conn.execute("""
             INSERT INTO labor_catalog
                 (labor_type, description, cost, retail_display, unit, gpm_markup)
@@ -2396,49 +2399,33 @@ def insert_labor_catalog_entry(data: dict) -> int:
             data.get("cost", 0), data.get("retail_display", ""),
             data.get("unit", ""), data.get("gpm_markup", 0),
         ))
-        conn.commit()
         return cur.lastrowid
-    finally:
-        conn.close()
 
 
-def delete_labor_catalog_entry(entry_id: int) -> bool:
+def delete_labor_catalog_entry(entry_id: int, *, conn: sqlite3.Connection | None = None) -> bool:
     """Delete a single labor catalog entry."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         cur = conn.execute("DELETE FROM labor_catalog WHERE id=?", (entry_id,))
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
-def clear_labor_catalog() -> None:
+def clear_labor_catalog(*, conn: sqlite3.Connection | None = None) -> None:
     """Delete all labor catalog entries."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM labor_catalog")
-        conn.commit()
-    finally:
-        conn.close()
 
 
-def clear_price_list() -> None:
+def clear_price_list(*, conn: sqlite3.Connection | None = None) -> None:
     """Delete all price list entries."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM price_list")
-        conn.commit()
-    finally:
-        conn.close()
 
 
 # ── Price List ───────────────────────────────────────────────────────────────
 
-def save_price_list_entries(entries: list[dict]) -> None:
+def save_price_list_entries(entries: list[dict], *, conn: sqlite3.Connection | None = None) -> None:
     """Replace all price list entries."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM price_list")
         for e in entries:
             conn.execute("""
@@ -2450,15 +2437,11 @@ def save_price_list_entries(entries: list[dict]) -> None:
                 e.get("unit", ""), e.get("unit_price", 0),
                 e.get("vendor", ""), e.get("notes", "")
             ))
-        conn.commit()
-    finally:
-        conn.close()
 
 
-def add_price_list_entry(entry: dict) -> int:
+def add_price_list_entry(entry: dict, *, conn: sqlite3.Connection | None = None) -> int:
     """Add a single price list entry. Returns the id."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         cur = conn.execute("""
             INSERT INTO price_list
                 (product_name, material_type, unit, unit_price, vendor, notes)
@@ -2468,16 +2451,12 @@ def add_price_list_entry(entry: dict) -> int:
             entry.get("unit", ""), entry.get("unit_price", 0),
             entry.get("vendor", ""), entry.get("notes", "")
         ))
-        conn.commit()
         return cur.lastrowid
-    finally:
-        conn.close()
 
 
-def update_price_list_entry(entry_id: int, entry: dict) -> bool:
+def update_price_list_entry(entry_id: int, entry: dict, *, conn: sqlite3.Connection | None = None) -> bool:
     """Update a price list entry. Returns True if found."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         cur = conn.execute("""
             UPDATE price_list SET
                 product_name=?, material_type=?, unit=?, unit_price=?, vendor=?, notes=?
@@ -2488,21 +2467,14 @@ def update_price_list_entry(entry_id: int, entry: dict) -> bool:
             entry.get("vendor", ""), entry.get("notes", ""),
             entry_id
         ))
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
-def delete_price_list_entry(entry_id: int) -> bool:
+def delete_price_list_entry(entry_id: int, *, conn: sqlite3.Connection | None = None) -> bool:
     """Delete a price list entry. Returns True if found."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         cur = conn.execute("DELETE FROM price_list WHERE id=?", (entry_id,))
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
 def get_price_list_entries() -> list[dict]:
@@ -2527,18 +2499,14 @@ def get_company_rate(rate_type: str) -> Optional[str]:
         conn.close()
 
 
-def save_company_rate(rate_type: str, data: str) -> None:
+def save_company_rate(rate_type: str, data: str, *, conn: sqlite3.Connection | None = None) -> None:
     """Save a company rate JSON blob (upsert)."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute(
             "INSERT INTO company_rates (rate_type, data) VALUES (?, ?) "
             "ON CONFLICT(rate_type) DO UPDATE SET data=excluded.data",
             (rate_type, data)
         )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def get_all_company_rates() -> dict:
@@ -2643,11 +2611,11 @@ def upsert_golden_job(
     rules_registry_snapshot: dict | None = None,
     config_snapshot: dict | None = None,
     status: str = "active",
+    conn: sqlite3.Connection | None = None,
 ) -> dict:
     """Create a new immutable golden version and update the compatibility pointer."""
     now = datetime.now().isoformat()
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         existing = conn.execute(
             "SELECT * FROM golden_jobs WHERE source_job_id=?",
             (source_job_id,),
@@ -2742,11 +2710,8 @@ def upsert_golden_job(
                 source_fingerprint or "", notes or "", status or "active", version_id, now, golden_id,
             ),
         )
-        conn.commit()
         row = conn.execute("SELECT * FROM golden_jobs WHERE id=?", (golden_id,)).fetchone()
         return _attach_current_golden_version(conn, _decode_golden_job_row(row))
-    finally:
-        conn.close()
 
 
 def get_golden_job_for_source(source_job_id: int) -> dict | None:
@@ -2783,11 +2748,11 @@ def save_golden_replay(
     generated_proposal: dict = None,
     audit_run_id: int | None = None,
     golden_version_id: int | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> dict:
     """Persist one golden job replay report."""
     now = datetime.now().isoformat()
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         cur = conn.execute(
             """
             INSERT INTO golden_job_replays
@@ -2808,11 +2773,8 @@ def save_golden_replay(
                 now,
             ),
         )
-        conn.commit()
         row = conn.execute("SELECT * FROM golden_job_replays WHERE id=?", (cur.lastrowid,)).fetchone()
         return _decode_golden_replay_row(row)
-    finally:
-        conn.close()
 
 
 def list_golden_replays_for_job(source_job_id: int, limit: int = 20) -> list[dict]:
@@ -2888,11 +2850,14 @@ def get_golden_replay(replay_id: int) -> dict | None:
 
 
 def list_jobs() -> list[dict]:
-    """List all jobs (summary with bundle count)."""
+    """List all jobs (summary with bundle count and bid status)."""
+    from bid_tracker import effective_bid_status
+
     conn = _get_conn()
     try:
         rows = conn.execute(
             """SELECT j.id, j.slug, j.project_name, j.gc_name, j.salesperson, j.city, j.state, j.created_at,
+                      j.bid_status,
                       (SELECT COUNT(*) FROM job_bundles b WHERE b.job_id = j.id) AS bundle_count,
                       (SELECT COUNT(*) FROM job_materials m WHERE m.job_id = j.id) AS material_count,
                       (SELECT COUNT(*) FROM job_materials m WHERE m.job_id = j.id AND m.unit_price > 0) AS priced_count
@@ -2908,6 +2873,9 @@ def list_jobs() -> list[dict]:
             pc = d.pop("priced_count", 0)
             if mc > 0:
                 d["materials"] = [{"unit_price": 1}] * pc + [{"unit_price": 0}] * (mc - pc)
+            # Same status the Bid Tracker shows: untracked jobs read "Estimating"
+            # once they have materials, otherwise "Not started".
+            d["bid_status"], d["bid_status_is_default"] = effective_bid_status(d.get("bid_status"), mc)
             results.append(d)
         return results
     finally:
@@ -2945,10 +2913,14 @@ def get_or_create_vendor(name: str) -> int:
         conn.close()
 
 
-def save_vendor_prices_from_quotes(job_id: int, products: list[dict]) -> int:
+def save_vendor_prices_from_quotes(
+    job_id: int,
+    products: list[dict],
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> int:
     """Save parsed quote products to vendor_prices. Returns count saved."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         count = 0
         now = datetime.now().isoformat()
         for p in products:
@@ -2984,7 +2956,6 @@ def save_vendor_prices_from_quotes(job_id: int, products: list[dict]) -> int:
                 now, p.get("file_name"), p.get("notes"), p.get("_source_hash"), now
             ))
             count += int(conn.execute("SELECT changes()").fetchone()[0] or 0)
-        conn.commit()
 
         # Now link vendor_ids (separate pass to avoid nested connections)
         rows = conn.execute(
@@ -3008,17 +2979,13 @@ def save_vendor_prices_from_quotes(job_id: int, products: list[dict]) -> int:
                     vendor_cache[vname] = vcur.lastrowid
             conn.execute("UPDATE vendor_prices SET vendor_id=? WHERE id=?",
                          (vendor_cache[vname], row["id"]))
-        conn.commit()
 
         return count
-    finally:
-        conn.close()
 
 
-def create_vendor(data: dict) -> dict:
+def create_vendor(data: dict, *, conn: sqlite3.Connection | None = None) -> dict:
     """Create a new vendor. Returns the created vendor dict."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         now = datetime.now().isoformat()
         name = (data.get("name") or "").strip()
         if not name:
@@ -3034,30 +3001,22 @@ def create_vendor(data: dict) -> dict:
              data.get("contact_email", ""), data.get("contact_phone", ""),
              data.get("notes", ""), now, now)
         )
-        conn.commit()
         vendor_id = cur.lastrowid
         row = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
         return dict(row)
-    finally:
-        conn.close()
 
 
-def delete_vendor(vendor_id: int) -> bool:
+def delete_vendor(vendor_id: int, *, conn: sqlite3.Connection | None = None) -> bool:
     """Delete a vendor and its associated vendor_prices."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM vendor_prices WHERE vendor_id=?", (vendor_id,))
         cur = conn.execute("DELETE FROM vendors WHERE id=?", (vendor_id,))
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
-def merge_vendors(keep_id: int, merge_ids: list[int]) -> bool:
+def merge_vendors(keep_id: int, merge_ids: list[int], *, conn: sqlite3.Connection | None = None) -> bool:
     """Merge multiple vendor records into one. Reassigns vendor_prices and quote_requests, then deletes the duplicates."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         for mid in merge_ids:
             if mid == keep_id:
                 continue
@@ -3065,10 +3024,7 @@ def merge_vendors(keep_id: int, merge_ids: list[int]) -> bool:
             conn.execute("UPDATE quote_requests SET vendor_id=? WHERE vendor_id=?", (keep_id, mid))
             conn.execute("UPDATE job_materials SET vendor=(SELECT name FROM vendors WHERE id=?) WHERE vendor=(SELECT name FROM vendors WHERE id=?)", (keep_id, mid))
             conn.execute("DELETE FROM vendors WHERE id=?", (mid,))
-        conn.commit()
         return True
-    finally:
-        conn.close()
 
 
 def list_vendors() -> list[dict]:
@@ -3179,10 +3135,9 @@ def get_vendor(vendor_id: int) -> dict | None:
         conn.close()
 
 
-def update_vendor(vendor_id: int, data: dict) -> bool:
+def update_vendor(vendor_id: int, data: dict, *, conn: sqlite3.Connection | None = None) -> bool:
     """Update vendor contact info."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         fields = []
         values = []
         for key in ("name", "contact_name", "contact_title", "contact_email", "contact_phone", "notes"):
@@ -3195,10 +3150,7 @@ def update_vendor(vendor_id: int, data: dict) -> bool:
         values.append(datetime.now().isoformat())
         values.append(vendor_id)
         cur = conn.execute(f"UPDATE vendors SET {', '.join(fields)} WHERE id=?", values)
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
 def search_vendor_prices(vendor: str = None, product: str = None, limit: int = 50) -> list[dict]:
@@ -3276,12 +3228,11 @@ def get_price_history(item_code: str = None, product: str = None, exclude_job_id
         conn.close()
 
 
-def import_vendor_prices_csv(text: str) -> dict:
+def import_vendor_prices_csv(text: str, *, conn: sqlite3.Connection | None = None) -> dict:
     """Bulk import vendor prices from CSV text. Accepts partial data."""
     import csv as _csv
     reader = _csv.DictReader(io.StringIO(text))
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         imported = 0
         errors = []
         for i, row in enumerate(reader, 2):
@@ -3326,10 +3277,7 @@ def import_vendor_prices_csv(text: str) -> dict:
                 (row.get('quote_date', '') or '').strip() or None,
             ))
             imported += 1
-        conn.commit()
         return {"imported": imported, "errors": errors}
-    finally:
-        conn.close()
 
 
 # ── Notifications ────────────────────────────────────────────────────────────
@@ -3350,10 +3298,10 @@ def is_file_imported(job_id: int, file_hash: str) -> bool:
 def record_imported_file(job_id: int, file_name: str, file_hash: str,
                          file_size: int = 0, source: str = "manual",
                          artifact_path: str | None = None,
-                         artifact_kind: str = "source"):
+                         artifact_kind: str = "source",
+                         *, conn: sqlite3.Connection | None = None):
     """Record an import and repair legacy rows when durable evidence is re-uploaded."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute(
             "INSERT INTO imported_files "
             "(job_id, file_name, file_hash, file_size, source, artifact_path, artifact_kind, imported_at) "
@@ -3366,9 +3314,6 @@ def record_imported_file(job_id: int, file_name: str, file_hash: str,
             "imported_at=excluded.imported_at",
             (job_id, file_name, file_hash, file_size, source, artifact_path, artifact_kind, datetime.now().isoformat())
         )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def list_imported_files(job_id: int) -> list[dict]:
@@ -3524,15 +3469,11 @@ def get_notifications(unread_only: bool = True) -> list[dict]:
         conn.close()
 
 
-def mark_notification_read(notification_id: int) -> bool:
+def mark_notification_read(notification_id: int, *, conn: sqlite3.Connection | None = None) -> bool:
     """Mark a notification as read."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         cur = conn.execute("UPDATE notifications SET read=1 WHERE id=?", (notification_id,))
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
 # ── Activity Log ─────────────────────────────────────────────────────────────
@@ -3543,24 +3484,63 @@ def log_activity(job_id: int, action: str, summary: str, detail: dict = None, us
     The logged-in person (set per request by the sign-in middleware) is saved
     in ``username``; ``user`` is the name shown in the activity list and falls
     back to their display name, or "System" for background work.
+
+    Also writes the audit trail in the same transaction (for one release,
+    while routes move to job_write): inside a job_write for the same bid the
+    text becomes that entry's summary, otherwise it is an entry of its own.
     """
     import json as _json
+    import audit
     current = get_current_user()
     username = current.get("username") if current else None
     if not user:
         user = _current_user_label(current)
-    conn = _get_conn()
-    try:
-        detail_str = _json.dumps(detail) if detail else None
-        cur = conn.execute(
-            "INSERT INTO job_activity (job_id, action, summary, detail, created_at, user, username) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (job_id, action, summary, detail_str, datetime.now().isoformat(), user, username)
-        )
-        conn.commit()
+    detail_str = _json.dumps(detail) if detail else None
+    insert_sql = (
+        "INSERT INTO job_activity (job_id, action, summary, detail, created_at, user, username) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    values = (job_id, action, summary, detail_str, datetime.now().isoformat(), user, username)
+
+    active = audit.active_write()
+    if active is not None:
+        # Inside job_write/entity_write: use its transaction. A second
+        # connection would wait for the write lock that transaction holds.
+        cur = active.conn.execute(insert_sql, values)
+        _audit_legacy_activity(active.conn, job_id, action, summary, detail)
         return cur.lastrowid
+
+    conn = _get_conn()
+    committed = False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(insert_sql, values)
+        _audit_legacy_activity(conn, job_id, action, summary, detail)
+        conn.commit()
+        committed = True
+        audit.after_commit(conn)
+        return cur.lastrowid
+    except BaseException:
+        if not committed:
+            conn.rollback()
+            audit.discard_pending(conn)
+        raise
     finally:
         conn.close()
+
+
+def _audit_legacy_activity(conn, job_id, action, summary, detail) -> None:
+    """The audit half of log_activity. If it fails, the activity row is
+    still saved and the error is logged."""
+    import audit
+    conn.execute("SAVEPOINT legacy_activity_audit")
+    try:
+        audit.record_legacy_activity(conn, job_id, action, summary, detail)
+    except Exception as err:
+        conn.execute("ROLLBACK TO SAVEPOINT legacy_activity_audit")
+        print(f"[audit] ERROR: couldn't add '{action}' on job {job_id} to the audit log: {err}")
+    finally:
+        conn.execute("RELEASE SAVEPOINT legacy_activity_audit")
 
 
 def get_activity(job_id: int, limit: int = 50) -> list[dict]:
@@ -3588,21 +3568,17 @@ def get_activity(job_id: int, limit: int = 50) -> list[dict]:
 
 # ── Job Comments ─────────────────────────────────────────────────────────────
 
-def add_comment(job_id: int, text: str, user: str | None = None) -> dict:
+def add_comment(job_id: int, text: str, user: str | None = None, *, conn: sqlite3.Connection | None = None) -> dict:
     """Add a comment to a job. Returns the created comment."""
     if not user:
         user = _current_user_label(get_current_user())
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         now = datetime.now().isoformat()
         cur = conn.execute(
             "INSERT INTO job_comments (job_id, text, created_at, user) VALUES (?, ?, ?, ?)",
             (job_id, text, now, user)
         )
-        conn.commit()
         return {"id": cur.lastrowid, "job_id": job_id, "text": text, "created_at": now, "user": user}
-    finally:
-        conn.close()
 
 
 def get_comments(job_id: int) -> list[dict]:
@@ -3622,10 +3598,10 @@ def get_comments(job_id: int) -> list[dict]:
 
 def create_quote_request(job_id: int, vendor_name: str, material_ids: list,
                          request_text: str = "", vendor_id: int = None,
-                         status: str = "draft", sent_at: str = None) -> dict:
+                         status: str = "draft", sent_at: str = None,
+                         *, conn: sqlite3.Connection | None = None) -> dict:
     """Create a quote request record."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         now = datetime.now().isoformat()
         import json
         cur = conn.execute(
@@ -3633,11 +3609,8 @@ def create_quote_request(job_id: int, vendor_name: str, material_ids: list,
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, vendor_id, vendor_name, status, json.dumps(material_ids), request_text, sent_at, now)
         )
-        conn.commit()
         row = conn.execute("SELECT * FROM quote_requests WHERE id=?", (cur.lastrowid,)).fetchone()
         return dict(row)
-    finally:
-        conn.close()
 
 
 def list_quote_requests(job_id: int) -> list[dict]:
@@ -3662,10 +3635,9 @@ def list_quote_requests(job_id: int) -> list[dict]:
         conn.close()
 
 
-def update_quote_request(request_id: int, **fields) -> bool:
+def update_quote_request(request_id: int, *, conn: sqlite3.Connection | None = None, **fields) -> bool:
     """Update a quote request (status, sent_at, received_at, request_text)."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         allowed = {"status", "sent_at", "received_at", "request_text", "vendor_name", "vendor_id", "material_ids", "response_file", "response_notes"}
         updates = []
         values = []
@@ -3681,32 +3653,24 @@ def update_quote_request(request_id: int, **fields) -> bool:
             return False
         values.append(request_id)
         cur = conn.execute(f"UPDATE quote_requests SET {', '.join(updates)} WHERE id=?", values)
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
-def delete_quote_request(request_id: int) -> bool:
+def delete_quote_request(request_id: int, *, conn: sqlite3.Connection | None = None) -> bool:
     """Delete a quote request."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         cur = conn.execute("DELETE FROM quote_requests WHERE id=?", (request_id,))
-        conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
 # ── Price Book ──────────────────────────────────────────────────────────────
 
 
-def import_price_book(vendor: str, items: list[dict], discount_pct: float, category: str = "") -> int:
+def import_price_book(vendor: str, items: list[dict], discount_pct: float, category: str = "", *, conn: sqlite3.Connection | None = None) -> int:
     """Import a vendor price book. Clears existing items for this vendor first.
     items: list of {product_line, item_no, material_finish, size_mm, size_inches, list_price, net_price, length, unit}
     Returns number of items imported."""
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM price_book_items WHERE vendor=?", (vendor,))
         for item in items:
             conn.execute(
@@ -3721,10 +3685,7 @@ def import_price_book(vendor: str, items: list[dict], discount_pct: float, categ
                  item.get("length", ""), item.get("unit", "length"),
                  item.get("category", category))
             )
-        conn.commit()
         return len(items)
-    finally:
-        conn.close()
 
 
 def search_price_book(query: str, vendor: str = None) -> list[dict]:
@@ -3824,6 +3785,45 @@ def get_current_user() -> dict | None:
     return _current_user.get()
 
 
+# Where the current request came from, for audit entries and log lines:
+# request_id, source ("http" or "websocket"), session_id, client_ip and route.
+# Set by the sign-in middleware in main.py next to the current user. "route"
+# may be stored as a function, because the middleware runs before FastAPI has
+# matched the route; get_audit_context() calls it when the context is read.
+_audit_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar("si_audit_context", default=None)
+
+
+def set_audit_context(context: dict | None) -> contextvars.Token:
+    return _audit_context.set(context)
+
+
+def reset_audit_context(token: contextvars.Token) -> None:
+    _audit_context.reset(token)
+
+
+def get_audit_context() -> dict:
+    """The current request's context as a plain dict.
+
+    Work outside a request (startup, background threads) gets source
+    "system" and None for everything else.
+    """
+    context = _audit_context.get()
+    if context is None:
+        return {"request_id": None, "source": "system", "session_id": None, "client_ip": None, "route": None}
+    result = dict(context)
+    if callable(result.get("route")):
+        result["route"] = result["route"]()
+    return result
+
+
+def set_audit_session(session_id: int | None) -> None:
+    """The current request now belongs to this session (it just logged in),
+    so its audit entries carry the new session id."""
+    context = _audit_context.get()
+    if context is not None:
+        context["session_id"] = session_id
+
+
 def _current_user_label(user: dict | None) -> str:
     if not user:
         return "System"
@@ -3917,23 +3917,18 @@ def clean_display_name(name) -> str:
     return name
 
 
-@contextmanager
 def _user_write_transaction():
     """One connection holding the write lock, so the "keep at least one admin"
-    checks and the change they guard can't interleave with another change."""
-    conn = _get_conn()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        yield conn
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    checks and the change they guard can't interleave with another change.
+    Commits (and publishes its audit entries) on success."""
+    import audit
+    return audit.write_transaction()
 
 
 def _log_admin_action(conn, actor: dict | None, action: str, target_username: str, details: dict | None = None) -> None:
+    """Write the change to admin_log (the Users page list) and to the audit
+    trail, in the caller's transaction. ``details`` never holds a PIN."""
+    import audit
     conn.execute(
         "INSERT INTO admin_log (created_at, username, action, target_username, details) VALUES (?, ?, ?, ?, ?)",
         (
@@ -3943,6 +3938,18 @@ def _log_admin_action(conn, actor: dict | None, action: str, target_username: st
             target_username,
             json.dumps(details or {}, default=str),
         ),
+    )
+    row = conn.execute("SELECT display_name FROM users WHERE username = ?", (target_username,)).fetchone()
+    name = (row["display_name"] if row else "") or target_username
+    audit_action, summary, changes = audit.admin_log_entry(action, target_username, details, name)
+    audit.record(
+        conn,
+        action=audit_action,
+        entity_type="user",
+        entity_id=target_username,
+        summary=summary,
+        changes=changes,
+        extra=dict(details) if details else None,
     )
 
 
@@ -3980,19 +3987,29 @@ def create_user(
 
 
 def seed_default_users() -> bool:
-    """Create the TEMPORARY shared test account if it does not exist yet."""
+    """Create the TEMPORARY shared test account if it does not exist yet.
+    Adds an audit entry (not an admin_log row) when it does."""
+    import audit
     conn = _get_conn()
     try:
         if conn.execute("SELECT 1 FROM users WHERE username = ?", (STARTER_USERNAME,)).fetchone():
             return False
-        conn.execute(
-            "INSERT OR IGNORE INTO users (username, display_name, pin_hash, active, created_at) VALUES (?, ?, ?, 1, ?)",
-            (STARTER_USERNAME, STARTER_DISPLAY_NAME, hash_pin(STARTER_PIN), _utc_iso(_utc_now())),
-        )
-        conn.commit()
-        return True
     finally:
         conn.close()
+    pin_hash = hash_pin(STARTER_PIN)  # slow on purpose, so do it before taking the write lock
+    with audit.write_transaction() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO users (username, display_name, pin_hash, active, created_at) VALUES (?, ?, ?, 1, ?)",
+            (STARTER_USERNAME, STARTER_DISPLAY_NAME, pin_hash, _utc_iso(_utc_now())),
+        )
+        if not cur.rowcount:
+            return False
+        _, summary, changes = audit.admin_log_entry(
+            "added", STARTER_USERNAME, {"display_name": STARTER_DISPLAY_NAME}, STARTER_DISPLAY_NAME,
+        )
+        audit.record(conn, action="user.create", entity_type="user", entity_id=STARTER_USERNAME,
+                     summary=summary, changes=changes, extra={"shared_test_login": True})
+    return True
 
 
 def authenticate_user(username: str, pin: str) -> dict | None:
@@ -4019,12 +4036,11 @@ def authenticate_user(username: str, pin: str) -> dict | None:
         conn.close()
 
 
-def create_session(user_id: int) -> str:
+def create_session(user_id: int, *, conn: sqlite3.Connection | None = None) -> str:
     """Start a session for a user and return the raw token for the cookie."""
     token = secrets.token_urlsafe(32)
     now = _utc_now()
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (_utc_iso(now),))
         conn.execute(
             "INSERT INTO sessions (token_hash, user_id, created_at, last_seen_at, expires_at) VALUES (?, ?, ?, ?, ?)",
@@ -4036,16 +4052,26 @@ def create_session(user_id: int) -> str:
                 _utc_iso(now + timedelta(days=SESSION_LIFETIME_DAYS)),
             ),
         )
-        conn.commit()
         return token
-    finally:
-        conn.close()
 
 
-def get_session_user(token: str | None) -> dict | None:
-    """Look up the active user for a session token, refreshing "last seen" about once a minute."""
+def session_id_for_token(token: str | None, *, conn: sqlite3.Connection | None = None) -> int | None:
+    """The id of the session row for a cookie token (expired or not), or None."""
     if not token or len(token) > 200:
         return None
+    with _conn_or_new(conn) as conn:
+        row = conn.execute("SELECT id FROM sessions WHERE token_hash=?", (_hash_session_token(token),)).fetchone()
+        return int(row["id"]) if row else None
+
+
+def get_session(token: str | None) -> tuple[dict | None, int | None]:
+    """Look up a session token: (active user, session id), or (None, None).
+
+    The session id is kept out of the user dict, which is sent to the
+    browser. Refreshes "last seen" about once a minute.
+    """
+    if not token or len(token) > 200:
+        return None, None
     now = _utc_now()
     conn = _get_conn()
     try:
@@ -4056,7 +4082,7 @@ def get_session_user(token: str | None) -> dict | None:
             (_hash_session_token(token), _utc_iso(now)),
         ).fetchone()
         if row is None:
-            return None
+            return None, None
         user = _public_user(row)
         try:
             seen = datetime.fromisoformat(row["session_seen_at"])
@@ -4064,25 +4090,28 @@ def get_session_user(token: str | None) -> dict | None:
             seen = None
         if seen is None or seen.tzinfo is None or (now - seen).total_seconds() >= SESSION_TOUCH_SECONDS:
             try:
+                # Don't hold up every request behind a long save just for this.
+                conn.execute("PRAGMA busy_timeout = 1000")
                 conn.execute("UPDATE sessions SET last_seen_at=? WHERE id=?", (_utc_iso(now), row["session_id"]))
                 conn.execute("UPDATE users SET last_seen_at=? WHERE id=?", (_utc_iso(now), row["id"]))
                 conn.commit()
             except sqlite3.OperationalError:
                 pass  # Database busy; "last seen" can wait for the next request.
-        return user
+        return user, row["session_id"]
     finally:
         conn.close()
 
 
-def delete_session(token: str | None) -> None:
+def get_session_user(token: str | None) -> dict | None:
+    """Look up the active user for a session token, refreshing "last seen" about once a minute."""
+    return get_session(token)[0]
+
+
+def delete_session(token: str | None, *, conn: sqlite3.Connection | None = None) -> None:
     if not token:
         return
-    conn = _get_conn()
-    try:
+    with _conn_or_new(conn) as conn:
         conn.execute("DELETE FROM sessions WHERE token_hash=?", (_hash_session_token(token),))
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def list_online_users(window_minutes: int = ONLINE_WINDOW_MINUTES) -> list[dict]:
@@ -4461,31 +4490,54 @@ def save_bid_tracking(
     updates: dict,
     events: list[tuple[str, dict]],
     username: str | None,
+    *,
+    conn: sqlite3.Connection | None = None,
 ) -> list[int]:
-    """Update a job's bid tracking columns and record history events in one transaction."""
+    """Update a job's bid tracking columns and record history events in one transaction.
+
+    The audit entry is written in the same transaction: inside a job_write
+    for this job (pass tx.conn) the events are added to that write's entry,
+    which is always recorded when there are events; called on its own, this
+    runs its own job_write.
+    """
+    import audit
     unknown = set(updates) - set(BID_TRACKING_COLUMNS)
     if unknown:
         raise ValueError(f"Not a bid tracking field: {', '.join(sorted(unknown))}")
-    conn = _get_conn()
-    try:
-        if updates:
-            columns = list(updates)
-            conn.execute(
-                f"UPDATE jobs SET {', '.join(f'{column}=?' for column in columns)} WHERE id=?",
-                [updates[column] for column in columns] + [job_id],
-            )
-        created_at = _utc_iso(_utc_now())
-        event_ids = []
-        for event_type, details in events:
-            cur = conn.execute(
-                "INSERT INTO bid_events (job_id, event_type, created_at, username, details) VALUES (?, ?, ?, ?, ?)",
-                (job_id, event_type, created_at, username, json.dumps(details or {}, default=str)),
-            )
-            event_ids.append(cur.lastrowid)
-        conn.commit()
-        return event_ids
-    finally:
-        conn.close()
+    active = audit.active_write()
+    if conn is None and active is None:
+        from job_writes import job_write
+        action = f"bid.{events[0][0]}" if events else "bid.tracking.update"
+        with job_write(job_id, action=action, scopes=("tracking",)) as tx:
+            return save_bid_tracking(job_id, updates, events, username, conn=tx.conn)
+    conn = conn or active.conn
+    if updates:
+        columns = list(updates)
+        conn.execute(
+            f"UPDATE jobs SET {', '.join(f'{column}=?' for column in columns)} WHERE id=?",
+            [updates[column] for column in columns] + [job_id],
+        )
+    created_at = _utc_iso(_utc_now())
+    event_ids = []
+    for event_type, details in events:
+        cur = conn.execute(
+            "INSERT INTO bid_events (job_id, event_type, created_at, username, details) VALUES (?, ?, ?, ?, ?)",
+            (job_id, event_type, created_at, username, json.dumps(details or {}, default=str)),
+        )
+        event_ids.append(cur.lastrowid)
+    if (
+        events
+        and active is not None
+        and active.conn is conn
+        and getattr(active, "job_id", None) is not None
+        and int(active.job_id) == int(job_id)
+    ):
+        # A bid event is history even when no tracking field changed.
+        active.force_record()
+        recorded = active.extra.setdefault("bid_events", [])
+        for event_id, (event_type, details) in zip(event_ids, events):
+            recorded.append({"id": event_id, "type": event_type, "details": details or {}})
+    return event_ids
 
 
 def get_latest_job_artifact(job_id: int, artifact_kind: str) -> dict | None:

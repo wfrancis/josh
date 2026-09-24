@@ -6,6 +6,7 @@ import asyncio
 import copy
 import csv
 import hashlib
+import hmac
 import io
 import json
 import math
@@ -15,16 +16,25 @@ import shutil
 import sqlite3
 import tempfile
 import time
+import uuid
+from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Optional
 
+try:
+    import fcntl
+except ImportError:  # Windows dev machines have no fcntl.
+    fcntl = None
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import MutableHeaders
+from starlette.requests import HTTPConnection
 
 from models import (
     init_db, save_job, load_job, list_jobs, delete_job,
@@ -59,9 +69,11 @@ from models import (
     save_golden_replay, list_golden_replays_for_job, list_golden_replays_for_version,
     get_latest_golden_replay_for_version,
     JOB_ESTIMATE_HEADER_FIELDS,
-    seed_default_users, authenticate_user, create_session, get_session_user,
+    seed_default_users, authenticate_user, create_session, get_session, get_session_user,
     delete_session, list_online_users, set_current_user, reset_current_user,
-    SESSION_LIFETIME_DAYS,
+    set_audit_context, reset_audit_context, DB_PATH,
+    SESSION_LIFETIME_DAYS, session_id_for_token, set_audit_session, insert_labor_catalog_entry,
+    merge_vendors,
     UserAdminError, create_user, ensure_admin_user, list_users_for_admin, remove_user,
     restore_user, reset_user_pin, update_user, list_admin_log,
     list_bid_tracker_jobs, get_bid_tracker_job, list_bid_events, save_bid_tracking,
@@ -110,6 +122,18 @@ from email_agent import compose_quote_request, send_email, generate_quote_reques
 from ai_client import chat_complete, get_provider_info
 from inbox_monitor import InboxMonitor
 from audit_engine import AuditTraceBuilder
+import audit
+from audit import AuditBackstopMiddleware, audit_route, no_audit, system_context
+from job_writes import JobWriteError, resolve_job_ref
+# Changes that touch several bids at once (vendor merge) take each bid's lock.
+from job_writes import JobBusyError, LOCK_WAIT_SECONDS, job_lock
+# Bid writes (jobs, bid tracking, uploads, materials, bid, proposal): locked,
+# versioned and audited through job_write / entity_write.
+from job_writes import (
+    JobNotFoundError, ProposalConflictError,
+    entity_write, job_write, load_job_snapshot, create_job as create_job_row,
+    update_job_fields, set_proposal_data, set_bid_data,
+)
 from build_info import build_manifest_for_snapshot, get_build_info
 from readiness import evaluate_job_readiness, is_valid_material_classification, proposal_math_errors
 
@@ -120,6 +144,63 @@ SESSION_COOKIE = "si_session"
 # The only /api paths that work without logging in.
 PUBLIC_API_PATHS = frozenset({"/api/auth/login", "/api/auth/me", "/api/system/build"})
 
+# Web pages allowed to call the API from another address and to open live
+# (websocket) connections. Override with ALLOWED_ORIGINS, comma separated.
+DEFAULT_ALLOWED_ORIGINS = (
+    "https://si-bid-tool.fly.dev",
+    "https://si-bid-stg-20260714-c0fa.fly.dev",
+    "http://localhost:5173",
+    "http://localhost:8000",
+)
+ALLOWED_ORIGINS = tuple(
+    origin.strip().rstrip("/")
+    for origin in (os.environ.get("ALLOWED_ORIGINS") or ",".join(DEFAULT_ALLOWED_ORIGINS)).split(",")
+    if origin.strip()
+)
+# Websocket close code for "not logged in" (or a page from another site).
+WS_CLOSE_LOGGED_OUT = 4401
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+# HTTP requests being handled right now (key -> (audit context, start time))
+# and the last few that finished ((audit context, start, end)). Lets a stalled
+# event loop say what was running. Event loop only.
+_requests_in_flight: dict[object, tuple[dict, float]] = {}
+_requests_finished: deque = deque(maxlen=50)
+
+
+def _route_label(scope) -> str:
+    """"POST /api/jobs/{job_id}/upload-rfms" once FastAPI has matched the route, else the raw path."""
+    template = getattr(scope.get("route"), "path", None) or scope.get("path") or ""
+    return f"{scope.get('method') or 'WS'} {template}"
+
+
+def _client_ip(conn: HTTPConnection) -> str:
+    # Fly's proxy sets Fly-Client-IP to the real caller address.
+    forwarded = (conn.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    return (conn.headers.get("fly-client-ip") or forwarded or (conn.client.host if conn.client else ""))[:64]
+
+
+async def _close_websocket_logged_out(scope, receive, send) -> None:
+    """Accept, then close with 4401, so the browser actually gets the code.
+
+    A close sent before accepting never reaches the page: uvicorn turns it
+    into an HTTP 403 and the browser only reports code 1006, the same as a
+    dropped network, so the page would keep reconnecting instead of showing
+    the login screen. Starlette's TestClient passes a pre-accept close code
+    straight through, so tests can't tell the two apart; check against a real
+    server when changing this.
+    """
+    message = await receive()
+    if message.get("type") != "websocket.connect":
+        return  # the browser already went away
+    # A browser that asked for a subprotocol drops a reply that names none.
+    subprotocols = scope.get("subprotocols") or []
+    accept = {"type": "websocket.accept"}
+    if subprotocols:
+        accept["subprotocol"] = subprotocols[0]
+    await send(accept)
+    await send({"type": "websocket.close", "code": WS_CLOSE_LOGGED_OUT, "reason": "Please log in."})
+
 
 class RequireLoginMiddleware:
     """Every /api/* request needs a logged-in user, except PUBLIC_API_PATHS.
@@ -127,7 +208,14 @@ class RequireLoginMiddleware:
     One plain ASGI middleware guards all API routes (including ones added
     later), while the React app and its static files stay public. The user is
     available to handlers as ``request.state.user`` and to ``log_activity``
-    through ``models.get_current_user()``.
+    through ``models.get_current_user()``; the request id, session and caller
+    address through ``models.get_audit_context()``.
+
+    Websockets under /api/ also need a page from ALLOWED_ORIGINS (otherwise
+    the handshake is refused: the browser sees a failed connection) and the
+    login cookie (otherwise the socket is accepted and then closed with code
+    4401, so the page knows to show the login screen). Every /api/ HTTP
+    response carries an X-Request-Id header.
     """
 
     def __init__(self, app):
@@ -135,34 +223,109 @@ class RequireLoginMiddleware:
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path") or ""
-        if scope["type"] != "http" or not (path == "/api" or path.startswith("/api/")):
+        if scope["type"] not in ("http", "websocket") or not (path == "/api" or path.startswith("/api/")):
             await self.app(scope, receive, send)
             return
 
-        token = Request(scope).cookies.get(SESSION_COOKIE)
-        user = await run_in_threadpool(get_session_user, token) if token else None
-        if user is None and path not in PUBLIC_API_PATHS:
-            response = JSONResponse(status_code=401, content={"detail": "Please log in."})
-            await response(scope, receive, send)
+        is_websocket = scope["type"] == "websocket"
+        conn = HTTPConnection(scope)
+        request_id = (conn.headers.get("fly-request-id") or "").strip()
+        if not _REQUEST_ID_RE.fullmatch(request_id):
+            request_id = uuid.uuid4().hex
+
+        if is_websocket and (conn.headers.get("origin") or "").rstrip("/") not in ALLOWED_ORIGINS:
+            # Stops a page on another site opening a live connection with
+            # someone's login cookie. Closing before accepting refuses the
+            # handshake (uvicorn answers HTTP 403); no close code is needed.
+            await send({"type": "websocket.close", "code": WS_CLOSE_LOGGED_OUT})
             return
 
-        scope["state"] = {**(scope.get("state") or {}), "user": user}
-        context_token = set_current_user(user)
+        token = conn.cookies.get(SESSION_COOKIE)
+        user, session_id = await run_in_threadpool(get_session, token) if token else (None, None)
+        if user is None and (is_websocket or path not in PUBLIC_API_PATHS):
+            if is_websocket:
+                await _close_websocket_logged_out(scope, receive, send)
+            else:
+                response = JSONResponse(status_code=401, content={"detail": "Please log in."},
+                                        headers={"X-Request-Id": request_id})
+                await response(scope, receive, send)
+            return
+
+        scope["state"] = {
+            **(scope.get("state") or {}),
+            "user": user,
+            "session_id": session_id,
+            "request_id": request_id,
+        }
+        audit_context = {
+            "request_id": request_id,
+            "source": "websocket" if is_websocket else "http",
+            "session_id": session_id,
+            "client_ip": _client_ip(conn),
+            # Worked out when read: FastAPI matches the route after this runs.
+            "route": lambda: _route_label(scope),
+        }
+        user_token = set_current_user(user)
+        audit_token = set_audit_context(audit_context)
         try:
-            await self.app(scope, receive, send)
+            if is_websocket:
+                await self.app(scope, receive, send)
+            else:
+                await self._call_http(scope, receive, send, request_id, audit_context)
         finally:
-            reset_current_user(context_token)
+            reset_audit_context(audit_token)
+            reset_current_user(user_token)
 
+    async def _call_http(self, scope, receive, send, request_id, audit_context):
+        response_started = False
+
+        async def send_with_request_id(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+                MutableHeaders(scope=message)["X-Request-Id"] = request_id
+            await send(message)
+
+        flight_key = object()
+        began = time.monotonic()
+        _requests_in_flight[flight_key] = (audit_context, began)
+        try:
+            await self.app(scope, receive, send_with_request_id)
+        except Exception:
+            # Same plain 500 Starlette sends, plus the request id so a failure
+            # someone reports can be found in the logs.
+            if not response_started:
+                print(f"[request {request_id}] {_route_label(scope)} failed with an unexpected error")
+                response = PlainTextResponse("Internal Server Error", status_code=500,
+                                             headers={"X-Request-Id": request_id})
+                await response(scope, receive, send)
+            raise
+        finally:
+            _requests_in_flight.pop(flight_key, None)
+            _requests_finished.append((audit_context, began, time.monotonic()))
+
+
+# Added first so it sits inside RequireLoginMiddleware and can see the request's
+# audit context: flags write routes that changed data without an audit entry
+# (a 500 instead when AUDIT_STRICT=1). See audit.AuditBackstopMiddleware.
+app.add_middleware(AuditBackstopMiddleware)
 
 # Added before CORS so CORS stays the outer layer and still answers preflights.
 app.add_middleware(RequireLoginMiddleware)
 
+
+@app.exception_handler(JobWriteError)
+async def _job_write_error(request: Request, err: JobWriteError):
+    # Not found / deleted / someone else saved first / busy, from job_writes.
+    return JSONResponse(status_code=err.status_code, content={"detail": err.message, **err.info})
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(ALLOWED_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-Id"],
 )
 
 def _match_price_book(material: dict) -> dict | None:
@@ -660,7 +823,45 @@ def _ingest_automated_quote(
     source: str,
     simulated: bool = False,
 ) -> bool:
-    """Persist, parse, and import one automated vendor response idempotently."""
+    """Persist, parse, and import one automated vendor response idempotently.
+
+    Runs on the inbox monitor / test-mode watcher thread: its history entries
+    are by System (source inbox_monitor or sim_watcher) and share one id, the
+    way a request's entries do.
+    """
+    context_token = set_audit_context({
+        "request_id": uuid.uuid4().hex,
+        "source": "system",
+        "session_id": None,
+        "client_ip": None,
+        "route": "simulated vendor quote" if simulated else "vendor quote email",
+    })
+    try:
+        with system_context("sim_watcher" if simulated else "inbox_monitor",
+                            subject=str(subject or "")[:200], vendor_email=vendor_email):
+            return _import_automated_quote(
+                job_reference=job_reference,
+                temp_files=temp_files,
+                vendor_email=vendor_email,
+                filenames=filenames,
+                subject=subject,
+                source=source,
+                simulated=simulated,
+            )
+    finally:
+        reset_audit_context(context_token)
+
+
+def _import_automated_quote(
+    *,
+    job_reference=None,
+    temp_files=None,
+    vendor_email=None,
+    filenames=None,
+    subject="",
+    source: str,
+    simulated: bool = False,
+) -> bool:
     temp_files = temp_files or []
     filenames = filenames or []
     job_id = _find_incoming_quote_job(job_reference, subject)
@@ -716,10 +917,23 @@ def _ingest_automated_quote(
         print(f"[{log_prefix}] No products extracted from: {str(subject)[:60]}")
         return False
 
-    save_quotes(job_id, all_products)
-    matched = _auto_match_quotes(job_id, all_products)
-    save_vendor_prices_from_quotes(job_id, all_products)
+    vendor_name = all_products[0].get("vendor", vendor_email or "Unknown")
+    file_names_str = ", ".join(filenames[:3]) if filenames else "email"
+    sim_prefix = "[SIM] " if simulated else ""
+    activity_summary = (
+        f"{sim_prefix}Auto-imported quote from {vendor_name} via {'test mode' if simulated else 'email monitor'}"
+    )
+
+    _save_quote_products(job_id, all_products, filenames, action="quotes.auto_import")
+    # The matching (AI included) runs without holding the bid.
+    matched, loaded_materials, priced_materials = _match_quotes_to_materials(job_id, all_products)
+    with job_write(job_id, action="quotes.auto_import", scopes=("materials",), summary=activity_summary) as tx:
+        tx.force_record()
+        if priced_materials is not None:
+            _apply_material_patches(tx.conn, job_id, loaded_materials, priced_materials)
+        _learn_vendor_prices(tx.conn, job_id, all_products)
     _link_upload_to_requests(job_id, all_products)
+    # Marked imported only after the pricing is saved, so a failure is retried.
     _persist_automated_quote_evidence(
         job_id,
         temp_files,
@@ -728,9 +942,6 @@ def _ingest_automated_quote(
         source=source,
     )
 
-    vendor_name = all_products[0].get("vendor", vendor_email or "Unknown")
-    file_names_str = ", ".join(filenames[:3]) if filenames else "email"
-    sim_prefix = "[SIM] " if simulated else ""
     create_notification(
         job_id,
         "quote_received",
@@ -740,7 +951,7 @@ def _ingest_automated_quote(
     log_activity(
         job_id,
         "agent_quote_imported",
-        f"{sim_prefix}Auto-imported quote from {vendor_name} via {'test mode' if simulated else 'email monitor'}",
+        activity_summary,
         {"vendor": vendor_name, "products": len(all_products), "matched": matched, "sim": simulated},
     )
     print(f"[{log_prefix}] Imported {len(all_products)} products for job #{job_id} from {vendor_name}")
@@ -850,7 +1061,17 @@ def _start_inbox_monitor():
 
 @app.on_event("startup")
 def startup():
+    _take_single_process_lock()
     init_db()
+    # Anything the seeds add or change goes in the history as "System"
+    # (server startup); a seed that finds nothing to do records nothing.
+    with system_context("startup"):
+        _run_off_event_loop(_seed_on_startup)
+    _start_inbox_monitor()
+    _start_sim_watcher()
+
+
+def _seed_on_startup():
     if seed_default_users():
         print("[seed] Created the shared 'test' login")
     _seed_admin_from_env()
@@ -858,8 +1079,124 @@ def startup():
     _seed_company_rates()
     _seed_rules_registry()
     _auto_import_price_books()
-    _start_inbox_monitor()
-    _start_sim_watcher()
+
+
+def _run_off_event_loop(fn):
+    """Run blocking startup work to the end. entity_write refuses to run on
+    the event loop (sync startup handlers are called on it), so the work goes
+    to a worker thread, with this context (who is acting) copied over."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return fn()
+    import concurrent.futures
+    import contextvars
+    context = contextvars.copy_context()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="startup") as pool:
+        return pool.submit(context.run, fn).result()
+
+
+# ── One app process only ─────────────────────────────────────────────────────
+# Live editing keeps shared state in memory, so the app must run as exactly
+# one process on one machine. A second process started against the same
+# database folder (e.g. a second uvicorn worker) can't take this lock and says
+# so loudly in the logs. It keeps running so nobody is locked out.
+SINGLE_PROCESS_OK = True
+_single_process_lock_file = None
+
+
+def _take_single_process_lock() -> bool:
+    global SINGLE_PROCESS_OK, _single_process_lock_file
+    if _single_process_lock_file is not None:
+        return True  # This process already holds it (startup ran again).
+    if fcntl is None:
+        print("[single-process] File locks aren't available on this computer; skipped the one-process check")
+        return True
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), ".collab.lock")
+    try:
+        lock_file = open(lock_path, "a+")
+    except OSError as err:
+        SINGLE_PROCESS_OK = False
+        print(f"[single-process] ERROR: couldn't open {lock_path} ({err}); can't check this is the only app process")
+        return False
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        SINGLE_PROCESS_OK = False
+        print("!" * 78)
+        print(f"[single-process] ERROR: another app process already holds {lock_path}.")
+        print("[single-process] The bid tool must run as ONE process on ONE machine, or live edits can be lost.")
+        print("!" * 78)
+        return False
+    lock_file.truncate(0)
+    lock_file.write(f"{os.getpid()}\n")
+    lock_file.flush()
+    _single_process_lock_file = lock_file
+    SINGLE_PROCESS_OK = True
+    return True
+
+
+# ── Event loop watch ─────────────────────────────────────────────────────────
+# Every live connection shares one event loop, so a handler that blocks it
+# freezes everyone. Log each stall longer than EVENT_LOOP_STALL_MS with the
+# requests that were running, so the slow code can be found.
+EVENT_LOOP_CHECK_SECONDS = 0.5
+EVENT_LOOP_STALL_MS = 200
+# One watch per running event loop (tests can start the app more than once).
+_event_loop_watch_tasks: dict[asyncio.AbstractEventLoop, asyncio.Task] = {}
+
+
+async def _watch_event_loop() -> None:
+    while True:
+        started = time.monotonic()
+        await asyncio.sleep(EVENT_LOOP_CHECK_SECONDS)
+        now = time.monotonic()
+        stall_ms = (now - started - EVENT_LOOP_CHECK_SECONDS) * 1000
+        if stall_ms <= EVENT_LOOP_STALL_MS:
+            continue
+        # Suspects: requests still running plus any that finished during the
+        # stall (a blocking handler usually finishes before this wakes up).
+        # Requests quicker than the threshold can't have caused it; longest first.
+        suspects = [(now - began, "running ", context) for context, began in _requests_in_flight.values()]
+        suspects += [(ended - began, "", context) for context, began, ended in _requests_finished if ended >= started]
+        suspects = sorted(
+            (entry for entry in suspects if entry[0] * 1000 >= EVENT_LOOP_STALL_MS),
+            key=lambda entry: entry[0], reverse=True,
+        )
+        described = ", ".join(
+            f"{context['route']()} [{context['request_id']}] {label}{seconds:.1f}s"
+            for seconds, label, context in suspects[:5]
+        )
+        if len(suspects) > 5:
+            described += f" and {len(suspects) - 5} more"
+        print(f"[event_loop] Stalled for {stall_ms:.0f} ms. Requests at the time: {described or 'none'}")
+
+
+@app.on_event("startup")
+async def _start_event_loop_watch():
+    loop = asyncio.get_running_loop()
+    task = _event_loop_watch_tasks.get(loop)
+    if task is None or task.done():
+        _event_loop_watch_tasks[loop] = asyncio.create_task(_watch_event_loop())
+
+
+@app.on_event("shutdown")
+async def _stop_event_loop_watch():
+    task = _event_loop_watch_tasks.pop(asyncio.get_running_loop(), None)
+    if task is not None:
+        task.cancel()
+
+
+# Closes grouped history entries once nobody has edited them for a while.
+@app.on_event("startup")
+async def _start_audit_sweeper():
+    audit.start_sweeper()
+
+
+@app.on_event("shutdown")
+async def _stop_audit_sweeper():
+    audit.stop_sweeper()
 
 
 def _seed_admin_from_env():
@@ -899,13 +1236,13 @@ def _auto_import_price_books():
         import json as _json
         with open(json_path) as f:
             items = _json.load(f)
-        count = import_price_book("Schluter", items, discount_pct=0.55, category="transitions")
+        count = _import_price_book_audited("Schluter", items, discount_pct=0.55, category="transitions")
         print(f"Auto-imported Schluter price book: {count} items (45% of list)")
 
 
 def _seed_rules_registry():
     """Seed hard estimating rules if they are not already in the registry."""
-    result = seed_rules_registry_defaults()
+    result = _seed_rules_audited()
     if result.get("inserted"):
         print(f"[seed] Seeded {result['inserted']} estimating rules")
 
@@ -1091,6 +1428,160 @@ def _ruleset_with_engine_contract(ruleset: dict | None) -> dict | None:
     return result
 
 
+# ── History for shared data (settings, catalogs, vendors, rules) ─────────────
+# entity_write compares what a loader returns before and after a change, so
+# each loader shapes its data for readable history paths ("/unit_price",
+# "/email_config/smtp_host"). API keys, passwords and PINs are hidden by name
+# in audit.prepare_changes, so loaders don't need to drop them.
+
+# Entity id for a whole list (a catalog upload or clear); single rows use their id.
+WHOLE_LIST = "all"
+# Entity id for changes to the whole estimating rules registry.
+RULES_REGISTRY = "registry"
+
+
+def _person_name() -> str:
+    """Who is making this change, as people see it (display name, or "System")."""
+    return audit.current_actor()["display"]
+
+
+def _count(n: int, singular: str, plural: str | None = None) -> str:
+    """"1 entry", "3 entries" for history summaries."""
+    return f"{n} {singular if n == 1 else (plural or singular + 's')}"
+
+
+def _row_loader(table: str, key: str = "id", drop: tuple[str, ...] = ()):
+    """Loader for one row of ``table`` (None once it's deleted)."""
+    def load(conn, entity_id):
+        row = conn.execute(f"SELECT * FROM {table} WHERE {key} = ?", (entity_id,)).fetchone()
+        return None if row is None else {k: v for k, v in dict(row).items() if k not in drop}
+    return load
+
+
+def _list_loader(table: str, *, where: str = "", drop: tuple[str, ...] = ("id",)):
+    """Loader for a whole list that is replaced or cleared at once. Row ids
+    are left out: a replace re-creates every row, so rows line up by content."""
+    def load(conn, entity_id):
+        sql = f"SELECT * FROM {table}" + (f" WHERE {where}" if where else "") + " ORDER BY id"
+        rows = conn.execute(sql, (entity_id,) if where else ()).fetchall()
+        return {"entries": [{k: v for k, v in dict(row).items() if k not in drop} for row in rows]}
+    return load
+
+
+_load_labor_catalog_entry = _row_loader("labor_catalog")
+_load_labor_catalog = _list_loader("labor_catalog")
+_load_price_list_entry = _row_loader("price_list")
+_load_price_list = _list_loader("price_list")
+_load_price_book = _list_loader("price_book_items", where="vendor = ?", drop=("id", "vendor"))
+_load_notification = _row_loader("notifications")
+
+
+def _load_company_rate(conn, rate_type):
+    row = conn.execute("SELECT data FROM company_rates WHERE rate_type = ?", (rate_type,)).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["data"])
+    except (TypeError, ValueError):
+        return {"data": row["data"]}
+
+
+# What the Settings page changes (other app_settings rows are bookkeeping),
+# with the names history summaries use.
+SETTING_LABELS = {
+    "openai_api_key": "OpenAI API key",
+    "anthropic_api_key": "Anthropic API key",
+    "openai_model": "AI model",
+    "multi_pass_count": "quote reading passes",
+    "email_automation_enabled": "email automation",
+    "email_config": "mailbox settings",
+    "bid_folder_path": "bid folder",
+    "vendor_quote_test_mode": "vendor quote test mode",
+}
+AUDITED_SETTINGS = tuple(SETTING_LABELS)
+
+
+def _load_settings(conn, _entity_id):
+    placeholders = ", ".join("?" for _ in AUDITED_SETTINGS)
+    settings = {
+        row["key"]: row["value"]
+        for row in conn.execute(f"SELECT key, value FROM app_settings WHERE key IN ({placeholders})", AUDITED_SETTINGS)
+    }
+    raw = settings.get("email_config")
+    if raw:
+        # Compared field by field, so the mailbox password inside is hidden by name.
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            parsed = None
+        settings["email_config"] = parsed if isinstance(parsed, dict) else {
+            # Not readable as settings: note that it changed, never what it says.
+            "unreadable": True, "fingerprint": hashlib.sha256(str(raw).encode("utf-8")).hexdigest()[:12],
+        }
+    return settings
+
+
+def _load_vendor(conn, vendor_id):
+    row = conn.execute("SELECT * FROM vendors WHERE id = ?", (vendor_id,)).fetchone()
+    if row is None:
+        return None
+    vendor = {k: v for k, v in dict(row).items() if k not in ("created_at", "updated_at")}
+    vendor["price_count"] = conn.execute(
+        "SELECT COUNT(*) FROM vendor_prices WHERE vendor_id = ?", (vendor_id,)
+    ).fetchone()[0]
+    return vendor
+
+
+def _load_quote_request(conn, request_id):
+    row = conn.execute("SELECT * FROM quote_requests WHERE id = ?", (request_id,)).fetchone()
+    if row is None:
+        return None
+    quote_request = dict(row)
+    try:
+        quote_request["material_ids"] = json.loads(quote_request.get("material_ids") or "[]")
+    except (TypeError, ValueError):
+        pass
+    return quote_request
+
+
+def _rule_view(row) -> dict:
+    rule = {k: v for k, v in dict(row).items() if k not in ("created_at", "updated_at")}
+    for field in ("condition_json", "action_json"):
+        try:
+            rule[field] = json.loads(rule.get(field) or "{}")
+        except (TypeError, ValueError):
+            pass
+    return rule
+
+
+def _load_rule(conn, rule_id):
+    row = conn.execute("SELECT * FROM estimating_rules WHERE rule_id = ?", (rule_id,)).fetchone()
+    return None if row is None else _rule_view(row)
+
+
+def _load_rules_registry(conn, _entity_id):
+    """Every rule, keyed by rule_id ("/<rule_id>/status" in the history)."""
+    return {
+        row["rule_id"]: _rule_view(row)
+        for row in conn.execute("SELECT * FROM estimating_rules ORDER BY rule_id").fetchall()
+    }
+
+
+def _max_id(conn, table: str) -> int:
+    return int(conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()[0])
+
+
+def _added_rows(conn, table: str, after_id: int, columns: tuple[str, ...], path: str) -> list[dict]:
+    """"add" changes for the rows put into ``table`` after id ``after_id`` (imports)."""
+    rows = conn.execute(
+        f"SELECT id, {', '.join(columns)} FROM {table} WHERE id > ? ORDER BY id", (after_id,)
+    ).fetchall()
+    return [
+        {"path": f"{path}/{row['id']}", "op": "add", "before": None, "after": {c: row[c] for c in columns}}
+        for row in rows
+    ]
+
+
 # ── Log in / log out ─────────────────────────────────────────────────────────
 
 LOGIN_FAILURE_DELAY_SECONDS = 1.0
@@ -1156,11 +1647,133 @@ def _request_is_https(request: Request) -> bool:
     return forwarded.split(",")[0].strip().lower() == "https"
 
 
+# New for each run of the server, so the tags below can't be turned back into
+# what was typed (a PIN typed into the username box is only a few digits).
+_UNKNOWN_USERNAME_KEY = os.urandom(32)
+
+
+def _attempted_username(conn, username) -> dict:
+    """How the history names the username someone typed at login.
+
+    Everyone logged in can read the history, and people sometimes type
+    their PIN into the username box, so only a username that really exists
+    is kept. Anything else is "a username no one has" plus a short tag that
+    is the same for the same text (until the server restarts), so repeated
+    tries can be linked without storing what was typed.
+
+    Returns {"username", "tag", "user_key"}: user_key replaces the typed text
+    in the "user:<name>" login-lock key."""
+    typed = str(username or "").strip()
+    if not typed:
+        return {"username": None, "tag": None, "user_key": "user:"}
+    row = conn.execute("SELECT username FROM users WHERE username = ?", (typed[:256],)).fetchone()
+    if row is not None:
+        return {"username": row["username"], "tag": None, "user_key": "user:" + row["username"].lower()}
+    tag = hmac.new(_UNKNOWN_USERNAME_KEY, typed.lower().encode("utf-8"), hashlib.sha256).hexdigest()[:8]
+    return {"username": None, "tag": tag, "user_key": f"user:unknown-{tag}"}
+
+
+def _record_login_failed(username: str, address: str) -> None:
+    """History entry for a wrong username or PIN: the username (only if it
+    exists, see _attempted_username) and where from. Never the PIN."""
+    with audit.write_transaction() as conn:
+        typed = _attempted_username(conn, username)
+        if typed["username"]:
+            entity_id = typed["username"]
+            summary = f"Wrong username or PIN for '{typed['username']}'"
+            extra = {"attempted_username": typed["username"], "ip": address}
+        elif typed["tag"]:
+            entity_id = f"unknown-{typed['tag']}"
+            summary = "Tried to log in with a username no one has"
+            extra = {"unknown_username_tag": typed["tag"], "ip": address}
+        else:
+            entity_id = None
+            summary = "Tried to log in without a username"
+            extra = {"ip": address}
+        audit.record(
+            conn,
+            action="auth.login_failed",
+            entity_type="session",
+            entity_id=entity_id,
+            summary=summary,
+            extra=extra,
+        )
+
+
+# Every refused try while a username (or address) is locked joins one entry,
+# so someone hammering the login can't flood the history.
+_LOGIN_THROTTLED_GROUP = audit.GroupPolicy(idle_s=LOGIN_TRY_WINDOW_SECONDS, max_s=LOGIN_TRY_WINDOW_SECONDS)
+
+
+def _record_login_throttled(username: str, address: str, locked_key: str) -> None:
+    """History entry for a login turned away for too many wrong tries.
+    ``locked_key`` is the lock that applied ("user:<typed name>" or
+    "ip:<address>"); the typed name is only kept if it is a real username."""
+    by_address = locked_key.startswith("ip:")
+    with audit.write_transaction() as conn:
+        typed = _attempted_username(conn, username)
+        if typed["username"]:
+            name = f"'{typed['username']}'"
+            extra = {"attempted_username": typed["username"]}
+        elif typed["tag"]:
+            name = "a username no one has"
+            extra = {"unknown_username_tag": typed["tag"]}
+        else:
+            name = "no username"
+            extra = {}
+        if by_address:
+            summary = f"Too many wrong tries from {address}: turned away a login as {name}"
+        else:
+            summary = f"Too many wrong tries for {name}: turned away a login"
+        audit.record(
+            conn,
+            action="auth.login_throttled",
+            entity_type="session",
+            entity_id=locked_key if by_address else typed["user_key"],
+            summary=summary,
+            group=_LOGIN_THROTTLED_GROUP,
+            extra={**extra, "ip": address, "locked": "address" if by_address else "username"},
+        )
+
+
+async def _record_login_problem(recorder, *args) -> None:
+    """Write a wrong-PIN / too-many-tries entry. If the database is busy the
+    person still gets the right answer (401 / 429); the error is logged."""
+    try:
+        await run_in_threadpool(recorder, *args)
+    except Exception as err:
+        print(f"[audit] ERROR: couldn't add a failed login to the history: {err}")
+
+
+def _start_login_session(user: dict, old_token: str | None) -> str:
+    """End the browser's old session (if any), start a new one and add the
+    login to the history, in one transaction. Returns the new cookie token."""
+    user_token = set_current_user(user)  # the entry names the person who just logged in
+    try:
+        with audit.write_transaction() as conn:
+            if old_token:
+                delete_session(old_token, conn=conn)
+            token = create_session(user["id"], conn=conn)
+            set_audit_session(session_id_for_token(token, conn=conn))
+            audit.record(
+                conn,
+                action="auth.login",
+                entity_type="session",
+                entity_id=user["username"],
+                summary="Logged in",
+            )
+        return token
+    finally:
+        reset_current_user(user_token)
+
+
 @app.post("/api/auth/login")
+@audit_route("auth.login", "auth.login_failed", "auth.login_throttled")
 async def api_auth_login(body: LoginRequest, request: Request):
     now = time.monotonic()
     _prune_login_tries(now)
     user_key, address_key = _login_try_keys(body.username, request)
+    address = address_key[len("ip:"):]
     user_tries = _recent_login_tries(user_key, now)
     address_tries = _recent_login_tries(address_key, now)
     if len(user_tries) >= LOGIN_MAX_TRIES_PER_USERNAME or len(address_tries) >= LOGIN_MAX_TRIES_PER_ADDRESS:
@@ -1169,6 +1782,8 @@ async def api_auth_login(body: LoginRequest, request: Request):
             address_tries[0] if len(address_tries) >= LOGIN_MAX_TRIES_PER_ADDRESS else now,
         )
         wait_seconds = max(1, int(LOGIN_TRY_WINDOW_SECONDS - (now - oldest)) + 1)
+        locked_key = user_key if len(user_tries) >= LOGIN_MAX_TRIES_PER_USERNAME else address_key
+        await _record_login_problem(_record_login_throttled, body.username, address, locked_key)
         raise HTTPException(status_code=429, detail=LOGIN_TOO_MANY_TRIES,
                             headers={"Retry-After": str(wait_seconds)})
     # Count this try before checking the PIN, so a burst of requests sent at
@@ -1179,6 +1794,7 @@ async def api_auth_login(body: LoginRequest, request: Request):
     async with _pin_check_semaphore():
         user = await run_in_threadpool(authenticate_user, body.username, body.pin)
     if not user:
+        await _record_login_problem(_record_login_failed, body.username, address)
         # Slow down guessing a little without tying up a worker thread.
         await asyncio.sleep(LOGIN_FAILURE_DELAY_SECONDS)
         raise HTTPException(status_code=401, detail="That username and PIN don't match. Try again.")
@@ -1189,10 +1805,7 @@ async def api_auth_login(body: LoginRequest, request: Request):
     address_tries = _login_tries.get(address_key)
     if address_tries and now in address_tries:
         address_tries.remove(now)
-    old_token = request.cookies.get(SESSION_COOKIE)
-    if old_token:
-        await run_in_threadpool(delete_session, old_token)
-    token = await run_in_threadpool(create_session, user["id"])
+    token = await run_in_threadpool(_start_login_session, user, request.cookies.get(SESSION_COOKIE))
     response = JSONResponse(content=user)
     response.set_cookie(
         SESSION_COOKIE,
@@ -1215,8 +1828,13 @@ def api_auth_me(request: Request):
 
 
 @app.post("/api/auth/logout")
+@audit_route("auth.logout")
 def api_auth_logout(request: Request):
-    delete_session(request.cookies.get(SESSION_COOKIE))
+    user = getattr(request.state, "user", None) or {}
+    with audit.write_transaction() as conn:
+        delete_session(request.cookies.get(SESSION_COOKIE), conn=conn)
+        audit.record(conn, action="auth.logout", entity_type="session",
+                     entity_id=user.get("username"), summary="Logged out")
     response = JSONResponse(content={"ok": True})
     response.delete_cookie(
         SESSION_COOKIE,
@@ -1274,7 +1892,12 @@ def api_admin_list_users(request: Request):
     return list_users_for_admin()
 
 
+# People changes are written to admin_log and to the audit trail in the same
+# transaction (models._log_admin_action). A change that changes nothing (say,
+# restoring someone who is already active) writes neither.
+
 @app.post("/api/admin/users")
+@audit_route("user.create")
 def api_admin_add_user(body: AdminUserCreate, request: Request):
     admin = _require_admin(request)
     try:
@@ -1284,28 +1907,33 @@ def api_admin_add_user(body: AdminUserCreate, request: Request):
 
 
 @app.post("/api/admin/users/{username}/remove")
+@audit_route("user.remove")
 def api_admin_remove_user(username: str, request: Request):
     admin = _require_admin(request)
     try:
         user, sessions_ended = remove_user(username, admin)
     except UserAdminError as err:
         raise HTTPException(status_code=err.status_code, detail=err.message)
+    audit.note_checked()  # already removed: nothing to record
     return {**user, "sessions_ended": sessions_ended}
 
 
 # async so the wrong-try counts (event-loop only) can be cleared safely.
 @app.post("/api/admin/users/{username}/restore")
+@audit_route("user.restore")
 async def api_admin_restore_user(username: str, request: Request):
     admin = _require_admin(request)
     try:
         user = await run_in_threadpool(restore_user, username, admin)
     except UserAdminError as err:
         raise HTTPException(status_code=err.status_code, detail=err.message)
+    audit.note_checked()  # already active: nothing to record
     _clear_login_tries(user["username"])
     return user
 
 
 @app.post("/api/admin/users/{username}/reset-pin")
+@audit_route("user.reset_pin")
 async def api_admin_reset_pin(username: str, body: AdminPinReset, request: Request):
     admin = _require_admin(request)
     try:
@@ -1319,12 +1947,15 @@ async def api_admin_reset_pin(username: str, body: AdminPinReset, request: Reque
 
 
 @app.patch("/api/admin/users/{username}")
+@audit_route("user.rename", "user.make_admin", "user.remove_admin")
 def api_admin_update_user(username: str, body: AdminUserUpdate, request: Request):
     admin = _require_admin(request)
     try:
-        return update_user(username, admin, display_name=body.display_name, is_admin=body.is_admin)
+        user = update_user(username, admin, display_name=body.display_name, is_admin=body.is_admin)
     except UserAdminError as err:
         raise HTTPException(status_code=err.status_code, detail=err.message)
+    audit.note_checked()  # same name and admin rights as before: nothing to record
+    return user
 
 
 @app.get("/api/admin/log")
@@ -1510,10 +2141,25 @@ def _rules_registry_contract() -> dict:
     }
 
 
+def _seed_rules_audited(overwrite: bool = False) -> dict:
+    """Seed the built-in rules with one history entry listing what changed
+    (none when every built-in rule was already there)."""
+    with entity_write("ruleset", RULES_REGISTRY, _load_rules_registry, "rules.seed") as tx:
+        result = seed_rules_registry_defaults(overwrite=overwrite, changed_by=_person_name(), conn=tx.conn)
+        done = [f"{result[key]} {label}" for key, label in (
+            ("inserted", "added"), ("updated", "overwritten"), ("corrected", "corrected"),
+            ("contract_backfilled", "given code and test references"),
+        ) if result.get(key)]
+        tx.set_summary("Built-in estimating rules: " + (", ".join(done) or "no changes"))
+        tx.extra.update({"overwrite": bool(overwrite), **result})
+    return result
+
+
 @app.post("/api/rules/seed")
+@audit_route("rules.seed")
 def api_seed_rules(overwrite: bool = False):
     """Seed built-in hard estimating rules."""
-    return seed_rules_registry_defaults(overwrite=overwrite)
+    return _seed_rules_audited(overwrite)
 
 
 @app.get("/api/rulesets")
@@ -1540,15 +2186,22 @@ def api_get_ruleset(version: int):
 
 
 @app.post("/api/rulesets/{version}/rollback")
+@audit_route("ruleset.rollback")
 def api_rollback_ruleset(version: int, body: Optional[RulesetRollbackRequest] = None):
     """Restore rules to a previous whole-registry snapshot as a new ruleset version."""
     body = body or RulesetRollbackRequest()
+    change_note = body.change_note or f"Rolled registry back to ruleset v{version}."
     try:
-        new_version = rollback_ruleset_version(
-            version,
-            changed_by=body.changed_by or "Josh",
-            change_note=body.change_note or f"Rolled registry back to ruleset v{version}.",
-        )
+        with entity_write(
+            "ruleset", RULES_REGISTRY, _load_rules_registry, "ruleset.rollback",
+            summary=f"Rolled the estimating rules back to rule set v{version}",
+            extra={"rolled_back_to": version, "change_note": change_note},
+        ) as tx:
+            new_version = rollback_ruleset_version(
+                version, changed_by=_person_name(), change_note=change_note, conn=tx.conn,
+            )
+            tx.extra["new_version"] = new_version
+            tx.force_record()  # a new rule set version is saved even if no rule changed
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {
@@ -1560,6 +2213,7 @@ def api_rollback_ruleset(version: int, body: Optional[RulesetRollbackRequest] = 
 
 
 @app.post("/api/rules/draft-from-lesson")
+@no_audit("AI draft only: returns a suggested rule and saves nothing")
 def api_draft_rule_from_lesson(body: RuleDraftRequest):
     """Use AI to turn a spoken/plain-English lesson into a rule draft."""
     lesson = (body.lesson_text or "").strip()
@@ -1662,7 +2316,8 @@ Draft the rule fields for the registry. Use a stable rule_id starting with custo
             "implementation_ref": "",
             "test_ref": "",
             "notes": str(parsed.get("notes") or "").strip(),
-            "changed_by": body.changed_by or "Josh",
+            # Saving the rule records the logged-in person whatever this says.
+            "changed_by": _person_name(),
             "change_note": str(parsed.get("change_note") or "Initial spoken lesson from Josh.").strip(),
         },
         "assumptions": parsed.get("assumptions") if isinstance(parsed.get("assumptions"), list) else [],
@@ -1696,14 +2351,23 @@ def api_get_rule(rule_id: str):
     return _rule_with_engine_contract(rule)
 
 
+# Rule versions record the logged-in person as changed_by (a changed_by sent
+# by the page is ignored), and each change also gets an audit entry.
+
 @app.post("/api/rules")
+@audit_route("rule.create")
 def api_create_rule(body: RuleCreate):
     """Create a hard estimating rule."""
     data = body.model_dump()
     data["condition_json"] = data.get("condition_json") or {}
     data["action_json"] = data.get("action_json") or {}
+    data["changed_by"] = _person_name()
     try:
-        rule_id = create_rule(data)
+        with entity_write("rule", None, _load_rule, "rule.create",
+                          extra={"change_note": data.get("change_note") or "Rule created."}) as tx:
+            rule_id = create_rule(data, conn=tx.conn)
+            tx.entity_id = rule_id
+            tx.set_summary(f"Added rule {rule_id}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except sqlite3.IntegrityError:
@@ -1712,10 +2376,12 @@ def api_create_rule(body: RuleCreate):
 
 
 @app.put("/api/rules/{rule_id}")
+@audit_route("rule.update")
 def api_update_rule(rule_id: str, body: RuleUpdate):
     """Update a hard estimating rule. Each edit creates a new version."""
     updates = body.model_dump(exclude_unset=True)
-    changed_by = updates.pop("changed_by", None) or "Rules Registry"
+    updates.pop("changed_by", None)
+    changed_by = _person_name()
     change_note = updates.pop("change_note", None) or "Rule updated from registry."
     if updates.get("name") is None and "name" in updates:
         raise HTTPException(status_code=400, detail="name cannot be null")
@@ -1732,7 +2398,9 @@ def api_update_rule(rule_id: str, body: RuleUpdate):
     if not updates:
         raise HTTPException(status_code=400, detail="No rule fields supplied")
     try:
-        updated = update_rule(rule_id, updates, changed_by=changed_by, change_note=change_note)
+        with entity_write("rule", rule_id, _load_rule, "rule.update",
+                          summary=f"Changed rule {rule_id}", extra={"change_note": change_note}) as tx:
+            updated = update_rule(rule_id, updates, changed_by=changed_by, change_note=change_note, conn=tx.conn)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except sqlite3.IntegrityError as e:
@@ -1742,24 +2410,27 @@ def api_update_rule(rule_id: str, body: RuleUpdate):
     return _rule_with_engine_contract(get_rule(rule_id))
 
 
+def _archive_rule_audited(rule_id: str, change_note: str) -> bool:
+    with entity_write("rule", rule_id, _load_rule, "rule.archive",
+                      summary=f"Archived rule {rule_id}", extra={"change_note": change_note}) as tx:
+        return archive_rule(rule_id, changed_by=_person_name(), change_note=change_note, conn=tx.conn)
+
+
 @app.post("/api/rules/{rule_id}/archive")
+@audit_route("rule.archive")
 def api_archive_rule(rule_id: str, body: Optional[RuleChangeMeta] = None):
     """Archive a rule without erasing its history."""
     body = body or RuleChangeMeta()
-    archived = archive_rule(
-        rule_id,
-        changed_by=(body.changed_by or "Rules Registry"),
-        change_note=(body.change_note or "Rule archived from registry."),
-    )
-    if not archived:
+    if not _archive_rule_audited(rule_id, body.change_note or "Rule archived from registry."):
         raise HTTPException(status_code=404, detail="Rule not found")
     return _rule_with_engine_contract(get_rule(rule_id))
 
 
 @app.delete("/api/rules/{rule_id}")
+@audit_route("rule.archive")
 def api_delete_rule(rule_id: str):
     """Archive a hard estimating rule. History is preserved for old bids."""
-    if not delete_rule(rule_id):
+    if not _archive_rule_audited(rule_id, "Rule archived."):
         raise HTTPException(status_code=404, detail="Rule not found")
     return {"message": "Rule archived", "rule": _rule_with_engine_contract(get_rule(rule_id))}
 
@@ -1827,11 +2498,18 @@ def api_match_job(q: str = ""):
 
 
 @app.post("/api/jobs")
+@audit_route("job.create")
 def api_create_job(job: JobCreate):
     """Create a new job."""
-    job_id = save_job(job.model_dump())
+    summary = f"Job '{job.project_name}' created"
+    try:
+        with entity_write("job", None, load_job_snapshot, "job.create", summary=summary) as tx:
+            job_id = create_job_row(tx.conn, job.model_dump())
+            tx.entity_id = tx.job_id = job_id
+            log_activity(job_id, "job_created", summary)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     created = load_job(job_id)
-    log_activity(job_id, "job_created", f"Job '{job.project_name}' created")
     return {"id": job_id, "slug": created.get("slug", ""), "message": "Job created"}
 
 
@@ -1921,26 +2599,89 @@ def _enrich_known_prices(job: dict):
     return applied_count
 
 
+def _job_delete_snapshot(conn, db_id: int, row: dict) -> dict:
+    """What a bid held just before it is deleted: counts and totals for the history entry."""
+    counts = {}
+    for label, table in (
+        ("materials", "job_materials"), ("sundries", "job_sundries"), ("labor", "job_labor"),
+        ("bundles", "job_bundles"), ("quotes", "job_quotes"), ("comments", "job_comments"),
+        ("activity", "job_activity"), ("bid_events", "bid_events"), ("imported_files", "imported_files"),
+    ):
+        try:
+            counts[label] = int(conn.execute(f"SELECT COUNT(*) FROM {table} WHERE job_id=?", (db_id,)).fetchone()[0])
+        except sqlite3.Error:
+            continue
+    material_cost = conn.execute(
+        "SELECT COALESCE(SUM(extended_cost), 0) FROM job_materials WHERE job_id=?", (db_id,)
+    ).fetchone()[0]
+
+    def saved_total(raw):
+        try:
+            data = json.loads(raw) if isinstance(raw, str) and raw else raw
+            total = (data or {}).get("grand_total") if isinstance(data, dict) else None
+            return round(float(total), 2) if total is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "project_name": row.get("project_name"),
+        "slug": row.get("slug"),
+        "gc_name": row.get("gc_name"),
+        "bid_status": row.get("bid_status"),
+        "version": row.get("version"),
+        "counts": counts,
+        "material_cost": round(float(material_cost or 0), 2),
+        "proposal_total": saved_total(row.get("proposal_data")),
+        "bid_total": saved_total(row.get("bid_data")),
+    }
+
+
+def _delete_job_audited(job_ref) -> bool:
+    """Delete one bid for good (soft delete comes later), recording what it held first.
+
+    The history entry outlives the bid: audit_log has no link that the delete cascades to.
+    """
+    try:
+        with job_write(job_ref, action="job.delete", scopes=("job", "tracking")) as tx:
+            snapshot = _job_delete_snapshot(tx.conn, tx.job_id, tx.row)
+            total = snapshot["proposal_total"] if snapshot["proposal_total"] is not None else snapshot["bid_total"]
+            material_count = snapshot["counts"].get("materials", 0)
+            details = [f"{material_count} material{'' if material_count == 1 else 's'}"]
+            if total is not None:
+                details.append(f"total ${total:,.2f}")
+            tx.set_summary(f"Deleted bid '{snapshot['project_name'] or tx.job_id}' ({', '.join(details)})")
+            tx.extra["deleted"] = snapshot
+            tx.force_record()
+            deleted = delete_job(tx.job_id, conn=tx.conn)
+    except JobNotFoundError:
+        return False
+    return deleted
+
+
 @app.post("/api/jobs/bulk-delete")
+@audit_route("job.delete")
 def api_bulk_delete(body: BulkDeleteRequest):
     """Delete multiple jobs."""
     deleted = 0
     for jid in body.job_ids:
-        if delete_job(jid):
+        if _delete_job_audited(jid):
             deleted += 1
+    audit.note_checked()  # none found still counts as handled
     return {"deleted": deleted}
 
 
 @app.delete("/api/jobs/{job_id}")
+@audit_route("job.delete")
 def api_delete_job(job_id: str):
     """Delete a job by ID or slug and all related data."""
     db_id = _resolve_job_id(job_id)
-    if not delete_job(db_id):
+    if not _delete_job_audited(db_id):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"message": "Job deleted"}
 
 
 @app.post("/api/jobs/{job_id}/duplicate")
+@audit_route("job.duplicate")
 def api_duplicate_job(job_id: str):
     """Duplicate a job and all its materials."""
     db_id = _resolve_job_id(job_id)
@@ -1973,7 +2714,6 @@ def api_duplicate_job(job_id: str):
     for field in JOB_ESTIMATE_HEADER_FIELDS:
         if field not in ("quote_number", "customer_po", "contract_number"):
             new_job[field] = job.get(field)
-    new_id = save_job(new_job)
 
     # Copy materials (strip id and job_id)
     materials = job.get("materials", [])
@@ -1981,24 +2721,33 @@ def api_duplicate_job(job_id: str):
     for m in materials:
         mat = {k: v for k, v in m.items() if k not in ("id", "job_id")}
         copied.append(mat)
-    if copied:
-        save_materials(new_id, copied)
+
+    summary = f"Duplicated from '{job['project_name']}'"
+    with entity_write(
+        "job", None, load_job_snapshot, "job.duplicate",
+        summary=summary, extra={"source_job_id": job["id"]},
+    ) as tx:
+        new_id = create_job_row(tx.conn, new_job)
+        tx.entity_id = tx.job_id = new_id
+        if copied:
+            save_materials(new_id, copied, conn=tx.conn)
+        log_activity(new_id, "job_created", summary, {"source_job_id": job["id"]})
 
     created = load_job(new_id)
-    log_activity(new_id, "job_created", f"Duplicated from '{job['project_name']}'", {"source_job_id": job["id"]})
     return {"id": new_id, "slug": created.get("slug", "")}
 
 
 @app.put("/api/jobs/{job_id}/notes")
+@audit_route("job.notes.update")
 def api_update_notes(job_id: str, body: NotesUpdate):
     """Update job notes."""
     db_id = _resolve_job_id(job_id)
-    job = load_job(db_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    job["notes"] = body.notes
-    save_job(job)
-    log_activity(job["id"], "notes_updated", "Notes updated")
+    with job_write(
+        db_id, action="job.notes.update", scopes=("job",), field_path="/notes",
+        group=audit.TEXT_EDITS, summary="Notes updated",
+    ) as tx:
+        update_job_fields(tx.conn, db_id, {"notes": body.notes})
+        log_activity(db_id, "notes_updated", "Notes updated")
     return {"message": "Notes saved"}
 
 
@@ -2035,24 +2784,29 @@ class JobUpdate(BaseModel):
     site_contact: Optional[str] = None
 
 @app.put("/api/jobs/{job_id}")
+@audit_route("job.update")
 def api_update_job(job_id: str, body: JobUpdate):
     """Update job fields."""
     db_id = _resolve_job_id(job_id)
-    job = load_job(db_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
     updates = body.model_dump(exclude_none=True)
-    changes = {}
-    for key, val in updates.items():
-        old_val = job.get(key)
-        if old_val != val:
-            changes[key] = {"old": old_val, "new": val}
-    for key, val in updates.items():
-        job[key] = val
-    save_job(job)
-    if changes:
-        changed_keys = ", ".join(changes.keys())
-        log_activity(job["id"], "job_updated", f"Updated {changed_keys}", {"changes": changes})
+    try:
+        # A form save: quick re-saves of the same field(s) join one history entry.
+        with job_write(db_id, action="job.update", scopes=("job",), group=audit.NUMBER_EDITS) as tx:
+            changes = {}
+            for key, val in updates.items():
+                old_val = tx.row.get(key)
+                if old_val != val:
+                    changes[key] = {"old": old_val, "new": val}
+            # "" and None read the same in the history, so the summary names real changes only.
+            real_changes = [key for key, change in changes.items() if not audit.values_equal(change["old"], change["new"])]
+            if real_changes:
+                tx.set_summary(f"Updated {', '.join(real_changes)}")
+            update_job_fields(tx.conn, db_id, updates)
+            if changes:
+                changed_keys = ", ".join(changes.keys())
+                log_activity(db_id, "job_updated", f"Updated {changed_keys}", {"changes": changes})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"message": "Job updated"}
 
 
@@ -2162,6 +2916,7 @@ def api_list_bid_events(job_id: str):
 
 
 @app.patch("/api/jobs/{job_id}/bid-tracking")
+@audit_route("bid.status", "bid.sent", "bid.tracking.update", "bid.note")
 def api_update_bid_tracking(job_id: str, body: BidTrackingUpdate, request: Request):
     """Change status, due date, estimator or next follow-up; records who changed what."""
     db_id = _resolve_job_id(job_id)
@@ -2215,27 +2970,43 @@ def api_update_bid_tracking(job_id: str, body: BidTrackingUpdate, request: Reque
         events.append(("sent", sent_details))
     else:
         events = [("status_change" if "to" in details else "note", details)] if details else []
-    if updates or events:
-        save_bid_tracking(db_id, updates, events, _request_username(request))
+
+    # (activity action, summary, detail) for the bid's activity list; the
+    # summary also names the history entry.
+    activity = None
+    action = "bid.tracking.update"
     if details.get("to") == "Sent":
+        action = "bid.sent"
         total = _bid_money_text(current["bid_total"])
         gc_text = f" to {current['gc_name']}" if current["gc_name"] else ""
-        log_activity(db_id, "bid_sent",
-                     f"Bid marked as sent{gc_text}" + (f" ({total})" if total else ""),
-                     {"gc_name": current["gc_name"], "bid_total": current["bid_total"],
-                      **({"changes": changes} if changes else {})})
+        activity = ("bid_sent",
+                    f"Bid marked as sent{gc_text}" + (f" ({total})" if total else ""),
+                    {"gc_name": current["gc_name"], "bid_total": current["bid_total"],
+                     **({"changes": changes} if changes else {})})
     elif "to" in details:
-        log_activity(db_id, "bid_status_changed", f"Bid status changed from {old_status} to {new_status}",
-                     {"changes": changes} if changes else None)
+        action = "bid.status"
+        activity = ("bid_status_changed", f"Bid status changed from {old_status} to {new_status}",
+                    {"changes": changes} if changes else None)
     elif changes:
         labels = ", ".join(BID_FIELD_LABELS.get(column, column).lower() for column in changes)
-        log_activity(db_id, "bid_tracking_updated", f"Bid tracking updated: {labels}", {"changes": changes})
+        activity = ("bid_tracking_updated", f"Bid tracking updated: {labels}", {"changes": changes})
     elif note:
-        log_activity(db_id, "bid_note_added", "Bid note added")
+        action = "bid.note"
+        activity = ("bid_note_added", "Bid note added", None)
+
+    if updates or events:
+        with job_write(db_id, action=action, scopes=("tracking",),
+                       summary=activity[1] if activity else None) as tx:
+            save_bid_tracking(db_id, updates, events, _request_username(request), conn=tx.conn)
+            if activity:
+                log_activity(db_id, *activity)
+    else:
+        audit.note_checked(db_id)  # nothing to change
     return _bid_tracking_payload(db_id, today)
 
 
 @app.post("/api/jobs/{job_id}/bid-events")
+@audit_route("bid.sent", "bid.follow_up", "bid.note", "bid.won", "bid.lost")
 def api_add_bid_event(job_id: str, body: BidEventCreate, request: Request):
     """Log that the bid was sent, a follow-up, a note, or that it was won or lost."""
     db_id = _resolve_job_id(job_id)
@@ -2312,26 +3083,31 @@ def api_add_bid_event(job_id: str, body: BidEventCreate, request: Request):
             updates["won_lost_at"] = today.isoformat()
         updates["bid_status"] = new_status
 
-    save_bid_tracking(db_id, updates, [(event_type, details)], _request_username(request))
-
     if event_type == "sent":
         who = details.get("sent_to") or details.get("gc_name") or "the GC"
         total = _bid_money_text(details.get("bid_total"))
-        log_activity(db_id, "bid_sent", f"Bid sent to {who}" + (f" ({total})" if total else ""),
-                     {"sent_to": details.get("sent_to"), "gc_name": details.get("gc_name"),
-                      "bid_total": details.get("bid_total")})
+        activity = ("bid_sent", f"Bid sent to {who}" + (f" ({total})" if total else ""),
+                    {"sent_to": details.get("sent_to"), "gc_name": details.get("gc_name"),
+                     "bid_total": details.get("bid_total")})
     elif event_type in ("won", "lost"):
         amount = _bid_money_text(details.get("awarded_amount"))
-        log_activity(db_id, f"bid_{event_type}", f"Bid {event_type}" + (f" ({amount})" if amount else ""),
-                     {"reason": details.get("reason"), "awarded_amount": details.get("awarded_amount")})
+        activity = (f"bid_{event_type}", f"Bid {event_type}" + (f" ({amount})" if amount else ""),
+                    {"reason": details.get("reason"), "awarded_amount": details.get("awarded_amount")})
     elif event_type == "follow_up":
-        log_activity(db_id, "bid_follow_up", "Bid follow-up logged")
+        activity = ("bid_follow_up", "Bid follow-up logged", None)
     else:
-        log_activity(db_id, "bid_note_added", "Bid note added")
+        activity = ("bid_note_added", "Bid note added", None)
+
+    # The tracking fields, the bid event, the activity row and the history
+    # entry are saved together.
+    with job_write(db_id, action=f"bid.{event_type}", scopes=("tracking",), summary=activity[1]) as tx:
+        save_bid_tracking(db_id, updates, [(event_type, details)], _request_username(request), conn=tx.conn)
+        log_activity(db_id, *activity)
     return _bid_tracking_payload(db_id, today)
 
 
 @app.post("/api/jobs/{job_id}/upload-rfms")
+@audit_route("rfms.upload")
 async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile] = File(default=None)):
     """Upload one or more RFMS pivot tables, parse them, return merged materials."""
     # Debug: log what we received
@@ -2348,8 +3124,12 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         if not files:
             raise HTTPException(status_code=422, detail=f"No files received. Form keys: {list(form.keys())}")
 
+    # Parsing, AI labelling and saving block, so they run off the event loop.
+    return await run_in_threadpool(_upload_rfms_files, job_id, files)
+
+
+def _upload_rfms_files(job_id: str, files: list[UploadFile]) -> dict:
     db_id = _resolve_job_id(job_id)
-    job = load_job(db_id)
 
     all_materials_raw = []
     rfms_job_info = {}
@@ -2358,7 +3138,7 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
     for file in files:
         if os.path.splitext(file.filename or "")[1].lower() != ".xlsx":
             raise HTTPException(status_code=400, detail=f"RFMS file '{file.filename}' must be an .xlsx workbook.")
-        content = await file.read(MAX_RFMS_FILE_BYTES + 1)
+        content = file.file.read(MAX_RFMS_FILE_BYTES + 1)
         if len(content) > MAX_RFMS_FILE_BYTES:
             raise HTTPException(
                 status_code=413,
@@ -2388,42 +3168,6 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             mat["area_type"] = area_type
         all_materials_raw.extend(result.get("materials", []))
 
-    for filename, file_hash, file_size, file_path in imported_uploads:
-        record_imported_file(
-            db_id,
-            filename,
-            file_hash,
-            file_size,
-            source="rfms",
-            artifact_path=os.path.relpath(file_path, ARTIFACT_ROOT),
-            artifact_kind="rfms",
-        )
-
-    # Update job info from RFMS if available
-    job_update = {
-        "id": db_id,
-        "project_name": rfms_job_info.get("project_name") or job["project_name"],
-        "gc_name": rfms_job_info.get("gc_name") or job.get("gc_name"),
-        "address": rfms_job_info.get("address") or job.get("address"),
-        "city": rfms_job_info.get("city") or job.get("city"),
-        "state": rfms_job_info.get("state") or job.get("state"),
-        "zip": rfms_job_info.get("zip") or job.get("zip"),
-        "tax_rate": job.get("tax_rate", 0),
-        "gpm_pct": job.get("gpm_pct", 0),
-        "unit_count": job.get("unit_count", 0),
-        "tub_shower_count": job.get("tub_shower_count", 0),
-        "salesperson": job.get("salesperson"),
-        "notes": job.get("notes"),
-        "exclusions": job.get("exclusions"),
-        "markup_pct": job.get("markup_pct", 0),
-        "bid_data": job.get("bid_data"),
-        "proposal_data": job.get("proposal_data"),
-        "architect": job.get("architect"),
-        "designer": job.get("designer"),
-        "textura_fee": job.get("textura_fee", 0),
-    }
-    save_job(job_update)
-
     # Give the newly parsed lines their final codes before any merge, so a
     # re-parsed line always gets the same code. On a re-upload a line that
     # replaces a saved line keeps the saved line's code (merge_reupload_materials),
@@ -2448,6 +3192,83 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             "crack_isolation_sf": m.get("crack_isolation_sf", 0),
         })
 
+    file_names = [f.filename for f in files if hasattr(f, 'filename')]
+    # Import receipts, the header fields, the merged lines and the activity
+    # rows are saved together, with one history entry.
+    with job_write(db_id, action="rfms.upload", scopes=("job", "materials")) as tx:
+        tx.force_record()
+        tx.extra["files"] = [
+            {"file_name": filename, "file_hash": file_hash, "file_size": file_size}
+            for filename, file_hash, file_size, _ in imported_uploads
+        ]
+        for filename, file_hash, file_size, file_path in imported_uploads:
+            record_imported_file(
+                db_id,
+                filename,
+                file_hash,
+                file_size,
+                source="rfms",
+                artifact_path=os.path.relpath(file_path, ARTIFACT_ROOT),
+                artifact_kind="rfms",
+                conn=tx.conn,
+            )
+
+        # Update job info from RFMS if available
+        update_job_fields(tx.conn, db_id, {
+            field: rfms_job_info[field]
+            for field in ("project_name", "gc_name", "address", "city", "state", "zip")
+            if rfms_job_info.get(field)
+        })
+
+        # The saved lines are read under the bid's lock, so a change saved
+        # while the files were being parsed is merged instead of lost.
+        existing_materials = [
+            dict(row)
+            for row in tx.conn.execute(
+                "SELECT * FROM job_materials WHERE job_id=? ORDER BY id", (db_id,)
+            ).fetchall()
+        ]
+        materials, dropped_saved_lines = _rfms_priced_materials(existing_materials, new_lines)
+        material_ids = save_materials(db_id, materials, conn=tx.conn)
+
+        # Attach IDs to returned materials
+        for mat, mid in zip(materials, material_ids):
+            mat["id"] = mid
+
+        log_activity(db_id, "rfms_uploaded", f"Uploaded {len(file_names)} RFMS file(s), {len(materials)} materials parsed", {"files": file_names, "material_count": len(materials)})
+        removed_materials = [
+            {
+                "item_code": em.get("item_code"),
+                "description": em.get("description"),
+                "area_type": em.get("area_type") or "unit",
+                "extended_cost": em.get("extended_cost"),
+            }
+            for em in dropped_saved_lines
+        ]
+        if removed_materials:
+            log_activity(
+                db_id,
+                "rfms_lines_removed",
+                f"Re-upload removed {len(removed_materials)} saved line(s) the revised takeoff no longer has",
+                {"files": file_names, "lines": removed_materials},
+            )
+
+    updated_job = load_job(db_id) or {}
+    return {
+        "job_id": db_id,
+        "slug": updated_job.get("slug"),
+        "job_info": rfms_job_info,
+        "materials": materials,
+        "removed_materials": removed_materials,
+    }
+
+
+def _rfms_priced_materials(existing_materials: list[dict], new_lines: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Merge freshly parsed RFMS lines onto the saved lines and price them.
+
+    Returns (materials to save, saved lines the revised takeoff dropped).
+    Reads company rates, the price list and price books; writes nothing.
+    """
     # Re-upload onto a job with saved lines: each new line replaces the saved
     # line with the same description and area (new qty; saved id, code, price,
     # vendor, quote, labor and fixture fields). Saved lines of an area the
@@ -2455,7 +3276,6 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
     # takeoff, or surplus duplicates) are dropped; saved lines of other areas
     # stay; new lines are added. Deterministic, so uploading the same takeoff
     # again never adds lines.
-    existing_materials = job.get("materials", [])
     dropped_saved_lines: list[dict] = []
     if existing_materials:
         print(f"[rfms_upload] Job has {len(existing_materials)} existing materials, merging by description and area")
@@ -2617,39 +3437,7 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
             if still_unpriced:
                 _price_book_match(materials, still_unpriced, allow_ai=False)
 
-    material_ids = save_materials(db_id, materials)
-
-    # Attach IDs to returned materials
-    for mat, mid in zip(materials, material_ids):
-        mat["id"] = mid
-
-    file_names = [f.filename for f in files if hasattr(f, 'filename')]
-    log_activity(db_id, "rfms_uploaded", f"Uploaded {len(file_names)} RFMS file(s), {len(materials)} materials parsed", {"files": file_names, "material_count": len(materials)})
-    removed_materials = [
-        {
-            "item_code": em.get("item_code"),
-            "description": em.get("description"),
-            "area_type": em.get("area_type") or "unit",
-            "extended_cost": em.get("extended_cost"),
-        }
-        for em in dropped_saved_lines
-    ]
-    if removed_materials:
-        log_activity(
-            db_id,
-            "rfms_lines_removed",
-            f"Re-upload removed {len(removed_materials)} saved line(s) the revised takeoff no longer has",
-            {"files": file_names, "lines": removed_materials},
-        )
-
-    updated_job = load_job(db_id) or {}
-    return {
-        "job_id": db_id,
-        "slug": updated_job.get("slug"),
-        "job_info": rfms_job_info,
-        "materials": materials,
-        "removed_materials": removed_materials,
-    }
+    return materials, dropped_saved_lines
 
 
 def _apply_fob_freight(mat: dict, prod: dict, freight_rates: dict | None = None):
@@ -2684,16 +3472,89 @@ def _apply_fob_freight(mat: dict, prod: dict, freight_rates: dict | None = None)
         print(f"[freight] FOB detected for {mat.get('item_code', '?')} — applied internal rate ${rate}/{unit}")
 
 
+def _material_patches(before_rows: list[dict], after_rows: list[dict]) -> dict[int, dict]:
+    """Per saved material id, the stored fields that differ between two copies of the lines."""
+    before_by_id = {}
+    for row in before_rows or []:
+        try:
+            before_by_id[int(row.get("id"))] = row
+        except (TypeError, ValueError):
+            continue
+    patches: dict[int, dict] = {}
+    for row in after_rows or []:
+        try:
+            material_id = int(row.get("id"))
+        except (TypeError, ValueError):
+            continue
+        base = before_by_id.get(material_id)
+        if base is None:
+            continue
+        # Only stored columns (the loaded row's keys), never transient extras.
+        fields = {
+            key: row.get(key)
+            for key in base
+            if key not in ("id", "job_id") and key in row and not audit.values_equal(base.get(key), row.get(key))
+        }
+        if fields:
+            patches[material_id] = fields
+    return patches
+
+
+def _apply_material_patches(conn, job_id: int, before_rows: list[dict], after_rows: list[dict]) -> int:
+    """Save what a slow step (quote matching, an AI estimate) changed on the lines it
+    loaded, on top of the lines as they are now. Run inside job_write with tx.conn,
+    so a line someone edited or removed meanwhile keeps their change.
+    Returns how many lines were changed."""
+    patches = _material_patches(before_rows, after_rows)
+    if not patches:
+        return 0
+    current = [
+        dict(row)
+        for row in conn.execute("SELECT * FROM job_materials WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
+    ]
+    applied = 0
+    for row in current:
+        patch = patches.get(int(row["id"]))
+        if patch:
+            row.update(patch)
+            applied += 1
+    if applied:
+        save_materials(job_id, current, conn=conn)
+    return applied
+
+
 def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
+    """Match parsed quote products to the job's materials and save the prices.
+
+    The matching (AI included) runs first without holding the bid; only the
+    changed fields are then saved, under the bid's lock, with a history entry.
+    """
+    matched, loaded, priced = _match_quotes_to_materials(job_id, products)
+    if priced is not None:
+        with job_write(job_id, action="quotes.auto_match", scopes=("materials",),
+                       summary=_quote_match_summary(matched)) as tx:
+            _apply_material_patches(tx.conn, job_id, loaded, priced)
+    return matched
+
+
+def _quote_match_summary(matched: int) -> str:
+    return f"Auto-priced {matched} material{'' if matched == 1 else 's'} from vendor quotes and price rules"
+
+
+def _match_quotes_to_materials(job_id: int, products: list[dict]) -> tuple[int, list[dict], list[dict] | None]:
     """Try to match parsed quote products to existing materials.
     Phase 1: exact item_code matching (fast, no AI).
-    Phase 2: AI fuzzy matching for remaining unmatched items."""
+    Phase 2: AI fuzzy matching for remaining unmatched items.
+
+    Saves nothing. Returns (matches, the materials as loaded, the materials
+    with the new prices, or None when nothing changed)."""
     job = load_job(job_id)
     if not job:
-        return 0
+        return 0, [], None
     materials = job.get("materials", [])
     if not materials:
-        return 0
+        return 0, [], None
+    loaded = copy.deepcopy(materials)
 
     matched = 0
     updated = False
@@ -3006,13 +3867,10 @@ def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
             mat["labor_catalog"] = "Schluter Schiene"
             updated = True
 
-    if updated:
-        save_materials(job_id, materials)
-
     # Also try to link to open quote requests
     _link_upload_to_requests(job_id, products)
 
-    return matched
+    return matched, loaded, (materials if updated else None)
 
 
 def _ai_match_quotes(unmatched_mats: list, unmatched_prods: list) -> list:
@@ -3611,8 +4469,69 @@ def _quote_upload_outcomes(
     }
 
 
+def _save_quote_products(db_id: int, products: list[dict], file_names: list[str], *, action: str) -> list[int]:
+    """Save parsed quote lines for a bid, with a history entry listing the new lines."""
+    with job_write(db_id, action=action, scopes=()) as tx:
+        ids = save_quotes(db_id, products, conn=tx.conn)
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            rows = [
+                dict(row)
+                for row in tx.conn.execute(
+                    f"""SELECT id, product_name, vendor, unit_price, unit, description, file_name,
+                               freight, lead_time, notes, source_hash
+                        FROM job_quotes WHERE id IN ({placeholders}) ORDER BY id""",
+                    ids,
+                ).fetchall()
+            ]
+            tx.add_changes(audit.diff({"quotes": []}, {"quotes": rows}, entity_type="job"))
+            where = f" from {', '.join(file_names[:3])}" if file_names else ""
+            tx.set_summary(f"Saved {len(ids)} vendor quote line{'' if len(ids) == 1 else 's'}{where}")
+    return ids
+
+
+def _learn_vendor_prices(conn, job_id: int, products: list[dict]) -> int:
+    """Add a bid's quoted prices to the shared vendor price history, with a
+    history entry of its own. Run inside job_write, with tx.conn."""
+    def snapshot() -> list[dict]:
+        return [
+            dict(row)
+            for row in conn.execute(
+                """SELECT id, product_name, vendor_name, unit_price, unit, freight_per_unit, file_name
+                   FROM vendor_prices WHERE job_id=? ORDER BY id""",
+                (job_id,),
+            ).fetchall()
+        ]
+
+    known_vendor_ids = {row[0] for row in conn.execute("SELECT id FROM vendors").fetchall()}
+    before = snapshot()
+    count = save_vendor_prices_from_quotes(job_id, products, conn=conn)
+    after = snapshot()
+    new_vendors = [
+        dict(row)
+        for row in conn.execute("SELECT id, name FROM vendors ORDER BY id").fetchall()
+        if row["id"] not in known_vendor_ids
+    ]
+    changes = audit.diff({"vendor_prices": before}, {"vendor_prices": after}, entity_type="vendor_prices")
+    changes += audit.diff({"vendors": []}, {"vendors": new_vendors}, entity_type="vendor_prices")
+    if changes:
+        summary = f"Added {count} price{'' if count == 1 else 's'} from this bid's quotes to the vendor price history"
+        if new_vendors:
+            summary += f" and {len(new_vendors)} new vendor{'' if len(new_vendors) == 1 else 's'}"
+        audit.record(
+            conn,
+            action="vendor_prices.learn",
+            entity_type="vendor_prices",
+            job_id=job_id,
+            summary=summary,
+            changes=changes,
+        )
+    return count
+
+
 @app.post("/api/jobs/{job_id}/upload-quotes")
-async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
+@audit_route("quotes.upload", "vendor_prices.learn")
+def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     """Upload vendor quote files, parse them, return pricing."""
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
@@ -3640,7 +4559,7 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     file_errors = []
     parsed_files = []
     for upload in files:
-        content = await upload.read(MAX_QUOTE_FILE_BYTES + 1)
+        content = upload.file.read(MAX_QUOTE_FILE_BYTES + 1)
         if len(content) > MAX_QUOTE_FILE_BYTES:
             file_errors.append({
                 "file": upload.filename,
@@ -3687,65 +4606,86 @@ async def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
             ),
         )
 
+    file_names = [u.filename for u in files if hasattr(u, 'filename')]
+    vendors_found = list(set(p.get("vendor", "Unknown") for p in all_products if p.get("vendor")))
+
     # Persist quotes to DB
-    save_quotes(db_id, all_products)
+    _save_quote_products(db_id, all_products, file_names, action="quotes.upload")
 
-    # Auto-match prices to materials
-    auto_matched = _auto_match_quotes(db_id, all_products)
-
-    # Save to vendor pricing database
-    save_vendor_prices_from_quotes(db_id, all_products)
+    # Match prices to materials. The matching (AI included) runs without
+    # holding the bid; its changes are saved below.
+    auto_matched, loaded_materials, priced_materials = _match_quotes_to_materials(db_id, all_products)
 
     # Detect matching quote requests (don't auto-link — frontend will confirm)
     linked_requests = _link_upload_to_requests(db_id, all_products)
 
-    # Mark source files imported only after every selected source parsed and all
-    # downstream pricing writes completed.
-    for parsed_file in parsed_files:
-        record_imported_file(
-            db_id,
-            parsed_file["file_name"],
-            parsed_file["file_hash"],
-            parsed_file["file_size"],
-            source="manual",
-            artifact_path=parsed_file["artifact_path"],
-            artifact_kind="vendor_quote",
+    # The matched prices, the vendor price history and the import receipts are
+    # saved together, so a source is only marked imported once all of its
+    # pricing is saved.
+    with job_write(db_id, action="quotes.upload", scopes=("materials",)) as tx:
+        tx.force_record()
+        if priced_materials is not None:
+            _apply_material_patches(tx.conn, db_id, loaded_materials, priced_materials)
+
+        # Save to vendor pricing database
+        _learn_vendor_prices(tx.conn, db_id, all_products)
+
+        for parsed_file in parsed_files:
+            record_imported_file(
+                db_id,
+                parsed_file["file_name"],
+                parsed_file["file_hash"],
+                parsed_file["file_size"],
+                source="manual",
+                artifact_path=parsed_file["artifact_path"],
+                artifact_kind="vendor_quote",
+                conn=tx.conn,
+            )
+
+        after_materials = [
+            dict(row)
+            for row in tx.conn.execute(
+                "SELECT * FROM job_materials WHERE job_id=? ORDER BY id", (db_id,)
+            ).fetchall()
+        ]
+        after_imports = [
+            dict(row)
+            for row in tx.conn.execute(
+                "SELECT file_hash, artifact_path, artifact_kind FROM imported_files WHERE job_id=?", (db_id,)
+            ).fetchall()
+        ]
+        after_verified_vendor_hashes = {
+            str(item.get("file_hash") or "").strip()
+            for item in after_imports
+            if _imported_artifact_is_verified(item, "vendor_quote")
+        }
+        upload_outcomes = _quote_upload_outcomes(
+            before_materials,
+            before_verified_vendor_hashes,
+            after_materials,
+            after_verified_vendor_hashes,
         )
 
-    file_names = [u.filename for u in files if hasattr(u, 'filename')]
-    vendors_found = list(set(p.get("vendor", "Unknown") for p in all_products if p.get("vendor")))
+        activity_detail = {
+            "files": file_names,
+            "vendors": vendors_found,
+            "product_count": len(all_products),
+            "auto_matched": auto_matched,
+            "provenance_repaired": upload_outcomes["provenance_repaired"],
+            "quote_price_matched": upload_outcomes["quote_price_matched"],
+        }
+        log_activity(
+            db_id,
+            "quotes_uploaded",
+            (
+                f"Uploaded {len(file_names)} quote file(s), {len(all_products)} products, "
+                f"{upload_outcomes['quote_price_matched']} prices matched, "
+                f"{upload_outcomes['provenance_repaired']} receipts repaired"
+            ),
+            activity_detail,
+        )
+
     refreshed = load_job(db_id) or {}
-    after_verified_vendor_hashes = {
-        str(item.get("file_hash") or "").strip()
-        for item in list_imported_files(db_id)
-        if _imported_artifact_is_verified(item, "vendor_quote")
-    }
-    upload_outcomes = _quote_upload_outcomes(
-        before_materials,
-        before_verified_vendor_hashes,
-        refreshed.get("materials") or [],
-        after_verified_vendor_hashes,
-    )
-
-    activity_detail = {
-        "files": file_names,
-        "vendors": vendors_found,
-        "product_count": len(all_products),
-        "auto_matched": auto_matched,
-        "provenance_repaired": upload_outcomes["provenance_repaired"],
-        "quote_price_matched": upload_outcomes["quote_price_matched"],
-    }
-    log_activity(
-        db_id,
-        "quotes_uploaded",
-        (
-            f"Uploaded {len(file_names)} quote file(s), {len(all_products)} products, "
-            f"{upload_outcomes['quote_price_matched']} prices matched, "
-            f"{upload_outcomes['provenance_repaired']} receipts repaired"
-        ),
-        activity_detail,
-    )
-
     return {
         "products": refreshed.get("quotes") or [],
         "parsed_products": all_products,
@@ -3767,37 +4707,62 @@ def api_imported_files(job_id: str):
     return list_imported_files(job["id"])
 
 
+_QUOTE_AUDIT_COLUMNS = (
+    "id, product_name, vendor, unit_price, unit, description, file_name, "
+    "freight, lead_time, notes, source_hash"
+)
+
+
 @app.delete("/api/jobs/{job_id}/quotes")
+@audit_route("quotes.clear")
 def api_clear_quotes(job_id: str):
     """Clear all parsed quotes for a job."""
     db_id = _resolve_job_id(job_id)
-    job = load_job(db_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    delete_quotes(job["id"])
-    log_activity(job["id"], "quotes_cleared", "All vendor quotes cleared")
+    with job_write(db_id, action="quotes.clear", scopes=(), summary="All vendor quotes cleared") as tx:
+        cleared = [
+            dict(row)
+            for row in tx.conn.execute(
+                f"SELECT {_QUOTE_AUDIT_COLUMNS} FROM job_quotes WHERE job_id=? ORDER BY id", (db_id,)
+            ).fetchall()
+        ]
+        delete_quotes(db_id, conn=tx.conn)
+        tx.add_changes(audit.diff({"quotes": cleared}, {"quotes": []}, entity_type="job"))
+        log_activity(db_id, "quotes_cleared", "All vendor quotes cleared")
     return {"message": "Quotes cleared"}
 
 
 @app.put("/api/quotes/{quote_id}")
+@audit_route("quotes.update", "quotes.auto_match")
 def api_update_quote(quote_id: int, body: dict = Body(...)):
     """Update a single quote entry and re-match against materials."""
     job_id = get_quote_job_id(quote_id)
     if not job_id:
         raise HTTPException(status_code=404, detail="Quote not found")
-    update_quote(quote_id, body)
+    summary = f"Quote #{quote_id} updated"
+    with job_write(job_id, action="quotes.update", scopes=(), summary=summary,
+                   group=audit.NUMBER_EDITS, field_path=f"/quotes/{quote_id}") as tx:
+        def quote_row():
+            row = tx.conn.execute(
+                f"SELECT {_QUOTE_AUDIT_COLUMNS} FROM job_quotes WHERE id=?", (quote_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+        before = quote_row()
+        update_quote(quote_id, body, conn=tx.conn)
+        tx.add_changes(audit.diff(before, quote_row(), f"/quotes/{quote_id}", entity_type="job"))
+        log_activity(job_id, "quote_updated", summary)
     # Re-run auto-match so the updated price flows to materials
     job = load_job(job_id)
     if job:
         quotes = job.get("quotes", [])
         _auto_match_quotes(job_id, quotes)
-    log_activity(job_id, "quote_updated", f"Quote #{quote_id} updated")
     return {"ok": True}
 
 
 # ── Dropbox Scanner Endpoints ────────────────────────────────────────────────
 
 @app.post("/api/jobs/{job_id}/match-dropbox-folder")
+@no_audit("read-only: matches folder names the browser sends and saves nothing")
 def api_match_dropbox_folder(job_id: str, body: dict = Body(...)):
     """Fuzzy-match job project name against a list of folder names from the browser.
     The browser reads the local Dropbox folder via File System Access API and sends folder names here.
@@ -3824,6 +4789,7 @@ def api_match_dropbox_folder(job_id: str, body: dict = Body(...)):
 
 
 @app.post("/api/jobs/{job_id}/calculate")
+@audit_route("bid.calculate")
 def api_calculate(job_id: str):
     """Run sundry + labor calculators, return results."""
     db_id = _resolve_job_id(job_id)
@@ -3852,11 +4818,16 @@ def api_calculate(job_id: str):
     trace = AuditTraceBuilder(job["id"])
 
     sundries = calculate_sundries_for_materials(materials, trace=trace)
-    save_sundries(job["id"], sundries)
 
     # Calculate labor
     labor_items = calculate_labor_for_materials(materials, trace=trace)
-    save_labor(job["id"], labor_items)
+
+    summary = f"Calculated {len(sundries)} sundries and {len(labor_items)} labor items"
+    with job_write(job["id"], action="bid.calculate", scopes=("sundries", "labor"), summary=summary) as tx:
+        tx.force_record()
+        save_sundries(job["id"], sundries, conn=tx.conn)
+        save_labor(job["id"], labor_items, conn=tx.conn)
+        log_activity(job["id"], "bid_calculated", summary)
 
     run_id = create_calculation_run(
         job["id"],
@@ -3866,8 +4837,6 @@ def api_calculate(job_id: str):
     trace_count = save_calculation_traces(job["id"], run_id, trace.records)
     complete_calculation_run(run_id, summary=trace.summary())
 
-    log_activity(job["id"], "bid_calculated", f"Calculated {len(sundries)} sundries and {len(labor_items)} labor items")
-
     return {
         "sundries": sundries,
         "labor": labor_items,
@@ -3875,7 +4844,54 @@ def api_calculate(job_id: str):
     }
 
 
+# Fields the materials table works out from the one typed into; they don't
+# make an autosave a multi-field edit.
+_MATERIAL_FOLLOW_FIELDS = {
+    "installed_qty": ("order_qty",),
+    "waste_pct": ("order_qty",),
+    "unit_price": ("price_source", "quote_status"),
+}
+# Typed text; every other material field is a number or a dropdown.
+_MATERIAL_TEXT_FIELDS = frozenset({"item_code", "description", "vendor"})
+
+
+def _material_edit_group(saved_rows: list[dict], incoming_rows: list[dict]):
+    """When a materials save changes one field of one saved line (the autosave
+    after typing in a cell), return (history field path, grouping policy,
+    summary) so quick re-saves of that cell join one history entry.
+    Otherwise (None, None, None)."""
+    saved = {str(row.get("id")): row for row in saved_rows or [] if row.get("id") is not None}
+    incoming_ids = set()
+    edited = []
+    for material in incoming_rows or []:
+        if not isinstance(material, dict) or material.get("id") is None or str(material.get("id")) not in saved:
+            return None, None, None  # a new line
+        incoming_ids.add(str(material["id"]))
+        base = saved[str(material["id"])]
+        fields = [
+            key for key, value in material.items()
+            if key in base and key not in ("id", "job_id") and value is not None
+            and key not in audit.DERIVED_KEYS and not audit.values_equal(base.get(key), value)
+        ]
+        for key in list(fields):
+            for follower in _MATERIAL_FOLLOW_FIELDS.get(key, ()):
+                if follower in fields:
+                    fields.remove(follower)
+        edited.extend((base, key, material[key]) for key in fields)
+    if incoming_ids != set(saved) or len(edited) != 1:
+        return None, None, None
+    base, field, value = edited[0]
+    policy = audit.TEXT_EDITS if field in _MATERIAL_TEXT_FIELDS else audit.NUMBER_EDITS
+    label = base.get("item_code") or base.get("description") or f"line {base.get('id')}"
+    return (
+        f"/materials/{audit.escape_path_key(base['id'])}/{field}",
+        policy,
+        f"Changed {field.replace('_', ' ')} on {label}",
+    )
+
+
 @app.put("/api/jobs/{job_id}/materials")
+@audit_route("materials.update")
 def api_update_materials(job_id: str, body: MaterialUpdate):
     """Update materials (edited pricing, waste, etc.)."""
     db_id = _resolve_job_id(job_id)
@@ -3890,10 +4906,11 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
     def deletion_key(material: dict) -> str:
         return str(material.get("item_code") or material.get("id") or "")
 
-    conn = _get_conn()
+    edit_path, edit_policy, edit_summary = _material_edit_group(job.get("materials") or [], body.materials)
     deleted_materials = []
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    with job_write(job["id"], action="materials.update", scopes=("materials",),
+                   group=edit_policy, field_path=edit_path, summary=edit_summary) as tx:
+        conn = tx.conn
         current_materials = [
             dict(row)
             for row in conn.execute(
@@ -4044,44 +5061,40 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
             ).fetchall()
         ]
         source_fingerprint = _materials_source_fingerprint(persisted_materials)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+
+        # Activity rows go in the same transaction; the first one names the
+        # history entry unless a single cell edit already did.
+        if deleted_materials:
+            log_activity(
+                job["id"],
+                "materials_deleted",
+                f"Removed {len(deleted_materials)} takeoff material(s) with estimator reasons",
+                {
+                    "deletions": [
+                        {
+                            "material_key": deletion_key(material),
+                            "description": material.get("description"),
+                            "reason": deletion_reasons.get(deletion_key(material)),
+                        }
+                        for material in deleted_materials
+                    ],
+                },
+            )
+        log_activity(job["id"], "materials_updated", f"Updated pricing for {len(body.materials)} materials")
+        if recounted_transitions:
+            print(f"[materials] Recounted sticks on {len(recounted_transitions)} EA transition line(s): {recounted_transitions}")
+            log_activity(
+                job["id"],
+                "transition_sticks_recounted",
+                f"Recounted Schluter/Silver Pin sticks on {len(recounted_transitions)} saved EA line(s); review the before/after totals",
+                {"lines": recounted_transitions},
+            )
 
     # Keep read-only price suggestions visible after an autosave without
     # including them in the durable source fingerprint.
     response_job = {"materials": persisted_materials}
     _enrich_known_prices(response_job)
     response_materials = response_job["materials"]
-
-    if deleted_materials:
-        log_activity(
-            job["id"],
-            "materials_deleted",
-            f"Removed {len(deleted_materials)} takeoff material(s) with estimator reasons",
-            {
-                "deletions": [
-                    {
-                        "material_key": deletion_key(material),
-                        "description": material.get("description"),
-                        "reason": deletion_reasons.get(deletion_key(material)),
-                    }
-                    for material in deleted_materials
-                ],
-            },
-        )
-    log_activity(job["id"], "materials_updated", f"Updated pricing for {len(body.materials)} materials")
-    if recounted_transitions:
-        print(f"[materials] Recounted sticks on {len(recounted_transitions)} EA transition line(s): {recounted_transitions}")
-        log_activity(
-            job["id"],
-            "transition_sticks_recounted",
-            f"Recounted Schluter/Silver Pin sticks on {len(recounted_transitions)} saved EA line(s); review the before/after totals",
-            {"lines": recounted_transitions},
-        )
 
     return {
         "materials": response_materials,
@@ -4102,6 +5115,7 @@ def api_get_material_price_decisions(job_id: str):
 
 
 @app.post("/api/jobs/{job_id}/materials/{material_id}/quote-conflict")
+@audit_route("materials.price_decision")
 def api_resolve_material_price_conflict(
     job_id: str,
     material_id: int,
@@ -4172,9 +5186,9 @@ def api_resolve_material_price_conflict(
             detail="This quote conflict changed or was already resolved. Refresh readiness and review the current evidence.",
         )
 
-    conn = _get_conn()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    action_label = "used the verified quote" if decision_type == "use_quote" else "kept the accepted price"
+    with job_write(db_id, action="materials.price_decision", scopes=("materials",)) as tx:
+        conn = tx.conn
         current_row = conn.execute(
             "SELECT * FROM job_materials WHERE id=? AND job_id=?",
             (material_id, db_id),
@@ -4232,32 +5246,27 @@ def api_resolve_material_price_conflict(
             reviewer_name=reviewer,
             conn=conn,
         )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-    action_label = "used the verified quote" if decision_type == "use_quote" else "kept the accepted price"
-    log_activity(
-        db_id,
-        "vendor_price_decision",
-        f"{reviewer} {action_label} for {conflict.get('item_code') or material_id}",
-        {
-            "decision_id": decision["id"],
-            "material_id": material_id,
-            "item_code": conflict.get("item_code"),
-            "decision": decision_type,
-            "accepted_price_before": round(current_price, 2),
-            "resolved_price": round(resolved_price, 2),
-            "quote_price": round(conflict["quote_price"], 2),
-            "source_hash": source_hash,
-            "source_file": conflict.get("source_file") or "",
-            "reason": reason,
-        },
-        user=reviewer,
-    )
+        tx.add_changes(audit.diff(
+            {"material_price_decisions": []}, {"material_price_decisions": [decision]}, entity_type="job",
+        ))
+        log_activity(
+            db_id,
+            "vendor_price_decision",
+            f"{reviewer} {action_label} for {conflict.get('item_code') or material_id}",
+            {
+                "decision_id": decision["id"],
+                "material_id": material_id,
+                "item_code": conflict.get("item_code"),
+                "decision": decision_type,
+                "accepted_price_before": round(current_price, 2),
+                "resolved_price": round(resolved_price, 2),
+                "quote_price": round(conflict["quote_price"], 2),
+                "source_hash": source_hash,
+                "source_file": conflict.get("source_file") or "",
+                "reason": reason,
+            },
+            user=reviewer,
+        )
     updated_job = load_job(db_id)
     return {
         "decision": decision,
@@ -4271,6 +5280,7 @@ def api_resolve_material_price_conflict(
 
 
 @app.post("/api/jobs/{job_id}/materials/{material_idx}/estimate-price")
+@audit_route("materials.ai_estimate")
 def api_estimate_price(job_id: str, material_idx: int):
     """Use AI to estimate a material's unit price based on its description."""
     db_id = _resolve_job_id(job_id)
@@ -4283,6 +5293,7 @@ def api_estimate_price(job_id: str, material_idx: int):
         raise HTTPException(status_code=404, detail="Material not found")
 
     m = materials[material_idx]
+    loaded_material = copy.deepcopy(m)
     settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
@@ -4354,10 +5365,14 @@ The price should be per {m.get('unit', 'unit')}. Be conservative — estimate on
         m["order_qty"] = round(m.get("installed_qty", 0) * (1 + m.get("waste_pct", 0)), 2)
         m["extended_cost"] = round(m["order_qty"] * m["unit_price"], 2)
         materials[material_idx] = m
-        save_materials(job["id"], materials)
 
-        log_activity(job["id"], "ai_estimate",
-                     f"AI estimated price for {m.get('item_code', m.get('description', 'material'))}: ${estimated_price:.2f}/{m.get('unit', 'unit')}")
+        # The AI call ran without holding the bid; only this line's new price
+        # fields are saved, on top of the lines as they are now.
+        summary = f"AI estimated price for {m.get('item_code', m.get('description', 'material'))}: ${estimated_price:.2f}/{m.get('unit', 'unit')}"
+        with job_write(job["id"], action="materials.ai_estimate", scopes=("materials",), summary=summary,
+                       extra={"confidence": confidence, "reasoning": reasoning}) as tx:
+            _apply_material_patches(tx.conn, job["id"], [loaded_material], [m])
+            log_activity(job["id"], "ai_estimate", summary)
 
         return {
             "estimated_price": estimated_price,
@@ -4365,11 +5380,14 @@ The price should be per {m.get('unit', 'unit')}. Be conservative — estimate on
             "reasoning": reasoning,
             "material": m,
         }
+    except (HTTPException, JobWriteError):
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI estimation failed: {e}")
 
 
 @app.post("/api/jobs/{job_id}/generate-bid")
+@audit_route("bid.generate")
 def api_generate_bid(job_id: str):
     """Assemble bid + generate PDF, return bid data."""
     db_id = _resolve_job_id(job_id)
@@ -4411,9 +5429,6 @@ def api_generate_bid(job_id: str):
     bid_data = assemble_bid(job_info, materials, sundries, labor_items, exclusions=custom_exclusions)
     bid_audit = _record_bid_audit(job["id"], bid_data)
 
-    # Save bundles
-    save_bundles(job["id"], bid_data["bundles"])
-
     # Persist full bid data to job record (bundles + totals)
     bid_persist = {
         "bundles": bid_data["bundles"],
@@ -4445,34 +5460,36 @@ def api_generate_bid(job_id: str):
             "markup_amount": bid_data.get("markup_amount", 0),
         },
     }
-    job["bid_data"] = _json.dumps(bid_persist)
-    save_job(job)
+    bundle_count = len(bid_data.get("bundles", []))
+    grand_total = bid_data.get("grand_total", 0)
+    summary = f"Bid generated: {bundle_count} bundles, total ${grand_total:,.2f}"
+    # Save bundles and the bid data (only those; the rest of the bid is untouched)
+    with job_write(job["id"], action="bid.generate", scopes=("bundles", "bid"), summary=summary) as tx:
+        tx.force_record()
+        save_bundles(job["id"], bid_data["bundles"], conn=tx.conn)
+        set_bid_data(tx.conn, job["id"], bid_persist)
 
     # Generate PDF
     pdf_path = _job_pdf_path(job["id"], "bid")
     generate_bid_pdf(bid_data, pdf_path)
     _record_artifact(job["id"], pdf_path, "bid_pdf")
 
-    bundle_count = len(bid_data.get("bundles", []))
-    grand_total = bid_data.get("grand_total", 0)
-    log_activity(job["id"], "bid_generated", f"Bid generated: {bundle_count} bundles, total ${grand_total:,.2f}", {"bundle_count": bundle_count, "grand_total": grand_total})
+    log_activity(job["id"], "bid_generated", summary, {"bundle_count": bundle_count, "grand_total": grand_total})
 
     bid_data["audit"] = bid_persist["audit"]
     return bid_data
 
 
 @app.delete("/api/jobs/{job_id}/bid")
+@audit_route("bid.clear")
 def api_clear_bid(job_id: str):
     """Clear saved bid data for a job."""
     db_id = _resolve_job_id(job_id)
-    job = load_job(db_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    job["bid_data"] = None
-    save_job(job)
-    # Clear bundles too
-    save_bundles(job["id"], [])
-    log_activity(job["id"], "bid_cleared", "Bid data cleared")
+    with job_write(db_id, action="bid.clear", scopes=("bundles", "bid"), summary="Bid data cleared") as tx:
+        set_bid_data(tx.conn, db_id, None)
+        # Clear bundles too
+        save_bundles(db_id, [], conn=tx.conn)
+        log_activity(db_id, "bid_cleared", "Bid data cleared")
     return {"message": "Bid cleared"}
 
 
@@ -4498,8 +5515,14 @@ def api_download_bid_pdf(job_id: str):
 # ── Proposal Endpoints ─────────────────────────────────────────────────────
 
 @app.post("/api/jobs/{job_id}/proposal/rewrite-descriptions")
+@no_audit("AI draft only: returns suggested descriptions and saves nothing")
 async def api_rewrite_descriptions(job_id: str, request: Request):
     """Use AI to rewrite bundle descriptions in professional proposal style."""
+    raw_body = await request.body()
+    return await run_in_threadpool(_rewrite_descriptions, job_id, raw_body)
+
+
+def _rewrite_descriptions(job_id: str, raw_body: bytes) -> dict:
     from description_agent import rewrite_bundle_descriptions
 
     db_id = _resolve_job_id(job_id)
@@ -4507,7 +5530,7 @@ async def api_rewrite_descriptions(job_id: str, request: Request):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    body = await request.json()
+    body = json.loads(raw_body)
     bundles = body.get("bundles", [])
     if not bundles:
         raise HTTPException(status_code=400, detail="No bundles provided")
@@ -4639,6 +5662,7 @@ def api_get_calculation_run_trace(
 
 
 @app.post("/api/rules/audit-harness")
+@no_audit("read-only check: runs rule probes in memory and saves nothing")
 def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
     """Small UI probe for rules/audit visibility; full harness lives in scripts/."""
     body = body or {}
@@ -5489,7 +6513,39 @@ def api_get_job_reproducibility(job_id: str):
     }
 
 
+def _golden_baseline_for_audit(conn, source_job_id):
+    """A bid's golden baseline as the history shows it (the snapshot itself is too big)."""
+    row = conn.execute(
+        """SELECT g.id, g.jr_quote_id, g.target_totals_json, g.tolerance_json, g.ruleset_version,
+                  g.source_fingerprint, g.notes, g.status, g.current_version_id,
+                  v.version_number, v.reviewer_name
+           FROM golden_jobs g LEFT JOIN golden_job_versions v ON v.id = g.current_version_id
+           WHERE g.source_job_id=?""",
+        (source_job_id,),
+    ).fetchone()
+    if not row:
+        return None
+    baseline = dict(row)
+    for column, key in (("target_totals_json", "target_totals"), ("tolerance_json", "tolerance")):
+        raw = baseline.pop(column, None)
+        try:
+            baseline[key] = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            baseline[key] = raw
+    return baseline
+
+
+def _golden_replay_for_audit(conn, replay_id):
+    row = conn.execute(
+        """SELECT id, golden_job_id, golden_version_id, source_job_id, mode, status, audit_run_id
+           FROM golden_job_replays WHERE id=?""",
+        (replay_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 @app.post("/api/jobs/{job_id}/reproducibility/baseline")
+@audit_route("golden.capture")
 def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     """Capture the current accepted proposal as this job's golden baseline."""
     db_id = _resolve_job_id(job_id)
@@ -5707,29 +6763,35 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
         config_snapshot=config_snapshot,
         proposal_source_fingerprint=current_proposal_fingerprint,
     )
-    golden = upsert_golden_job(
-        source_job_id=job["id"],
-        name=job.get("project_name") or f"Job {job['id']}",
-        jr_quote_id=body.jr_quote_id or "",
-        target_totals=target_totals,
-        tolerance=snapshot.get("tolerance") or DEFAULT_TOLERANCE,
-        snapshot=snapshot,
-        ruleset_version=(ruleset or {}).get("version"),
-        source_fingerprint=fingerprint,
-        notes=body.notes or "",
-        reviewer_name=body.reviewer_name or "",
-        engine_fingerprint=build_manifest_for_snapshot().get("engine_fingerprint", ""),
-        artifact_manifest=_job_artifact_manifest(job["id"]),
-        rules_registry_snapshot=ruleset or {},
-        config_snapshot=config_snapshot,
-        status="active",
-    )
-    log_activity(
-        job["id"],
-        "golden_baseline_captured",
-        "Captured golden reproducibility baseline",
-        {"golden_job_id": golden["id"], "jr_quote_id": body.jr_quote_id, "source_fingerprint": fingerprint},
-    )
+    engine_fingerprint = build_manifest_for_snapshot().get("engine_fingerprint", "")
+    artifact_manifest = _job_artifact_manifest(job["id"])
+    with entity_write("golden_job", job["id"], _golden_baseline_for_audit, "golden.capture",
+                      summary="Captured golden reproducibility baseline", job_id=job["id"]) as tx:
+        golden = upsert_golden_job(
+            source_job_id=job["id"],
+            name=job.get("project_name") or f"Job {job['id']}",
+            jr_quote_id=body.jr_quote_id or "",
+            target_totals=target_totals,
+            tolerance=snapshot.get("tolerance") or DEFAULT_TOLERANCE,
+            snapshot=snapshot,
+            ruleset_version=(ruleset or {}).get("version"),
+            source_fingerprint=fingerprint,
+            notes=body.notes or "",
+            reviewer_name=body.reviewer_name or "",
+            engine_fingerprint=engine_fingerprint,
+            artifact_manifest=artifact_manifest,
+            rules_registry_snapshot=ruleset or {},
+            config_snapshot=config_snapshot,
+            status="active",
+            conn=tx.conn,
+        )
+        tx.force_record()  # a re-capture of identical figures is still a new baseline version
+        log_activity(
+            job["id"],
+            "golden_baseline_captured",
+            "Captured golden reproducibility baseline",
+            {"golden_job_id": golden["id"], "jr_quote_id": body.jr_quote_id, "source_fingerprint": fingerprint},
+        )
     return {
         "golden_job": _public_golden_job(golden),
         "latest_replay": None,
@@ -5745,6 +6807,7 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
 
 
 @app.post("/api/jobs/{job_id}/reproducibility/replay")
+@audit_route("golden.replay")
 def api_replay_golden_job(job_id: str, body: GoldenReplayRequest):
     """Run a non-mutating golden replay and persist the replay report."""
     db_id = _resolve_job_id(job_id)
@@ -5790,23 +6853,28 @@ def api_replay_golden_job(job_id: str, body: GoldenReplayRequest):
     summary["trace_count"] = trace_count
     complete_calculation_run(run_id, summary=summary)
 
-    replay = save_golden_replay(
-        golden_job_id=golden["id"],
-        source_job_id=db_id,
-        mode=mode,
-        status=summary["status"],
-        summary=summary,
-        diff=result["diff"],
-        generated_proposal=result["proposal"],
-        audit_run_id=run_id,
-        golden_version_id=golden.get("version_id"),
-    )
-    log_activity(
-        db_id,
-        "golden_replay_ran",
-        f"Golden replay {mode} finished: {summary['status'].upper()}",
-        {"golden_job_id": golden["id"], "replay_id": replay["id"], "mode": mode, "status": summary["status"]},
-    )
+    activity_summary = f"Golden replay {mode} finished: {summary['status'].upper()}"
+    with entity_write("golden_replay", None, _golden_replay_for_audit, "golden.replay",
+                      summary=activity_summary, job_id=db_id) as tx:
+        replay = save_golden_replay(
+            golden_job_id=golden["id"],
+            source_job_id=db_id,
+            mode=mode,
+            status=summary["status"],
+            summary=summary,
+            diff=result["diff"],
+            generated_proposal=result["proposal"],
+            audit_run_id=run_id,
+            golden_version_id=golden.get("version_id"),
+            conn=tx.conn,
+        )
+        tx.entity_id = replay["id"]
+        log_activity(
+            db_id,
+            "golden_replay_ran",
+            activity_summary,
+            {"golden_job_id": golden["id"], "replay_id": replay["id"], "mode": mode, "status": summary["status"]},
+        )
     return _public_replay(replay, include_generated=False)
 
 
@@ -6796,72 +7864,164 @@ def _append_proposal_totals_snapshot(trace: AuditTraceBuilder, job_id: int, prop
 
 @app.put("/api/jobs/{job_id}/proposal/bundles")
 @app.post("/api/jobs/{job_id}/proposal/bundles/save")
+@audit_route("proposal.save")
 async def api_save_proposal_bundles(job_id: str, request: Request):
     """Auto-save proposal editor state (bundles, notes, terms, GPM, etc.)."""
-    import json as _json
-    db_id = _resolve_job_id(job_id)
-    job = load_job(db_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    body = await request.json()
-    previous_proposal_data = job.get("proposal_data") or {}
+    raw_body = await request.body()
+    return await run_in_threadpool(_save_proposal_bundles, job_id, raw_body)
+
+
+# A proposal save that finds another save landed first (proposal_rev moved)
+# re-runs its checks against the newer proposal. Every retry means another
+# save made progress, so it ends in "ok", "stale_ignored" or a real conflict
+# from another tab; this limit only stops a bid that never stops saving.
+_PROPOSAL_SAVE_RETRY_SECONDS = 30
+_STALE_PROPOSAL_DETAIL = (
+    "This proposal changed in another tab or session. Your stale copy was not saved. "
+    "Reload the job and review the newer accepted proposal before editing again."
+)
+
+
+def _nonnegative_int(value, default: int = 0) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return default
+
+
+def _stored_proposal(raw) -> dict:
+    """proposal_data from a jobs row (JSON text) as a dict."""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _proposal_save_check(stored: dict, body: dict) -> dict:
+    """Compare an incoming proposal save with the stored proposal.
+
+    ``verdict`` is "ok"; "stale" (an older save from the same browser tab
+    arrived after a newer one, so it is ignored); or "conflict" (another tab
+    or person saved since this copy was loaded)."""
+    stored = stored or {}
     incoming_session_id = str(body.get("client_session_id") or "").strip()
-    try:
-        incoming_edit_version = max(0, int(body.get("client_edit_version") or 0))
-    except (TypeError, ValueError):
-        incoming_edit_version = 0
-    try:
-        incoming_save_sequence = max(0, int(body.get("client_save_sequence") or 0))
-    except (TypeError, ValueError):
-        incoming_save_sequence = 0
-    stored_session_id = str(previous_proposal_data.get("_client_session_id") or "").strip()
-    try:
-        stored_edit_version = max(0, int(previous_proposal_data.get("_client_edit_version") or 0))
-    except (TypeError, ValueError):
-        stored_edit_version = 0
-    try:
-        stored_save_sequence = max(0, int(previous_proposal_data.get("_client_save_sequence") or 0))
-    except (TypeError, ValueError):
-        stored_save_sequence = 0
-    try:
-        stored_server_revision = max(0, int(previous_proposal_data.get("_server_revision") or 0))
-    except (TypeError, ValueError):
-        stored_server_revision = 0
-    incoming_base_revision_present = "base_server_revision" in body
-    try:
-        incoming_base_revision = max(0, int(body.get("base_server_revision") or 0))
-    except (TypeError, ValueError):
-        incoming_base_revision = -1
+    incoming_edit_version = _nonnegative_int(body.get("client_edit_version"))
+    incoming_save_sequence = _nonnegative_int(body.get("client_save_sequence"))
+    stored_session_id = str(stored.get("_client_session_id") or "").strip()
+    stored_edit_version = _nonnegative_int(stored.get("_client_edit_version"))
+    stored_save_sequence = _nonnegative_int(stored.get("_client_save_sequence"))
+    stored_server_revision = _nonnegative_int(stored.get("_server_revision"))
+    incoming_base_revision = _nonnegative_int(body.get("base_server_revision"), default=-1)
     same_client_session = bool(incoming_session_id and incoming_session_id == stored_session_id)
-    if (
-        same_client_session
-        and (
-            incoming_save_sequence < stored_save_sequence
-            or incoming_edit_version < stored_edit_version
-        )
+    if same_client_session and (
+        incoming_save_sequence < stored_save_sequence or incoming_edit_version < stored_edit_version
     ):
-        return {
-            "status": "stale_ignored",
-            "stale_save_ignored": True,
-            "manual_trace_count": 0,
-            "trace_count": 0,
-            "audit_trace": None,
-            "audit": None,
-            "proposal_data": previous_proposal_data,
-        }
-    if (
+        verdict = "stale"
+    elif (
         incoming_session_id
         and not same_client_session
-        and incoming_base_revision_present
+        and "base_server_revision" in body
         and incoming_base_revision != stored_server_revision
     ):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "This proposal changed in another tab or session. Your stale copy was not saved. "
-                "Reload the job and review the newer accepted proposal before editing again."
-            ),
-        )
+        verdict = "conflict"
+    else:
+        verdict = "ok"
+    return {
+        "verdict": verdict,
+        "incoming_session_id": incoming_session_id,
+        "incoming_edit_version": incoming_edit_version,
+        "incoming_save_sequence": incoming_save_sequence,
+        "stored_server_revision": stored_server_revision,
+    }
+
+
+def _stale_proposal_save_result(stored: dict) -> dict:
+    return {
+        "status": "stale_ignored",
+        "stale_save_ignored": True,
+        "manual_trace_count": 0,
+        "trace_count": 0,
+        "audit_trace": None,
+        "audit": None,
+        "proposal_data": stored,
+    }
+
+
+def _proposal_layout_changed(previous: dict, current: dict, changes: list[dict]) -> bool:
+    """True when this save added, removed or moved bundles (or rows inside them).
+
+    Bundles have no ids yet, so the history names them by position
+    ("/proposal/bundles/2/description_text"). After a layout change the same
+    position can be a different bundle, so such a save must not join an open
+    history entry, and it closes the open ones so later edits start fresh.
+    """
+    before = [bundle for bundle in (previous or {}).get("bundles") or [] if isinstance(bundle, dict)]
+    after = [bundle for bundle in (current or {}).get("bundles") or [] if isinstance(bundle, dict)]
+    if len(before) != len(after):
+        return True
+    # One renamed bundle keeps its place; two or more names changing at once
+    # is a reorder (or looks just like one).
+    renamed = sum(1 for old, new in zip(before, after) if old.get("bundle_name") != new.get("bundle_name"))
+    if renamed > 1:
+        return True
+    for change in changes:
+        if change.get("op") not in ("add", "remove"):
+            continue
+        parts = audit.split_path(change.get("path"))
+        if len(parts) >= 3 and parts[:2] == ["proposal", "bundles"] and parts[-1].isdigit():
+            return True
+    return False
+
+
+def _proposal_edit_group(changes: list[dict]) -> audit.GroupPolicy:
+    """Autosaves while typing join one history entry: text edits stay open
+    longer than number edits."""
+    edited = [change for change in changes if not change.get("derived")] or changes
+    if edited and all(
+        change.get("op") == "lines" or isinstance(change.get("after"), str) or isinstance(change.get("before"), str)
+        for change in edited
+    ):
+        return audit.TEXT_EDITS
+    return audit.NUMBER_EDITS
+
+
+def _save_proposal_bundles(job_id: str, raw_body: bytes):
+    db_id = _resolve_job_id(job_id)
+    body = json.loads(raw_body)
+    # The stale-copy checks run against the stored proposal, and the save only
+    # goes through if nobody saved since (checked again under the bid's lock).
+    # If someone did, the checks run again against their save. Losing that
+    # race is never itself a conflict: only the checks decide on a 409.
+    give_up_at = time.monotonic() + _PROPOSAL_SAVE_RETRY_SECONDS
+    while True:
+        job = load_job(db_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        base_proposal_rev = int(job.get("proposal_rev") or 0)
+        result = _try_save_proposal_bundles(db_id, job, body, base_proposal_rev)
+        if result is not None:
+            return result
+        if time.monotonic() >= give_up_at:
+            raise JobBusyError()
+
+
+def _try_save_proposal_bundles(db_id: int, job: dict, body: dict, base_proposal_rev: int) -> dict | None:
+    """One save attempt; None when another save landed after ``job`` was
+    loaded and passed the checks, so this save must be rebuilt on top of it."""
+    previous_proposal_data = job.get("proposal_data") or {}
+    check = _proposal_save_check(previous_proposal_data, body)
+    if check["verdict"] == "stale":
+        audit.note_checked(db_id)  # nothing saved
+        return _stale_proposal_save_result(previous_proposal_data)
+    if check["verdict"] == "conflict":
+        raise HTTPException(status_code=409, detail=_STALE_PROPOSAL_DETAIL)
+    incoming_session_id = check["incoming_session_id"]
+    incoming_edit_version = check["incoming_edit_version"]
+    incoming_save_sequence = check["incoming_save_sequence"]
+    stored_server_revision = check["stored_server_revision"]
     proposal_data = {
         "bundles": body.get("bundles", []),
         "notes": body.get("notes", []),
@@ -6897,8 +8057,32 @@ async def api_save_proposal_bundles(job_id: str, request: Request):
             "trace_count": audit_result["trace_count"],
             "summary": audit_result["audit_trace"].get("audit", {}),
         }
-    job["proposal_data"] = proposal_data
-    save_job(job)
+    changes = audit.diff(previous_proposal_data, proposal_data, "/proposal", entity_type="job")
+    described = audit.describe_changes(changes, "proposal")
+    summary = f"Edited the proposal ({described[:1].lower()}{described[1:]})" if changes else "Saved the proposal"
+    if _proposal_layout_changed(previous_proposal_data, proposal_data, changes):
+        group = None
+    else:
+        group = _proposal_edit_group(changes)
+    landed_first = None  # the newer stored proposal, when another save got in first
+    try:
+        with job_write(db_id, action="proposal.save", scopes=("proposal",),
+                       group=group, summary=summary) as tx:
+            if int(tx.row.get("proposal_rev") or 0) != base_proposal_rev:
+                # Another save landed after this one loaded the proposal. Check
+                # against it here, under the bid's lock, so an older save from
+                # the same tab is dropped now instead of being retried.
+                landed_first = _stored_proposal(tx.row.get("proposal_data"))
+                if _proposal_save_check(landed_first, body)["verdict"] == "conflict":
+                    raise HTTPException(status_code=409, detail=_STALE_PROPOSAL_DETAIL)
+            else:
+                set_proposal_data(tx.conn, db_id, proposal_data, expected_rev=base_proposal_rev)
+    except ProposalConflictError:
+        return None
+    if landed_first is not None:
+        if _proposal_save_check(landed_first, body)["verdict"] == "stale":
+            return _stale_proposal_save_result(landed_first)
+        return None  # still the newest edit: rebuild it on top of the other save
     return {
         "status": "ok",
         "manual_trace_count": audit_result.get("manual_trace_count", 0),
@@ -7287,6 +8471,7 @@ def _validate_proposal_pdf_download_ready(job: dict) -> None:
 
 
 @app.post("/api/jobs/{job_id}/proposal/generate")
+@audit_route("proposal.generate")
 def api_generate_proposal(job_id: str):
     """Auto-bundle materials into proposal line items.
 
@@ -7306,6 +8491,8 @@ def api_generate_proposal(job_id: str):
     existing_by_codes: dict[tuple[str, ...], list[dict]] = {}
     existing_pd = job.get("proposal_data") or {}
     has_saved_accepted_proposal = bool(existing_pd.get("bundles"))
+    # A first generation is saved only if nobody saved a proposal meanwhile.
+    base_proposal_rev = int(job.get("proposal_rev") or 0)
     for b in (existing_pd.get("bundles") or []):
         mats = b.get("materials") or []
         if not mats:
@@ -7336,6 +8523,7 @@ def api_generate_proposal(job_id: str):
 
     # Always recalculate sundries and labor to reflect latest rules/flags
     materials = job.get("materials", [])
+    loaded_materials = copy.deepcopy(materials)
     unit_count = job.get("unit_count", 0) or 0
     tub_shower_count = job.get("tub_shower_count", 0) or 0
 
@@ -7400,8 +8588,6 @@ def api_generate_proposal(job_id: str):
             source=mat.get("price_source") or "waste_factors",
         )
         waste_touched = True
-    if waste_touched:
-        save_materials(job["id"], materials)
 
     # Stamp job-level counts onto materials so sundry_calc can use them
     for mat in materials:
@@ -7411,11 +8597,20 @@ def api_generate_proposal(job_id: str):
         if mtype == "tub_shower_surround":
             mat["tub_shower_total"] = tub_shower_count  # total tubs/showers on job
 
+    sundries = labor_items = None
     if materials:
         sundries = calculate_sundries_for_materials(materials, trace=trace)
-        save_sundries(job["id"], sundries)
         labor_items = calculate_labor_for_materials(materials, trace=trace)
-        save_labor(job["id"], labor_items)
+    # The new waste figures, sundries and labor are saved together. Only the
+    # waste fields this step changed are written onto the lines.
+    with job_write(db_id, action="proposal.generate", scopes=("materials", "sundries", "labor"),
+                   summary="Recalculated waste, sundries and labor for the proposal") as tx:
+        if waste_touched:
+            _apply_material_patches(tx.conn, db_id, loaded_materials, materials)
+        if sundries is not None:
+            save_sundries(db_id, sundries, conn=tx.conn)
+            save_labor(db_id, labor_items, conn=tx.conn)
+    if materials:
         # Reload job with freshly calculated sundries/labor
         job = load_job(db_id)
 
@@ -7530,22 +8725,36 @@ def api_generate_proposal(job_id: str):
         except (TypeError, ValueError):
             prior_revision = 0
         proposal["_server_revision"] = prior_revision + 1
-        saved_job = load_job(db_id) or job
-        saved_job["proposal_data"] = proposal
-        save_job(saved_job)
+        bundle_count = len(proposal.get("bundles") or [])
+        grand_total = _as_number(proposal.get("grand_total")) or 0
+        try:
+            with job_write(db_id, action="proposal.generate", scopes=("proposal",),
+                           summary=f"Generated the proposal: {bundle_count} bundles, total ${grand_total:,.2f}") as tx:
+                set_proposal_data(tx.conn, db_id, proposal, expected_rev=base_proposal_rev)
+        except ProposalConflictError:
+            raise HTTPException(
+                status_code=409,
+                detail="Someone saved this proposal while it was being generated. Reload the job and generate it again.",
+            )
     return proposal
 
 
 @app.post("/api/jobs/{job_id}/proposal/pdf")
+@audit_route("proposal.pdf")
 async def api_generate_proposal_pdf(job_id: str, request: Request):
     """Generate proposal PDF from edited bundle data."""
+    raw_body = await request.body()
+    return await run_in_threadpool(_generate_proposal_pdf, job_id, raw_body)
+
+
+def _generate_proposal_pdf(job_id: str, raw_body: bytes) -> dict:
     import json as _json
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    body = await request.json()
+    body = json.loads(raw_body)
     _validate_proposal_pdf_ready(job, body)
     # Build proposal data from the edited bundles sent by frontend
     job_info = {
@@ -7630,13 +8839,21 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
     generate_proposal_pdf(proposal_data, pdf_path)
     _record_artifact(job["id"], pdf_path, "proposal_pdf")
 
-    # Save proposal data to job
-    job["proposal_data"] = _json.dumps(proposal_data)
-    save_job(job)
-
-    log_activity(job["id"], "proposal_generated",
-                 f"Proposal generated: {len(proposal_data['bundles'])} bundles, total ${proposal_data['grand_total']:,.2f}",
-                 {"bundle_count": len(proposal_data["bundles"]), "grand_total": proposal_data["grand_total"]})
+    # Save proposal data to job, only if nobody saved the proposal while the
+    # PDF was being made (that PDF would print an older proposal).
+    summary = f"Proposal generated: {len(proposal_data['bundles'])} bundles, total ${proposal_data['grand_total']:,.2f}"
+    try:
+        with job_write(job["id"], action="proposal.pdf", scopes=("proposal",), summary=summary,
+                       extra={"pdf": {"file_hash": _file_hash(pdf_path)}}) as tx:
+            tx.force_record()
+            set_proposal_data(tx.conn, job["id"], proposal_data, expected_rev=int(job.get("proposal_rev") or 0))
+            log_activity(job["id"], "proposal_generated", summary,
+                         {"bundle_count": len(proposal_data["bundles"]), "grand_total": proposal_data["grand_total"]})
+    except ProposalConflictError:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot generate PDF because the proposal was saved again while the PDF was being made. Try again.",
+        )
 
     return {"status": "ok", "pdf_url": f"/api/jobs/{job_id}/proposal.pdf"}
 
@@ -7661,22 +8878,24 @@ def api_download_proposal_pdf(job_id: str):
 
 
 @app.post("/api/labor-catalog/upload")
-async def api_upload_labor_catalog(file: UploadFile = File(...)):
+@audit_route("labor_catalog.upload")
+def api_upload_labor_catalog(file: UploadFile = File(...)):
     """Upload labor catalog (Excel or PDF)."""
     file_path = os.path.join(UPLOAD_DIR, f"labor_catalog_{file.filename}")
     with open(file_path, "wb") as f:
-        content = await file.read()
+        content = file.file.read()
         f.write(content)
 
     ext = os.path.splitext(file.filename)[1].lower()
+    # Read the file first (a PDF goes through AI), then save it in one audited step.
     try:
         if ext == ".pdf":
             settings = get_settings()
             api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
             model = settings.get("openai_model", "gpt-5-mini")
-            catalog = load_labor_catalog_from_pdf(file_path, api_key=api_key, model=model)
+            catalog = load_labor_catalog_from_pdf(file_path, api_key=api_key, model=model, save=False)
         elif ext in (".xlsx", ".xls"):
-            catalog = load_labor_catalog(file_path)
+            catalog = load_labor_catalog(file_path, save=False)
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Upload .pdf or .xlsx")
     except HTTPException:
@@ -7684,6 +8903,10 @@ async def api_upload_labor_catalog(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse labor catalog: {e}")
 
+    with entity_write("labor_catalog", WHOLE_LIST, _load_labor_catalog, "labor_catalog.upload",
+                      summary=f"Uploaded the labor catalog from {file.filename} ({_count(len(catalog), 'entry', 'entries')})",
+                      extra={"file_name": file.filename}) as tx:
+        save_labor_catalog_entries(catalog, conn=tx.conn)
     return {"message": "Labor catalog loaded", "entries": len(catalog)}
 
 
@@ -7694,17 +8917,16 @@ class ExclusionsUpdate(BaseModel):
 
 
 @app.put("/api/jobs/{job_id}/exclusions")
+@audit_route("job.exclusions.update")
 def api_update_exclusions(job_id: str, body: ExclusionsUpdate):
     """Update job-specific exclusions list."""
-    import json as _json
     db_id = _resolve_job_id(job_id)
-    job = load_job(db_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    job["exclusions"] = _json.dumps(body.exclusions)
-    save_job(job)
     excl_count = len(body.exclusions) if body.exclusions else 0
-    log_activity(job["id"], "exclusions_updated", f"Updated exclusions ({excl_count} items)")
+    summary = f"Updated exclusions ({excl_count} items)"
+    with job_write(db_id, action="job.exclusions.update", scopes=("exclusions",), field_path="/exclusions",
+                   group=audit.TEXT_EDITS, summary=summary) as tx:
+        update_job_fields(tx.conn, db_id, {"exclusions": json.dumps(body.exclusions)})
+        log_activity(db_id, "exclusions_updated", summary)
     return {"message": "Exclusions saved", "exclusions": body.exclusions}
 
 
@@ -7784,34 +9006,55 @@ def api_get_stair_labor():
     return {"entries": stair_entries}
 
 
+def _labor_entry_name(entry: dict | None) -> str:
+    entry = entry or {}
+    return str(entry.get("description") or entry.get("labor_type") or "an entry")
+
+
 @app.post("/api/labor-catalog/entry")
+@audit_route("labor_catalog.create")
 def api_insert_labor_catalog_entry(body: dict):
     """Insert a single labor catalog entry; returns the new entry id."""
-    from models import insert_labor_catalog_entry
-    new_id = insert_labor_catalog_entry(body)
+    with entity_write("labor_catalog", None, _load_labor_catalog_entry, "labor_catalog.create",
+                      summary=f"Added '{_labor_entry_name(body)}' to the labor catalog") as tx:
+        new_id = insert_labor_catalog_entry(body, conn=tx.conn)
+        tx.entity_id = new_id
     return {"id": new_id}
 
 
 @app.put("/api/labor-catalog/{entry_id}")
+@audit_route("labor_catalog.update")
 def api_update_labor_catalog_entry(entry_id: int, body: dict):
     """Update a single labor catalog entry."""
-    if not update_labor_catalog_entry(entry_id, body):
+    # A form save: quick re-saves of the same entry join one history entry.
+    with entity_write("labor_catalog", entry_id, _load_labor_catalog_entry, "labor_catalog.update",
+                      audit.NUMBER_EDITS,
+                      summary=f"Changed '{_labor_entry_name(body)}' in the labor catalog") as tx:
+        found = update_labor_catalog_entry(entry_id, body, conn=tx.conn)
+    if not found:
         raise HTTPException(status_code=404, detail="Entry not found")
     return {"message": "Entry updated"}
 
 
 @app.delete("/api/labor-catalog/{entry_id}")
+@audit_route("labor_catalog.delete")
 def api_delete_labor_catalog_entry(entry_id: int):
     """Delete a single labor catalog entry."""
-    if not delete_labor_catalog_entry(entry_id):
+    with entity_write("labor_catalog", entry_id, _load_labor_catalog_entry, "labor_catalog.delete") as tx:
+        found = delete_labor_catalog_entry(entry_id, conn=tx.conn)
+        tx.set_summary(f"Removed '{_labor_entry_name(tx.before)}' from the labor catalog")
+    if not found:
         raise HTTPException(status_code=404, detail="Entry not found")
     return {"message": "Entry deleted"}
 
 
 @app.delete("/api/labor-catalog")
+@audit_route("labor_catalog.clear")
 def api_clear_labor_catalog():
     """Clear all labor catalog entries."""
-    clear_labor_catalog()
+    with entity_write("labor_catalog", WHOLE_LIST, _load_labor_catalog, "labor_catalog.clear") as tx:
+        clear_labor_catalog(conn=tx.conn)
+        tx.set_summary(f"Cleared the labor catalog ({_count(len(tx.before['entries']), 'entry', 'entries')})")
     return {"message": "Labor catalog cleared"}
 
 
@@ -7841,7 +9084,9 @@ def _seed_company_rates():
     ]:
         existing = get_company_rate(rate_type)
         if existing is None:
-            save_company_rate(rate_type, _json.dumps(default_data))
+            with entity_write("company_rates", rate_type, _load_company_rate, "company_rates.seed",
+                              summary=f"Added the default {rate_type.replace('_', ' ')}") as tx:
+                save_company_rate(rate_type, _json.dumps(default_data), conn=tx.conn)
             print(f"[seed] Seeded {rate_type} from config.py defaults")
 
 
@@ -7866,12 +9111,16 @@ class CompanyRateUpdate(BaseModel):
 
 
 @app.put("/api/company-rates/{rate_type}")
+@audit_route("company_rates.update")
 def api_update_company_rate(rate_type: str, body: CompanyRateUpdate):
     """Update a company rate."""
     import json as _json
     if rate_type not in ("sundry_rules", "waste_factors", "freight_rates", "sundry_prices"):
         raise HTTPException(status_code=400, detail=f"Invalid rate type: {rate_type}")
-    save_company_rate(rate_type, _json.dumps(body.data))
+    # A table of numbers saved as people edit: quick re-saves join one entry.
+    with entity_write("company_rates", rate_type, _load_company_rate, "company_rates.update",
+                      audit.NUMBER_EDITS, summary=f"Changed {rate_type.replace('_', ' ')}") as tx:
+        save_company_rate(rate_type, _json.dumps(body.data), conn=tx.conn)
     return {"message": f"{rate_type} updated"}
 
 
@@ -7894,24 +9143,38 @@ class PriceListEntry(BaseModel):
 
 
 @app.post("/api/price-list")
+@audit_route("price_list.create")
 def api_add_price_list_entry(body: PriceListEntry):
     """Add a single price list entry."""
-    entry_id = add_price_list_entry(body.model_dump())
+    with entity_write("price_list", None, _load_price_list_entry, "price_list.create",
+                      summary=f"Added '{body.product_name}' to the price list") as tx:
+        entry_id = add_price_list_entry(body.model_dump(), conn=tx.conn)
+        tx.entity_id = entry_id
     return {"id": entry_id, "message": "Entry added"}
 
 
 @app.put("/api/price-list/{entry_id}")
+@audit_route("price_list.update")
 def api_update_price_list_entry(entry_id: int, body: PriceListEntry):
     """Update a price list entry."""
-    if not update_price_list_entry(entry_id, body.model_dump()):
+    # A form save: quick re-saves of the same entry join one history entry.
+    with entity_write("price_list", entry_id, _load_price_list_entry, "price_list.update", audit.NUMBER_EDITS,
+                      summary=f"Changed '{body.product_name}' in the price list") as tx:
+        found = update_price_list_entry(entry_id, body.model_dump(), conn=tx.conn)
+    if not found:
         raise HTTPException(status_code=404, detail="Entry not found")
     return {"message": "Entry updated"}
 
 
 @app.delete("/api/price-list/{entry_id}")
+@audit_route("price_list.delete")
 def api_delete_price_list_entry(entry_id: int):
     """Delete a price list entry."""
-    if not delete_price_list_entry(entry_id):
+    with entity_write("price_list", entry_id, _load_price_list_entry, "price_list.delete") as tx:
+        found = delete_price_list_entry(entry_id, conn=tx.conn)
+        if found:
+            tx.set_summary(f"Removed '{(tx.before or {}).get('product_name') or 'an entry'}' from the price list")
+    if not found:
         raise HTTPException(status_code=404, detail="Entry not found")
     return {"message": "Entry deleted"}
 
@@ -7920,27 +9183,38 @@ class PriceListBulkUpload(BaseModel):
     entries: list[dict]
 
 
+def _replace_price_list_audited(entries: list[dict], action: str, summary: str, extra: dict | None = None) -> None:
+    with entity_write("price_list", WHOLE_LIST, _load_price_list, action, summary=summary, extra=extra) as tx:
+        save_price_list_entries(entries, conn=tx.conn)
+
+
 @app.post("/api/price-list/bulk")
+@audit_route("price_list.replace")
 def api_bulk_upload_price_list(body: PriceListBulkUpload):
     """Replace all price list entries (bulk upload)."""
-    save_price_list_entries(body.entries)
+    _replace_price_list_audited(body.entries, "price_list.replace",
+                                f"Replaced the price list ({_count(len(body.entries), 'entry', 'entries')})")
     return {"message": "Price list updated", "count": len(body.entries)}
 
 
 @app.delete("/api/price-list")
+@audit_route("price_list.clear")
 def api_clear_price_list():
     """Clear all price list entries."""
-    clear_price_list()
+    with entity_write("price_list", WHOLE_LIST, _load_price_list, "price_list.clear") as tx:
+        clear_price_list(conn=tx.conn)
+        tx.set_summary(f"Cleared the price list ({_count(len(tx.before['entries']), 'entry', 'entries')})")
     return {"message": "Price list cleared"}
 
 
 @app.post("/api/price-list/upload")
-async def api_upload_price_list(file: UploadFile = File(...)):
+@audit_route("price_list.upload")
+def api_upload_price_list(file: UploadFile = File(...)):
     """Upload price list from CSV or Excel file."""
     import json as _json
     file_path = os.path.join(UPLOAD_DIR, f"price_list_{file.filename}")
     with open(file_path, "wb") as f:
-        content = await file.read()
+        content = file.file.read()
         f.write(content)
 
     ext = os.path.splitext(file.filename)[1].lower()
@@ -7988,7 +9262,9 @@ async def api_upload_price_list(file: UploadFile = File(...)):
     if not entries:
         raise HTTPException(status_code=400, detail="No entries found in uploaded file")
 
-    save_price_list_entries(entries)
+    _replace_price_list_audited(entries, "price_list.upload",
+                                f"Uploaded the price list from {file.filename} ({_count(len(entries), 'entry', 'entries')})",
+                                {"file_name": file.filename})
     return {"message": "Price list uploaded", "count": len(entries)}
 
 
@@ -8077,8 +9353,10 @@ def api_get_settings():
 
 
 @app.post("/api/settings")
+@audit_route("settings.update")
 def api_update_settings(body: SettingsUpdate):
-    """Update app settings."""
+    """Update app settings. The history shows which settings changed; API
+    keys and the mailbox password show only as "changed" (audit redaction)."""
     updates = {}
     if body.openai_api_key is not None:
         updates["openai_api_key"] = body.openai_api_key
@@ -8101,8 +9379,16 @@ def api_update_settings(body: SettingsUpdate):
         updates["bid_folder_path"] = body.bid_folder_path
     if body.vendor_quote_test_mode is not None:
         updates["vendor_quote_test_mode"] = body.vendor_quote_test_mode
+    if not updates:
+        audit.note_checked()  # nothing sent, nothing saved
     if updates:
-        save_settings(updates)
+        # A form: quick re-saves join one history entry.
+        with entity_write("settings", "app", _load_settings, "settings.update", audit.NUMBER_EDITS) as tx:
+            stored = {row["key"]: row["value"] for row in tx.conn.execute("SELECT key, value FROM app_settings")}
+            changed = [key for key, value in updates.items() if stored.get(key) != str(value)]
+            save_settings(updates, conn=tx.conn)
+            if changed:
+                tx.set_summary("Changed settings: " + ", ".join(SETTING_LABELS.get(key, key) for key in changed))
         # Apply API key and model to quote parser
         settings = get_settings()
         _apply_openai_config(settings)
@@ -8139,69 +9425,191 @@ def _apply_openai_config(settings: dict = None):
 # ── Vendor Pricing Intelligence ───────────────────────────────────────────────
 
 @app.get("/api/vendors")
-async def api_list_vendors():
+def api_list_vendors():
     return list_vendors()
 
 
 @app.get("/api/vendors/{vendor_id}")
-async def api_get_vendor(vendor_id: int):
+def api_get_vendor(vendor_id: int):
     v = get_vendor(vendor_id)
     if not v:
         raise HTTPException(status_code=404, detail="Vendor not found")
     return v
 
 
+def _vendor_name(vendor: dict | None, fallback: str = "a vendor") -> str:
+    return str((vendor or {}).get("name") or fallback)
+
+
+def _create_vendor_audited(data: dict) -> dict:
+    with entity_write("vendor", None, _load_vendor, "vendor.create",
+                      summary=f"Added vendor {_vendor_name(data)}") as tx:
+        vendor = create_vendor(data, conn=tx.conn)
+        tx.entity_id = vendor["id"]
+    return vendor
+
+
+def _update_vendor_audited(vendor_id: int, data: dict) -> None:
+    # A contact form: quick re-saves of the same vendor join one history entry.
+    with entity_write("vendor", vendor_id, _load_vendor, "vendor.update", audit.NUMBER_EDITS) as tx:
+        update_vendor(vendor_id, data, conn=tx.conn)
+        tx.set_summary(f"Changed vendor {_vendor_name(tx.before or data)}")
+
+
 @app.post("/api/vendors")
+@audit_route("vendor.create")
 async def api_create_vendor(request: Request):
     data = await request.json()
     try:
-        vendor = create_vendor(data)
+        vendor = await run_in_threadpool(_create_vendor_audited, data)
         return vendor
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.put("/api/vendors/{vendor_id}")
+@audit_route("vendor.update")
 async def api_update_vendor(vendor_id: int, request: Request):
     data = await request.json()
-    update_vendor(vendor_id, data)
+    await run_in_threadpool(_update_vendor_audited, vendor_id, data)
     return {"ok": True}
 
 
 @app.delete("/api/vendors/{vendor_id}")
-async def api_delete_vendor(vendor_id: int):
-    if delete_vendor(vendor_id):
+@audit_route("vendor.delete")
+def api_delete_vendor(vendor_id: int):
+    with entity_write("vendor", vendor_id, _load_vendor, "vendor.delete") as tx:
+        deleted = delete_vendor(vendor_id, conn=tx.conn)
+        if deleted:
+            prices = (tx.before or {}).get("price_count") or 0
+            tx.set_summary(f"Deleted vendor {_vendor_name(tx.before)}"
+                           + (f" and its {_count(prices, 'saved price')}" if prices else ""))
+    if deleted:
         return {"ok": True}
     raise HTTPException(status_code=404, detail="Vendor not found")
 
 
+def _merge_vendors_audited(keep_id: int, merge_ids: list[int]) -> None:
+    """Merge vendors into ``keep_id``: one history entry on the kept vendor,
+    plus one on each bid whose materials now carry the kept vendor's name.
+    Those bids are changed under their own locks and get a new version."""
+    others = [mid for mid in dict.fromkeys(merge_ids) if mid != keep_id]
+    conn = _get_conn()
+    try:
+        names = {
+            row["id"]: row["name"]
+            for row in conn.execute(
+                f"SELECT id, name FROM vendors WHERE id IN ({', '.join('?' for _ in [keep_id, *others])})",
+                [keep_id, *others],
+            ).fetchall()
+        }
+        merged_names = [names[mid] for mid in others if mid in names]
+        job_ids = sorted({
+            row["job_id"]
+            for row in conn.execute(
+                f"SELECT DISTINCT job_id FROM job_materials WHERE vendor IN ({', '.join('?' for _ in merged_names)})",
+                merged_names,
+            ).fetchall()
+        }) if merged_names else []
+    finally:
+        conn.close()
+    if keep_id not in names:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    keep_name = names[keep_id]
+
+    held = []
+    try:
+        for job_id in job_ids:  # always in id order, so two merges can't wait on each other
+            lock = job_lock(job_id)
+            if not lock.acquire(timeout=LOCK_WAIT_SECONDS):
+                raise JobBusyError()
+            held.append(lock)
+        with entity_write(
+            "vendor", keep_id, _load_vendor, "vendor.merge",
+            summary=f"Merged {', '.join(merged_names) or 'no other vendors'} into {keep_name}",
+        ) as tx:
+            merged = {mid: _load_vendor(tx.conn, mid) for mid in others}
+            merged = {mid: vendor for mid, vendor in merged.items() if vendor}
+            renamed = tx.conn.execute(
+                f"SELECT id, job_id, vendor FROM job_materials WHERE vendor IN ({', '.join('?' for _ in merged_names)})",
+                merged_names,
+            ).fetchall() if merged_names else []
+            merge_vendors(keep_id, merge_ids, conn=tx.conn)
+            tx.add_changes([
+                {"path": f"/merged_vendors/{mid}", "op": "remove", "before": vendor, "after": None}
+                for mid, vendor in merged.items()
+            ])
+            by_job: dict[int, list] = {}
+            for row in renamed:
+                by_job.setdefault(row["job_id"], []).append(row)
+            now, who = audit.iso_ms(audit.utc_now()), audit.actor_label()
+            for job_id, rows in sorted(by_job.items()):
+                tx.conn.execute(
+                    "UPDATE jobs SET version = COALESCE(version, 0) + 1, updated_at = ?, updated_by = ? WHERE id = ?",
+                    (now, who, job_id),
+                )
+                audit.record(
+                    tx.conn,
+                    action="vendor.merge",
+                    entity_type="job",
+                    entity_id=job_id,
+                    job_id=job_id,
+                    summary=f"Vendor merged: {_count(len(rows), 'material')} now say {keep_name}",
+                    changes=[
+                        {"path": f"/materials/{row['id']}/vendor", "op": "replace",
+                         "before": row["vendor"], "after": keep_name}
+                        for row in rows
+                    ],
+                    extra={"vendor_id": keep_id},
+                )
+            tx.extra.update({"merged_vendor_ids": sorted(merged), "bids_changed": sorted(by_job)})
+    finally:
+        for lock in reversed(held):
+            lock.release()
+
+
 @app.post("/api/vendors/merge")
-async def api_merge_vendors(body: dict):
+@audit_route("vendor.merge")
+def api_merge_vendors(body: dict):
     keep_id = body.get("keep_id")
     merge_ids = body.get("merge_ids", [])
     if not keep_id or not merge_ids:
         raise HTTPException(status_code=400, detail="keep_id and merge_ids required")
-    from models import merge_vendors
-    merge_vendors(keep_id, merge_ids)
+    try:
+        keep_id = int(keep_id)
+        merge_ids = [int(mid) for mid in merge_ids]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="keep_id and merge_ids must be vendor numbers")
+    _merge_vendors_audited(keep_id, merge_ids)
     return {"ok": True}
 
 
 @app.get("/api/vendor-prices")
-async def api_search_vendor_prices(vendor: str = None, product: str = None, limit: int = 50):
+def api_search_vendor_prices(vendor: str = None, product: str = None, limit: int = 50):
     return search_vendor_prices(vendor, product, limit)
 
 
 @app.post("/api/vendor-prices/import")
-async def api_import_vendor_prices(file: UploadFile = File(...)):
+@audit_route("vendor_prices.import")
+def api_import_vendor_prices(file: UploadFile = File(...)):
     """Bulk import vendor prices from CSV. Accepts partial data - only product_name and unit_price required."""
-    contents = await file.read()
+    contents = file.file.read()
     text = contents.decode('utf-8-sig')  # handle BOM
-    result = import_vendor_prices_csv(text)
+    # The history lists each new price (and any vendor the import added).
+    with entity_write("vendor_price", None, lambda conn, entity_id: None, "vendor_prices.import") as tx:
+        last_vendor, last_price = _max_id(tx.conn, "vendors"), _max_id(tx.conn, "vendor_prices")
+        result = import_vendor_prices_csv(text, conn=tx.conn)
+        tx.add_changes(_added_rows(tx.conn, "vendors", last_vendor, ("name",), "/vendors"))
+        tx.add_changes(_added_rows(
+            tx.conn, "vendor_prices", last_price, ("product_name", "vendor_name", "unit_price", "unit"), "/vendor_prices",
+        ))
+        tx.set_summary(f"Imported {_count(result['imported'], 'vendor price')} from {file.filename}")
+        tx.extra.update({"file_name": file.filename, "imported": result["imported"], "rows_skipped": len(result["errors"])})
     return result
 
 
 @app.get("/api/materials/price-history")
-async def api_price_history(item_code: str = None, product: str = None, exclude_job: int = None):
+def api_price_history(item_code: str = None, product: str = None, exclude_job: int = None):
     return get_price_history(item_code, product, exclude_job)
 
 
@@ -8214,45 +9622,72 @@ def _require_quote_emails():
 
 
 @app.post("/api/jobs/{job_id}/quote-requests")
+@audit_route("quote_request.create")
 async def api_create_quote_request(job_id: str, request: Request):
+    raw_body = await request.body()
+    return await run_in_threadpool(_create_quote_request, job_id, raw_body)
+
+
+def _create_quote_request(job_id: str, raw_body: bytes):
     _require_quote_emails()
     db_id = _resolve_job_id(job_id)
-    data = await request.json()
+    data = json.loads(raw_body)
     vendor_name = data.get("vendor_name", "").strip()
     if not vendor_name:
         raise HTTPException(status_code=400, detail="vendor_name is required")
     status = data.get("status", "draft")
     sent_at = data.get("sent_at")
-    qr = create_quote_request(
-        job_id=db_id,
-        vendor_name=vendor_name,
-        material_ids=data.get("material_ids", []),
-        request_text=data.get("request_text", ""),
-        vendor_id=data.get("vendor_id"),
-        status=status,
-        sent_at=sent_at,
-    )
+    # Shows in the bid's history too (job_id).
+    with entity_write("quote_request", None, _load_quote_request, "quote_request.create", job_id=db_id,
+                      summary=f"Made a quote request for {vendor_name}") as tx:
+        qr = create_quote_request(
+            job_id=db_id,
+            vendor_name=vendor_name,
+            material_ids=data.get("material_ids", []),
+            request_text=data.get("request_text", ""),
+            vendor_id=data.get("vendor_id"),
+            status=status,
+            sent_at=sent_at,
+            conn=tx.conn,
+        )
+        tx.entity_id = qr["id"]
     return qr
 
 
 @app.get("/api/jobs/{job_id}/quote-requests")
-async def api_list_quote_requests(job_id: str):
+def api_list_quote_requests(job_id: str):
     db_id = _resolve_job_id(job_id)
     return list_quote_requests(db_id)
 
 
+def _update_quote_request_audited(request_id: int, data: dict) -> None:
+    # Only the quote request's own fields ("conn" would reach the database layer).
+    fields = {key: value for key, value in data.items() if isinstance(key, str) and key != "conn"}
+    with entity_write("quote_request", request_id, _load_quote_request, "quote_request.update",
+                      audit.NUMBER_EDITS) as tx:
+        tx.job_id = (tx.before or {}).get("job_id")
+        update_quote_request(request_id, conn=tx.conn, **fields)
+        tx.set_summary(f"Updated the quote request for {(tx.before or {}).get('vendor_name') or 'a vendor'}")
+
+
 @app.put("/api/quote-requests/{request_id}")
+@audit_route("quote_request.update")
 async def api_update_quote_request(request_id: int, request: Request):
     _require_quote_emails()
     data = await request.json()
-    update_quote_request(request_id, **data)
+    await run_in_threadpool(_update_quote_request_audited, request_id, data)
     return {"ok": True}
 
 
 @app.delete("/api/quote-requests/{request_id}")
-async def api_delete_quote_request(request_id: int):
+@audit_route("quote_request.delete")
+def api_delete_quote_request(request_id: int):
     _require_quote_emails()
-    if delete_quote_request(request_id):
+    with entity_write("quote_request", request_id, _load_quote_request, "quote_request.delete") as tx:
+        tx.job_id = (tx.before or {}).get("job_id")
+        deleted = delete_quote_request(request_id, conn=tx.conn)
+        tx.set_summary(f"Deleted the quote request for {(tx.before or {}).get('vendor_name') or 'a vendor'}")
+    if deleted:
         return {"ok": True}
     raise HTTPException(status_code=404, detail="Quote request not found")
 
@@ -8410,7 +9845,8 @@ def _quick_regex_extract(description: str) -> list[str]:
 
 
 @app.post("/api/jobs/{job_id}/detect-vendors")
-async def api_detect_vendors(job_id: str):
+@audit_route("materials.detect_vendors")
+def api_detect_vendors(job_id: str):
     """Hybrid vendor detection: memory + regex + AI.
 
     1. MEMORY: Check vendor_prices history and vendors table for known names/aliases
@@ -8428,7 +9864,11 @@ async def api_detect_vendors(job_id: str):
 
     materials = job.get("materials", [])
     if not materials:
+        audit.note_checked(db_id)  # nothing to look at, nothing saved
         return {"vendors": {}, "materials": []}
+    # Vendor on each line when this started: only lines nobody changed while
+    # the AI was working get the vendor it found.
+    loaded_vendors = [m.get("vendor") for m in materials]
 
     import json
 
@@ -8614,10 +10054,10 @@ async def api_detect_vendors(job_id: str):
     for m in materials:
         m.pop("_regex_candidate", None)
 
-    # ── Learning: save new vendor-product associations for future jobs ──
-    # When AI fills in or corrects a vendor, learn the association
-    conn = _get_conn()
-    try:
+    def learn_vendor_products(conn) -> list[dict]:
+        # ── Learning: save new vendor-product associations for future jobs ──
+        # When AI fills in or corrects a vendor, learn the association
+        learned = []
         for i, m in enumerate(materials):
             if method_log.get(i) in ("ai", "ai_corrected") and m.get("vendor"):
                 item_code = (m.get("item_code") or "").strip()
@@ -8634,18 +10074,37 @@ async def api_detect_vendors(job_id: str):
                         vendor_id = conn.execute(
                             "SELECT id FROM vendors WHERE name=? LIMIT 1", (m["vendor"],)
                         ).fetchone()
-                        conn.execute("""
+                        cur = conn.execute("""
                             INSERT INTO vendor_prices (product_name, product_normalized, vendor_name, vendor_id, job_id, unit_price, unit, quote_date, notes, created_at)
                             VALUES (?, ?, ?, ?, ?, 0, '', datetime('now'), 'Auto-learned from AI vendor detection', datetime('now'))
                         """, (product_name, normalized, m["vendor"], vendor_id["id"] if vendor_id else None, db_id))
-        conn.commit()
-    except Exception as e:
-        print(f"Learning save failed: {e}")
-    finally:
-        conn.close()
+                        learned.append({
+                            "path": f"/learned_vendor_products/{cur.lastrowid}", "op": "add", "before": None,
+                            "after": {"product_name": product_name, "vendor_name": m["vendor"]}, "derived": True,
+                        })
+        return learned
 
-    # Save updated vendor fields
-    save_materials(db_id, materials)
+    # Save the vendor names found (only on lines nobody changed meanwhile)
+    # and the learned pairs, in one audited step.
+    with job_write(db_id, action="materials.detect_vendors", scopes=("materials",)) as tx:
+        tx.conn.execute("SAVEPOINT learn_vendor_products")
+        try:
+            tx.add_changes(learn_vendor_products(tx.conn))
+        except Exception as e:
+            # Learning is a bonus: the vendor names still save without it.
+            tx.conn.execute("ROLLBACK TO SAVEPOINT learn_vendor_products")
+            print(f"Learning save failed: {e}")
+        finally:
+            tx.conn.execute("RELEASE SAVEPOINT learn_vendor_products")
+        saved = 0
+        for i, m in enumerate(materials):
+            if m.get("id") is None or (m.get("vendor") or None) == (loaded_vendors[i] or None):
+                continue
+            saved += tx.conn.execute(
+                "UPDATE job_materials SET vendor = ? WHERE id = ? AND job_id = ? AND vendor IS ?",
+                (m.get("vendor"), m["id"], db_id, loaded_vendors[i]),
+            ).rowcount
+        tx.set_summary(f"Found vendors for {_count(saved, 'material')}" if saved else "Learned vendor names for future bids")
 
     return {
         "vendor_groups": vendor_groups,
@@ -8660,15 +10119,21 @@ async def api_detect_vendors(job_id: str):
 
 
 @app.post("/api/jobs/{job_id}/generate-quote-text")
+@no_audit("AI draft only: returns suggested email text and saves nothing")
 async def api_generate_quote_text(job_id: str, request: Request):
     """Use AI to generate professional quote request text for a vendor."""
+    raw_body = await request.body()
+    return await run_in_threadpool(_generate_quote_text, job_id, raw_body)
+
+
+def _generate_quote_text(job_id: str, raw_body: bytes) -> dict:
     _require_quote_emails()
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    data = await request.json()
+    data = json.loads(raw_body)
     vendor_name = data.get("vendor_name", "")
     material_indices = data.get("material_indices", [])
     is_follow_up = data.get("follow_up", False)
@@ -8770,15 +10235,21 @@ Write a clean, professional email body. Requirements:
 
 
 @app.post("/api/jobs/{job_id}/suggest-vendors")
+@no_audit("AI suggestions only: returns suggested vendors and saves nothing")
 async def api_suggest_vendors(job_id: str, request: Request):
     """AI suggests which vendor to contact for unassigned materials based on history."""
+    raw_body = await request.body()
+    return await run_in_threadpool(_suggest_vendors, job_id, raw_body)
+
+
+def _suggest_vendors(job_id: str, raw_body: bytes) -> dict:
     _require_quote_emails()
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    data = await request.json()
+    data = json.loads(raw_body)
     material_indices = data.get("material_indices", [])
     materials = job.get("materials", [])
     unassigned = []
@@ -8870,10 +10341,15 @@ If you cannot suggest a vendor, omit that material from the array."""
 
 
 @app.post("/api/vendors/suggest-contacts")
+@no_audit("AI suggestions only: returns suggested contact details and saves nothing")
 async def api_suggest_vendor_contacts(request: Request):
     """Use AI to suggest contact info for vendors."""
     _require_quote_emails()
     data = await request.json()
+    return await run_in_threadpool(_suggest_vendor_contacts, data)
+
+
+def _suggest_vendor_contacts(data) -> dict:
     vendor_names = data.get("vendor_names", [])
     if not vendor_names:
         return {"suggestions": []}
@@ -8920,13 +10396,18 @@ Return ONLY a JSON array:
 # ── Notifications ────────────────────────────────────────────────────────────
 
 @app.get("/api/notifications")
-async def api_get_notifications(unread_only: bool = True):
+def api_get_notifications(unread_only: bool = True):
     return get_notifications(unread_only)
 
 
 @app.put("/api/notifications/{notification_id}/read")
-async def api_mark_notification_read(notification_id: int):
-    mark_notification_read(notification_id)
+@audit_route("notification.read")
+def api_mark_notification_read(notification_id: int):
+    with entity_write("notification", notification_id, _load_notification, "notification.read") as tx:
+        mark_notification_read(notification_id, conn=tx.conn)
+        tx.job_id = (tx.before or {}).get("job_id")
+        message = (tx.before or {}).get("message")
+        tx.set_summary(f"Marked a notification as read: {message}" if message else "Marked a notification as read")
     return {"ok": True}
 
 
@@ -8953,14 +10434,20 @@ def api_get_comments(job_id: str):
 class CommentCreate(BaseModel):
     text: str
 
+def _comment_for_audit(conn, comment_id):
+    row = conn.execute("SELECT id, job_id, text, user FROM job_comments WHERE id=?", (comment_id,)).fetchone()
+    return dict(row) if row else None
+
+
 @app.post("/api/jobs/{job_id}/comments")
+@audit_route("comment.add")
 def api_add_comment(job_id: str, body: CommentCreate):
     db_id = _resolve_job_id(job_id)
-    job = load_job(db_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    comment = add_comment(job["id"], body.text)
-    log_activity(job["id"], "comment_added", "Comment added", {"text": body.text})
+    with entity_write("comment", None, _comment_for_audit, "comment.add",
+                      summary="Comment added", job_id=db_id) as tx:
+        comment = add_comment(db_id, body.text, conn=tx.conn)
+        tx.entity_id = comment["id"]
+        log_activity(db_id, "comment_added", "Comment added", {"text": body.text})
     return comment
 
 
@@ -8973,7 +10460,17 @@ def api_price_book_summary():
     return get_price_book_summary()
 
 
+def _import_price_book_audited(vendor: str, items: list[dict], discount_pct: float, category: str = "") -> int:
+    """Replace one vendor's price book, with a history entry listing the rows
+    that changed (none when the same book is imported again)."""
+    with entity_write("price_book", vendor, _load_price_book, "price_book.import",
+                      summary=f"Imported the {vendor} price book ({_count(len(items), 'item')})",
+                      extra={"discount_pct": discount_pct, "category": category}) as tx:
+        return import_price_book(vendor, items, discount_pct, category, conn=tx.conn)
+
+
 @app.post("/api/price-book/import")
+@audit_route("price_book.import")
 def api_import_price_book(body: dict = Body(...)):
     """Import a vendor price book from JSON data.
     Body: {vendor, discount_pct, items: [{product_line, item_no, ...}]}
@@ -8984,7 +10481,7 @@ def api_import_price_book(body: dict = Body(...)):
     category = body.get("category", "")
     if not vendor or not items:
         raise HTTPException(status_code=400, detail="vendor and items required")
-    count = import_price_book(vendor, items, discount_pct, category)
+    count = _import_price_book_audited(vendor, items, discount_pct, category)
     return {"imported": count, "vendor": vendor}
 
 
@@ -8997,6 +10494,7 @@ def api_search_price_book(q: str = "", vendor: str = None):
 
 
 @app.post("/api/price-book/import-schluter")
+@audit_route("price_book.import")
 def api_import_schluter():
     """Import the pre-parsed Schluter price book (schluter_prices.json)."""
     json_path = os.path.join(os.path.dirname(__file__), "schluter_prices.json")
@@ -9005,7 +10503,7 @@ def api_import_schluter():
     import json as _json
     with open(json_path) as f:
         items = _json.load(f)
-    count = import_price_book("Schluter", items, discount_pct=0.55, category="transitions")
+    count = _import_price_book_audited("Schluter", items, discount_pct=0.55, category="transitions")
     return {"imported": count, "vendor": "Schluter", "discount": "45% of list (55% off)"}
 
 
@@ -9025,18 +10523,24 @@ def api_sim_status():
 
 
 @app.post("/api/jobs/{job_id}/send-quote-email")
+@audit_route("quote_request.email")
 async def api_send_quote_email(job_id: str, request: Request):
     """Send a vendor quote request email via SMTP.
 
     In test mode: routes to localhost:2525 (PowerShell relay → Vendor Simulator)
     In production: routes to real SMTP server → real vendor
     """
+    raw_body = await request.body()
+    return await run_in_threadpool(_send_quote_email, job_id, raw_body)
+
+
+def _send_quote_email(job_id: str, raw_body: bytes) -> dict:
     _require_quote_emails()
     db_id = _resolve_job_id(job_id)
     if not db_id:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    body = await request.json()
+    body = json.loads(raw_body)
     vendor_name = body.get("vendor_name", "").strip()
     vendor_email = body.get("vendor_email", "").strip()
     subject = body.get("subject", "").strip()
@@ -9070,23 +10574,99 @@ async def api_send_quote_email(job_id: str, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
 
-    # Create quote_request record (same as existing Mark Sent flow)
-    qr = create_quote_request(
-        job_id=db_id,
-        vendor_name=vendor_name,
-        material_ids=material_ids,
-        request_text=email_body,
-        vendor_id=vendor_id,
-        status="sent",
-        sent_at=body.get("sent_at") or __import__("datetime").datetime.utcnow().isoformat(),
-    )
-
+    # Create quote_request record (same as existing Mark Sent flow). One
+    # history entry on the bid: the activity text below is its summary.
     test_mode = str(settings.get("vendor_quote_test_mode", "false")).lower() == "true"
-    log_activity(db_id, "quote_email_sent",
-                 f"{'[SIM] ' if test_mode else ''}Quote email sent to {vendor_name} ({vendor_email})",
-                 {"vendor": vendor_name, "vendor_email": vendor_email, "test_mode": test_mode})
+    with entity_write("quote_request", None, _load_quote_request, "quote_request.email", job_id=db_id,
+                      extra={"vendor_email": vendor_email, "subject": subject, "test_mode": test_mode}) as tx:
+        qr = create_quote_request(
+            job_id=db_id,
+            vendor_name=vendor_name,
+            material_ids=material_ids,
+            request_text=email_body,
+            vendor_id=vendor_id,
+            status="sent",
+            sent_at=body.get("sent_at") or __import__("datetime").datetime.utcnow().isoformat(),
+            conn=tx.conn,
+        )
+        tx.entity_id = qr["id"]
+        log_activity(db_id, "quote_email_sent",
+                     f"{'[SIM] ' if test_mode else ''}Quote email sent to {vendor_name} ({vendor_email})",
+                     {"vendor": vendor_name, "vendor_email": vendor_email, "test_mode": test_mode})
 
     return {"status": "sent", "quote_request": qr, "test_mode": test_mode}
+
+
+# ── Audit trail (read) ───────────────────────────────────────────────────────
+# Who changed what, for everything. Open to everyone who is logged in.
+# Filters: job_id (id or slug), entity_type, entity_id, actor (username, or
+# "system"), action ("bid" also matches "bid.sent", ...), since/until (a date
+# or ISO time, UTC), q (text search). Newest first; pass next_before_id back
+# as before_id for the next page.
+
+def _audit_query_filters(**raw) -> dict:
+    job_ref = raw.pop("job_id", None)
+    try:
+        filters = audit.clean_filters(**raw)
+    except audit.AuditQueryError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    if job_ref not in (None, ""):
+        # A number is used as is, so history of a bid that's gone still shows.
+        job_id = int(job_ref) if str(job_ref).strip().isdigit() else resolve_job_ref(job_ref)
+        filters["job_id"] = job_id if job_id is not None else -1  # unknown slug: nothing matches
+    return filters
+
+
+@app.get("/api/audit")
+def api_audit_list(
+    job_id: Optional[str] = None, entity_type: Optional[str] = None, entity_id: Optional[str] = None,
+    actor: Optional[str] = None, action: Optional[str] = None, since: Optional[str] = None,
+    until: Optional[str] = None, q: Optional[str] = None, before_id: Optional[int] = None,
+    limit: int = audit.DEFAULT_PAGE_SIZE,
+):
+    filters = _audit_query_filters(job_id=job_id, entity_type=entity_type, entity_id=entity_id,
+                                   actor=actor, action=action, since=since, until=until, q=q)
+    return audit.query_entries(filters, before_id=before_id, limit=limit)
+
+
+# Registered before /api/audit/{audit_id} so "export.csv" isn't read as an id.
+@app.get("/api/audit/export.csv")
+def api_audit_export(
+    job_id: Optional[str] = None, entity_type: Optional[str] = None, entity_id: Optional[str] = None,
+    actor: Optional[str] = None, action: Optional[str] = None, since: Optional[str] = None,
+    until: Optional[str] = None, q: Optional[str] = None,
+):
+    filters = _audit_query_filters(job_id=job_id, entity_type=entity_type, entity_id=entity_id,
+                                   actor=actor, action=action, since=since, until=until, q=q)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
+    return StreamingResponse(
+        audit.iter_export_csv(filters),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="bid-tool-history-{stamp}.csv"'},
+    )
+
+
+@app.get("/api/audit/{audit_id}")
+def api_audit_entry(audit_id: int):
+    entry = audit.get_entry(audit_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="History entry not found")
+    return entry
+
+
+@app.get("/api/jobs/{job_id}/history")
+def api_job_history(
+    job_id: str, entity_type: Optional[str] = None, entity_id: Optional[str] = None,
+    actor: Optional[str] = None, action: Optional[str] = None, since: Optional[str] = None,
+    until: Optional[str] = None, q: Optional[str] = None, before_id: Optional[int] = None,
+    limit: int = audit.DEFAULT_PAGE_SIZE,
+):
+    """One bid's history (id or slug). A numeric id works even once the bid is gone."""
+    if not job_id.strip().isdigit() and resolve_job_ref(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    filters = _audit_query_filters(job_id=job_id, entity_type=entity_type, entity_id=entity_id,
+                                   actor=actor, action=action, since=since, until=until, q=q)
+    return audit.query_entries(filters, before_id=before_id, limit=limit)
 
 
 # ── Static Files (React frontend) ────────────────────────────────────────────

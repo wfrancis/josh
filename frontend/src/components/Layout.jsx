@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell, Building2, ListChecks, LogOut, ClipboardList, Users } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell, Building2, ListChecks, LogOut, ClipboardList, Users, History } from 'lucide-react'
 import { api } from '../api'
 import { useAuth } from '../auth'
 import { QUOTE_EMAILS_ENABLED } from '../features'
@@ -208,6 +208,7 @@ function SidebarContent({ location, onNavigate }) {
         <NavItem to="/" icon={LayoutDashboard} label="Dashboard" active={location.pathname === '/'} onClick={onNavigate} />
         <NavItem to="/jobs" icon={FolderOpen} label="All Jobs" active={location.pathname === '/jobs' || location.pathname.startsWith('/jobs/')} onClick={onNavigate} />
         <NavItem to="/bids" icon={ClipboardList} label="Bid Tracker" active={location.pathname === '/bids'} onClick={onNavigate} />
+        <NavItem to="/audit" icon={History} label="Audit" active={location.pathname === '/audit'} onClick={onNavigate} />
       </nav>
 
       {/* Bottom section */}

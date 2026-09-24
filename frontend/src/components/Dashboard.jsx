@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { api } from '../api'
 import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
+import BidStatusBadge from './BidStatusBadge'
 
 /* ── Stat Card ─────────────────────────────────────────── */
 function StatCard({ icon: Icon, label, value, gradient }) {
@@ -272,7 +273,11 @@ export default function Dashboard() {
                       <span>{new Date(job.created_at).toLocaleDateString()}</span>
                     </div>
                   </div>
-                  <StatusBadge status={status} />
+                  {/* Readiness and bid status (Won / Lost / Sent...) side by side; stacked on phones */}
+                  <div className="flex flex-col sm:flex-row items-end sm:items-center gap-1.5 sm:gap-2 flex-shrink-0">
+                    <StatusBadge status={status} />
+                    <BidStatusBadge status={job.bid_status} />
+                  </div>
                   {confidenceStatus && <span className="hidden sm:inline-flex"><StatusBadge status={confidenceStatus} /></span>}
                   <ChevronRight className="w-4 h-4 text-gray-600" />
                 </div>

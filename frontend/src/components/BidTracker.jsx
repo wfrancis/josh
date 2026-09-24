@@ -10,12 +10,14 @@ import {
   formatDay, formatTime, formatMoney, formatWhen, daysAgoText, dueText,
 } from '../bidTracker'
 
+// 'all' is the default tab (no ?tab= in the address), so every bid shows, won and lost included.
+const DEFAULT_TAB = 'all'
 const TABS = [
+  { key: 'all', label: 'All', statuses: null },
   { key: 'open', label: 'Open', statuses: OPEN_BID_STATUSES },
   { key: 'sent', label: 'Sent', statuses: ['Sent'] },
   { key: 'won', label: 'Won', statuses: ['Won'] },
   { key: 'lost', label: 'Lost', statuses: ['Lost'] },
-  { key: 'all', label: 'All', statuses: null },
 ]
 
 // Dates are 'YYYY-MM-DD', so plain string order is date order. Blank dates go last.
@@ -87,8 +89,8 @@ export default function BidTracker() {
   const [error, setError] = useState(null)
   const [search, setSearch] = useState('')
 
-  const tab = TABS.some(t => t.key === searchParams.get('tab')) ? searchParams.get('tab') : 'open'
-  const setTab = (key) => setSearchParams(key === 'open' ? {} : { tab: key }, { replace: true })
+  const tab = TABS.some(t => t.key === searchParams.get('tab')) ? searchParams.get('tab') : DEFAULT_TAB
+  const setTab = (key) => setSearchParams(key === DEFAULT_TAB ? {} : { tab: key }, { replace: true })
 
   useEffect(() => {
     api.getBidTracker()

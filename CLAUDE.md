@@ -42,6 +42,11 @@
 - All testing is done on Fly.io, never locally
 - App URL: https://si-bid-tool.fly.dev/
 
+### Audit trail checks
+- **Every write route needs `@audit_route("action", ...)` or `@no_audit("reason")`** (from `server/audit.py`). The Docker build runs `scripts/audit_route_coverage.py --missing`, so a deploy **fails** while any POST/PUT/PATCH/DELETE route has neither. Run it yourself first: `python3 scripts/audit_route_coverage.py`.
+- **Staging (`si-bid-stg-20260714-c0fa`) runs with `AUDIT_STRICT` on**: a write that saved data without a history entry answers 500 instead of only logging it. This is automatic on that app (the code checks Fly's `FLY_APP_NAME`); `fly secrets set AUDIT_STRICT=0 -a si-bid-stg-20260714-c0fa` turns it off, and `AUDIT_STRICT=1` turns it on anywhere else. Prod is not strict.
+- After deploying to staging, run `AUDIT_PROBE_PIN=<pin> python3 scripts/audit_completeness_probe.py --base-url https://si-bid-stg-20260714-c0fa.fly.dev --username <login>`. It edits a throwaway bid and vendor (then deletes them) and checks each change shows up in `/api/audit` with the right action, person and values. `--list-unprobed` lists the audited routes it doesn't call yet.
+
 ## Tech Stack
 - Frontend: React 18 + Vite 5 + Tailwind CSS 3 + Lucide React icons
 - Backend: FastAPI + SQLite + plain sqlite3
@@ -67,7 +72,11 @@
 ### Deploying Local DB to Fly.io
 - **NEVER fight with `fly sftp` or chunked SSH uploads on Windows.** It doesn't work reliably.
 - To push a local SQLite DB to Fly: temporarily modify the Dockerfile `CMD` to `cp /app/seed_db.db /data/si_bid.db` before starting uvicorn, add a `COPY server/si_bid_tool.db /app/seed_db.db` line, deploy, then **revert the Dockerfile** so future deploys don't overwrite.
+- **The DB runs in WAL mode**, so recent changes can sit in `si_bid.db-wal` next to the `.db` file.
+  - Before copying a local DB, stop the local server (or run `sqlite3 server/si_bid_tool.db "PRAGMA wal_checkpoint(TRUNCATE);"`) so every change is in the `.db` file.
+  - When copying a DB in on Fly, **also delete `/data/si_bid.db-wal` and `/data/si_bid.db-shm`** in the same command, e.g. `rm -f /data/si_bid.db-wal /data/si_bid.db-shm && cp /app/seed_db.db /data/si_bid.db`. A leftover `-wal` file from the old DB would be applied on top of the new one and corrupt it.
 - The Fly volume mounts at `/data`, and `DATABASE_PATH` env var points to `/data/si_bid.db`.
+- The app must run as **one process on one Fly machine** (never scale out or add uvicorn workers). Startup takes a lock on `/data/.collab.lock` and logs a loud `[single-process] ERROR` if another process already holds it.
 - Local dev uses `server/si_bid_tool.db` (fallback in `models.py`).
 
 ### Fly Deploy Commands (Windows)

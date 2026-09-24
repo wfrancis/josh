@@ -11,6 +11,7 @@ tmp
 tmp-*
 *.db
 *.db-*
+**/.collab.lock
 *.sqlite
 *.sqlite-*
 .DS_Store

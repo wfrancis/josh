@@ -1,5 +1,12 @@
+# The app must stay on ONE machine running ONE uvicorn process: live editing
+# keeps shared state in memory and SQLite lives on this machine's volume.
+# Never `fly scale count` above 1 or add uvicorn workers. Startup logs a loud
+# "[single-process] ERROR" if a second process shares the database folder.
 app = 'si-bid-tool'
 primary_region = 'sjc'
+# Seconds Fly waits after SIGINT before killing the machine, so open saves and
+# live connections can finish (uvicorn itself gives them 20 s).
+kill_timeout = 30
 
 [build]
   dockerfile = "Dockerfile"
@@ -18,6 +25,13 @@ primary_region = 'sjc'
   auto_stop_machines = true
   auto_start_machines = true
   min_machines_running = 0
+
+  # Live editing holds one open connection per browser tab; Fly's default
+  # limits are far lower than a team working at once needs.
+  [http_service.concurrency]
+    type = 'connections'
+    soft_limit = 200
+    hard_limit = 250
 
 [[vm]]
   memory = '512mb'

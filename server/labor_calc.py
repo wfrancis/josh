@@ -193,10 +193,11 @@ LABOR_RULES: dict[str, dict] = {
 }
 
 
-def load_labor_catalog(file_path: str) -> list[dict]:
+def load_labor_catalog(file_path: str, *, save: bool = True) -> list[dict]:
     """
     Parse the Labor Catalog Excel file and persist to database.
     Sheet1, columns A-F: Labor Type, Description, Cost, Retail Display, Unit, GPM Markup
+    With save=False only parse it (the caller saves it, e.g. with an audit entry).
     """
     wb = openpyxl.load_workbook(file_path, data_only=True)
     ws = wb[wb.sheetnames[0]]  # Sheet1
@@ -223,13 +224,15 @@ def load_labor_catalog(file_path: str) -> list[dict]:
         })
 
     wb.close()
-    save_labor_catalog_entries(catalog)
+    if save:
+        save_labor_catalog_entries(catalog)
     return catalog
 
 
-def load_labor_catalog_from_pdf(file_path: str, api_key: str = None, model: str = None) -> list[dict]:
+def load_labor_catalog_from_pdf(file_path: str, api_key: str = None, model: str = None, *, save: bool = True) -> list[dict]:
     """
     Parse a Labor Catalog PDF using pdfplumber + OpenAI and persist to database.
+    With save=False only parse it (the caller saves it, e.g. with an audit entry).
     """
     if model is None:
         settings = get_settings()
@@ -272,7 +275,8 @@ def load_labor_catalog_from_pdf(file_path: str, api_key: str = None, model: str 
             "gpm_markup": _safe_float(entry.get("gpm_markup")),
         })
 
-    save_labor_catalog_entries(catalog)
+    if save:
+        save_labor_catalog_entries(catalog)
     return catalog
 
 

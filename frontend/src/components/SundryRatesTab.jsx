@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { Loader2, Check, Plus, Trash2, Save, AlertTriangle } from 'lucide-react'
+import { Loader2, Check, Plus, Trash2, Save, AlertTriangle, RefreshCw } from 'lucide-react'
 import { api } from '../api'
 
 const DEFAULT_SUNDRY_PRICES = {
@@ -24,6 +24,8 @@ export default function SundryRatesTab() {
   const [saving, setSaving] = useState(false)
   const [saveSuccess, setSaveSuccess] = useState(false)
   const [error, setError] = useState(null)
+  const [loadError, setLoadError] = useState(null)
+  const [showingStartingPrices, setShowingStartingPrices] = useState(false)
   const [showNewRow, setShowNewRow] = useState(false)
   const [newProduct, setNewProduct] = useState({ name: '', unit: '', price: '', coverage: '', notes: '' })
   const newNameRef = useRef(null)
@@ -41,30 +43,34 @@ export default function SundryRatesTab() {
     }
   }, [saveSuccess])
 
+  // Never writes anything. If nothing is saved yet, the starting prices are shown
+  // as unsaved edits; if the load fails, nothing is shown so a save can't wipe real prices.
   async function loadPrices() {
     setLoading(true)
     setError(null)
+    setLoadError(null)
     try {
-      const res = await api.getCompanyRate('sundry_prices')
-      const data = res.data && Object.keys(res.data).length > 0 ? res.data : null
+      let data = null
+      try {
+        const res = await api.getCompanyRate('sundry_prices')
+        data = res?.data && Object.keys(res.data).length > 0 ? res.data : null
+      } catch (e) {
+        // 404 only means no sundry prices have been saved yet.
+        if (e?.status !== 404) throw e
+      }
       if (data) {
         setPrices(data)
         setEditedPrices(JSON.parse(JSON.stringify(data)))
+        setShowingStartingPrices(false)
       } else {
-        // Seed defaults
-        await api.updateCompanyRate('sundry_prices', DEFAULT_SUNDRY_PRICES)
-        setPrices(JSON.parse(JSON.stringify(DEFAULT_SUNDRY_PRICES)))
+        setPrices({})
         setEditedPrices(JSON.parse(JSON.stringify(DEFAULT_SUNDRY_PRICES)))
+        setShowingStartingPrices(true)
       }
     } catch (e) {
-      // If 404 or no data, seed defaults
-      try {
-        await api.updateCompanyRate('sundry_prices', DEFAULT_SUNDRY_PRICES)
-        setPrices(JSON.parse(JSON.stringify(DEFAULT_SUNDRY_PRICES)))
-        setEditedPrices(JSON.parse(JSON.stringify(DEFAULT_SUNDRY_PRICES)))
-      } catch (e2) {
-        setError('Failed to load sundry prices: ' + e2.message)
-      }
+      setPrices(null)
+      setEditedPrices({})
+      setLoadError(e?.message || 'Request failed')
     } finally {
       setLoading(false)
     }
@@ -104,11 +110,13 @@ export default function SundryRatesTab() {
   }
 
   async function handleSave() {
+    if (prices === null) return
     setSaving(true)
     setError(null)
     try {
       await api.updateCompanyRate('sundry_prices', editedPrices)
       setPrices(JSON.parse(JSON.stringify(editedPrices)))
+      setShowingStartingPrices(false)
       setSaveSuccess(true)
     } catch (e) {
       setError('Failed to save: ' + e.message)
@@ -128,21 +136,55 @@ export default function SundryRatesTab() {
     )
   }
 
+  const header = (
+    <div className="mb-5">
+      <h3 className="text-sm font-semibold text-white">Sundry Product Prices</h3>
+      <p className="text-[11px] text-gray-500 mt-0.5">
+        Master price list for all sundry items. Changes here update prices across all material types.
+      </p>
+    </div>
+  )
+
+  // Load failed: show nothing editable, so the saved prices can't be overwritten.
+  if (loadError) {
+    return (
+      <div className="glass-card p-6">
+        {header}
+        <div className="flex flex-col items-center text-center gap-3 py-12">
+          <AlertTriangle className="w-6 h-6 text-red-400" />
+          <div>
+            <p className="text-sm text-red-400">Couldn't load sundry prices: {loadError}</p>
+            <p className="text-xs text-gray-500 mt-1">Nothing was changed. Try again in a moment.</p>
+          </div>
+          <button
+            onClick={loadPrices}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-white/[0.06] border border-white/10 text-gray-200 hover:bg-white/[0.1] transition-colors"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            Retry
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="glass-card p-6">
-      {/* Header */}
-      <div className="mb-5">
-        <h3 className="text-sm font-semibold text-white">Sundry Product Prices</h3>
-        <p className="text-[11px] text-gray-500 mt-0.5">
-          Master price list for all sundry items. Changes here update prices across all material types.
-        </p>
-      </div>
+      {header}
 
       {/* Error */}
       {error && (
         <div className="mb-4 flex items-center gap-2 text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
           {error}
+        </div>
+      )}
+
+      {/* Nothing saved yet: starting prices are shown but not saved */}
+      {showingStartingPrices && (
+        <div className="mb-4 flex items-center gap-2 text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
+          <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+          No sundry prices are saved yet. These are the starting prices. Click Save Changes to keep them.
         </div>
       )}
 

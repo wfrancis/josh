@@ -16,16 +16,45 @@ export async function apiFetch(input, init = {}) {
   return res;
 }
 
+// Thrown when the server answers with an error. The message is the text to show;
+// .status is the HTTP status (409 = someone else changed it, 404 = not found),
+// .detail is the server's "detail" value and .body the whole reply.
+export class ApiError extends Error {
+  constructor(message, { status = 0, detail = null, body = null } = {}) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.detail = detail;
+    this.body = body;
+  }
+}
+
 async function request(url, options = {}) {
   const res = await apiFetch(`${BASE}${url}`, {
     headers: { 'Content-Type': 'application/json', ...options.headers },
     ...options,
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || 'Request failed');
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = body?.detail ?? null;
+    throw new ApiError(detail || 'Request failed', { status: res.status, detail, body });
   }
   return res.json();
+}
+
+const AUDIT_FILTER_KEYS = ['job_id', 'entity_type', 'entity_id', 'actor', 'action', 'since', 'until', 'q', 'before_id', 'limit'];
+
+// "?actor=josh&since=..." from a filters object; blank filters are left out.
+function auditQuery(filters = {}) {
+  const params = new URLSearchParams();
+  for (const key of AUDIT_FILTER_KEYS) {
+    const value = filters[key];
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (text !== '') params.set(key, text);
+  }
+  const qs = params.toString();
+  return qs ? '?' + qs : '';
 }
 
 // Login calls expect 401 as a normal answer, so they skip the login-screen trigger.
@@ -37,9 +66,8 @@ async function authRequest(url, options = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error(typeof data.detail === 'string' ? data.detail : 'Request failed');
-    err.status = res.status;
-    throw err;
+    const detail = data?.detail ?? null;
+    throw new ApiError(typeof detail === 'string' ? detail : 'Request failed', { status: res.status, detail, body: data });
   }
   return data;
 }
@@ -94,8 +122,9 @@ export const api = {
       const text = await r.text();
       console.error('[uploadRFMS] error:', r.status, text);
       let msg;
-      try { const err = JSON.parse(text); msg = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail); } catch { msg = text; }
-      throw new Error(msg || 'Upload failed');
+      let body = null;
+      try { body = JSON.parse(text); msg = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail); } catch { msg = text; }
+      throw new ApiError(msg || 'Upload failed', { status: r.status, detail: body?.detail ?? null, body });
     }
     return r.json();
   },
@@ -111,7 +140,7 @@ export const api = {
     if (!r.ok) {
       const err = await r.json().catch(() => ({ detail: r.statusText }));
       const msg = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
-      throw new Error(msg || 'Upload failed');
+      throw new ApiError(msg || 'Upload failed', { status: r.status, detail: err?.detail ?? null, body: err });
     }
     return r.json();
   },
@@ -290,6 +319,20 @@ export const api = {
   getActivity: (jobId) => request('/jobs/' + jobId + '/activity'),
   getComments: (jobId) => request('/jobs/' + jobId + '/comments'),
   addComment: (jobId, text) => request('/jobs/' + jobId + '/comments', { method: 'POST', body: JSON.stringify({ text }) }),
+
+  // History (audit trail): who changed what, for everything. Open to everyone logged in.
+  // Filters: job_id, entity_type, entity_id, actor, action, since, until, q; paging:
+  // before_id (the last reply's next_before_id) and limit. Replies: { items, next_before_id }.
+  getAudit: (filters = {}) => request('/audit' + auditQuery(filters)),
+  getAuditItem: (id) => request('/audit/' + encodeURIComponent(id)),
+  getJobHistory: (jobId, filters = {}) => {
+    const { job_id: _ignored, ...rest } = filters;
+    return request('/jobs/' + encodeURIComponent(jobId) + '/history' + auditQuery(rest));
+  },
+  auditExportUrl: (filters = {}) => {
+    const { before_id: _before, limit: _limit, ...rest } = filters;
+    return `${BASE}/audit/export.csv` + auditQuery(rest);
+  },
 
   // Bid Tracker. "today" is the browser's date so due/overdue match the person's calendar.
   getBidTracker: () => request('/bid-tracker?today=' + localToday()),

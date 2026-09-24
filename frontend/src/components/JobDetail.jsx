@@ -1,16 +1,15 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
-import { useParams, useNavigate, Link } from 'react-router-dom'
+import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react'
+import { useParams, useNavigate, useSearchParams, Link } from 'react-router-dom'
 import {
   ArrowLeft, Building2, MapPin, User, Percent, Hash,
   Loader2, FileSpreadsheet, Save, AlertTriangle, Trash2,
-  StickyNote, ChevronDown, ChevronUp, Cpu, CheckCircle2, X, Upload, Download, Copy,
-  Pencil
+  StickyNote, ChevronDown, ChevronUp, ChevronRight, Cpu, CheckCircle2, X, Upload, Download, Copy,
+  Pencil, RefreshCw, History
 } from 'lucide-react'
 import { api } from '../api'
 import StepIndicator from './StepIndicator'
 
 import MaterialsTable from './MaterialsTable'
-import BidPreview from './BidPreview'
 import ProposalEditor from './ProposalEditor'
 import QuoteUpload from './QuoteUpload'
 import VendorQuoteFlow from './VendorQuoteFlow'
@@ -20,8 +19,13 @@ import ReproducibilityPanel from './ReproducibilityPanel'
 import ReadinessSummary from './ReadinessSummary'
 import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
-import ActivityLog from './ActivityLog'
 import BidTrackingCard from './BidTrackingCard'
+import HistoryDrawerBoundary from '../history/HistoryDrawerBoundary'
+
+// The History drawer loads when first opened. Plain lazy() on purpose: the
+// pages' reload-on-failure helper would throw away unsaved edits here. If it
+// fails, HistoryDrawerBoundary shows the error and "Try again" loads it anew.
+const loadBidHistoryPanel = () => import('../history/BidHistoryPanel')
 
 // Optional fields printed on the customer Estimate PDF header (JobRunner layout).
 // Blank fields print as empty boxes/lines.
@@ -44,6 +48,26 @@ const ESTIMATE_HEADER_FIELDS = [
 export default function JobDetail() {
   const { jobId } = useParams()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  // History drawer. ?history=<entry id> (e.g. from the Audit page) opens it at that entry.
+  const historyParam = searchParams.get('history')
+  const historyFocusId = /^\d+$/.test(historyParam || '') ? Number(historyParam) : null
+  const [historyOpen, setHistoryOpen] = useState(historyParam !== null)
+  useEffect(() => { if (historyParam !== null) setHistoryOpen(true) }, [historyParam])
+  // A failed lazy() load stays failed, so "Try again" swaps in a fresh one.
+  const [historyLoad, setHistoryLoad] = useState(() => ({ attempt: 0, Panel: lazy(loadBidHistoryPanel) }))
+  const retryHistory = useCallback(() => {
+    setHistoryLoad(prev => ({ attempt: prev.attempt + 1, Panel: lazy(loadBidHistoryPanel) }))
+  }, [])
+  const BidHistoryPanel = historyLoad.Panel
+  const closeHistory = useCallback(() => {
+    setHistoryOpen(false)
+    if (searchParams.has('history')) {
+      const next = new URLSearchParams(searchParams)
+      next.delete('history')
+      setSearchParams(next, { replace: true })
+    }
+  }, [searchParams, setSearchParams])
   const [job, setJob] = useState(null)
   const [loading, setLoading] = useState(true)
   const [step, setStep] = useState('takeoff')
@@ -60,6 +84,10 @@ export default function JobDetail() {
   const [aiSettings, setAiSettings] = useState(null)
   const [confirmDialog, setConfirmDialog] = useState(null)
   const [isDirty, setIsDirty] = useState(false)
+  // Set when a materials save is refused because someone else saved first (409).
+  // Edits stay marked unsaved until the person reloads the latest copy.
+  const [materialsConflict, setMaterialsConflict] = useState(null)
+  const [reloadingLatest, setReloadingLatest] = useState(false)
   const [quotePanel, setQuotePanel] = useState(null) // null | 'request' | 'upload'
   const [quotePreSelectedIds, setQuotePreSelectedIds] = useState(null)
   const [quoteMaterial, setQuoteMaterial] = useState(null) // single-material quote modal
@@ -99,6 +127,7 @@ export default function JobDetail() {
       pendingMaterialDeletionReasonsRef.current = {}
       setJob(data)
       setIsDirty(false)
+      setMaterialsConflict(null)
       refreshReadiness(data.id)
       setNotes(data.notes || '')
       setNotesOpen(!!data.notes)
@@ -199,6 +228,7 @@ export default function JobDetail() {
       pendingMaterialDeletionReasonsRef.current = {}
       setJob(updated)
       setIsDirty(false)
+      setMaterialsConflict(null)
       await refreshReadiness(updated.id)
       setRfmsSuccess(true)
       setStagedFiles([])
@@ -306,7 +336,13 @@ export default function JobDetail() {
       return saved
     } catch (err) {
       console.error('Material save failed:', err)
-      if (surfaceError) setError(err.message || 'Material pricing could not be saved.')
+      if (err?.status === 409) {
+        // Someone else saved these materials first. Always show it (autosave too),
+        // and keep the edits marked unsaved so leaving the page still warns.
+        setMaterialsConflict(err.message || 'These materials were changed somewhere else, so your edits were not saved.')
+      } else if (surfaceError) {
+        setError(err.message || 'Material pricing could not be saved.')
+      }
       return false
     } finally {
       if (ownsTask && materialSavePromiseRef.current === task) {
@@ -316,18 +352,60 @@ export default function JobDetail() {
     }
   }, [jobId, refreshReadiness])
 
-  // Auto-save: debounce 1.5s after any material edit.
+  // Auto-save: debounce 1.5s after any material edit. Paused while a save
+  // conflict is showing, since every retry would be refused the same way.
   useEffect(() => {
-    if (!isDirty) return
+    if (!isDirty || materialsConflict) return
     clearTimeout(autoSaveRef.current)
     autoSaveRef.current = setTimeout(() => { saveMaterialsNow() }, 1500)
     return () => clearTimeout(autoSaveRef.current)
-  }, [isDirty, job?.materials, saveMaterialsNow])
+  }, [isDirty, materialsConflict, job?.materials, saveMaterialsNow])
 
   const handleSavePricing = async () => {
     clearTimeout(autoSaveRef.current)
     setError(null)
     return saveMaterialsNow({ surfaceError: true })
+  }
+
+  // Replace the local materials with the newest saved copy (after a save conflict).
+  // Stays on the current step, unlike a full page load.
+  const reloadLatestJob = async () => {
+    clearTimeout(autoSaveRef.current)
+    setReloadingLatest(true)
+    try {
+      const data = await api.getJob(jobId)
+      materialsStateRef.current = data.materials || []
+      materialsFingerprintRef.current = data.materials_source_fingerprint || ''
+      materialEditVersionRef.current = 0
+      pendingMaterialDeletionReasonsRef.current = {}
+      setJob(data)
+      setIsDirty(false)
+      setMaterialsConflict(null)
+      setNotes(data.notes || '')
+      setError(null)
+      await refreshReadiness(data.id)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setReloadingLatest(false)
+    }
+  }
+
+  const confirmReloadLatest = () => {
+    if (!isDirty) {
+      reloadLatestJob()
+      return
+    }
+    setConfirmDialog({
+      title: 'Reload latest materials',
+      message: 'Your material edits that were not saved will be replaced by the newest saved copy. Note anything you want to keep before reloading.',
+      confirmLabel: 'Reload latest',
+      confirmVariant: 'warning',
+      onConfirm: () => {
+        setConfirmDialog(null)
+        reloadLatestJob()
+      },
+    })
   }
 
   const scrollToUnpricedLine = () => {
@@ -357,6 +435,7 @@ export default function JobDetail() {
     setJob({ ...updatedJob, readiness: result.readiness })
     setReadiness(result.readiness)
     setIsDirty(false)
+    setMaterialsConflict(null)
     return result
   }
 
@@ -570,6 +649,14 @@ export default function JobDetail() {
           )}
         </div>
         <div className="flex items-center gap-1">
+          <button
+            onClick={() => setHistoryOpen(true)}
+            className="btn-ghost px-2.5 py-2 mt-0.5 text-gray-500 hover:text-si-bright hover:bg-si-bright/10"
+            title="See every change to this bid, and its comments"
+          >
+            <History className="w-5 h-5" />
+            <span className="hidden sm:inline text-sm">History</span>
+          </button>
           {!editing && (
             <button
               onClick={startEditing}
@@ -672,6 +759,23 @@ export default function JobDetail() {
           {error}
           <button onClick={() => setError(null)} className="ml-auto p-1 text-red-500/60 hover:text-red-400" title="Dismiss error">
             <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Materials save conflict: someone else saved first, so these edits were not saved */}
+      {materialsConflict && (
+        <div role="alert" className="flex flex-col sm:flex-row sm:items-center gap-3 px-4 py-3 mb-6 bg-amber-500/10 border border-amber-500/20 rounded-xl text-sm text-amber-300">
+          <div className="flex items-start gap-2 flex-1 min-w-0">
+            <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <div className="font-semibold">Your material edits were not saved</div>
+              <div className="text-xs text-amber-300/80 mt-0.5">{materialsConflict}</div>
+            </div>
+          </div>
+          <button onClick={confirmReloadLatest} disabled={reloadingLatest} className="btn-secondary text-sm self-start sm:self-auto flex-shrink-0">
+            {reloadingLatest ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+            Reload latest
           </button>
         </div>
       )}
@@ -979,7 +1083,34 @@ export default function JobDetail() {
         )}
       </div>
 
-      <ActivityLog jobId={job.id} />
+      {/* History and comments open in a side drawer */}
+      <button
+        type="button"
+        onClick={() => setHistoryOpen(true)}
+        className="glass-card w-full mt-6 px-4 py-3 flex items-center gap-3 text-left hover:bg-white/[0.05] transition-colors"
+      >
+        <History className="w-4 h-4 text-gray-400 flex-shrink-0" />
+        <span className="flex-1 min-w-0">
+          <span className="block text-sm font-semibold text-gray-300">History and comments</span>
+          <span className="block text-xs text-gray-500">Every change to this bid: who made it, when, and what it was before.</span>
+        </span>
+        <ChevronRight className="w-4 h-4 text-gray-600 flex-shrink-0" />
+      </button>
+
+      {/* History drawer: rendered into the page body, outside any animated container */}
+      {historyOpen && (
+        <HistoryDrawerBoundary key={historyLoad.attempt} onRetry={retryHistory} onClose={closeHistory}>
+          <Suspense fallback={null}>
+            <BidHistoryPanel
+              key={historyFocusId ?? 'all'}
+              jobId={job.id}
+              jobName={job.project_name}
+              focusId={historyFocusId}
+              onClose={closeHistory}
+            />
+          </Suspense>
+        </HistoryDrawerBoundary>
+      )}
 
       <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
 
