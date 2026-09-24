@@ -62,6 +62,8 @@ from models import (
     seed_default_users, authenticate_user, create_session, get_session_user,
     delete_session, list_online_users, set_current_user, reset_current_user,
     SESSION_LIFETIME_DAYS,
+    UserAdminError, create_user, ensure_admin_user, list_users_for_admin, remove_user,
+    restore_user, reset_user_pin, update_user, list_admin_log,
     list_bid_tracker_jobs, get_bid_tracker_job, list_bid_events, save_bid_tracking,
     get_latest_job_artifact,
 )
@@ -851,12 +853,40 @@ def startup():
     init_db()
     if seed_default_users():
         print("[seed] Created the shared 'test' login")
+    _seed_admin_from_env()
     _apply_openai_config()
     _seed_company_rates()
     _seed_rules_registry()
     _auto_import_price_books()
     _start_inbox_monitor()
     _start_sim_watcher()
+
+
+def _seed_admin_from_env():
+    """Set up the first admin from Fly secrets ADMIN_USERNAME / ADMIN_PIN.
+
+    Creates ADMIN_USERNAME as an admin with ADMIN_PIN when it doesn't exist.
+    An existing login is only made an active admin again when there are no
+    active admins left, so removing it on the Users page sticks across
+    restarts. An existing PIN is never replaced, so changing the PIN in the
+    app sticks too. The PIN is never printed.
+    """
+    username = (os.environ.get("ADMIN_USERNAME") or "").strip()
+    pin = (os.environ.get("ADMIN_PIN") or "").strip()
+    if not username and not pin:
+        return
+    if not username or not pin:
+        print("[seed] Set both ADMIN_USERNAME and ADMIN_PIN to create the admin login; skipped")
+        return
+    try:
+        changes = ensure_admin_user(username, pin, os.environ.get("ADMIN_DISPLAY_NAME", ""))
+    except UserAdminError as err:
+        # err.message describes the rule that failed, never the PIN itself.
+        print(f"[seed] Admin login from ADMIN_USERNAME not set up: {err.message}")
+        return
+    if changes:
+        why = "" if "created" in changes else " (there were no active admins)"
+        print(f"[seed] Admin login '{username}': {', '.join(changes)}{why}")
 
 
 def _auto_import_price_books():
@@ -1202,6 +1232,106 @@ def api_auth_logout(request: Request):
 def api_auth_online():
     """People who used the tool in the last 15 minutes."""
     return list_online_users()
+
+
+# ── People (admins only) ─────────────────────────────────────────────────────
+# Add and remove people who can log in. Every route checks the caller is an
+# admin; the login middleware has already turned away anyone logged out.
+
+def _require_admin(request: Request) -> dict:
+    user = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="Please log in.")
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Only admins can add or remove people.")
+    return user
+
+
+def _clear_login_tries(username: str) -> None:
+    """Forget someone's wrong PIN tries, e.g. after an admin gives them a new PIN."""
+    _login_tries.pop("user:" + (username or "").strip().lower()[:64], None)
+
+
+class AdminUserCreate(BaseModel):
+    username: str = ""
+    display_name: str = ""
+    pin: str | int = ""
+    is_admin: bool = False
+
+
+class AdminPinReset(BaseModel):
+    pin: str | int = ""
+
+
+class AdminUserUpdate(BaseModel):
+    display_name: Optional[str] = None
+    is_admin: Optional[bool] = None
+
+
+@app.get("/api/admin/users")
+def api_admin_list_users(request: Request):
+    _require_admin(request)
+    return list_users_for_admin()
+
+
+@app.post("/api/admin/users")
+def api_admin_add_user(body: AdminUserCreate, request: Request):
+    admin = _require_admin(request)
+    try:
+        return create_user(body.username, body.pin, body.display_name, is_admin=body.is_admin, actor=admin)
+    except UserAdminError as err:
+        raise HTTPException(status_code=err.status_code, detail=err.message)
+
+
+@app.post("/api/admin/users/{username}/remove")
+def api_admin_remove_user(username: str, request: Request):
+    admin = _require_admin(request)
+    try:
+        user, sessions_ended = remove_user(username, admin)
+    except UserAdminError as err:
+        raise HTTPException(status_code=err.status_code, detail=err.message)
+    return {**user, "sessions_ended": sessions_ended}
+
+
+# async so the wrong-try counts (event-loop only) can be cleared safely.
+@app.post("/api/admin/users/{username}/restore")
+async def api_admin_restore_user(username: str, request: Request):
+    admin = _require_admin(request)
+    try:
+        user = await run_in_threadpool(restore_user, username, admin)
+    except UserAdminError as err:
+        raise HTTPException(status_code=err.status_code, detail=err.message)
+    _clear_login_tries(user["username"])
+    return user
+
+
+@app.post("/api/admin/users/{username}/reset-pin")
+async def api_admin_reset_pin(username: str, body: AdminPinReset, request: Request):
+    admin = _require_admin(request)
+    try:
+        user, sessions_ended = await run_in_threadpool(
+            reset_user_pin, username, body.pin, admin, request.cookies.get(SESSION_COOKIE)
+        )
+    except UserAdminError as err:
+        raise HTTPException(status_code=err.status_code, detail=err.message)
+    _clear_login_tries(user["username"])
+    return {**user, "sessions_ended": sessions_ended}
+
+
+@app.patch("/api/admin/users/{username}")
+def api_admin_update_user(username: str, body: AdminUserUpdate, request: Request):
+    admin = _require_admin(request)
+    try:
+        return update_user(username, admin, display_name=body.display_name, is_admin=body.is_admin)
+    except UserAdminError as err:
+        raise HTTPException(status_code=err.status_code, detail=err.message)
+
+
+@app.get("/api/admin/log")
+def api_admin_log(request: Request, limit: int = 50):
+    """Recent people changes: who added, removed or changed whom, and when."""
+    _require_admin(request)
+    return list_admin_log(limit)
 
 
 @app.get("/api/system/build")

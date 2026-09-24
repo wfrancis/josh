@@ -14,6 +14,7 @@ import InternalRatesPage from './components/InternalRatesPage'
 import PricingRulesPage from './components/PricingRulesPage'
 import VendorContactsPage from './components/VendorContactsPage'
 import RulesRegistryPage from './components/RulesRegistryPage'
+import UsersPage from './components/UsersPage'
 
 export default function App() {
   const navigate = useNavigate()
@@ -48,7 +49,14 @@ export default function App() {
     navigate('/')
   }, [navigate])
 
-  const auth = useMemo(() => ({ user, logout }), [user, logout])
+  const refreshUser = useCallback(async () => {
+    try {
+      const me = await api.getCurrentUser()
+      if (me) setUser(me)
+    } catch { /* keep what we have */ }
+  }, [])
+
+  const auth = useMemo(() => ({ user, logout, refreshUser }), [user, logout, refreshUser])
 
   if (checking) {
     return (
@@ -77,6 +85,7 @@ export default function App() {
           <Route path="/internal-rates" element={<PricingRulesPage />} />
           <Route path="/vendor-contacts" element={<VendorContactsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/users" element={<UsersPage />} />
         </Routes>
       </Layout>
       {/* Session ended mid-work: log in over the page so unsaved edits stay put. */}

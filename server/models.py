@@ -12,6 +12,7 @@ import re
 import io
 import json
 import secrets
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -479,6 +480,7 @@ def init_db() -> None:
                 display_name TEXT NOT NULL DEFAULT '',
                 pin_hash TEXT NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
+                is_admin INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 last_login_at TEXT,
                 last_seen_at TEXT
@@ -496,6 +498,18 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen_at);
+
+            -- Who added, removed or changed a login, and when. username is the
+            -- admin who made the change (NULL when the server did it at startup).
+            -- details is JSON and never holds a PIN.
+            CREATE TABLE IF NOT EXISTS admin_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                username TEXT,
+                action TEXT NOT NULL,
+                target_username TEXT,
+                details TEXT NOT NULL DEFAULT '{}'
+            );
 
             -- Bid tracker history: what happened to each bid, who did it and when.
             -- details is JSON (sent to, GC, bid total at send time, note, ...).
@@ -568,6 +582,8 @@ def init_db() -> None:
             ("won_lost_at", "ALTER TABLE jobs ADD COLUMN won_lost_at TEXT"),
             ("won_lost_reason", "ALTER TABLE jobs ADD COLUMN won_lost_reason TEXT"),
             ("awarded_amount", "ALTER TABLE jobs ADD COLUMN awarded_amount REAL"),
+            # Admins can add and remove people. Everyone already signed up stays a regular user.
+            ("user_is_admin", "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"),
             *[
                 (f"job_{column}", f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
                 for column in JOB_ESTIMATE_HEADER_FIELDS
@@ -3777,8 +3793,13 @@ PIN_HASH_ITERATIONS = 200_000
 SESSION_LIFETIME_DAYS = 30          # log in again after this many days
 SESSION_TOUCH_SECONDS = 60          # write "last seen" at most once a minute per session
 ONLINE_WINDOW_MINUTES = 15
+MIN_USERNAME_LENGTH = 2
 MAX_USERNAME_LENGTH = 40
+MIN_PIN_LENGTH = 4
 MAX_PIN_LENGTH = 12
+MAX_DISPLAY_NAME_LENGTH = 80
+_USERNAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+_PIN_RE = re.compile(r"[0-9]+")
 
 # TEMPORARY shared test account so everyone can get in while real accounts
 # are set up. The login page is pre-filled with the same username and PIN.
@@ -3857,28 +3878,105 @@ def _public_user(row) -> dict:
         "id": user["id"],
         "username": user["username"],
         "display_name": user.get("display_name") or user["username"],
+        "is_admin": bool(user.get("is_admin")),
     }
 
 
-def create_user(username: str, pin: str, display_name: str = "", active: bool = True) -> dict:
-    """Add a person who can log in. PIN must be 4-12 digits."""
-    username = (username or "").strip()
-    pin = str(pin or "")
-    if not username or len(username) > MAX_USERNAME_LENGTH:
-        raise ValueError(f"Username must be 1-{MAX_USERNAME_LENGTH} characters.")
-    if not pin.isdigit() or not (4 <= len(pin) <= MAX_PIN_LENGTH):
-        raise ValueError(f"PIN must be 4-{MAX_PIN_LENGTH} digits.")
+class UserAdminError(ValueError):
+    """A change to someone's login that can't be made, with a plain-English reason."""
+
+    def __init__(self, message: str, status_code: int = 400):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+def clean_username(username) -> str:
+    username = str(username or "").strip()
+    if not (MIN_USERNAME_LENGTH <= len(username) <= MAX_USERNAME_LENGTH):
+        raise UserAdminError(f"Username must be {MIN_USERNAME_LENGTH}-{MAX_USERNAME_LENGTH} characters.")
+    if not _USERNAME_RE.fullmatch(username):
+        raise UserAdminError("Username can only use letters, numbers, dots, dashes and underscores (no spaces).")
+    if not any(ch.isalnum() for ch in username):
+        raise UserAdminError("Username needs at least one letter or number.")
+    return username
+
+
+def clean_pin(pin) -> str:
+    """The PIN as text. Never put the PIN itself in an error message or log."""
+    pin = str(pin if pin is not None else "").strip()
+    if not _PIN_RE.fullmatch(pin) or not (MIN_PIN_LENGTH <= len(pin) <= MAX_PIN_LENGTH):
+        raise UserAdminError(f"PIN must be {MIN_PIN_LENGTH}-{MAX_PIN_LENGTH} digits, numbers only.")
+    return pin
+
+
+def clean_display_name(name) -> str:
+    name = " ".join(str(name or "").split())
+    if len(name) > MAX_DISPLAY_NAME_LENGTH:
+        raise UserAdminError(f"Name must be {MAX_DISPLAY_NAME_LENGTH} characters or fewer.")
+    return name
+
+
+@contextmanager
+def _user_write_transaction():
+    """One connection holding the write lock, so the "keep at least one admin"
+    checks and the change they guard can't interleave with another change."""
     conn = _get_conn()
     try:
-        cur = conn.execute(
-            "INSERT INTO users (username, display_name, pin_hash, active, created_at) VALUES (?, ?, ?, ?, ?)",
-            (username, (display_name or "").strip() or username, hash_pin(pin), 1 if active else 0, _utc_iso(_utc_now())),
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
         conn.commit()
-        row = conn.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
-        return _public_user(row)
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+
+
+def _log_admin_action(conn, actor: dict | None, action: str, target_username: str, details: dict | None = None) -> None:
+    conn.execute(
+        "INSERT INTO admin_log (created_at, username, action, target_username, details) VALUES (?, ?, ?, ?, ?)",
+        (
+            _utc_iso(_utc_now()),
+            (actor or {}).get("username"),
+            action,
+            target_username,
+            json.dumps(details or {}, default=str),
+        ),
+    )
+
+
+def create_user(
+    username: str,
+    pin: str,
+    display_name: str = "",
+    active: bool = True,
+    is_admin: bool = False,
+    actor: dict | None = None,
+) -> dict:
+    """Add a person who can log in. Returns the admin view of the new person."""
+    username = clean_username(username)
+    pin_hash = hash_pin(clean_pin(pin))  # slow on purpose, so do it before taking the write lock
+    display_name = clean_display_name(display_name) or username
+    try:
+        with _user_write_transaction() as conn:
+            existing = conn.execute("SELECT username, active FROM users WHERE username = ?", (username,)).fetchone()
+            if existing is not None:
+                if existing["active"]:
+                    raise UserAdminError(f"The username \"{existing['username']}\" is already taken.", 409)
+                raise UserAdminError(
+                    f"The username \"{existing['username']}\" belongs to someone who was removed. "
+                    "Restore them instead, or pick a different username.",
+                    409,
+                )
+            conn.execute(
+                "INSERT INTO users (username, display_name, pin_hash, active, is_admin, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (username, display_name, pin_hash, 1 if active else 0, 1 if is_admin else 0, _utc_iso(_utc_now())),
+            )
+            _log_admin_action(conn, actor, "added", username, {"display_name": display_name, "is_admin": bool(is_admin)})
+    except sqlite3.IntegrityError:
+        raise UserAdminError(f"The username \"{username}\" is already taken.", 409) from None
+    return get_user_for_admin(username)
 
 
 def seed_default_users() -> bool:
@@ -3952,7 +4050,7 @@ def get_session_user(token: str | None) -> dict | None:
     conn = _get_conn()
     try:
         row = conn.execute(
-            """SELECT u.id, u.username, u.display_name, s.id AS session_id, s.last_seen_at AS session_seen_at
+            """SELECT u.id, u.username, u.display_name, u.is_admin, s.id AS session_id, s.last_seen_at AS session_seen_at
                FROM sessions s JOIN users u ON u.id = s.user_id
                WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1""",
             (_hash_session_token(token), _utc_iso(now)),
@@ -4011,6 +4109,219 @@ def list_online_users(window_minutes: int = ONLINE_WINDOW_MINUTES) -> list[dict]
         ]
     finally:
         conn.close()
+
+
+# ── People admin ─────────────────────────────────────────────────────────────
+# Admins add and remove people, reset PINs and choose who else is an admin.
+# Removing someone keeps their row (so history still shows their name) but
+# marks it inactive and ends their sessions. There is always at least one
+# active admin, and nobody can remove themselves.
+
+def _online_user_ids(conn, window_minutes: int = ONLINE_WINDOW_MINUTES) -> set[int]:
+    now = _utc_now()
+    rows = conn.execute(
+        "SELECT DISTINCT user_id FROM sessions WHERE last_seen_at >= ? AND expires_at > ?",
+        (_utc_iso(now - timedelta(minutes=window_minutes)), _utc_iso(now)),
+    ).fetchall()
+    return {row["user_id"] for row in rows}
+
+
+def _admin_user_view(row, online_ids: set[int]) -> dict:
+    user = dict(row)
+    active = bool(user.get("active"))
+    return {
+        "username": user["username"],
+        "display_name": user.get("display_name") or user["username"],
+        "is_admin": bool(user.get("is_admin")),
+        "active": active,
+        "created_at": user.get("created_at"),
+        "last_login_at": user.get("last_login_at"),
+        "last_seen_at": user.get("last_seen_at"),
+        "online": active and user["id"] in online_ids,
+    }
+
+
+def list_users_for_admin() -> list[dict]:
+    """Everyone who has a login, active people first, then by name."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM users
+               ORDER BY active DESC, COALESCE(NULLIF(display_name, ''), username) COLLATE NOCASE, username"""
+        ).fetchall()
+        online_ids = _online_user_ids(conn)
+        return [_admin_user_view(row, online_ids) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_user_for_admin(username: str) -> dict | None:
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (str(username or "").strip(),)).fetchone()
+        return _admin_user_view(row, _online_user_ids(conn)) if row else None
+    finally:
+        conn.close()
+
+
+def _find_user_row(conn, username: str):
+    username = str(username or "").strip()
+    row = None
+    if username and len(username) <= MAX_USERNAME_LENGTH:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if row is None:
+        raise UserAdminError("No one has that username.", 404)
+    return row
+
+
+def _is_same_user(row, actor: dict | None) -> bool:
+    return bool(actor) and actor.get("id") == row["id"]
+
+
+def _other_active_admin_count(conn, user_id: int) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND active = 1 AND id != ?", (user_id,)
+    ).fetchone()[0]
+
+
+def _name(row) -> str:
+    return row["display_name"] or row["username"]
+
+
+def remove_user(username: str, actor: dict | None) -> tuple[dict, int]:
+    """Stop someone logging in and log them out everywhere. Returns (person, sessions ended)."""
+    with _user_write_transaction() as conn:
+        row = _find_user_row(conn, username)
+        if _is_same_user(row, actor):
+            raise UserAdminError("You can't remove yourself. Ask another admin to do it.")
+        if row["is_admin"] and row["active"] and _other_active_admin_count(conn, row["id"]) == 0:
+            raise UserAdminError(f"{_name(row)} is the only admin. Make someone else an admin first.")
+        ended = conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],)).rowcount
+        if row["active"]:
+            conn.execute("UPDATE users SET active = 0 WHERE id = ?", (row["id"],))
+            _log_admin_action(conn, actor, "removed", row["username"], {"sessions_ended": ended})
+        username = row["username"]
+    return get_user_for_admin(username), ended
+
+
+def restore_user(username: str, actor: dict | None) -> dict:
+    """Let a removed person log in again (with their old PIN)."""
+    with _user_write_transaction() as conn:
+        row = _find_user_row(conn, username)
+        if not row["active"]:
+            conn.execute("UPDATE users SET active = 1 WHERE id = ?", (row["id"],))
+            _log_admin_action(conn, actor, "restored", row["username"])
+        username = row["username"]
+    return get_user_for_admin(username)
+
+
+def reset_user_pin(username: str, pin, actor: dict | None, keep_session_token: str | None = None) -> tuple[dict, int]:
+    """Give someone a new PIN and log them out everywhere.
+
+    ``keep_session_token`` is the admin's own session, so resetting your own
+    PIN logs out your other devices but not the one you're using.
+    """
+    pin_hash = hash_pin(clean_pin(pin))
+    keep_hash = _hash_session_token(keep_session_token) if keep_session_token else ""
+    with _user_write_transaction() as conn:
+        row = _find_user_row(conn, username)
+        conn.execute("UPDATE users SET pin_hash = ? WHERE id = ?", (pin_hash, row["id"]))
+        ended = conn.execute(
+            "DELETE FROM sessions WHERE user_id = ? AND token_hash != ?", (row["id"], keep_hash)
+        ).rowcount
+        _log_admin_action(conn, actor, "reset_pin", row["username"], {"sessions_ended": ended})
+        username = row["username"]
+    return get_user_for_admin(username), ended
+
+
+def update_user(
+    username: str,
+    actor: dict | None,
+    display_name: str | None = None,
+    is_admin: bool | None = None,
+) -> dict:
+    """Change someone's name and/or whether they are an admin."""
+    new_name = None if display_name is None else clean_display_name(display_name)
+    with _user_write_transaction() as conn:
+        row = _find_user_row(conn, username)
+        if new_name is not None:
+            new_name = new_name or row["username"]
+            if new_name != row["display_name"]:
+                conn.execute("UPDATE users SET display_name = ? WHERE id = ?", (new_name, row["id"]))
+                _log_admin_action(conn, actor, "renamed", row["username"], {"from": row["display_name"], "to": new_name})
+        if is_admin is not None and bool(is_admin) != bool(row["is_admin"]):
+            if not is_admin and row["active"] and _other_active_admin_count(conn, row["id"]) == 0:
+                raise UserAdminError(f"{_name(row)} is the only admin. Make someone else an admin first.")
+            conn.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if is_admin else 0, row["id"]))
+            _log_admin_action(conn, actor, "made_admin" if is_admin else "removed_admin", row["username"])
+        username = row["username"]
+    return get_user_for_admin(username)
+
+
+def ensure_admin_user(username: str, pin, display_name: str = "") -> list[str]:
+    """First-time setup and lock-out recovery for the startup admin login.
+
+    Creates the login as an admin with this PIN when the username is new.
+    An existing login is only changed when there are no active admins at all:
+    then it is made an active admin again, so someone can get back in.
+    Otherwise it is left alone, so removing it or taking away its admin on the
+    Users page sticks across restarts. An existing PIN is never overwritten
+    (a PIN is only set when the login has none). Returns what changed, empty
+    when nothing did. Never logs or returns the PIN.
+    """
+    username = clean_username(username)
+    pin = clean_pin(pin)
+    display_name = clean_display_name(display_name) or username
+    changes: list[str] = []
+    with _user_write_transaction() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO users (username, display_name, pin_hash, active, is_admin, created_at) VALUES (?, ?, ?, 1, 1, ?)",
+                (username, display_name, hash_pin(pin), _utc_iso(_utc_now())),
+            )
+            changes.append("created")
+        elif conn.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1 AND active = 1").fetchone()[0] == 0:
+            # No one can manage logins, so bring this one back as the way in.
+            if not row["is_admin"]:
+                conn.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (row["id"],))
+                changes.append("made admin")
+            if not row["active"]:
+                conn.execute("UPDATE users SET active = 1 WHERE id = ?", (row["id"],))
+                changes.append("restored")
+            if not row["pin_hash"]:
+                conn.execute("UPDATE users SET pin_hash = ? WHERE id = ?", (hash_pin(pin), row["id"]))
+                changes.append("PIN set")
+            username = row["username"]
+        if changes:
+            _log_admin_action(conn, None, "startup_admin", username, {"changes": changes})
+    return changes
+
+
+def list_admin_log(limit: int = 50) -> list[dict]:
+    """Recent people changes, newest first, with display names where known."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT l.id, l.created_at, l.username, l.action, l.target_username, l.details,
+                      a.display_name AS actor_name, t.display_name AS target_name
+               FROM admin_log l
+               LEFT JOIN users a ON a.username = l.username
+               LEFT JOIN users t ON t.username = l.target_username
+               ORDER BY l.id DESC LIMIT ?""",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+    finally:
+        conn.close()
+    entries = []
+    for row in rows:
+        entry = dict(row)
+        details = _json_loads_safe(entry.get("details"), {})
+        entry["details"] = details if isinstance(details, dict) else {}
+        entry["actor_name"] = entry.get("actor_name") or entry.get("username") or None
+        entry["target_name"] = entry.get("target_name") or entry.get("target_username") or ""
+        entries.append(entry)
+    return entries
 
 
 # ── Bid Tracker ──────────────────────────────────────────────────────────────

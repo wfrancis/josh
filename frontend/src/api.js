@@ -58,6 +58,17 @@ export const api = {
   logout: () => authRequest('/auth/logout', { method: 'POST' }),
   getOnlineUsers: () => request('/auth/online'),
 
+  // People (admins only)
+  listPeople: () => request('/admin/users'),
+  addPerson: (data) => request('/admin/users', { method: 'POST', body: JSON.stringify(data) }),
+  updatePerson: (username, data) =>
+    request('/admin/users/' + encodeURIComponent(username), { method: 'PATCH', body: JSON.stringify(data) }),
+  removePerson: (username) => request('/admin/users/' + encodeURIComponent(username) + '/remove', { method: 'POST' }),
+  restorePerson: (username) => request('/admin/users/' + encodeURIComponent(username) + '/restore', { method: 'POST' }),
+  resetPersonPin: (username, pin) =>
+    request('/admin/users/' + encodeURIComponent(username) + '/reset-pin', { method: 'POST', body: JSON.stringify({ pin }) }),
+  getPeopleLog: () => request('/admin/log'),
+
   // Jobs
   listJobs: () => request('/jobs'),
   createJob: (data) => request('/jobs', { method: 'POST', body: JSON.stringify(data) }),
