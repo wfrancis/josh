@@ -60,7 +60,7 @@ function TabButton({ active, onClick, icon: Icon, children }) {
   )
 }
 
-function CommentsTab({ jobId, comments, error, onAdded }) {
+function CommentsTab({ jobId, comments, error, onAdded, readOnly = false }) {
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState('')
@@ -84,27 +84,33 @@ function CommentsTab({ jobId, comments, error, onAdded }) {
 
   return (
     <div className="px-5 py-4">
-      <form onSubmit={submit} className="mb-4">
-        <div className="flex gap-2">
-          <textarea
-            value={text}
-            onChange={e => setText(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit(e) }}
-            placeholder="Add a comment for everyone on this bid..."
-            rows={2}
-            className="flex-1 bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none resize-y"
-          />
-          <button
-            type="submit"
-            disabled={!text.trim() || sending}
-            className="btn-primary px-3 py-2 text-sm self-start"
-            title="Post comment"
-          >
-            {sending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
-          </button>
-        </div>
-        {sendError && <p className="mt-2 text-xs text-red-400">{sendError}</p>}
-      </form>
+      {readOnly ? (
+        <p className="mb-4 text-xs text-gray-500 bg-white/[0.03] border border-white/[0.05] rounded-lg px-3 py-2">
+          This bid is deleted, so comments are closed. The comments made before it was deleted are below.
+        </p>
+      ) : (
+        <form onSubmit={submit} className="mb-4">
+          <div className="flex gap-2">
+            <textarea
+              value={text}
+              onChange={e => setText(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit(e) }}
+              placeholder="Add a comment for everyone on this bid..."
+              rows={2}
+              className="flex-1 bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none resize-y"
+            />
+            <button
+              type="submit"
+              disabled={!text.trim() || sending}
+              className="btn-primary px-3 py-2 text-sm self-start"
+              title="Post comment"
+            >
+              {sending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+            </button>
+          </div>
+          {sendError && <p className="mt-2 text-xs text-red-400">{sendError}</p>}
+        </form>
+      )}
 
       {error && <p className="text-xs text-red-400 mb-3">{error}</p>}
       {comments === null && !error ? (
@@ -127,7 +133,8 @@ function CommentsTab({ jobId, comments, error, onAdded }) {
   )
 }
 
-export default function BidHistoryPanel({ jobId, jobName, focusId = null, onClose }) {
+// readOnly: the bid is deleted, so its history and comments can be read but no comment added.
+export default function BidHistoryPanel({ jobId, jobName, focusId = null, onClose, readOnly = false }) {
   const [tab, setTab] = useState('history')
   const [person, setPerson] = useState('')
   const [type, setType] = useState('')
@@ -322,6 +329,7 @@ export default function BidHistoryPanel({ jobId, jobName, focusId = null, onClos
               jobId={jobId}
               comments={comments}
               error={commentsError}
+              readOnly={readOnly}
               onAdded={() => { loadComments(); feed.reload({ keepItems: true }) }}
             />
           </div>

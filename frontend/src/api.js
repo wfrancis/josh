@@ -100,13 +100,22 @@ export const api = {
   // Jobs
   listJobs: () => request('/jobs'),
   createJob: (data) => request('/jobs', { method: 'POST', body: JSON.stringify(data) }),
-  getJob: (id) => request(`/jobs/${id}`),
+  // includeDeleted: also return a deleted bid (read-only, with deleted_at / deleted_by /
+  // delete_reason) instead of "not found". Used when opening a deleted bid from a link.
+  getJob: (id, { includeDeleted = false } = {}) => request(`/jobs/${id}` + (includeDeleted ? '?include_deleted=1' : '')),
   getJobReadiness: (id) => request(`/jobs/${id}/readiness`),
   getBuildInfo: () => request('/system/build'),
   getVendorIngestionHealth: () => request('/system/vendor-ingestion'),
-  deleteJob: (id) => request(`/jobs/${id}`, { method: 'DELETE' }),
+  // Deleting only hides the bid (it moves to Deleted bids); an admin can restore it.
+  // reason is required (1-500 characters).
+  deleteJob: (id, reason) => request(`/jobs/${id}`, { method: 'DELETE', body: JSON.stringify({ reason }) }),
   duplicateJob: (jobId) => request('/jobs/' + jobId + '/duplicate', { method: 'POST' }),
-  bulkDeleteJobs: (jobIds) => request('/jobs/bulk-delete', { method: 'POST', body: JSON.stringify({ job_ids: jobIds }) }),
+  bulkDeleteJobs: (jobIds, reason) =>
+    request('/jobs/bulk-delete', { method: 'POST', body: JSON.stringify({ ids: jobIds, job_ids: jobIds, reason }) }),
+  // Deleted bids: [{ id, slug, project_name, gc_name, deleted_at, deleted_by, delete_reason, grand_total }]
+  listDeletedJobs: () => request('/jobs/deleted'),
+  // Admins only. Returns the restored job.
+  restoreJob: (id) => request(`/jobs/${encodeURIComponent(id)}/restore`, { method: 'POST' }),
   updateNotes: (jobId, notes) => request(`/jobs/${jobId}/notes`, { method: 'PUT', body: JSON.stringify({ notes }) }),
 
   // RFMS Upload (supports multiple files)
@@ -166,6 +175,29 @@ export const api = {
   loadProposalBundles: (jobId) => request(`/jobs/${jobId}/proposal/bundles`),
   saveProposalBundles: (jobId, data) =>
     request(`/jobs/${jobId}/proposal/bundles`, { method: 'PUT', body: JSON.stringify(data) }),
+
+  // Proposal versions: saved copies of the proposal, newest first.
+  // [{ id, version_no, created_at, created_by, contributors, reason, label, grand_total,
+  //    bundle_count, artifact_id, restored_from_version_id }]
+  listProposalVersions: (jobId) => request(`/jobs/${jobId}/proposal/versions`),
+  // One version with its proposal_data and job_fields.
+  getProposalVersion: (jobId, versionId) =>
+    request(`/jobs/${jobId}/proposal/versions/${encodeURIComponent(versionId)}`),
+  // against: 'current' or another version id. { changes, summary }
+  diffProposalVersion: (jobId, versionId, against = 'current') =>
+    request(`/jobs/${jobId}/proposal/versions/${encodeURIComponent(versionId)}/diff?against=${encodeURIComponent(against)}`),
+  renameProposalVersion: (jobId, versionId, label) =>
+    request(`/jobs/${jobId}/proposal/versions/${encodeURIComponent(versionId)}`, { method: 'PATCH', body: JSON.stringify({ label }) }),
+  // Saves the current proposal as a version first, then puts this one back. { job, version }
+  restoreProposalVersion: (jobId, versionId) =>
+    request(`/jobs/${jobId}/proposal/versions/${encodeURIComponent(versionId)}/restore`, { method: 'POST' }),
+
+  // Past PDFs (every PDF ever made is kept). kind: 'proposal_pdf' | 'bid_pdf'.
+  // [{ id, kind, created_at, created_by, grand_total, proposal_version_id, sha256, size }], newest first
+  listJobArtifacts: (jobId, kind) =>
+    request(`/jobs/${jobId}/artifacts` + (kind ? '?kind=' + encodeURIComponent(kind) : '')),
+  jobArtifactDownloadUrl: (jobId, artifactId) =>
+    `${BASE}/jobs/${jobId}/artifacts/${encodeURIComponent(artifactId)}/download`,
 
   // Rules registry / audit traces
   listRules: (params = {}) => {
@@ -295,7 +327,9 @@ export const api = {
   markNotificationRead: (id) => request('/notifications/' + id + '/read', { method: 'PUT' }),
 
   // AI Price Estimation
-  estimatePrice: (jobId, materialIdx) => request(`/jobs/${jobId}/materials/${materialIdx}/estimate-price`, { method: 'POST' }),
+  // By the line's id, so a line added or removed by someone else can't shift which line gets priced.
+  // 409 = someone changed that line's price meanwhile (their change is kept).
+  estimatePrice: (jobId, materialId) => request(`/jobs/${jobId}/materials/by-id/${encodeURIComponent(materialId)}/estimate-price`, { method: 'POST' }),
 
   // Quote Requests
   listQuoteRequests: (jobId) => request('/jobs/' + jobId + '/quote-requests'),
@@ -317,7 +351,8 @@ export const api = {
 
   // Activity Log & Comments
   getActivity: (jobId) => request('/jobs/' + jobId + '/activity'),
-  getComments: (jobId) => request('/jobs/' + jobId + '/comments'),
+  // Comments of a deleted bid can still be read (posting is closed).
+  getComments: (jobId) => request('/jobs/' + jobId + '/comments?include_deleted=1'),
   addComment: (jobId, text) => request('/jobs/' + jobId + '/comments', { method: 'POST', body: JSON.stringify({ text }) }),
 
   // History (audit trail): who changed what, for everything. Open to everyone logged in.

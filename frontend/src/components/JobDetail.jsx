@@ -4,9 +4,11 @@ import {
   ArrowLeft, Building2, MapPin, User, Percent, Hash,
   Loader2, FileSpreadsheet, Save, AlertTriangle, Trash2,
   StickyNote, ChevronDown, ChevronUp, ChevronRight, Cpu, CheckCircle2, X, Upload, Download, Copy,
-  Pencil, RefreshCw, History
+  Pencil, RefreshCw, History, ArchiveRestore
 } from 'lucide-react'
 import { api } from '../api'
+import { useAuth } from '../auth'
+import { formatWhen } from '../bidTracker'
 import StepIndicator from './StepIndicator'
 
 import MaterialsTable from './MaterialsTable'
@@ -19,6 +21,7 @@ import ReproducibilityPanel from './ReproducibilityPanel'
 import ReadinessSummary from './ReadinessSummary'
 import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
 import ConfirmDialog from './ConfirmDialog'
+import DeleteBidDialog from './DeleteBidDialog'
 import BidTrackingCard from './BidTrackingCard'
 import HistoryDrawerBoundary from '../history/HistoryDrawerBoundary'
 
@@ -48,6 +51,8 @@ const ESTIMATE_HEADER_FIELDS = [
 export default function JobDetail() {
   const { jobId } = useParams()
   const navigate = useNavigate()
+  const { user } = useAuth()
+  const isAdmin = !!user?.is_admin
   const [searchParams, setSearchParams] = useSearchParams()
   // History drawer. ?history=<entry id> (e.g. from the Audit page) opens it at that entry.
   const historyParam = searchParams.get('history')
@@ -83,6 +88,9 @@ export default function JobDetail() {
   const [notes, setNotes] = useState('')
   const [aiSettings, setAiSettings] = useState(null)
   const [confirmDialog, setConfirmDialog] = useState(null)
+  // Delete asks for a reason; the bid moves to Deleted bids and an admin can restore it.
+  const [askDelete, setAskDelete] = useState(false)
+  const [restoringBid, setRestoringBid] = useState(false)
   const [isDirty, setIsDirty] = useState(false)
   // Set when a materials save is refused because someone else saved first (409).
   // Edits stay marked unsaved until the person reloads the latest copy.
@@ -97,6 +105,11 @@ export default function JobDetail() {
   const [editSaving, setEditSaving] = useState(false)
   const [quoteRequests, setQuoteRequests] = useState([])
   const [readiness, setReadiness] = useState(null)
+  // A Regenerate / Make PDF button on the "Before you send this bid" card asks
+  // the proposal editor to do it ({ type, nonce }).
+  const [proposalAction, setProposalAction] = useState(null)
+  const clearProposalAction = useCallback(() => setProposalAction(null), [])
+  const stepsRef = useRef(null)
   // Bumped when the proposal is saved so the Bid Tracking card re-reads the bid total.
   const [bidTrackingRefresh, setBidTrackingRefresh] = useState(0)
   const handleProposalSaved = useCallback(() => setBidTrackingRefresh(n => n + 1), [])
@@ -118,9 +131,51 @@ export default function JobDetail() {
     }
   }, [jobId])
 
+  // A proposal version was restored: pick up the bid fields it brought back
+  // (tax, GPM, Textura) without touching the materials on this page.
+  const handleProposalRestored = useCallback((result) => {
+    setBidTrackingRefresh(n => n + 1)
+    const fresh = result?.job
+    if (fresh && typeof fresh === 'object' && !Array.isArray(fresh)) {
+      setJob(current => current ? {
+        ...current,
+        ...fresh,
+        materials: current.materials,
+        materials_source_fingerprint: current.materials_source_fingerprint,
+        readiness: current.readiness,
+      } : current)
+    }
+    refreshReadiness()
+  }, [refreshReadiness])
+
   const loadJob = async () => {
     try {
-      const data = await api.getJob(jobId)
+      let data
+      try {
+        data = await api.getJob(jobId)
+      } catch (err) {
+        // A deleted bid answers "not found" / "gone". Open it read-only instead,
+        // so links from history and the Audit page still show what it was.
+        if (err?.status !== 404 && err?.status !== 410) throw err
+        const deleted = await api.getJob(jobId, { includeDeleted: true }).catch(() => null)
+        if (!deleted?.deleted_at) throw err
+        data = deleted
+      }
+      if (data.deleted_at) {
+        // Read-only: nothing here may save, generate or recalculate.
+        clearTimeout(autoSaveRef.current)
+        materialsStateRef.current = data.materials || []
+        materialsFingerprintRef.current = data.materials_source_fingerprint || ''
+        materialEditVersionRef.current = 0
+        pendingMaterialDeletionReasonsRef.current = {}
+        setJob(data)
+        setIsDirty(false)
+        setMaterialsConflict(null)
+        setReadiness(null)
+        setNotes(data.notes || '')
+        setEditing(false)
+        return
+      }
       materialsStateRef.current = data.materials || []
       materialsFingerprintRef.current = data.materials_source_fingerprint || ''
       materialEditVersionRef.current = 0
@@ -336,7 +391,11 @@ export default function JobDetail() {
       return saved
     } catch (err) {
       console.error('Material save failed:', err)
-      if (err?.status === 409) {
+      if (err?.status === 410) {
+        // Someone deleted this bid: switch to the read-only view that says who and why.
+        setError(err.message || 'This bid was deleted.')
+        loadJob()
+      } else if (err?.status === 409) {
         // Someone else saved these materials first. Always show it (autosave too),
         // and keep the edits marked unsaved so leaving the page still warns.
         setMaterialsConflict(err.message || 'These materials were changed somewhere else, so your edits were not saved.')
@@ -420,6 +479,33 @@ export default function JobDetail() {
     window.setTimeout(() => quoteSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
   }
 
+  // A button on the "Before you send this bid" card: take the estimator to the fix.
+  const handleReadinessAction = async (actionId) => {
+    if (actionId === 'job_details') {
+      startEditing()
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    } else if (actionId === 'materials' || actionId === 'price_lines') {
+      setStep('takeoff')
+      window.setTimeout(() => {
+        if (actionId === 'price_lines') scrollToUnpricedLine()
+        else materialsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }, 100)
+    } else if (actionId === 'quotes') {
+      openEvidenceRecovery()
+    } else if (actionId === 'labor_prices') {
+      navigate('/pricing-rules')
+    } else if (['proposal', 'regenerate', 'make_pdf'].includes(actionId)) {
+      // Same as clicking the step: a just-typed price must reach the bid first
+      if (isDirty || materialSavePromiseRef.current) {
+        clearTimeout(autoSaveRef.current)
+        if (!(await saveMaterialsNow({ surfaceError: true }))) return
+      }
+      setStep('bid')
+      if (actionId !== 'proposal') setProposalAction({ type: actionId, nonce: Date.now() })
+      window.setTimeout(() => stepsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+    }
+  }
+
   const handleResolveVendorConflict = async (conflict, resolution) => {
     clearTimeout(autoSaveRef.current)
     if (isDirty || materialSavePromiseRef.current) {
@@ -459,6 +545,151 @@ export default function JobDetail() {
       <div className="max-w-5xl mx-auto px-8 py-12 text-center">
         <p className="text-gray-500">Job not found</p>
         <Link to="/" className="text-si-bright hover:underline mt-2 inline-block">Back to Dashboard</Link>
+      </div>
+    )
+  }
+
+  const historyDrawer = historyOpen && (
+    <HistoryDrawerBoundary key={historyLoad.attempt} onRetry={retryHistory} onClose={closeHistory}>
+      <Suspense fallback={null}>
+        <BidHistoryPanel
+          key={historyFocusId ?? 'all'}
+          jobId={job.id}
+          jobName={job.project_name}
+          focusId={historyFocusId}
+          onClose={closeHistory}
+          readOnly={!!job.deleted_at}
+        />
+      </Suspense>
+    </HistoryDrawerBoundary>
+  )
+
+  // ── Deleted bid: read-only, with who deleted it and why ──
+  if (job.deleted_at) {
+    const restoreBid = async () => {
+      setRestoringBid(true)
+      setError(null)
+      try {
+        const restored = await api.restoreJob(job.id)
+        const target = restored?.slug || job.slug
+        if (target && target !== jobId) navigate(`/jobs/${target}`, { replace: true })
+        else await loadJob()
+      } catch (err) {
+        setError(err.message || "The bid couldn't be restored.")
+      } finally {
+        setRestoringBid(false)
+      }
+    }
+    const materials = job.materials || []
+    return (
+      <div className="max-w-5xl mx-auto px-4 sm:px-8 py-6 sm:py-8">
+        <div className="flex items-start gap-4 mb-6">
+          <button onClick={() => navigate(isAdmin ? '/deleted-bids' : '/jobs')} className="btn-ghost p-2 mt-0.5" title="Back">
+            <ArrowLeft className="w-5 h-5" />
+          </button>
+          <div className="flex-1 min-w-0">
+            <h1 className="text-xl sm:text-2xl font-extrabold text-gray-300 tracking-tight break-words">{job.project_name}</h1>
+            <div className="flex flex-wrap items-center gap-4 mt-2 text-sm text-gray-500">
+              {job.gc_name && (
+                <span className="flex items-center gap-1.5"><Building2 className="w-3.5 h-3.5" /> {job.gc_name}</span>
+              )}
+              {(job.city || job.state) && (
+                <span className="flex items-center gap-1.5">
+                  <MapPin className="w-3.5 h-3.5" />
+                  {[job.address, job.city, job.state, job.zip].filter(Boolean).join(', ')}
+                </span>
+              )}
+              {job.salesperson && (
+                <span className="flex items-center gap-1.5"><User className="w-3.5 h-3.5" /> {job.salesperson}</span>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={() => setHistoryOpen(true)}
+            className="btn-ghost px-2.5 py-2 mt-0.5 text-gray-500 hover:text-si-bright hover:bg-si-bright/10"
+            title="See every change to this bid, and its comments"
+          >
+            <History className="w-5 h-5" />
+            <span className="hidden sm:inline text-sm">History</span>
+          </button>
+        </div>
+
+        <div role="status" className="flex flex-col sm:flex-row sm:items-center gap-3 px-4 py-3 mb-6 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-300">
+          <div className="flex items-start gap-2 flex-1 min-w-0">
+            <Trash2 className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <div className="font-semibold break-words">
+                Deleted by {job.deleted_by_name || job.deleted_by || 'someone'}{job.deleted_at ? ` on ${formatWhen(job.deleted_at)}` : ''}
+                {job.delete_reason ? <span className="font-normal"> — {job.delete_reason}</span> : null}
+              </div>
+              <div className="text-xs text-red-300/80 mt-0.5">
+                This bid is read-only. {isAdmin ? 'Restore it to work on it again.' : 'An admin can restore it.'} Its history is still here.
+              </div>
+            </div>
+          </div>
+          {isAdmin && (
+            <button
+              onClick={() => setConfirmDialog({
+                title: 'Restore this bid?',
+                message: `"${job.project_name}" goes back to All Jobs and everyone can work on it again.`,
+                confirmLabel: 'Restore bid',
+                confirmVariant: 'restore',
+                onConfirm: () => { setConfirmDialog(null); restoreBid() },
+              })}
+              disabled={restoringBid}
+              className="btn-secondary text-sm self-start sm:self-auto flex-shrink-0"
+            >
+              {restoringBid ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArchiveRestore className="w-4 h-4" />}
+              Restore bid
+            </button>
+          )}
+        </div>
+
+        {error && (
+          <div className="flex items-center gap-2 px-4 py-3 mb-6 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-400">
+            <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+            {error}
+            <button onClick={() => setError(null)} className="ml-auto p-1 text-red-500/60 hover:text-red-400" title="Dismiss error">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+
+        {job.notes && (
+          <div className="glass-card p-4 mb-6">
+            <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em] mb-2 flex items-center gap-2">
+              <StickyNote className="w-3.5 h-3.5" /> Notes
+            </h3>
+            <p className="text-sm text-gray-300 whitespace-pre-wrap break-words">{job.notes}</p>
+          </div>
+        )}
+
+        {materials.length > 0 ? (
+          <div className="glass-card p-4 sm:p-6">
+            <h3 className="text-xs font-bold text-gray-500 uppercase tracking-[0.15em] mb-4">
+              Materials ({materials.length})
+            </h3>
+            <MaterialsTable materials={materials} />
+          </div>
+        ) : (
+          <div className="glass-card p-6 text-center text-sm text-gray-500">This bid had no materials.</div>
+        )}
+
+        <button
+          type="button"
+          onClick={() => setHistoryOpen(true)}
+          className="glass-card w-full mt-6 px-4 py-3 flex items-center gap-3 text-left hover:bg-white/[0.05] transition-colors"
+        >
+          <History className="w-4 h-4 text-gray-400 flex-shrink-0" />
+          <span className="flex-1 min-w-0">
+            <span className="block text-sm font-semibold text-gray-300">History and comments</span>
+            <span className="block text-xs text-gray-500">Every change to this bid, including who deleted it and why.</span>
+          </span>
+          <ChevronRight className="w-4 h-4 text-gray-600 flex-shrink-0" />
+        </button>
+
+        {historyDrawer}
+        <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
       </div>
     )
   }
@@ -683,18 +914,9 @@ export default function JobDetail() {
             <Copy className="w-5 h-5" />
           </button>
         <button
-          onClick={() => setConfirmDialog({
-            title: 'Delete Job',
-            message: `Are you sure you want to delete "${job.project_name}"? All materials, pricing, quotes, and bid data will be permanently removed. This cannot be undone.`,
-            confirmLabel: 'Delete Job',
-            confirmVariant: 'danger',
-            onConfirm: () => {
-              setConfirmDialog(null)
-              api.deleteJob(jobId).then(() => navigate('/')).catch(err => setError(err.message))
-            }
-          })}
+          onClick={() => setAskDelete(true)}
           className="btn-ghost p-2 mt-0.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10"
-          title="Delete job"
+          title="Delete bid (an admin can restore it)"
         >
           <Trash2 className="w-5 h-5" />
         </button>
@@ -731,12 +953,13 @@ export default function JobDetail() {
         onRefresh={() => refreshReadiness(job.id)}
         onRecoverEvidence={openEvidenceRecovery}
         onResolveVendorConflict={handleResolveVendorConflict}
+        onAction={handleReadinessAction}
       />
 
       <ReproducibilityPanel jobId={jobId} onConfidenceChange={refreshReadiness} />
 
       {/* Stepper */}
-      <div className="glass-card px-3 sm:px-6 py-3 sm:py-4 mb-6 sm:mb-8">
+      <div ref={stepsRef} className="glass-card scroll-mt-20 px-3 sm:px-6 py-3 sm:py-4 mb-6 sm:mb-8">
         <StepIndicator
           current={step}
           onStepClick={async (next) => {
@@ -1033,14 +1256,32 @@ export default function JobDetail() {
                     onRequestAllQuotes={QUOTE_EMAILS_ENABLED ? () => {
                       setQuotePanel('request')
                     } : undefined}
-                    onAiEstimate={async (materialIdx) => {
+                    onAiEstimate={async (material, place) => {
                       try {
                         if (isDirty && !(await saveMaterialsNow({ surfaceError: true }))) return
-                        await api.estimatePrice(job.id, materialIdx)
+                        // The server finds the line by its id. A line added here and only
+                        // just saved gets its id from the save.
+                        let materialId = material?.id
+                        if (materialId === null || materialId === undefined) {
+                          const saved = materialsStateRef.current || []
+                          const found = (material?.uid && saved.find(m => m.uid === material.uid)) || saved[place]
+                          materialId = found?.id
+                        }
+                        if (materialId === null || materialId === undefined) {
+                          setError('Save the materials first, then ask for the AI estimate again.')
+                          return
+                        }
+                        await api.estimatePrice(job.id, materialId)
                         await loadJob()
                       } catch (err) {
                         console.error('AI estimate failed:', err)
-                        setError(err.message)
+                        if (err?.status === 409 || err?.status === 404) {
+                          // Someone else changed or removed that line meanwhile: show their version.
+                          setError(`${err.message} The list now shows the latest.`)
+                          await loadJob()
+                        } else {
+                          setError(err.message)
+                        }
                       }
                     }}
                   />
@@ -1078,7 +1319,17 @@ export default function JobDetail() {
 
         {step === 'bid' && (
           <div className="glass-card p-4 sm:p-8">
-            <ProposalEditor job={job} api={api} onGoBack={() => setStep('takeoff')} onConfidenceChange={refreshReadiness} onSaved={handleProposalSaved} />
+            <ProposalEditor
+              job={job}
+              api={api}
+              onGoBack={() => setStep('takeoff')}
+              onConfidenceChange={refreshReadiness}
+              onSaved={handleProposalSaved}
+              onRestored={handleProposalRestored}
+              onBidDeleted={loadJob}
+              requestedAction={proposalAction}
+              onActionHandled={clearProposalAction}
+            />
           </div>
         )}
       </div>
@@ -1098,21 +1349,20 @@ export default function JobDetail() {
       </button>
 
       {/* History drawer: rendered into the page body, outside any animated container */}
-      {historyOpen && (
-        <HistoryDrawerBoundary key={historyLoad.attempt} onRetry={retryHistory} onClose={closeHistory}>
-          <Suspense fallback={null}>
-            <BidHistoryPanel
-              key={historyFocusId ?? 'all'}
-              jobId={job.id}
-              jobName={job.project_name}
-              focusId={historyFocusId}
-              onClose={closeHistory}
-            />
-          </Suspense>
-        </HistoryDrawerBoundary>
-      )}
+      {historyDrawer}
 
       <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
+
+      <DeleteBidDialog
+        open={askDelete}
+        bidName={job.project_name}
+        onConfirm={async (reason) => {
+          await api.deleteJob(job.id, reason)
+          setAskDelete(false)
+          navigate('/')
+        }}
+        onCancel={() => setAskDelete(false)}
+      />
 
       {/* Vendor Quote Flow Modal — rendered outside animated containers to avoid transform containing block issues */}
       {QUOTE_EMAILS_ENABLED && quotePanel === 'request' && job && (

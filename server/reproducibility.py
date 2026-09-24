@@ -482,7 +482,10 @@ def _combine_generated_bundles(selected: list[dict], accepted_bundle: dict) -> d
     )
     sundries = [copy.deepcopy(item) for bundle in selected for item in (bundle.get("sundry_items") or [])]
     labor = [copy.deepcopy(item) for bundle in selected for item in (bundle.get("labor_items") or [])]
+    # The rebuilt bundle is the accepted bundle: it keeps that bundle's uid.
+    uid = accepted_bundle.get("uid") or selected[0].get("uid")
     return {
+        **({"uid": uid} if uid else {}),
         "bundle_name": accepted_bundle.get("bundle_name") or selected[0].get("bundle_name") or "Bundle",
         "description_text": accepted_bundle.get("description_text") or selected[0].get("description_text") or "",
         "materials": materials,

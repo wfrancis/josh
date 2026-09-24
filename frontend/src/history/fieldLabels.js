@@ -67,6 +67,10 @@ const FIELD_LABELS = {
   won_lost_at: 'Won/lost date',
   won_lost_reason: 'Won/lost reason',
   awarded_amount: 'Awarded amount',
+  // Deleting and restoring a bid
+  deleted_at: 'Deleted on',
+  deleted_by: 'Deleted by',
+  delete_reason: 'Reason for deleting',
   // Takeoff lines
   item_code: 'Item code',
   description: 'Description',
@@ -509,7 +513,9 @@ const ACTION_LABELS = {
   'proposal.generate': 'Generated the proposal',
   'proposal.regenerate': 'Regenerated the proposal',
   'proposal.restore': 'Restored an earlier proposal',
+  'proposal.version_label': 'Named a proposal version',
   'proposal.pdf': 'Made the proposal PDF',
+  'proposal.audit_refresh': "Rechecked the bid's numbers with the latest version of the tool",
   'comment.add': 'Added a comment',
   'golden.capture': 'Saved a reproducibility baseline',
   'golden.replay': 'Ran a reproducibility check',

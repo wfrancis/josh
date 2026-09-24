@@ -354,7 +354,7 @@ def validate_proposal_cent_arithmetic_contract(client: "Client") -> Check:
         return Check("proposal_cent_arithmetic", "FAIL", f"deployed exact-cent probe unavailable: {exc}")
     contract = probe.get("proposal_cent_arithmetic_contract") or {}
     result = contract.get("result") or {}
-    expected_error = "Proposal grand total does not equal subtotal plus tax and Textura."
+    expected_error = "The total doesn't equal the subtotal plus tax and Textura fee."  # readiness.GRAND_TOTAL_MISMATCH
     ok = (
         contract.get("status") == "pass"
         and result.get("exact_cent_errors") == []
@@ -694,7 +694,7 @@ def validate_scanned_pdf_quote(client: Client) -> Check:
     finally:
         if temp_job_id:
             try:
-                client.request("DELETE", f"/api/jobs/{temp_job_id}")
+                client.request("DELETE", f"/api/jobs/{temp_job_id}", json_body={"reason": "Rules audit harness cleanup"})
             except Exception as exc:
                 cleanup_error = f"{type(exc).__name__}: {exc}"
     if cleanup_error:
@@ -1757,7 +1757,7 @@ def validate_manual_override_audit(client: Client, job_id: str, proposal: dict[s
         and almost_equal(actual_grand_delta, expected_grand_delta)
         and stale_result.get("stale_save_ignored") is True
         and cross_session_status == 409
-        and "stale copy was not saved" in str(cross_session_result.get("detail") or "")
+        and "your last change was not saved" in str(cross_session_result.get("detail") or "")
         and stale_save_target is not None
         and almost_equal(float(stale_save_target.get("price_override") or 0), new_price)
         and regenerated_target is not None
@@ -1906,7 +1906,7 @@ def validate_readiness_blockers(client: Client, job_id: str) -> Check:
     artifact_check = next((item for item in readiness_checks if item.get("id") == "durable_artifacts"), {})
     trust_summary = readiness.get("trust_summary") or {}
     exact_source_blocked = any(
-        "intact durable quote file" in str(item)
+        "don't match a saved quote file" in str(item)
         for item in (artifact_check.get("affected_items") or [])
     )
     cleared_receipt = (
@@ -2216,7 +2216,7 @@ def validate_vendor_price_decision_workflow(client: Client, fixture: dict[str, A
     finally:
         if temp_job_id:
             try:
-                client.request("DELETE", f"/api/jobs/{temp_job_id}")
+                client.request("DELETE", f"/api/jobs/{temp_job_id}", json_body={"reason": "Rules audit harness cleanup"})
             except Exception as exc:
                 cleanup_error = f"{type(exc).__name__}: {exc}"
     if cleanup_error:
@@ -2523,7 +2523,7 @@ def cleanup_job(client: Client, job_id: str, created: bool, keep_job: bool) -> C
     if keep_job:
         return Check("cleanup", "WARN", "test job retained by --keep-job", {"job_id": job_id})
     try:
-        client.request("DELETE", f"/api/jobs/{job_id}")
+        client.request("DELETE", f"/api/jobs/{job_id}", json_body={"reason": "Rules audit harness cleanup"})
         return Check("cleanup", "PASS", f"deleted test job {job_id}", {"job_id": job_id})
     except HarnessError as exc:
         return Check("cleanup", "FAIL", f"failed to delete test job {job_id}", {"error": str(exc)})

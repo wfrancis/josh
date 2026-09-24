@@ -5,6 +5,7 @@ import {
 } from 'lucide-react'
 import { api } from '../api'
 import VendorPicker from './VendorPicker'
+import { conflictNotice } from '../conflicts'
 
 /**
  * VendorQuoteFlow — AI-powered vendor-grouped quote request modal.
@@ -26,6 +27,8 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
   const [markingSent, setMarkingSent] = useState(null)
   const [sentVendors, setSentVendors] = useState(new Set())
   const [error, setError] = useState(null)
+  // Lines whose vendor wasn't saved because someone else changed them meanwhile.
+  const [conflictNote, setConflictNote] = useState('')
   const [existingRequests, setExistingRequests] = useState([])
   const [vendorSuggestions, setVendorSuggestions] = useState({}) // materialOrigIdx -> {suggested_vendor, reason}
   const [suggestingVendors, setSuggestingVendors] = useState(false)
@@ -85,8 +88,10 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
   const handleDetectVendors = async () => {
     setDetecting(true)
     setError(null)
+    setConflictNote('')
     try {
       const result = await api.detectVendors(job.id)
+      setConflictNote(conflictNotice(result?.conflicts))
       // Reload job materials with updated vendor fields
       const updated = await api.getJob(job.id)
       setMaterials(updated.materials || [])
@@ -287,6 +292,15 @@ export default function VendorQuoteFlow({ job, onClose, onQuoteRequestCreated })
           <div className="px-6 py-3 bg-red-500/10 border-b border-red-500/20 flex items-center justify-between">
             <span className="text-xs text-red-300">{error}</span>
             <button onClick={() => setError(null)} className="text-red-400 hover:text-red-300">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        {conflictNote && (
+          <div role="status" className="px-6 py-3 bg-amber-500/10 border-b border-amber-500/20 flex items-start justify-between gap-3">
+            <span className="text-xs text-amber-300">Some vendors were not saved. {conflictNote}</span>
+            <button onClick={() => setConflictNote('')} className="text-amber-400 hover:text-amber-300" title="Dismiss">
               <X className="w-3.5 h-3.5" />
             </button>
           </div>

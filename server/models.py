@@ -11,10 +11,13 @@ import os
 import re
 import io
 import json
+import math
 import secrets
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+import stable_ids
 
 
 def _slugify(text: str) -> str:
@@ -610,6 +613,32 @@ def init_db() -> None:
                 (f"job_{column}", f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
                 for column in JOB_ESTIMATE_HEADER_FIELDS
             ],
+            # Deleting a bid only hides it (soft delete); an admin can restore it.
+            ("job_deleted_at", "ALTER TABLE jobs ADD COLUMN deleted_at TEXT"),
+            ("job_deleted_by", "ALTER TABLE jobs ADD COLUMN deleted_by TEXT"),
+            ("job_delete_reason", "ALTER TABLE jobs ADD COLUMN delete_reason TEXT"),
+            # Every printed PDF is kept (insert-only receipts): who made it,
+            # in which request, from which proposal version, for what total.
+            ("artifact_created_by", "ALTER TABLE job_artifacts ADD COLUMN created_by TEXT"),
+            ("artifact_request_id", "ALTER TABLE job_artifacts ADD COLUMN request_id TEXT"),
+            ("artifact_proposal_version_id", "ALTER TABLE job_artifacts ADD COLUMN proposal_version_id INTEGER"),
+            ("artifact_grand_total", "ALTER TABLE job_artifacts ADD COLUMN grand_total REAL"),
+            # Stable row ids (stable_ids.py): a material line keeps its uid for
+            # life; sundry and labor lines are matched by line_key, so saves
+            # update rows in place. row_version / updated_at / updated_by say
+            # when and by whom each row last changed.
+            ("material_uid", "ALTER TABLE job_materials ADD COLUMN uid TEXT"),
+            *[
+                (f"{table}_{column}", f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+                for table in ("job_materials", "job_sundries", "job_labor")
+                for column, kind in (
+                    ("row_version", "INTEGER NOT NULL DEFAULT 0"),
+                    ("updated_at", "TEXT"),
+                    ("updated_by", "TEXT"),
+                )
+            ],
+            ("sundry_line_key", "ALTER TABLE job_sundries ADD COLUMN line_key TEXT"),
+            ("labor_line_key", "ALTER TABLE job_labor ADD COLUMN line_key TEXT"),
         ]:
             try:
                 conn.execute(sql)
@@ -671,6 +700,11 @@ def init_db() -> None:
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_vendor_prices_source_product
                ON vendor_prices(job_id, source_hash, COALESCE(product_name, ''), COALESCE(vendor_name, ''), COALESCE(unit_price, 0), COALESCE(unit, ''))
                WHERE source_hash IS NOT NULL AND source_hash != ''""",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_deleted_at ON jobs(deleted_at)",
+            # PDF and file receipts are history: never rewritten once saved.
+            """CREATE TRIGGER IF NOT EXISTS job_artifacts_insert_only
+               BEFORE UPDATE ON job_artifacts
+               BEGIN SELECT RAISE(ABORT, 'job_artifacts rows are insert-only'); END""",
         ]:
             try:
                 conn.execute(idx_sql)
@@ -680,6 +714,7 @@ def init_db() -> None:
 
         _ensure_rule_history_baseline(conn)
         _ensure_ruleset_history_baseline(conn)
+        _ensure_stable_row_ids(conn)
 
         # Backfill slugs for any jobs missing them
         rows = conn.execute("SELECT id, project_name FROM jobs WHERE slug IS NULL OR slug = ''").fetchall()
@@ -693,8 +728,117 @@ def init_db() -> None:
         # history tables, and closing edit groups left open by the last run.
         import audit
         audit.init_audit(conn)
+
+        # Proposal versions: the table, and an "original" version of every
+        # proposal saved before versions existed (once per bid).
+        import proposal_versions
+        proposal_versions.init_versions(conn)
     finally:
         conn.close()
+
+
+# Sundry and labor tables, with the field that names a line.
+_LINE_TABLES = (("job_sundries", "sundry_name"), ("job_labor", "labor_description"))
+
+
+def _material_uids(conn, job_id: int) -> dict[int, str]:
+    """{material id: uid} for one bid's material lines."""
+    return {
+        int(row["id"]): row["uid"]
+        for row in conn.execute("SELECT id, uid FROM job_materials WHERE job_id=?", (job_id,)).fetchall()
+        if row["uid"]
+    }
+
+
+def _ensure_stable_row_ids(conn) -> None:
+    """Fill in missing material uids, sundry/labor line keys and proposal
+    bundle uids (databases from before stable ids), then add the uniqueness
+    indexes and the triggers that keep them filled in. Runs on every start;
+    once everything has an id it changes nothing."""
+    conn.execute("UPDATE job_materials SET uid = 'm' || id WHERE uid IS NULL OR TRIM(uid) = ''")
+    for table, name_field in _LINE_TABLES:
+        job_ids = [
+            row[0] for row in conn.execute(
+                f"SELECT DISTINCT job_id FROM {table} WHERE line_key IS NULL OR TRIM(line_key) = ''"
+            ).fetchall()
+        ]
+        for job_id in job_ids:
+            rows = [
+                dict(row) for row in conn.execute(
+                    f"SELECT id, material_id, {name_field}, line_key FROM {table} WHERE job_id=? ORDER BY id",
+                    (job_id,),
+                ).fetchall()
+            ]
+            taken = {row["line_key"] for row in rows if str(row["line_key"] or "").strip()}
+            missing = [row for row in rows if not str(row["line_key"] or "").strip()]
+            keys = stable_ids.assign_line_keys(missing, name_field, _material_uids(conn, job_id), taken)
+            for row, key in zip(missing, keys):
+                conn.execute(f"UPDATE {table} SET line_key=? WHERE id=?", (key, row["id"]))
+    conn.commit()
+
+    statements = [
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_job_materials_uid ON job_materials(job_id, uid)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_job_sundries_line_key ON job_sundries(job_id, line_key)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_job_labor_line_key ON job_labor(job_id, line_key)",
+        # A line added some other way still gets an identity.
+        """CREATE TRIGGER IF NOT EXISTS job_materials_fill_uid AFTER INSERT ON job_materials
+           WHEN NEW.uid IS NULL OR TRIM(NEW.uid) = ''
+           BEGIN UPDATE job_materials SET uid = 'm' || NEW.id WHERE id = NEW.id; END""",
+    ]
+    for table, _name_field in _LINE_TABLES:
+        statements.append(
+            f"""CREATE TRIGGER IF NOT EXISTS {table}_fill_line_key AFTER INSERT ON {table}
+                WHEN NEW.line_key IS NULL OR TRIM(NEW.line_key) = ''
+                BEGIN UPDATE {table} SET line_key = 'row' || NEW.id WHERE id = NEW.id; END"""
+        )
+    for table in ("job_materials", "job_sundries", "job_labor"):
+        # A row changed some other way (a direct UPDATE) still gets a new
+        # row_version; who changed it isn't known there, so updated_by is cleared.
+        statements.append(
+            f"""CREATE TRIGGER IF NOT EXISTS {table}_bump_row_version AFTER UPDATE ON {table}
+                WHEN NEW.row_version IS OLD.row_version
+                BEGIN
+                    UPDATE {table} SET
+                        row_version = COALESCE(OLD.row_version, 0) + 1,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        updated_by = CASE WHEN NEW.updated_by IS OLD.updated_by THEN NULL ELSE NEW.updated_by END
+                    WHERE id = NEW.id;
+                END"""
+        )
+    for sql in statements:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except sqlite3.DatabaseError as err:
+            print(f"[db] WARNING: couldn't set up stable row ids: {err}")
+
+    # Proposal bundles saved before uids get a deterministic uid. The JSON is
+    # read in Python, not with SQLite's json functions: SQLite may run those
+    # on a row whose proposal_data isn't valid JSON and stop the whole start.
+    try:
+        rows = conn.execute(
+            "SELECT id, proposal_data FROM jobs WHERE proposal_data LIKE '%bundles%'"
+        ).fetchall()
+        changed = False
+        for row in rows:
+            try:
+                proposal = json.loads(row["proposal_data"])
+            except (TypeError, ValueError):
+                continue
+            bundles = proposal.get("bundles") if isinstance(proposal, dict) else None
+            if not isinstance(bundles, list) or not any(
+                isinstance(bundle, dict) and not isinstance(bundle.get("uid"), str)
+                for bundle in bundles
+            ):
+                continue
+            if stable_ids.backfill_proposal_bundle_uids(row["id"], proposal):
+                conn.execute("UPDATE jobs SET proposal_data=? WHERE id=?", (json.dumps(proposal), row["id"]))
+                changed = True
+        if changed:
+            conn.commit()
+    except (sqlite3.DatabaseError, TypeError, ValueError) as err:
+        conn.rollback()
+        print(f"[db] WARNING: couldn't give older proposal bundles their ids: {err}")
 
 
 def _make_unique_slug(conn, base_slug: str, exclude_id: int = None) -> str:
@@ -797,13 +941,65 @@ def save_job(job_data: dict) -> int:
         conn.close()
 
 
+# Stored fields of a material line, in the order save_materials writes them
+# (everything but id, job_id, uid and the row bookkeeping columns).
+MATERIAL_COLUMNS = (
+    "item_code", "description", "material_type", "installed_qty", "unit", "waste_pct",
+    "order_qty", "vendor", "unit_price", "extended_cost", "ai_confidence", "quote_status",
+    "price_source", "quote_source_hash", "quote_file_name", "freight_per_unit",
+    "freight_source", "fixture_count", "labor_rate_lf", "labor_catalog",
+    "tack_strip_lf", "seam_tape_lf", "pad_sy", "area_type", "is_mosaic",
+    "is_penny_hex", "crack_isolation_sf", "weld_rod_lf",
+)
+
+
+class SavedRows(list):
+    """The saved rows' ids in the order given (a plain list, so callers can
+    zip them with their rows), plus what the save changed:
+
+    - ``uids``: each saved row's uid, in the same order;
+    - ``diff``: {"added": [uid], "updated": {uid: [field, ...]}, "removed": [uid]}.
+    """
+
+    def __init__(self, ids=(), uids=(), diff=None):
+        super().__init__(ids)
+        self.uids = list(uids)
+        self.diff = diff or {"added": [], "updated": {}, "removed": []}
+
+
+def _same_stored_value(a, b) -> bool:
+    """Whether writing ``b`` over the stored ``a`` would change nothing."""
+    if isinstance(a, bool):
+        a = int(a)
+    if isinstance(b, bool):
+        b = int(b)
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return math.isclose(float(a), float(b), rel_tol=1e-12, abs_tol=1e-9)
+    return a == b
+
+
+def _row_stamp() -> tuple[str, str]:
+    """(updated_at, updated_by) for rows changed now by whoever is saving."""
+    import audit
+    return audit.iso_ms(audit.utc_now()), audit.actor_label()
+
+
 def save_materials(
     job_id: int,
     materials: list[dict],
     *,
     conn: sqlite3.Connection | None = None,
-) -> list[int]:
-    """Save material lines while retaining IDs for rows that still exist."""
+) -> SavedRows:
+    """Save a bid's material lines: exactly the given rows, in this order.
+
+    A row with the id of a saved line (or, failing that, its uid) updates
+    that line, which keeps its id and uid. Any other row is added, with the
+    uid it brought if this bid doesn't use it yet, else a new one. Saved lines
+    that aren't given are deleted. Only lines whose stored fields change are
+    written; they get row_version + 1, updated_at and updated_by.
+
+    Returns the ids in the order given (SavedRows, with .uids and .diff).
+    """
     owns_connection = conn is None
     conn = conn or _get_conn()
     try:
@@ -815,6 +1011,9 @@ def save_materials(
             ).fetchall()
         }
         existing_ids = set(existing_rows)
+        id_by_uid = {row["uid"]: row_id for row_id, row in existing_rows.items() if row.get("uid")}
+        taken_uids = set(id_by_uid)
+        updated_at, updated_by = _row_stamp()
 
         def decision_identity(material: dict) -> tuple:
             try:
@@ -861,53 +1060,67 @@ def save_materials(
                 material.get("weld_rod_lf", 0),
             )
 
-        ids = []
+        assignments = ", ".join(f"{column}=?" for column in MATERIAL_COLUMNS)
+        insert_columns = ", ".join(MATERIAL_COLUMNS)
+        insert_marks = ", ".join("?" for _ in MATERIAL_COLUMNS)
+        ids, uids = [], []
         retained_ids = set()
+        diff = {"added": [], "updated": {}, "removed": []}
         for m in materials:
             try:
                 requested_id = int(m.get("id")) if m.get("id") is not None else None
             except (TypeError, ValueError):
                 requested_id = None
+            if requested_id not in existing_ids or requested_id in retained_ids:
+                # No saved line with that id: the same line may still be
+                # named by its uid (e.g. a client that only knows uids).
+                requested_id = id_by_uid.get(stable_ids.clean_uid(m.get("uid")))
+                if requested_id in retained_ids:
+                    requested_id = None
             values = material_values(m)
-            if requested_id in existing_ids and requested_id not in retained_ids:
-                if decision_identity(existing_rows[requested_id]) != decision_identity(m):
+            if requested_id is not None:
+                existing = existing_rows[requested_id]
+                if decision_identity(existing) != decision_identity(m):
                     conn.execute(
                         """UPDATE material_price_decisions
                            SET superseded_at=?
                            WHERE material_id=? AND superseded_at IS NULL""",
                         (datetime.now().isoformat(), requested_id),
                     )
-                conn.execute("""
-                    UPDATE job_materials SET
-                        item_code=?, description=?, material_type=?, installed_qty=?,
-                        unit=?, waste_pct=?, order_qty=?, vendor=?, unit_price=?,
-                        extended_cost=?, ai_confidence=?, quote_status=?, price_source=?,
-                        quote_source_hash=?, quote_file_name=?, freight_per_unit=?,
-                        freight_source=?, fixture_count=?, labor_rate_lf=?,
-                        labor_catalog=?, tack_strip_lf=?, seam_tape_lf=?, pad_sy=?,
-                        area_type=?, is_mosaic=?, is_penny_hex=?, crack_isolation_sf=?,
-                        weld_rod_lf=?
-                    WHERE id=? AND job_id=?
-                """, (*values, requested_id, job_id))
+                changed = [
+                    column for column, value in zip(MATERIAL_COLUMNS, values)
+                    if not _same_stored_value(existing.get(column), value)
+                ]
+                if changed:
+                    conn.execute(
+                        f"""UPDATE job_materials SET {assignments},
+                                row_version = COALESCE(row_version, 0) + 1, updated_at=?, updated_by=?
+                            WHERE id=? AND job_id=?""",
+                        (*values, updated_at, updated_by, requested_id, job_id),
+                    )
+                    diff["updated"][existing.get("uid") or str(requested_id)] = changed
                 material_id = requested_id
+                uid = existing.get("uid")
             else:
-                cur = conn.execute("""
-                    INSERT INTO job_materials
-                        (job_id, item_code, description, material_type, installed_qty,
-                         unit, waste_pct, order_qty, vendor, unit_price, extended_cost,
-                         ai_confidence, quote_status, price_source, quote_source_hash,
-                         quote_file_name, freight_per_unit, freight_source, fixture_count,
-                         labor_rate_lf, labor_catalog,
-                         tack_strip_lf, seam_tape_lf, pad_sy, area_type, is_mosaic,
-                         is_penny_hex, crack_isolation_sf, weld_rod_lf)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (job_id, *values))
+                uid = stable_ids.clean_uid(m.get("uid"))
+                if not uid or uid in taken_uids:
+                    uid = stable_ids.new_material_uid(taken_uids)
+                taken_uids.add(uid)
+                cur = conn.execute(
+                    f"""INSERT INTO job_materials
+                            (job_id, uid, {insert_columns}, row_version, updated_at, updated_by)
+                        VALUES (?, ?, {insert_marks}, 1, ?, ?)""",
+                    (job_id, uid, *values, updated_at, updated_by),
+                )
                 material_id = int(cur.lastrowid)
+                diff["added"].append(uid)
             retained_ids.add(material_id)
             ids.append(material_id)
+            uids.append(uid)
 
+        removed_ids = existing_ids - retained_ids
+        diff["removed"] = [existing_rows[row_id].get("uid") or str(row_id) for row_id in sorted(removed_ids)]
         if retained_ids:
-            removed_ids = existing_ids - retained_ids
             if removed_ids:
                 placeholders = ",".join("?" for _ in removed_ids)
                 conn.execute(
@@ -931,7 +1144,7 @@ def save_materials(
             conn.execute("DELETE FROM job_materials WHERE job_id=?", (job_id,))
         if owns_connection:
             conn.commit()
-        return ids
+        return SavedRows(ids, uids, diff)
     finally:
         if owns_connection:
             conn.close()
@@ -959,37 +1172,81 @@ def _conn_or_new(conn: sqlite3.Connection | None = None):
         own.close()
 
 
-def save_sundries(job_id: int, sundries: list[dict], *, conn: sqlite3.Connection | None = None) -> None:
-    """Save sundry lines for a job."""
-    with _conn_or_new(conn) as conn:
-        conn.execute("DELETE FROM job_sundries WHERE job_id=?", (job_id,))
-        for s in sundries:
-            conn.execute("""
-                INSERT INTO job_sundries
-                    (job_id, material_id, sundry_name, qty, unit, unit_price, extended_cost, freight_cost)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                job_id, s.get("material_id"), s.get("sundry_name"),
-                s.get("qty", 0), s.get("unit"),
-                s.get("unit_price", 0), s.get("extended_cost", 0),
-                s.get("freight_cost", 0),
-            ))
+# Stored fields of sundry and labor lines (besides job_id and line_key), with
+# what a missing value is saved as.
+SUNDRY_COLUMNS = ("material_id", "sundry_name", "qty", "unit", "unit_price", "extended_cost", "freight_cost")
+_SUNDRY_DEFAULTS = {"qty": 0, "unit_price": 0, "extended_cost": 0, "freight_cost": 0}
+LABOR_COLUMNS = ("material_id", "labor_description", "qty", "unit", "rate", "extended_cost")
+_LABOR_DEFAULTS = {"qty": 0, "rate": 0, "extended_cost": 0}
 
 
-def save_labor(job_id: int, labor_items: list[dict], *, conn: sqlite3.Connection | None = None) -> None:
-    """Save labor lines for a job."""
+def _save_keyed_lines(conn, table: str, name_field: str, columns: tuple, defaults: dict,
+                      job_id: int, lines: list[dict]) -> dict:
+    """Make a bid's sundry or labor lines exactly ``lines``, matched to the
+    saved lines by line_key (stable_ids.assign_line_keys): a matching line is
+    updated in place (only if a field changed), new lines are added and saved
+    lines no longer listed are deleted.
+    Returns {"added": [key], "updated": {key: [field, ...]}, "removed": [key]}."""
+    lines = [line for line in lines or [] if isinstance(line, dict)]
+    keys = stable_ids.assign_line_keys(lines, name_field, _material_uids(conn, job_id))
+    saved: dict[str, dict] = {}
+    unkeyed_ids = []
+    for row in conn.execute(f"SELECT * FROM {table} WHERE job_id=? ORDER BY id", (job_id,)).fetchall():
+        row = dict(row)
+        if str(row.get("line_key") or "").strip():
+            saved[row["line_key"]] = row
+        else:
+            unkeyed_ids.append(row["id"])
+    updated_at, updated_by = _row_stamp()
+    diff = {"added": [], "updated": {}, "removed": []}
+
+    wanted = set(keys)
+    removed = [key for key in saved if key not in wanted]
+    doomed = unkeyed_ids + [saved[key]["id"] for key in removed]
+    for start in range(0, len(doomed), 500):
+        chunk = doomed[start:start + 500]
+        conn.execute(f"DELETE FROM {table} WHERE id IN ({','.join('?' for _ in chunk)})", chunk)
+    diff["removed"] = removed
+
+    assignments = ", ".join(f"{column}=?" for column in columns)
+    for line, key in zip(lines, keys):
+        values = [line.get(column, defaults.get(column)) for column in columns]
+        current = saved.get(key)
+        if current is None:
+            conn.execute(
+                f"""INSERT INTO {table} (job_id, line_key, {', '.join(columns)}, row_version, updated_at, updated_by)
+                    VALUES (?, ?, {', '.join('?' for _ in columns)}, 1, ?, ?)""",
+                (job_id, key, *values, updated_at, updated_by),
+            )
+            diff["added"].append(key)
+            continue
+        changed = [
+            column for column, value in zip(columns, values)
+            if not _same_stored_value(current.get(column), value)
+        ]
+        if changed:
+            conn.execute(
+                f"""UPDATE {table} SET {assignments},
+                        row_version = COALESCE(row_version, 0) + 1, updated_at=?, updated_by=?
+                    WHERE id=?""",
+                (*values, updated_at, updated_by, current["id"]),
+            )
+            diff["updated"][key] = changed
+    return diff
+
+
+def save_sundries(job_id: int, sundries: list[dict], *, conn: sqlite3.Connection | None = None) -> dict:
+    """Save a bid's sundry lines (keyed upsert by line_key; see _save_keyed_lines)."""
     with _conn_or_new(conn) as conn:
-        conn.execute("DELETE FROM job_labor WHERE job_id=?", (job_id,))
-        for l in labor_items:
-            conn.execute("""
-                INSERT INTO job_labor
-                    (job_id, material_id, labor_description, qty, unit, rate, extended_cost)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                job_id, l.get("material_id"), l.get("labor_description"),
-                l.get("qty", 0), l.get("unit"),
-                l.get("rate", 0), l.get("extended_cost", 0)
-            ))
+        return _save_keyed_lines(conn, "job_sundries", "sundry_name", SUNDRY_COLUMNS, _SUNDRY_DEFAULTS,
+                                 job_id, sundries)
+
+
+def save_labor(job_id: int, labor_items: list[dict], *, conn: sqlite3.Connection | None = None) -> dict:
+    """Save a bid's labor lines (keyed upsert by line_key; see _save_keyed_lines)."""
+    with _conn_or_new(conn) as conn:
+        return _save_keyed_lines(conn, "job_labor", "labor_description", LABOR_COLUMNS, _LABOR_DEFAULTS,
+                                 job_id, labor_items)
 
 
 def save_bundles(job_id: int, bundles: list[dict], *, conn: sqlite3.Connection | None = None) -> None:
@@ -1330,25 +1587,91 @@ def delete_quotes(job_id: int, *, conn: sqlite3.Connection | None = None) -> Non
         conn.execute("DELETE FROM job_quotes WHERE job_id=?", (job_id,))
 
 
-def delete_job(job_ref, *, conn: sqlite3.Connection | None = None) -> bool:
-    """Delete a job by ID or slug and all related data (cascading)."""
+MAX_DELETE_REASON_LENGTH = 500
+
+
+def clean_delete_reason(reason) -> str:
+    """The reason someone gives for deleting a bid: required, 1-500 characters."""
+    text = " ".join(str(reason or "").split())
+    if not text:
+        raise ValueError("Please say why you're deleting this bid.")
+    if len(text) > MAX_DELETE_REASON_LENGTH:
+        raise ValueError(f"Keep the reason under {MAX_DELETE_REASON_LENGTH} characters.")
+    return text
+
+
+def _job_ref_where(job_ref) -> tuple[str, tuple]:
+    if isinstance(job_ref, int) or (isinstance(job_ref, str) and job_ref.strip().isdigit()):
+        return "id=?", (int(job_ref),)
+    return "slug=?", (str(job_ref).strip(),)
+
+
+def delete_job(job_ref, *, reason: str, deleted_by: str | None,
+               conn: sqlite3.Connection | None = None) -> bool:
+    """Hide a bid (soft delete): sets deleted_at, deleted_by and delete_reason.
+
+    No rows are removed, so the bid's materials, proposal, PDFs and history
+    all stay and an admin can bring it back with ``restore_job``. Run it in a
+    job_write (pass tx.conn) so it is locked and audited. Returns False when
+    there's no such bid or it was already deleted.
+    """
+    reason = clean_delete_reason(reason)
+    where, params = _job_ref_where(job_ref)
     with _conn_or_new(conn) as conn:
-        if isinstance(job_ref, int) or (isinstance(job_ref, str) and job_ref.isdigit()):
-            cur = conn.execute("DELETE FROM jobs WHERE id=?", (int(job_ref),))
-        else:
-            cur = conn.execute("DELETE FROM jobs WHERE slug=?", (job_ref,))
+        cur = conn.execute(
+            f"UPDATE jobs SET deleted_at=?, deleted_by=?, delete_reason=? WHERE {where} AND deleted_at IS NULL",
+            (_utc_iso_ms(), deleted_by, reason, *params),
+        )
         return cur.rowcount > 0
 
 
-def load_job(job_ref) -> Optional[dict]:
-    """Load a job by ID (int) or slug (str) with all related data."""
+def restore_job(job_ref, *, conn: sqlite3.Connection | None = None) -> bool:
+    """Bring back a deleted bid. Returns False when it wasn't deleted."""
+    where, params = _job_ref_where(job_ref)
+    with _conn_or_new(conn) as conn:
+        cur = conn.execute(
+            f"UPDATE jobs SET deleted_at=NULL, deleted_by=NULL, delete_reason=NULL "
+            f"WHERE {where} AND deleted_at IS NOT NULL",
+            params,
+        )
+        return cur.rowcount > 0
+
+
+def list_deleted_jobs() -> list[dict]:
+    """Deleted bids, most recently deleted first, with who deleted them, why and the saved total."""
     conn = _get_conn()
     try:
-        if isinstance(job_ref, int) or (isinstance(job_ref, str) and job_ref.isdigit()):
-            row = conn.execute("SELECT * FROM jobs WHERE id=?", (int(job_ref),)).fetchone()
-        else:
-            row = conn.execute("SELECT * FROM jobs WHERE slug=?", (job_ref,)).fetchone()
+        rows = conn.execute(
+            """SELECT j.id, j.slug, j.project_name, j.gc_name, j.deleted_at, j.deleted_by, j.delete_reason,
+                      j.proposal_data, j.bid_data, u.display_name AS deleted_by_name
+               FROM jobs j LEFT JOIN users u ON u.username = j.deleted_by
+               WHERE j.deleted_at IS NOT NULL
+               ORDER BY j.deleted_at DESC, j.id DESC"""
+        ).fetchall()
+    finally:
+        conn.close()
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["grand_total"] = _saved_bid_total(item.pop("proposal_data", None), item.pop("bid_data", None))
+        item["deleted_by_name"] = item.get("deleted_by_name") or item.get("deleted_by") or ""
+        results.append(item)
+    return results
+
+
+def load_job(job_ref, include_deleted: bool = False) -> Optional[dict]:
+    """Load a job by ID (int) or slug (str) with all related data.
+
+    A deleted bid loads as None unless ``include_deleted`` (it then carries
+    deleted_at / deleted_by / delete_reason, like every job row does).
+    """
+    conn = _get_conn()
+    try:
+        where, params = _job_ref_where(job_ref)
+        row = conn.execute(f"SELECT * FROM jobs WHERE {where}", params).fetchone()
         if not row:
+            return None
+        if row["deleted_at"] and not include_deleted:
             return None
         job = dict(row)
         jid = job["id"]
@@ -1426,7 +1749,7 @@ def save_settings(settings: dict, *, conn: sqlite3.Connection | None = None) -> 
 
 
 def search_all(query: str) -> dict:
-    """Search jobs and materials by query string."""
+    """Search jobs and materials by query string (deleted bids left out)."""
     conn = _get_conn()
     try:
         q = f"%{query}%"
@@ -1435,7 +1758,8 @@ def search_all(query: str) -> dict:
             conn.execute(
                 """SELECT id, slug, project_name, gc_name, salesperson, city, state
                    FROM jobs
-                   WHERE project_name LIKE ? OR gc_name LIKE ? OR salesperson LIKE ? OR city LIKE ?
+                   WHERE deleted_at IS NULL
+                     AND (project_name LIKE ? OR gc_name LIKE ? OR salesperson LIKE ? OR city LIKE ?)
                    ORDER BY created_at DESC LIMIT 10""",
                 (q, q, q, q)
             ).fetchall()
@@ -1445,7 +1769,7 @@ def search_all(query: str) -> dict:
                       j.project_name, j.slug
                FROM job_materials m
                JOIN jobs j ON m.job_id = j.id
-               WHERE m.description LIKE ? OR m.item_code LIKE ?
+               WHERE j.deleted_at IS NULL AND (m.description LIKE ? OR m.item_code LIKE ?)
                ORDER BY m.job_id DESC LIMIT 20""",
             (q, q)
         ).fetchall()
@@ -2346,20 +2670,79 @@ def rollback_ruleset_version(
 
 # ── Labor Catalog ────────────────────────────────────────────────────────────
 
-def save_labor_catalog_entries(entries: list[dict], *, conn: sqlite3.Connection | None = None) -> None:
-    """Replace all labor catalog entries."""
+def _catalog_key(row: dict, key_fields: tuple[str, ...]) -> tuple[str, ...]:
+    # Case and extra spaces don't make a different entry ("SY" = "sy").
+    return tuple(" ".join(str(row.get(field) or "").split()).casefold() for field in key_fields)
+
+
+def upsert_keyed_rows(conn, table: str, columns: tuple[str, ...], key_fields: tuple[str, ...],
+                      entries: list[dict], *, scope: dict | None = None,
+                      delete_missing: bool = True) -> dict:
+    """Make ``table`` (or the rows matching ``scope``, e.g. {"vendor": "Schluter"})
+    hold ``entries``, matching saved rows by ``key_fields`` instead of
+    clearing and re-inserting everything.
+
+    A saved row with the same key is updated in place (only when a value
+    changed) and keeps its id; when a key repeats, the first entry takes the
+    first saved row, the second the second, and so on. Other entries are
+    added. With ``delete_missing`` the saved rows no entry matched are deleted
+    one by one, so the history lists exactly which rows went.
+    Returns {"added": n, "updated": n, "removed": n, "unchanged": n}.
+    """
+    scope = dict(scope or {})
+    where = (" WHERE " + " AND ".join(f"{column} = ?" for column in scope)) if scope else ""
+    saved: dict[tuple, list[dict]] = {}
+    for row in conn.execute(f"SELECT * FROM {table}{where} ORDER BY id", tuple(scope.values())).fetchall():
+        row = dict(row)
+        saved.setdefault(_catalog_key(row, key_fields), []).append(row)
+    counts = {"added": 0, "updated": 0, "removed": 0, "unchanged": 0}
+    for entry in entries:
+        values = {column: entry.get(column) for column in columns}
+        matches = saved.get(_catalog_key(values, key_fields))
+        if matches:
+            row = matches.pop(0)
+            changed = [column for column in columns if not _same_stored_value(row.get(column), values[column])]
+            if changed:
+                conn.execute(
+                    f"UPDATE {table} SET {', '.join(f'{column}=?' for column in changed)} WHERE id=?",
+                    (*[values[column] for column in changed], row["id"]),
+                )
+                counts["updated"] += 1
+            else:
+                counts["unchanged"] += 1
+        else:
+            conn.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                tuple(values[column] for column in columns),
+            )
+            counts["added"] += 1
+    if delete_missing:
+        leftover = [row["id"] for rows in saved.values() for row in rows]
+        for start in range(0, len(leftover), 500):
+            chunk = leftover[start:start + 500]
+            conn.execute(f"DELETE FROM {table} WHERE id IN ({','.join('?' for _ in chunk)})", chunk)
+        counts["removed"] = len(leftover)
+    return counts
+
+
+LABOR_CATALOG_COLUMNS = ("labor_type", "description", "cost", "retail_display", "unit", "gpm_markup")
+LABOR_CATALOG_KEY = ("labor_type", "description", "unit")
+
+
+def save_labor_catalog_entries(entries: list[dict], *, conn: sqlite3.Connection | None = None) -> dict:
+    """Make the labor catalog exactly these entries: an entry with the same
+    labor type, description and unit as a saved one updates it in place, new
+    ones are added and saved ones not in the list are deleted."""
+    rows = [
+        {
+            "labor_type": e.get("labor_type", ""), "description": e.get("description", ""),
+            "cost": e.get("cost", 0), "retail_display": e.get("retail_display", ""),
+            "unit": e.get("unit", ""), "gpm_markup": e.get("gpm_markup", 0),
+        }
+        for e in entries
+    ]
     with _conn_or_new(conn) as conn:
-        conn.execute("DELETE FROM labor_catalog")
-        for e in entries:
-            conn.execute("""
-                INSERT INTO labor_catalog
-                    (labor_type, description, cost, retail_display, unit, gpm_markup)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                e.get("labor_type", ""), e.get("description", ""),
-                e.get("cost", 0), e.get("retail_display", ""),
-                e.get("unit", ""), e.get("gpm_markup", 0)
-            ))
+        return upsert_keyed_rows(conn, "labor_catalog", LABOR_CATALOG_COLUMNS, LABOR_CATALOG_KEY, rows)
 
 
 def get_labor_catalog_entries() -> list[dict]:
@@ -2423,20 +2806,24 @@ def clear_price_list(*, conn: sqlite3.Connection | None = None) -> None:
 
 # ── Price List ───────────────────────────────────────────────────────────────
 
-def save_price_list_entries(entries: list[dict], *, conn: sqlite3.Connection | None = None) -> None:
-    """Replace all price list entries."""
+PRICE_LIST_COLUMNS = ("product_name", "material_type", "unit", "unit_price", "vendor", "notes")
+PRICE_LIST_KEY = ("product_name", "vendor", "unit")
+
+
+def save_price_list_entries(entries: list[dict], *, conn: sqlite3.Connection | None = None) -> dict:
+    """Make the price list exactly these entries: an entry with the same
+    product, vendor and unit as a saved one updates it in place, new ones are
+    added and saved ones not in the list are deleted."""
+    rows = [
+        {
+            "product_name": e.get("product_name", ""), "material_type": e.get("material_type", ""),
+            "unit": e.get("unit", ""), "unit_price": e.get("unit_price", 0),
+            "vendor": e.get("vendor", ""), "notes": e.get("notes", ""),
+        }
+        for e in entries
+    ]
     with _conn_or_new(conn) as conn:
-        conn.execute("DELETE FROM price_list")
-        for e in entries:
-            conn.execute("""
-                INSERT INTO price_list
-                    (product_name, material_type, unit, unit_price, vendor, notes)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                e.get("product_name", ""), e.get("material_type", ""),
-                e.get("unit", ""), e.get("unit_price", 0),
-                e.get("vendor", ""), e.get("notes", "")
-            ))
+        return upsert_keyed_rows(conn, "price_list", PRICE_LIST_COLUMNS, PRICE_LIST_KEY, rows)
 
 
 def add_price_list_entry(entry: dict, *, conn: sqlite3.Connection | None = None) -> int:
@@ -2850,7 +3237,7 @@ def get_golden_replay(replay_id: int) -> dict | None:
 
 
 def list_jobs() -> list[dict]:
-    """List all jobs (summary with bundle count and bid status)."""
+    """List all jobs that aren't deleted (summary with bundle count and bid status)."""
     from bid_tracker import effective_bid_status
 
     conn = _get_conn()
@@ -2861,7 +3248,7 @@ def list_jobs() -> list[dict]:
                       (SELECT COUNT(*) FROM job_bundles b WHERE b.job_id = j.id) AS bundle_count,
                       (SELECT COUNT(*) FROM job_materials m WHERE m.job_id = j.id) AS material_count,
                       (SELECT COUNT(*) FROM job_materials m WHERE m.job_id = j.id AND m.unit_price > 0) AS priced_count
-               FROM jobs j ORDER BY j.created_at DESC"""
+               FROM jobs j WHERE j.deleted_at IS NULL ORDER BY j.created_at DESC"""
         ).fetchall()
         results = []
         for r in rows:
@@ -3336,35 +3723,77 @@ def record_job_artifact(
     artifact_path: str,
     file_hash: str,
     file_size: int = 0,
-) -> None:
-    """Record a durable artifact receipt for a job."""
+    *,
+    grand_total: float | None = None,
+    proposal_version_id: int | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Save a receipt for a file written for a job; returns the receipt id.
+
+    Insert-only: a receipt is never changed once saved. Printed PDFs get a new
+    file name every time, so each print keeps its own receipt. Recording the
+    same file again (same kind and path, e.g. one RFMS workbook uploaded
+    twice) keeps and returns the first receipt. Records who made it and in
+    which request. Inside a job_write, pass tx.conn (or let it find the open
+    write) so the receipt and the history entry are saved together.
+    """
+    import audit
+    context = get_audit_context()
+    with _conn_or_new(conn) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO job_artifacts (job_id, artifact_kind, artifact_path, file_hash, file_size, created_at,
+                                       created_by, request_id, proposal_version_id, grand_total)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id, artifact_kind, artifact_path) DO NOTHING
+            """,
+            (job_id, artifact_kind, artifact_path, file_hash, int(file_size or 0), _utc_iso_ms(),
+             audit.actor_label(), context.get("request_id"), proposal_version_id,
+             None if grand_total is None else round(float(grand_total), 2)),
+        )
+        if cur.rowcount:
+            return int(cur.lastrowid)
+        existing = conn.execute(
+            "SELECT id, file_hash FROM job_artifacts WHERE job_id=? AND artifact_kind=? AND artifact_path=?",
+            (job_id, artifact_kind, artifact_path),
+        ).fetchone()
+        if existing["file_hash"] != file_hash:
+            print(f"[artifacts] WARNING: {artifact_path} for job {job_id} changed after its receipt was saved; "
+                  "keeping the first receipt")
+        return int(existing["id"])
+
+
+_ARTIFACT_COLUMNS = (
+    "a.id, a.job_id, a.artifact_kind, a.artifact_path, a.file_hash, a.file_size, a.created_at, "
+    "a.created_by, a.request_id, a.proposal_version_id, a.grand_total, u.display_name AS created_by_name"
+)
+
+
+def list_job_artifacts(job_id: int, artifact_kind: str | None = None) -> list[dict]:
+    """A job's file receipts (optionally one kind), newest first."""
     conn = _get_conn()
     try:
-        conn.execute(
-            """
-            INSERT INTO job_artifacts (job_id, artifact_kind, artifact_path, file_hash, file_size, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(job_id, artifact_kind, artifact_path) DO UPDATE SET
-                file_hash=excluded.file_hash,
-                file_size=excluded.file_size,
-                created_at=excluded.created_at
-            """,
-            (job_id, artifact_kind, artifact_path, file_hash, file_size, datetime.now().isoformat()),
-        )
-        conn.commit()
+        sql = f"SELECT {_ARTIFACT_COLUMNS} FROM job_artifacts a LEFT JOIN users u ON u.username = a.created_by WHERE a.job_id=?"
+        params: list = [job_id]
+        if artifact_kind:
+            sql += " AND a.artifact_kind=?"
+            params.append(artifact_kind)
+        rows = conn.execute(sql + " ORDER BY a.created_at DESC, a.id DESC", params).fetchall()
+        return [dict(row) for row in rows]
     finally:
         conn.close()
 
 
-def list_job_artifacts(job_id: int) -> list[dict]:
-    """List recorded durable artifact receipts for a job."""
+def get_job_artifact(job_id: int, artifact_id: int) -> dict | None:
+    """One receipt of a job, or None."""
     conn = _get_conn()
     try:
-        rows = conn.execute(
-            "SELECT id, artifact_kind, artifact_path, file_hash, file_size, created_at FROM job_artifacts WHERE job_id=? ORDER BY created_at DESC",
-            (job_id,),
-        ).fetchall()
-        return [dict(row) for row in rows]
+        row = conn.execute(
+            f"SELECT {_ARTIFACT_COLUMNS} FROM job_artifacts a LEFT JOIN users u ON u.username = a.created_by "
+            "WHERE a.job_id=? AND a.id=?",
+            (job_id, artifact_id),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 
@@ -3453,16 +3882,17 @@ def create_notification(job_id: int, ntype: str, message: str) -> int:
 
 
 def get_notifications(unread_only: bool = True) -> list[dict]:
-    """Get notifications, optionally only unread."""
+    """Get notifications, optionally only unread (none for deleted bids)."""
     conn = _get_conn()
     try:
+        not_deleted = "NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = n.job_id AND j.deleted_at IS NOT NULL)"
         if unread_only:
             rows = conn.execute(
-                "SELECT * FROM notifications WHERE read=0 ORDER BY created_at DESC"
+                f"SELECT n.* FROM notifications n WHERE n.read=0 AND {not_deleted} ORDER BY n.created_at DESC"
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50"
+                f"SELECT n.* FROM notifications n WHERE {not_deleted} ORDER BY n.created_at DESC LIMIT 50"
             ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -3666,25 +4096,35 @@ def delete_quote_request(request_id: int, *, conn: sqlite3.Connection | None = N
 # ── Price Book ──────────────────────────────────────────────────────────────
 
 
+PRICE_BOOK_COLUMNS = (
+    "vendor", "product_line", "item_no", "material_finish", "size_mm", "size_inches",
+    "list_price", "discount_pct", "net_price", "length", "unit", "category",
+)
+# Within one vendor's book (the vendor is the scope of an import).
+PRICE_BOOK_KEY = ("item_no", "material_finish", "size_mm")
+
+
 def import_price_book(vendor: str, items: list[dict], discount_pct: float, category: str = "", *, conn: sqlite3.Connection | None = None) -> int:
-    """Import a vendor price book. Clears existing items for this vendor first.
+    """Import a vendor price book: afterwards the vendor's book is exactly
+    these items. An item with the same item number, finish and size as a
+    saved one updates it in place, new ones are added and the vendor's saved
+    items not in the book are deleted.
     items: list of {product_line, item_no, material_finish, size_mm, size_inches, list_price, net_price, length, unit}
     Returns number of items imported."""
+    rows = [
+        {
+            "vendor": vendor, "product_line": item.get("product_line", ""), "item_no": item.get("item_no", ""),
+            "material_finish": item.get("material_finish", ""), "size_mm": item.get("size_mm", ""),
+            "size_inches": item.get("size_inches", ""), "list_price": item.get("list_price", 0),
+            "discount_pct": discount_pct, "net_price": item.get("net_price", 0),
+            "length": item.get("length", ""), "unit": item.get("unit", "length"),
+            "category": item.get("category", category),
+        }
+        for item in items
+    ]
     with _conn_or_new(conn) as conn:
-        conn.execute("DELETE FROM price_book_items WHERE vendor=?", (vendor,))
-        for item in items:
-            conn.execute(
-                """INSERT INTO price_book_items
-                   (vendor, product_line, item_no, material_finish, size_mm, size_inches,
-                    list_price, discount_pct, net_price, length, unit, category)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (vendor, item.get("product_line", ""), item.get("item_no", ""),
-                 item.get("material_finish", ""), item.get("size_mm", ""),
-                 item.get("size_inches", ""), item.get("list_price", 0),
-                 discount_pct, item.get("net_price", 0),
-                 item.get("length", ""), item.get("unit", "length"),
-                 item.get("category", category))
-            )
+        upsert_keyed_rows(conn, "price_book_items", PRICE_BOOK_COLUMNS, PRICE_BOOK_KEY, rows,
+                          scope={"vendor": vendor})
         return len(items)
 
 
@@ -3837,6 +4277,12 @@ def _utc_now() -> datetime:
 def _utc_iso(value: datetime) -> str:
     # One fixed format so timestamps compare correctly as text in SQL.
     return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _utc_iso_ms() -> str:
+    """Now, in the audit trail's format (UTC, milliseconds, Z)."""
+    import audit
+    return audit.iso_ms(audit.utc_now())
 
 
 def _hash_session_token(token: str) -> str:
@@ -4422,7 +4868,8 @@ def list_bid_tracker_jobs(job_id: int | None = None) -> list[dict]:
     """
     conn = _get_conn()
     try:
-        where_sql = "WHERE j.id = ?" if job_id is not None else ""
+        # Deleted bids aren't tracked (an admin can restore them first).
+        where_sql = "WHERE j.deleted_at IS NULL" + (" AND j.id = ?" if job_id is not None else "")
         rows = conn.execute(
             f"""SELECT j.id AS job_id, j.slug, j.project_name, j.gc_name, j.salesperson,
                        j.city, j.state, j.created_at,
@@ -4541,12 +4988,14 @@ def save_bid_tracking(
 
 
 def get_latest_job_artifact(job_id: int, artifact_kind: str) -> dict | None:
+    """The newest receipt of one kind (e.g. the latest printed proposal PDF), or None."""
     conn = _get_conn()
     try:
         row = conn.execute(
-            """SELECT artifact_kind, artifact_path, file_hash, file_size, created_at
-               FROM job_artifacts WHERE job_id=? AND artifact_kind=?
-               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            f"""SELECT {_ARTIFACT_COLUMNS}
+                FROM job_artifacts a LEFT JOIN users u ON u.username = a.created_by
+                WHERE a.job_id=? AND a.artifact_kind=?
+                ORDER BY a.created_at DESC, a.id DESC LIMIT 1""",
             (job_id, artifact_kind),
         ).fetchone()
         return dict(row) if row else None

@@ -27,7 +27,7 @@ try:
 except ImportError:  # Windows dev machines have no fcntl.
     fcntl = None
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body, Depends
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -77,7 +77,8 @@ from models import (
     UserAdminError, create_user, ensure_admin_user, list_users_for_admin, remove_user,
     restore_user, reset_user_pin, update_user, list_admin_log,
     list_bid_tracker_jobs, get_bid_tracker_job, list_bid_events, save_bid_tracking,
-    get_latest_job_artifact,
+    get_latest_job_artifact, get_job_artifact,
+    clean_delete_reason, restore_job, list_deleted_jobs,
 )
 from bid_tracker import (
     BID_STATUSES, DECIDED_BID_STATUSES, FIELD_LABELS as BID_FIELD_LABELS,
@@ -125,6 +126,8 @@ from audit_engine import AuditTraceBuilder
 import audit
 from audit import AuditBackstopMiddleware, audit_route, no_audit, system_context
 from job_writes import JobWriteError, resolve_job_ref
+# Deleted bids are read-only: every change to one is refused with 410.
+from job_writes import JobDeletedError, deleted_bid_info, deleted_bid_message, deleted_job_row
 # Changes that touch several bids at once (vendor merge) take each bid's lock.
 from job_writes import JobBusyError, LOCK_WAIT_SECONDS, job_lock
 # Bid writes (jobs, bid tracking, uploads, materials, bid, proposal): locked,
@@ -135,10 +138,55 @@ from job_writes import (
     update_job_fields, set_proposal_data, set_bid_data,
 )
 from build_info import build_manifest_for_snapshot, get_build_info
-from readiness import evaluate_job_readiness, is_valid_material_classification, proposal_math_errors
+from readiness import evaluate_job_readiness, is_valid_material_classification, proposal_math_errors, proposal_check_message
+from readiness import (
+    CLICK_REGENERATE, GRAND_TOTAL_MISMATCH, JOB_FIELD_LABELS, NO_BID_YET, REVIEW_STEP,
+    amount_word, plain_list, totals_changed_message,
+)
+# Line pricing shared by every materials path, and compare-and-swap saves for
+# slow steps (AI quote matching, vendor detection, price estimates).
+from pricing_rows import (
+    apply_material_patches, conflict_note, material_patch, normalize_material_row, patches_from_rows,
+)
+# Stable ids: material uids, sundry/labor line keys, proposal bundle uids.
+import stable_ids
+# Proposal versions: saved copies of the proposal to compare and restore.
+import proposal_versions
+
+# ── Deleted bids are read-only ───────────────────────────────────────────────
+# Write routes with {job_id} in the path that still work on a deleted bid.
+DELETED_JOB_WRITE_ROUTES = frozenset({"/api/jobs/{job_id}/restore"})
+
+
+def _deleted_job_error(job_ref: str) -> JobDeletedError | None:
+    db_id = resolve_job_ref(job_ref)
+    row = deleted_job_row(db_id) if db_id is not None else None
+    return JobDeletedError.for_row(row) if row else None
+
+
+async def _refuse_writes_to_deleted_jobs(connection: HTTPConnection) -> None:
+    """A change to a deleted bid gets 410 "This bid was deleted by X on DATE...".
+
+    An app-wide dependency, so it runs before every POST/PUT/PATCH/DELETE
+    route with {job_id} in its path and no route can forget it. Changes that
+    reach a bid another way (PUT /api/quotes/{id}, ...) are refused by
+    job_write / entity_write. Reads (GET) are left to the route: most answer
+    404 for a deleted bid; ?include_deleted=1 and the history still work.
+    """
+    if connection.scope.get("type") != "http" or connection.scope.get("method") not in audit.WRITE_METHODS:
+        return
+    job_ref = str(connection.path_params.get("job_id") or "").strip()
+    if not job_ref:
+        return
+    if getattr(connection.scope.get("route"), "path", None) in DELETED_JOB_WRITE_ROUTES:
+        return
+    error = await run_in_threadpool(_deleted_job_error, job_ref)
+    if error is not None:
+        raise error
+
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="SI Bid Tool", version="1.0.0")
+app = FastAPI(title="SI Bid Tool", version="1.0.0", dependencies=[Depends(_refuse_writes_to_deleted_jobs)])
 
 SESSION_COOKIE = "si_session"
 # The only /api paths that work without logging in.
@@ -453,7 +501,16 @@ def _job_upload_path(job_id: int, filename: str, prefix: str) -> str:
 
 
 def _job_pdf_path(job_id: int, kind: str) -> str:
-    return os.path.join(_job_artifact_dir(job_id, "pdfs"), f"{kind}_{job_id}.pdf")
+    """A new, unique place for a PDF of this job: {kind}_{job_id}_{UTC time}_{8 random}.pdf.
+
+    Every print gets its own file, so earlier PDFs and their receipts stay as
+    they were. Write through _draft_job_pdf / _publish_job_pdf (temp file,
+    then os.replace) so a half-written PDF is never served. To read the
+    current PDF use _latest_job_pdf.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    name = f"{kind}_{job_id}_{stamp}_{uuid.uuid4().hex[:8]}.pdf"
+    return os.path.join(_job_artifact_dir(job_id, "pdfs"), name)
 
 
 @lru_cache(maxsize=512)
@@ -518,13 +575,80 @@ def _require_artifact_receipt(job_id: int, path: str, artifact_kind: str) -> Non
     if not receipt:
         raise HTTPException(
             status_code=409,
-            detail="This PDF has no durable storage receipt. Generate it again before downloading.",
+            detail="This PDF wasn't saved properly. Make the PDF again, then download it.",
         )
     if _file_hash(path) != receipt.get("file_hash"):
         raise HTTPException(
             status_code=409,
-            detail="This PDF no longer matches its recorded hash. Generate it again before downloading.",
+            detail="This PDF file was changed or damaged after it was made. Make the PDF again, then download it.",
         )
+
+
+# PDFs are written here first, then moved into the job's folder (same disk,
+# so the move is atomic). Kept out of the job folders so a crash never leaves
+# a half-written file among a job's artifacts.
+PDF_TEMP_DIR = os.path.join(ARTIFACT_ROOT, "shared", "tmp")
+os.makedirs(PDF_TEMP_DIR, exist_ok=True)
+PDF_ARTIFACT_KINDS = ("proposal_pdf", "bid_pdf")
+
+
+def _draft_job_pdf(job_id: int, kind: str, write) -> dict:
+    """Write a new PDF with ``write(temp_path)``; returns the draft (final path,
+    temp path, sha256, size) for _publish_job_pdf. Nothing is visible yet."""
+    final_path = _job_pdf_path(job_id, kind)
+    temp_path = os.path.join(PDF_TEMP_DIR, f".{os.path.basename(final_path)}.{uuid.uuid4().hex[:8]}.part")
+    try:
+        write(temp_path)
+        digest = hashlib.sha256()
+        with open(temp_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        size = os.path.getsize(temp_path)
+    except BaseException:
+        _discard_job_pdf({"temp_path": temp_path})
+        raise
+    return {"path": final_path, "temp_path": temp_path, "sha256": digest.hexdigest(), "size": size}
+
+
+def _discard_job_pdf(draft: dict | None) -> None:
+    temp_path = (draft or {}).get("temp_path")
+    if temp_path:
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+        except OSError as err:
+            print(f"[artifacts] Couldn't remove the unused PDF draft {temp_path}: {err}")
+
+
+def _publish_job_pdf(job_id: int, draft: dict, artifact_kind: str, *, conn,
+                     grand_total=None, proposal_version_id: int | None = None) -> int:
+    """Move a drafted PDF into place and save its receipt; returns the receipt id.
+
+    Call it inside the job_write that saves what the PDF shows (pass tx.conn),
+    so the receipt, the saved data and the history entry go in together.
+    """
+    os.replace(draft["temp_path"], draft["path"])
+    draft["temp_path"] = None
+    try:
+        total = round(float(grand_total), 2) if grand_total is not None else None
+    except (TypeError, ValueError):
+        total = None
+    return record_job_artifact(
+        job_id, artifact_kind, os.path.relpath(draft["path"], ARTIFACT_ROOT), draft["sha256"], draft["size"],
+        grand_total=total, proposal_version_id=proposal_version_id, conn=conn,
+    )
+
+
+def _latest_job_pdf(job_id: int, artifact_kind: str) -> tuple[str, dict] | None:
+    """The newest printed PDF of this kind: (full path, receipt), or None."""
+    receipt = get_latest_job_artifact(job_id, artifact_kind)
+    relative_path = (receipt or {}).get("artifact_path") or ""
+    if not receipt or not _checked_artifact_path(relative_path):
+        return None
+    # Joined (not resolved), so os.path.relpath(path, ARTIFACT_ROOT) gives
+    # back the recorded path even when ARTIFACT_ROOT sits behind a symlink.
+    return os.path.join(ARTIFACT_ROOT, relative_path), receipt
 
 
 def _checked_artifact_path(relative_path: str) -> str | None:
@@ -687,34 +811,53 @@ def _artifact_readiness(
         label = imported.get("file_name") or "source file"
         relative_path = imported.get("artifact_path") or ""
         if not relative_path:
-            warnings.append(f"{label} is a legacy import without a durable path")
+            warnings.append(f"{label}: uploaded before files were kept, so there's no saved copy")
             continue
         path = _checked_artifact_path(relative_path)
         if not path or not os.path.isfile(path):
-            add_failure(f"{label} is missing from durable storage")
+            add_failure(f"{label}: the saved copy is missing. Upload the file again")
             continue
         expected_hash = imported.get("file_hash")
         if expected_hash and _file_hash(path) != expected_hash:
-            add_failure(f"{label} no longer matches its recorded hash")
+            add_failure(f"{label}: the saved copy was changed or damaged. Upload the file again")
 
     artifact_receipts = list_job_artifacts(job_id)
-    for receipt in artifact_receipts:
+    # Every print is kept, but only the newest PDF of each kind counts here:
+    # a past print that went missing can't be fixed by printing again (Past
+    # PDFs says so for that one file when someone tries to download it).
+    # The latest proposal PDF is checked on its own further down.
+    checked_pdf_kinds: set = {"proposal_pdf"}
+    for receipt in artifact_receipts:  # newest first
+        kind = receipt.get("artifact_kind")
+        if kind in PDF_ARTIFACT_KINDS:
+            if kind in checked_pdf_kinds:
+                continue
+            checked_pdf_kinds.add(kind)
         relative_path = receipt.get("artifact_path") or ""
-        label = receipt.get("artifact_kind") or relative_path or "artifact"
         path = _checked_artifact_path(relative_path)
+        if kind == "bid_pdf":
+            if not path or not os.path.isfile(path):
+                add_failure("The latest bid PDF file is missing. Make the bid PDF again")
+            elif receipt.get("file_hash") and _file_hash(path) != receipt.get("file_hash"):
+                add_failure("The latest bid PDF file was changed or damaged. Make the bid PDF again")
+            continue
+        label = {
+            "vendor_quote": "A vendor quote file",
+            "rfms": "A takeoff file",
+        }.get(kind, "A saved file")
         if not path or not os.path.isfile(path):
-            add_failure(f"Recorded {label} artifact is missing from durable storage")
+            add_failure(f"{label} saved with this bid is missing")
             continue
         expected_hash = receipt.get("file_hash")
         if expected_hash and _file_hash(path) != expected_hash:
-            add_failure(f"Recorded {label} artifact no longer matches its hash")
+            add_failure(f"{label} saved with this bid was changed or damaged")
 
     has_rfms_evidence = any(
         _imported_artifact_is_verified(item, "rfms")
         for item in imported_files
     )
     if materials and not has_rfms_evidence:
-        warnings.append("No durable RFMS source workbook is recorded for this structured job")
+        warnings.append("No saved copy of the RFMS takeoff file")
 
     vendor_priced = [
         material
@@ -746,23 +889,25 @@ def _artifact_readiness(
             source == "vendor_quote_override"
             and str(material.get("id")) not in valid_decisions_by_material
         ):
-            add_failure(f"{label} has a vendor-price override without a current reviewer decision")
+            add_failure(f"{label}: the kept vendor price has no reviewer decision on file. Review that price again")
     if missing_quote_source:
         labels = ", ".join(missing_quote_source[:5])
         suffix = "..." if len(missing_quote_source) > 5 else ""
         add_failure(
-            f"{len(missing_quote_source)} vendor-quote material(s) do not identify their exact quote source: "
-            f"{labels}{suffix}"
+            f"{len(missing_quote_source)} material(s) priced from a vendor quote don't say which quote file "
+            f"the price came from: {labels}{suffix}"
         )
     if missing_quote_artifact:
         labels = ", ".join(missing_quote_artifact[:5])
         suffix = "..." if len(missing_quote_artifact) > 5 else ""
         add_failure(
-            f"{len(missing_quote_artifact)} vendor-quote material(s) do not match an intact durable quote file: "
+            f"{len(missing_quote_artifact)} material(s) priced from a vendor quote don't match a saved quote file: "
             f"{labels}{suffix}"
         )
 
-    expected_pdf_rel = os.path.relpath(proposal_pdf_path, ARTIFACT_ROOT)
+    # proposal_pdf_path is the latest printed proposal (_latest_job_pdf), or
+    # "" when none was printed yet.
+    expected_pdf_rel = os.path.relpath(proposal_pdf_path, ARTIFACT_ROOT) if proposal_pdf_path else None
     pdf_receipt = next(
         (
             item for item in artifact_receipts
@@ -771,18 +916,18 @@ def _artifact_readiness(
         ),
         None,
     )
-    if not os.path.isfile(proposal_pdf_path):
-        add_failure("The proposal PDF is missing from durable storage")
+    if not proposal_pdf_path or not os.path.isfile(proposal_pdf_path):
+        add_failure("The proposal PDF file is missing. Make the PDF again")
     elif not pdf_receipt:
-        add_failure("The proposal PDF does not have a durable artifact receipt")
+        add_failure("The proposal PDF wasn't saved properly. Make the PDF again")
     elif _file_hash(proposal_pdf_path) != pdf_receipt.get("file_hash"):
-        add_failure("The proposal PDF no longer matches its recorded hash")
+        add_failure("The proposal PDF file was changed or damaged. Make the PDF again")
 
     if failures:
-        return "fail", "Durable artifact verification failed.", failures
+        return "fail", "Some files saved with this bid are missing or damaged.", failures
     if warnings:
-        return "warn", "Current artifacts are intact, but some historical imports predate durable storage.", warnings
-    return "pass", "Recorded source files, vendor evidence, and the proposal PDF pass their hash checks.", []
+        return "warn", "Some older uploads have no saved copy. Nothing to do unless you need the original file.", warnings
+    return "pass", "All files saved with this bid are intact.", []
 
 
 def _find_incoming_quote_job(job_reference, subject: str) -> int | None:
@@ -929,8 +1074,9 @@ def _import_automated_quote(
     matched, loaded_materials, priced_materials = _match_quotes_to_materials(job_id, all_products)
     with job_write(job_id, action="quotes.auto_import", scopes=("materials",), summary=activity_summary) as tx:
         tx.force_record()
-        if priced_materials is not None:
-            _apply_material_patches(tx.conn, job_id, loaded_materials, priced_materials)
+        saved = _save_step_results(tx, loaded_materials, priced_materials)
+        if saved["conflicts"]:
+            tx.set_summary(activity_summary + conflict_note(saved["conflicts"]))
         _learn_vendor_prices(tx.conn, job_id, all_products)
     _link_upload_to_requests(job_id, all_products)
     # Marked imported only after the pricing is saved, so a failure is retried.
@@ -1191,6 +1337,8 @@ async def _stop_event_loop_watch():
 # Closes grouped history entries once nobody has edited them for a while.
 @app.on_event("startup")
 async def _start_audit_sweeper():
+    # After each sweep, save a proposal version of bids whose editing went quiet.
+    proposal_versions.register_sweeper()
     audit.start_sweeper()
 
 
@@ -1301,8 +1449,15 @@ class NotesUpdate(BaseModel):
     notes: str = ""
 
 
+class JobDeleteRequest(BaseModel):
+    # Why the bid is being deleted (required, 1-500 characters).
+    reason: str = ""
+
+
 class BulkDeleteRequest(BaseModel):
-    job_ids: list[int]
+    ids: list[int | str] = Field(default_factory=list)
+    job_ids: list[int | str] = Field(default_factory=list)  # older name for ids
+    reason: str = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -1458,9 +1613,11 @@ def _row_loader(table: str, key: str = "id", drop: tuple[str, ...] = ()):
     return load
 
 
-def _list_loader(table: str, *, where: str = "", drop: tuple[str, ...] = ("id",)):
-    """Loader for a whole list that is replaced or cleared at once. Row ids
-    are left out: a replace re-creates every row, so rows line up by content."""
+def _list_loader(table: str, *, where: str = "", drop: tuple[str, ...] = ()):
+    """Loader for a whole list that is replaced or cleared at once. Replaces
+    are keyed upserts (models.upsert_keyed_rows) that keep a row's id, so rows
+    are matched by id and the history shows each changed field, added row and
+    deleted row ("/entries/12/cost")."""
     def load(conn, entity_id):
         sql = f"SELECT * FROM {table}" + (f" WHERE {where}" if where else "") + " ORDER BY id"
         rows = conn.execute(sql, (entity_id,) if where else ()).fetchall()
@@ -1472,7 +1629,7 @@ _load_labor_catalog_entry = _row_loader("labor_catalog")
 _load_labor_catalog = _list_loader("labor_catalog")
 _load_price_list_entry = _row_loader("price_list")
 _load_price_list = _list_loader("price_list")
-_load_price_book = _list_loader("price_book_items", where="vendor = ?", drop=("id", "vendor"))
+_load_price_book = _list_loader("price_book_items", where="vendor = ?", drop=("vendor",))
 _load_notification = _row_loader("notifications")
 
 
@@ -1856,12 +2013,12 @@ def api_auth_online():
 # Add and remove people who can log in. Every route checks the caller is an
 # admin; the login middleware has already turned away anyone logged out.
 
-def _require_admin(request: Request) -> dict:
+def _require_admin(request: Request, message: str = "Only admins can add or remove people.") -> dict:
     user = getattr(request.state, "user", None)
     if not user:
         raise HTTPException(status_code=401, detail="Please log in.")
     if not user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Only admins can add or remove people.")
+        raise HTTPException(status_code=403, detail=message)
     return user
 
 
@@ -2437,8 +2594,18 @@ def api_delete_rule(rule_id: str):
 
 @app.get("/api/jobs")
 def api_list_jobs():
-    """List all jobs."""
+    """List all jobs (deleted bids left out: see /api/jobs/deleted)."""
     return list_jobs()
+
+
+# Registered before /api/jobs/{job_id} so "deleted" isn't read as a job id.
+@app.get("/api/jobs/deleted")
+def api_list_deleted_jobs():
+    """Deleted bids, most recently deleted first: who deleted each one, when, why and its saved total.
+
+    Anyone logged in can look; only an admin can restore one.
+    """
+    return list_deleted_jobs()
 
 
 @app.get("/api/jobs/match")
@@ -2513,21 +2680,36 @@ def api_create_job(job: JobCreate):
     return {"id": job_id, "slug": created.get("slug", ""), "message": "Job created"}
 
 
-def _resolve_job_id(job_id: str) -> int:
-    """Resolve a job_id string (could be slug or numeric ID) to a numeric DB id."""
-    job = load_job(job_id)
-    if not job:
+def _resolve_job_id(job_id: str, include_deleted: bool = False) -> int:
+    """Resolve a job_id string (could be slug or numeric ID) to a numeric DB id.
+
+    A deleted bid is "not found" (404, saying who deleted it and when) unless
+    ``include_deleted``. Changes to a deleted bid never get this far: they are
+    refused with 410 first (_refuse_writes_to_deleted_jobs).
+    """
+    db_id = resolve_job_ref(job_id)
+    if db_id is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job["id"]
+    if not include_deleted:
+        row = deleted_job_row(db_id)
+        if row is not None:
+            raise JobNotFoundError(deleted_bid_message(row), **deleted_bid_info(row))
+    return db_id
 
 
 @app.get("/api/jobs/{job_id}")
-def api_get_job(job_id: str):
-    """Get job details by ID or slug."""
-    db_id = _resolve_job_id(job_id)
-    job = load_job(db_id)
+def api_get_job(job_id: str, include_deleted: bool = False):
+    """Get job details by ID or slug.
+
+    ``?include_deleted=1`` also returns a deleted bid (read-only), with its
+    deleted_at, deleted_by (and deleted_by_name) and delete_reason.
+    """
+    db_id = _resolve_job_id(job_id, include_deleted=include_deleted)
+    job = load_job(db_id, include_deleted=include_deleted)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("deleted_at"):
+        job["deleted_by_name"] = deleted_bid_info(job)["deleted_by_name"]
     job["materials_source_fingerprint"] = _materials_source_fingerprint(job.get("materials") or [])
     # Known prices are read-only suggestions. Opening a job must never change
     # accepted source data or stale an existing proposal audit.
@@ -2623,6 +2805,8 @@ def _job_delete_snapshot(conn, db_id: int, row: dict) -> dict:
         except (TypeError, ValueError):
             return None
 
+    proposal_total = saved_total(row.get("proposal_data"))
+    bid_total = saved_total(row.get("bid_data"))
     return {
         "project_name": row.get("project_name"),
         "slug": row.get("slug"),
@@ -2631,53 +2815,114 @@ def _job_delete_snapshot(conn, db_id: int, row: dict) -> dict:
         "version": row.get("version"),
         "counts": counts,
         "material_cost": round(float(material_cost or 0), 2),
-        "proposal_total": saved_total(row.get("proposal_data")),
-        "bid_total": saved_total(row.get("bid_data")),
+        "proposal_total": proposal_total,
+        "bid_total": bid_total,
+        "grand_total": proposal_total if proposal_total is not None else bid_total,
     }
 
 
-def _delete_job_audited(job_ref) -> bool:
-    """Delete one bid for good (soft delete comes later), recording what it held first.
-
-    The history entry outlives the bid: audit_log has no link that the delete cascades to.
-    """
+def _clean_delete_reason(reason) -> str:
     try:
-        with job_write(job_ref, action="job.delete", scopes=("job", "tracking")) as tx:
-            snapshot = _job_delete_snapshot(tx.conn, tx.job_id, tx.row)
-            total = snapshot["proposal_total"] if snapshot["proposal_total"] is not None else snapshot["bid_total"]
-            material_count = snapshot["counts"].get("materials", 0)
-            details = [f"{material_count} material{'' if material_count == 1 else 's'}"]
-            if total is not None:
-                details.append(f"total ${total:,.2f}")
-            tx.set_summary(f"Deleted bid '{snapshot['project_name'] or tx.job_id}' ({', '.join(details)})")
-            tx.extra["deleted"] = snapshot
-            tx.force_record()
-            deleted = delete_job(tx.job_id, conn=tx.conn)
-    except JobNotFoundError:
-        return False
-    return deleted
+        return clean_delete_reason(reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _delete_job_audited(job_ref, reason: str) -> int:
+    """Delete (hide) one bid, recording what it held, who deleted it and why.
+
+    Nothing is removed: the bid, its PDFs and its history stay, and an admin
+    can restore it. Raises JobNotFoundError, or JobDeletedError (410) if it
+    was already deleted. Returns the bid's id.
+    """
+    with job_write(job_ref, action="job.delete", scopes=("job", "tracking")) as tx:
+        snapshot = _job_delete_snapshot(tx.conn, tx.job_id, tx.row)
+        total = snapshot["grand_total"]
+        material_count = snapshot["counts"].get("materials", 0)
+        details = [f"{material_count} material{'' if material_count == 1 else 's'}"]
+        if total is not None:
+            details.append(f"total ${total:,.2f}")
+        summary = f"Deleted bid '{snapshot['project_name'] or tx.job_id}' ({', '.join(details)}). Reason: {reason}"
+        tx.set_summary(summary)
+        tx.extra["deleted"] = snapshot
+        tx.extra["reason"] = reason
+        tx.force_record()
+        if not delete_job(tx.job_id, reason=reason, deleted_by=audit.actor_label(), conn=tx.conn):
+            raise JobDeletedError.for_row(tx.row, tx.conn)  # job_write already refuses deleted bids
+        log_activity(tx.job_id, "job_deleted", summary, {"reason": reason})
+    return tx.job_id
 
 
 @app.post("/api/jobs/bulk-delete")
 @audit_route("job.delete")
 def api_bulk_delete(body: BulkDeleteRequest):
-    """Delete multiple jobs."""
-    deleted = 0
-    for jid in body.job_ids:
-        if _delete_job_audited(jid):
-            deleted += 1
-    audit.note_checked()  # none found still counts as handled
-    return {"deleted": deleted}
+    """Delete (hide) several bids with one reason. Each bid gets its own history
+    entry; they share the request id. Bids already deleted or not found are
+    listed and skipped."""
+    reason = _clean_delete_reason(body.reason)
+    refs: list = []
+    for ref in [*body.ids, *body.job_ids]:
+        ref = str(ref).strip()
+        if ref and ref not in refs:
+            refs.append(ref)
+    if not refs:
+        raise HTTPException(status_code=400, detail="Pick at least one bid to delete.")
+    deleted_ids, not_found, already_deleted = [], [], []
+    for ref in refs:
+        try:
+            deleted_ids.append(_delete_job_audited(ref, reason))
+        except JobNotFoundError:
+            not_found.append(ref)
+        except JobDeletedError:
+            already_deleted.append(ref)
+    audit.note_checked()  # none deleted still counts as handled
+    return {
+        "deleted": len(deleted_ids),
+        "deleted_ids": deleted_ids,
+        "not_found": not_found,
+        "already_deleted": already_deleted,
+    }
 
 
 @app.delete("/api/jobs/{job_id}")
 @audit_route("job.delete")
-def api_delete_job(job_id: str):
-    """Delete a job by ID or slug and all related data."""
+def api_delete_job(job_id: str, body: Optional[JobDeleteRequest] = None):
+    """Delete (hide) a bid by ID or slug. Body: {"reason": "..."} (required).
+
+    The bid moves to Deleted bids: it disappears from lists, search and the
+    bid tracker, can't be changed (410), and an admin can restore it.
+    """
+    reason = _clean_delete_reason((body or JobDeleteRequest()).reason)
     db_id = _resolve_job_id(job_id)
-    if not _delete_job_audited(db_id):
+    _delete_job_audited(db_id, reason)
+    return {"message": "Bid deleted", "id": db_id}
+
+
+@app.post("/api/jobs/{job_id}/restore")
+@audit_route("job.restore")
+def api_restore_job(job_id: str, request: Request):
+    """Bring back a deleted bid (admins only). Returns the job."""
+    _require_admin(request, "Only an admin can restore a deleted bid.")
+    db_id = _resolve_job_id(job_id, include_deleted=True)
+    with job_write(db_id, action="job.restore", scopes=("job", "tracking"), allow_deleted=True) as tx:
+        if not tx.row.get("deleted_at"):
+            raise HTTPException(status_code=409, detail="This bid isn't deleted, so there's nothing to restore.")
+        info = deleted_bid_info(tx.row, tx.conn)
+        was = f"deleted by {info['deleted_by_name']}"
+        when = audit.parse_ts(tx.row.get("deleted_at"))
+        if when:
+            was += f" on {when:%b} {when.day}, {when.year}"
+        if tx.row.get("delete_reason"):
+            was += f": {tx.row['delete_reason']}"
+        summary = f"Restored bid '{tx.row.get('project_name') or tx.job_id}' ({was})"
+        tx.set_summary(summary)
+        tx.extra["restored"] = {key: info[key] for key in ("deleted_at", "deleted_by", "delete_reason")}
+        restore_job(tx.job_id, conn=tx.conn)
+        log_activity(tx.job_id, "job_restored", summary)
+    job = load_job(db_id)
+    if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {"message": "Job deleted"}
+    return job
 
 
 @app.post("/api/jobs/{job_id}/duplicate")
@@ -2715,11 +2960,12 @@ def api_duplicate_job(job_id: str):
         if field not in ("quote_number", "customer_po", "contract_number"):
             new_job[field] = job.get(field)
 
-    # Copy materials (strip id and job_id)
+    # Copy materials (strip id, job_id, uid and row bookkeeping: the copies
+    # are new lines with their own uids)
     materials = job.get("materials", [])
     copied = []
     for m in materials:
-        mat = {k: v for k, v in m.items() if k not in ("id", "job_id")}
+        mat = {k: v for k, v in m.items() if k not in ("id", "job_id", "uid", *stable_ids.ROW_META_COLUMNS)}
         copied.append(mat)
 
     summary = f"Duplicated from '{job['project_name']}'"
@@ -2878,12 +3124,16 @@ def _bid_send_evidence(db_id: int) -> dict:
         pdf_total = (proposal.get("pdf_totals") or {}).get("grand_total")
         if pdf_total is not None:
             evidence["pdf_total"] = pdf_total
+    # The exact printed PDF (every print is kept; download it by this id).
     pdf = get_latest_job_artifact(db_id, "proposal_pdf")
     if pdf:
         evidence["pdf"] = {
+            "artifact_id": pdf["id"],
             "file_hash": pdf["file_hash"],
             "file_size": pdf["file_size"],
             "created_at": pdf["created_at"],
+            "grand_total": pdf.get("grand_total"),
+            "proposal_version_id": pdf.get("proposal_version_id"),
         }
     return evidence
 
@@ -2997,6 +3247,7 @@ def api_update_bid_tracking(job_id: str, body: BidTrackingUpdate, request: Reque
     if updates or events:
         with job_write(db_id, action=action, scopes=("tracking",),
                        summary=activity[1] if activity else None) as tx:
+            _link_sent_version(tx, events)
             save_bid_tracking(db_id, updates, events, _request_username(request), conn=tx.conn)
             if activity:
                 log_activity(db_id, *activity)
@@ -3101,7 +3352,9 @@ def api_add_bid_event(job_id: str, body: BidEventCreate, request: Request):
     # The tracking fields, the bid event, the activity row and the history
     # entry are saved together.
     with job_write(db_id, action=f"bid.{event_type}", scopes=("tracking",), summary=activity[1]) as tx:
-        save_bid_tracking(db_id, updates, [(event_type, details)], _request_username(request), conn=tx.conn)
+        events = [(event_type, details)]
+        _link_sent_version(tx, events)
+        save_bid_tracking(db_id, updates, events, _request_username(request), conn=tx.conn)
         log_activity(db_id, *activity)
     return _bid_tracking_payload(db_id, today)
 
@@ -3197,6 +3450,9 @@ def _upload_rfms_files(job_id: str, files: list[UploadFile]) -> dict:
     # rows are saved together, with one history entry.
     with job_write(db_id, action="rfms.upload", scopes=("job", "materials")) as tx:
         tx.force_record()
+        # The proposal and the lines it was priced from as they are before this
+        # upload; kept as a version below if the upload changes the lines.
+        before_upload = proposal_versions.capture(tx.conn, db_id)
         tx.extra["files"] = [
             {"file_name": filename, "file_hash": file_hash, "file_size": file_size}
             for filename, file_hash, file_size, _ in imported_uploads
@@ -3230,10 +3486,17 @@ def _upload_rfms_files(job_id: str, files: list[UploadFile]) -> dict:
         ]
         materials, dropped_saved_lines = _rfms_priced_materials(existing_materials, new_lines)
         material_ids = save_materials(db_id, materials, conn=tx.conn)
+        if before_upload is not None and (
+            proposal_versions.current_materials_fingerprint(tx.conn, db_id) != before_upload["materials_fingerprint"]
+        ):
+            tx.proposal_version_id, _ = proposal_versions.store(
+                tx.conn, before_upload, "rfms_upload", match_materials=True,
+            )
 
-        # Attach IDs to returned materials
-        for mat, mid in zip(materials, material_ids):
+        # Attach IDs and uids to returned materials
+        for mat, mid, uid in zip(materials, material_ids, material_ids.uids):
             mat["id"] = mid
+            mat["uid"] = uid
 
         log_activity(db_id, "rfms_uploaded", f"Uploaded {len(file_names)} RFMS file(s), {len(materials)} materials parsed", {"files": file_names, "material_count": len(materials)})
         removed_materials = [
@@ -3472,69 +3735,55 @@ def _apply_fob_freight(mat: dict, prod: dict, freight_rates: dict | None = None)
         print(f"[freight] FOB detected for {mat.get('item_code', '?')} — applied internal rate ${rate}/{unit}")
 
 
-def _material_patches(before_rows: list[dict], after_rows: list[dict]) -> dict[int, dict]:
-    """Per saved material id, the stored fields that differ between two copies of the lines."""
-    before_by_id = {}
-    for row in before_rows or []:
-        try:
-            before_by_id[int(row.get("id"))] = row
-        except (TypeError, ValueError):
-            continue
-    patches: dict[int, dict] = {}
-    for row in after_rows or []:
-        try:
-            material_id = int(row.get("id"))
-        except (TypeError, ValueError):
-            continue
-        base = before_by_id.get(material_id)
-        if base is None:
-            continue
-        # Only stored columns (the loaded row's keys), never transient extras.
-        fields = {
-            key: row.get(key)
-            for key in base
-            if key not in ("id", "job_id") and key in row and not audit.values_equal(base.get(key), row.get(key))
-        }
-        if fields:
-            patches[material_id] = fields
-    return patches
+def _save_step_results(tx, loaded: list[dict], changed: list[dict] | None, *, depends_on=None) -> dict:
+    """Save what a slow step (quote matching, a price estimate, new waste
+    rules) changed on the lines it loaded, as compare-and-swap patches
+    (pricing_rows): each changed line is saved only if it still has the values
+    the step read. A line someone changed or removed meanwhile keeps their
+    change and comes back as a conflict (also noted in the history entry).
+    Run inside job_write. Returns {"applied": [...], "conflicts": [...]}."""
+    if changed is None:
+        return {"applied": [], "conflicts": []}
+    options = {} if depends_on is None else {"depends_on": depends_on}
+    return apply_material_patches(tx, patches_from_rows(loaded, changed, **options))
 
 
-def _apply_material_patches(conn, job_id: int, before_rows: list[dict], after_rows: list[dict]) -> int:
-    """Save what a slow step (quote matching, an AI estimate) changed on the lines it
-    loaded, on top of the lines as they are now. Run inside job_write with tx.conn,
-    so a line someone edited or removed meanwhile keeps their change.
-    Returns how many lines were changed."""
-    patches = _material_patches(before_rows, after_rows)
-    if not patches:
+def _priced_lines_skipped(loaded: list[dict], priced: list[dict] | None, conflicts: list[dict]) -> int:
+    """How many of the lines a matching step priced (its unit price or price
+    source changed) were skipped as conflicts, so they aren't reported as matched."""
+    if not conflicts or not priced:
         return 0
-    current = [
-        dict(row)
-        for row in conn.execute("SELECT * FROM job_materials WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
-    ]
-    applied = 0
-    for row in current:
-        patch = patches.get(int(row["id"]))
-        if patch:
-            row.update(patch)
-            applied += 1
-    if applied:
-        save_materials(job_id, current, conn=conn)
-    return applied
+    loaded_by_id = {str(row.get("id")): row for row in loaded or [] if isinstance(row, dict)}
+    priced_ids = {
+        str(row.get("id"))
+        for row in priced
+        if isinstance(row, dict) and str(row.get("id")) in loaded_by_id
+        and any(
+            not audit.values_equal(row.get(field), loaded_by_id[str(row.get("id"))].get(field))
+            for field in ("unit_price", "price_source")
+        )
+    }
+    return sum(1 for conflict in conflicts if str(conflict.get("material_id")) in priced_ids)
 
 
-def _auto_match_quotes(job_id: int, products: list[dict]) -> int:
+def _auto_match_quotes(job_id: int, products: list[dict]) -> dict:
     """Match parsed quote products to the job's materials and save the prices.
 
     The matching (AI included) runs first without holding the bid; only the
-    changed fields are then saved, under the bid's lock, with a history entry.
+    changed fields are then saved, under the bid's lock, with a history entry,
+    and only on lines nobody changed meanwhile.
+    Returns {"matched": n, "applied": [...], "conflicts": [...]}.
     """
     matched, loaded, priced = _match_quotes_to_materials(job_id, products)
+    result = {"matched": matched, "applied": [], "conflicts": []}
     if priced is not None:
         with job_write(job_id, action="quotes.auto_match", scopes=("materials",),
                        summary=_quote_match_summary(matched)) as tx:
-            _apply_material_patches(tx.conn, job_id, loaded, priced)
-    return matched
+            result.update(_save_step_results(tx, loaded, priced))
+            if result["conflicts"]:
+                result["matched"] = max(0, matched - _priced_lines_skipped(loaded, priced, result["conflicts"]))
+                tx.set_summary(_quote_match_summary(result["matched"]) + conflict_note(result["conflicts"]))
+    return result
 
 
 def _quote_match_summary(matched: int) -> str:
@@ -4624,8 +4873,11 @@ def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
     # pricing is saved.
     with job_write(db_id, action="quotes.upload", scopes=("materials",)) as tx:
         tx.force_record()
-        if priced_materials is not None:
-            _apply_material_patches(tx.conn, db_id, loaded_materials, priced_materials)
+        # Only on lines nobody changed while the quotes were being matched.
+        price_conflicts = _save_step_results(tx, loaded_materials, priced_materials)["conflicts"]
+        # A matched line someone changed meanwhile kept their change: it
+        # doesn't count as auto-matched.
+        auto_matched = max(0, auto_matched - _priced_lines_skipped(loaded_materials, priced_materials, price_conflicts))
 
         # Save to vendor pricing database
         _learn_vendor_prices(tx.conn, db_id, all_products)
@@ -4681,6 +4933,7 @@ def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
                 f"Uploaded {len(file_names)} quote file(s), {len(all_products)} products, "
                 f"{upload_outcomes['quote_price_matched']} prices matched, "
                 f"{upload_outcomes['provenance_repaired']} receipts repaired"
+                + conflict_note(price_conflicts)
             ),
             activity_detail,
         )
@@ -4694,6 +4947,9 @@ def api_upload_quotes(job_id: str, files: list[UploadFile] = File(...)):
         "linked_requests": linked_requests,
         "skipped_files": skipped_files,
         "file_errors": file_errors,
+        # Lines someone changed while the quotes were being matched: their
+        # change was kept and the quote price was not saved on them.
+        "conflicts": price_conflicts,
     }
 
 
@@ -4753,10 +5009,11 @@ def api_update_quote(quote_id: int, body: dict = Body(...)):
         log_activity(job_id, "quote_updated", summary)
     # Re-run auto-match so the updated price flows to materials
     job = load_job(job_id)
+    conflicts = []
     if job:
         quotes = job.get("quotes", [])
-        _auto_match_quotes(job_id, quotes)
-    return {"ok": True}
+        conflicts = _auto_match_quotes(job_id, quotes)["conflicts"]
+    return {"ok": True, "conflicts": conflicts}
 
 
 # ── Dropbox Scanner Endpoints ────────────────────────────────────────────────
@@ -4870,7 +5127,9 @@ def _material_edit_group(saved_rows: list[dict], incoming_rows: list[dict]):
         base = saved[str(material["id"])]
         fields = [
             key for key, value in material.items()
-            if key in base and key not in ("id", "job_id") and value is not None
+            # Identity and row bookkeeping aren't edits (a client's copy of
+            # row_version / updated_at can be older than the saved line's).
+            if key in base and key not in ("id", "job_id", "uid", *stable_ids.ROW_META_COLUMNS) and value is not None
             and key not in audit.DERIVED_KEYS and not audit.values_equal(base.get(key), value)
         ]
         for key in list(fields):
@@ -4884,7 +5143,8 @@ def _material_edit_group(saved_rows: list[dict], incoming_rows: list[dict]):
     policy = audit.TEXT_EDITS if field in _MATERIAL_TEXT_FIELDS else audit.NUMBER_EDITS
     label = base.get("item_code") or base.get("description") or f"line {base.get('id')}"
     return (
-        f"/materials/{audit.escape_path_key(base['id'])}/{field}",
+        # History paths name material lines by uid (job_writes.snapshot_job).
+        f"/materials/{audit.escape_path_key(base.get('uid') or base['id'])}/{field}",
         policy,
         f"Changed {field.replace('_', ' ')} on {label}",
     )
@@ -4926,8 +5186,9 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "These materials changed in another tab or workflow. Your stale pricing copy "
-                    "was not saved. Reload the job and review the newer values before editing again."
+                    "Someone changed these materials in another tab or on another computer after you "
+                    "opened them, so your last change was not saved. Reload the page to see their "
+                    "version, then make your change again."
                 ),
             )
 
@@ -4955,100 +5216,13 @@ def api_update_materials(job_id: str, body: MaterialUpdate):
                 ),
             )
 
-        updated = []
+        # Each line is merged onto the saved line and priced by the shared
+        # rule (pricing_rows.normalize_material_row).
         recounted_transitions = []
-        for material in body.materials:
-            base = existing.get(material.get("id"), {})
-            merged = {**base, **{key: value for key, value in material.items() if value is not None}}
-            if "price_source" in material:
-                merged["price_source"] = material.get("price_source")
-            if material.get("material_type") and base.get("material_type") != material.get("material_type"):
-                merged["ai_confidence"] = 1.0
-            if str(merged.get("price_source") or "").strip().lower() not in _VENDOR_EVIDENCE_SOURCES:
-                merged["quote_source_hash"] = None
-                merged["quote_file_name"] = None
-
-            waste_pct = merged.get("waste_pct", 0)
-            installed_qty = merged.get("installed_qty", 0)
-            unit_price = merged.get("unit_price", 0)
-            if not merged.get("price_source") and (_as_number(unit_price) or 0) <= 0:
-                merged["quote_status"] = None
-            # A typed price replaces the "needs price/quote" marker on the edited line.
-            if (
-                str(merged.get("price_source") or "").strip().lower() == "manual"
-                and (_as_number(unit_price) or 0) > 0
-                and merged.get("quote_status") in ("needs_quote", "needs_price")
-                and (
-                    str(base.get("price_source") or "").strip().lower() != "manual"
-                    or abs((_as_number(base.get("unit_price")) or 0) - (_as_number(unit_price) or 0)) > 0.005
-                )
-            ):
-                merged["quote_status"] = "manual"
-            order_qty_given = "order_qty" in material and material["order_qty"] is not None
-            order_qty = (
-                material["order_qty"]
-                if order_qty_given
-                else installed_qty * (1 + waste_pct)
-            )
-
-            if material.get("price_source") == "manual" and material.get("extended_cost") is not None:
-                extended_cost = material["extended_cost"]
-            elif (
-                merged.get("price_source") in ("price_book", "default_rule")
-                and (merged.get("material_type") or "").lower() == "transitions"
-            ):
-                # EA lines (Schluter sticks priced at RFMS upload) already store
-                # order_qty in pieces; dividing by the stick length again would
-                # under-price the line. Same rule as the EA skip in api_generate_proposal.
-                # An EA row whose order_qty equals its LF figure was saved in LF by
-                # the old editor, so its sticks are recounted from that LF. Storage is
-                # judged on the saved row, as the editor does (a new LF can equal the
-                # old stick count). An incoming order_qty equal to the incoming row's
-                # own LF figure is still LF: every reader (bid assembler, PDF gate,
-                # editor) reads it back as LF, and a client that saved from a stale
-                # copy (autosave re-send after this handler converted a legacy row)
-                # sends exactly that.
-                piece_qty = str(merged.get("unit") or "").strip().upper() == "EA"
-                stored_row = base or merged
-                if (
-                    piece_qty
-                    and order_qty_given
-                    and not _order_qty_is_lf(stored_row, stored_row.get("order_qty"))
-                    and not _order_qty_is_lf(merged, order_qty)
-                ):
-                    pieces = order_qty
-                else:
-                    pieces = _transition_pieces(order_qty, merged.get("vendor"), merged.get("fixture_count", 0))
-                    if piece_qty:
-                        # order_qty was in LF; store the stick count for an EA line
-                        order_qty = pieces
-                extended_cost = pieces * unit_price
-                # Log stored EA rows whose sticks/total the server changed without
-                # the estimator editing that line, so repriced jobs can be reviewed.
-                if (
-                    piece_qty
-                    and base
-                    and abs((_as_number(material.get("order_qty")) or 0) - (_as_number(base.get("order_qty")) or 0)) <= 0.005
-                    and abs((_as_number(unit_price) or 0) - (_as_number(base.get("unit_price")) or 0)) <= 0.005
-                    and (
-                        abs(round(order_qty, 2) - (_as_number(base.get("order_qty")) or 0)) > 0.005
-                        or abs(round(extended_cost, 2) - (_as_number(base.get("extended_cost")) or 0)) > 0.005
-                    )
-                ):
-                    recounted_transitions.append({
-                        "item_code": merged.get("item_code"),
-                        "description": merged.get("description"),
-                        "order_qty_before": base.get("order_qty"),
-                        "order_qty_after": round(order_qty, 2),
-                        "extended_cost_before": base.get("extended_cost"),
-                        "extended_cost_after": round(extended_cost, 2),
-                    })
-            else:
-                extended_cost = order_qty * unit_price
-
-            merged["order_qty"] = round(order_qty, 2)
-            merged["extended_cost"] = round(extended_cost, 2)
-            updated.append(merged)
+        updated = [
+            normalize_material_row(existing.get(material.get("id"), {}), material, recounted=recounted_transitions)
+            for material in body.materials
+        ]
 
         material_ids = save_materials(job["id"], updated, conn=conn)
         for material, material_id in zip(updated, material_ids):
@@ -5183,7 +5357,7 @@ def api_resolve_material_price_conflict(
     if not conflict:
         raise HTTPException(
             status_code=409,
-            detail="This quote conflict changed or was already resolved. Refresh readiness and review the current evidence.",
+            detail="This price was already reviewed or has changed. Reload the page and look at it again.",
         )
 
     action_label = "used the verified quote" if decision_type == "use_quote" else "kept the accepted price"
@@ -5279,10 +5453,32 @@ def api_resolve_material_price_conflict(
     }
 
 
+@app.post("/api/jobs/{job_id}/materials/by-id/{material_id}/estimate-price")
+@audit_route("materials.ai_estimate")
+def api_estimate_price_by_id(job_id: str, material_id: int):
+    """Use AI to estimate one material line's unit price (the line with this id)."""
+    db_id = _resolve_job_id(job_id)
+    job = load_job(db_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    material = next((m for m in job.get("materials") or [] if m.get("id") == material_id), None)
+    if material is None:
+        raise HTTPException(
+            status_code=404,
+            detail="That line isn't in this bid's takeoff anymore (someone may have removed it).",
+        )
+    return _estimate_material_price(job, material)
+
+
 @app.post("/api/jobs/{job_id}/materials/{material_idx}/estimate-price")
 @audit_route("materials.ai_estimate")
 def api_estimate_price(job_id: str, material_idx: int):
-    """Use AI to estimate a material's unit price based on its description."""
+    """Use AI to estimate a material's unit price based on its description.
+
+    Older form that names the line by its place in the list. The place is
+    turned into the line's id when the list is read, so the estimate is saved
+    on that line (and only if nobody changed its price meanwhile) even if lines
+    are added or removed while the AI is working."""
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
@@ -5291,9 +5487,16 @@ def api_estimate_price(job_id: str, material_idx: int):
     materials = job.get("materials", [])
     if material_idx < 0 or material_idx >= len(materials):
         raise HTTPException(status_code=404, detail="Material not found")
+    return _estimate_material_price(job, materials[material_idx])
 
-    m = materials[material_idx]
-    loaded_material = copy.deepcopy(m)
+
+def _estimate_material_price(job: dict, material: dict) -> dict:
+    """Ask the AI for a unit price for one line (without holding the bid),
+    then save it as a compare-and-swap patch: only if the line still has the
+    price, quantities and description the AI was given. Otherwise the other
+    person's change is kept, the skipped estimate is noted in the history and
+    the caller gets a 409 saying what happened."""
+    m = copy.deepcopy(material)
     settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
@@ -5358,32 +5561,43 @@ The price should be per {m.get('unit', 'unit')}. Be conservative — estimate on
         estimated_price = float(result.get("estimated_price", 0))
         confidence = float(result.get("confidence", 0.5))
         reasoning = result.get("reasoning", "")
-
-        # Update the material with the AI estimate
-        m["unit_price"] = round(estimated_price, 2)
-        m["price_source"] = "ai_estimate"
-        m["order_qty"] = round(m.get("installed_qty", 0) * (1 + m.get("waste_pct", 0)), 2)
-        m["extended_cost"] = round(m["order_qty"] * m["unit_price"], 2)
-        materials[material_idx] = m
-
-        # The AI call ran without holding the bid; only this line's new price
-        # fields are saved, on top of the lines as they are now.
-        summary = f"AI estimated price for {m.get('item_code', m.get('description', 'material'))}: ${estimated_price:.2f}/{m.get('unit', 'unit')}"
-        with job_write(job["id"], action="materials.ai_estimate", scopes=("materials",), summary=summary,
-                       extra={"confidence": confidence, "reasoning": reasoning}) as tx:
-            _apply_material_patches(tx.conn, job["id"], [loaded_material], [m])
-            log_activity(job["id"], "ai_estimate", summary)
-
-        return {
-            "estimated_price": estimated_price,
-            "confidence": confidence,
-            "reasoning": reasoning,
-            "material": m,
-        }
-    except (HTTPException, JobWriteError):
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI estimation failed: {e}")
+
+    # The AI call ran without holding the bid. The new price (with order qty
+    # and extended cost worked out by the shared pricing rule) is saved only
+    # if the line still has the values the AI was given.
+    label = m.get("item_code") or m.get("description") or "material"
+    patch = material_patch(
+        material,
+        {
+            "unit_price": round(estimated_price, 2),
+            "price_source": "ai_estimate",
+            "order_qty": round((m.get("installed_qty", 0) or 0) * (1 + (m.get("waste_pct", 0) or 0)), 2),
+        },
+        normalize=True,
+    )
+    summary = f"AI estimated price for {label}: ${estimated_price:.2f}/{m.get('unit', 'unit')}"
+    with job_write(job["id"], action="materials.ai_estimate", scopes=("materials",), summary=summary,
+                   extra={"confidence": confidence, "reasoning": reasoning,
+                          "material_id": material.get("id"), "material_uid": material.get("uid")}) as tx:
+        saved = apply_material_patches(tx, [patch])
+        if saved["conflicts"]:
+            tx.set_summary(f"AI price estimate for {label} not saved: someone changed the line meanwhile")
+        else:
+            log_activity(job["id"], "ai_estimate", summary)
+        current = tx.conn.execute(
+            "SELECT * FROM job_materials WHERE id=? AND job_id=?", (material.get("id"), job["id"]),
+        ).fetchone()
+    if saved["conflicts"]:
+        raise HTTPException(status_code=409, detail=saved["conflicts"][0]["message"])
+
+    return {
+        "estimated_price": estimated_price,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "material": dict(current) if current else m,
+    }
 
 
 @app.post("/api/jobs/{job_id}/generate-bid")
@@ -5463,20 +5677,23 @@ def api_generate_bid(job_id: str):
     bundle_count = len(bid_data.get("bundles", []))
     grand_total = bid_data.get("grand_total", 0)
     summary = f"Bid generated: {bundle_count} bundles, total ${grand_total:,.2f}"
-    # Save bundles and the bid data (only those; the rest of the bid is untouched)
-    with job_write(job["id"], action="bid.generate", scopes=("bundles", "bid"), summary=summary) as tx:
-        tx.force_record()
-        save_bundles(job["id"], bid_data["bundles"], conn=tx.conn)
-        set_bid_data(tx.conn, job["id"], bid_persist)
-
-    # Generate PDF
-    pdf_path = _job_pdf_path(job["id"], "bid")
-    generate_bid_pdf(bid_data, pdf_path)
-    _record_artifact(job["id"], pdf_path, "bid_pdf")
-
-    log_activity(job["id"], "bid_generated", summary, {"bundle_count": bundle_count, "grand_total": grand_total})
+    # Draw the PDF first (into a temp file), then save the bundles, the bid
+    # data (only those; the rest of the bid is untouched) and the new PDF's
+    # receipt together. Every print is kept as its own file.
+    draft = _draft_job_pdf(job["id"], "bid", lambda path: generate_bid_pdf(copy.deepcopy(bid_data), path))
+    try:
+        with job_write(job["id"], action="bid.generate", scopes=("bundles", "bid"), summary=summary) as tx:
+            tx.force_record()
+            save_bundles(job["id"], bid_data["bundles"], conn=tx.conn)
+            set_bid_data(tx.conn, job["id"], bid_persist)
+            log_activity(job["id"], "bid_generated", summary, {"bundle_count": bundle_count, "grand_total": grand_total})
+            artifact_id = _publish_job_pdf(job["id"], draft, "bid_pdf", conn=tx.conn, grand_total=grand_total)
+            tx.extra["pdf"] = {"artifact_id": artifact_id, "file_hash": draft["sha256"]}
+    finally:
+        _discard_job_pdf(draft)
 
     bid_data["audit"] = bid_persist["audit"]
+    bid_data["pdf_artifact_id"] = artifact_id
     return bid_data
 
 
@@ -5501,9 +5718,11 @@ def api_download_bid_pdf(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _validate_bid_pdf_download_ready(job)
-    pdf_path = _job_pdf_path(job["id"], "bid")
-    if not os.path.exists(pdf_path):
+    # The latest print; earlier ones are under /artifacts.
+    latest = _latest_job_pdf(job["id"], "bid_pdf")
+    if not latest or not os.path.exists(latest[0]):
         raise HTTPException(status_code=404, detail="PDF not found. Generate bid first.")
+    pdf_path = latest[0]
     _require_artifact_receipt(job["id"], pdf_path, "bid_pdf")
     return FileResponse(
         pdf_path,
@@ -5831,7 +6050,7 @@ def api_rules_audit_harness_probe(body: Optional[dict] = Body(default=None)):
     one_cent_drift = copy.deepcopy(exact_cent_proposal)
     one_cent_drift["grand_total"] = 110.01
     one_cent_errors = proposal_math_errors(one_cent_drift)
-    expected_cent_error = "Proposal grand total does not equal subtotal plus tax and Textura."
+    expected_cent_error = GRAND_TOTAL_MISMATCH
     response["proposal_cent_arithmetic_contract"] = {
         "status": "pass" if not exact_cent_errors and expected_cent_error in one_cent_errors else "fail",
         "result": {
@@ -6403,12 +6622,18 @@ def _readiness_trust_summary(
 
 def _evaluate_job_readiness(job: dict) -> dict:
     proposal = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
-    latest_run = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
+    # The calculation the saved bid points to: a newer one nothing points to
+    # (a Regenerate the editor didn't apply) left the bid as it was.
+    latest_run = _proposal_run(job["id"], proposal)
+    # A bid saved before an app update only needs the automatic recheck when
+    # its PDF is made; this read never recalculates or writes anything.
+    proposal_check = _proposal_check_status(job, proposal, latest_run)
     pdf_ready = False
     pdf_message = None
-    pdf_path = _job_pdf_path(job["id"], "proposal")
-    if not os.path.exists(pdf_path):
-        pdf_message = "The current proposal PDF is missing. Generate the proposal PDF first."
+    latest_pdf = _latest_job_pdf(job["id"], "proposal_pdf")
+    pdf_path = latest_pdf[0] if latest_pdf else ""
+    if not pdf_path or not os.path.exists(pdf_path):
+        pdf_message = PDF_NOT_MADE_YET
     else:
         try:
             _validate_proposal_pdf_download_ready(job)
@@ -6430,7 +6655,7 @@ def _evaluate_job_readiness(job: dict) -> dict:
             proposal_source_ok = False
             proposal_source_message = str(exc.detail)
     else:
-        proposal_source_message = "No saved proposal exists to compare with the current material source."
+        proposal_source_message = NO_BID_YET
 
     proposal_fingerprint = _proposal_source_fingerprint(job, proposal)
     build = get_build_info()
@@ -6459,6 +6684,7 @@ def _evaluate_job_readiness(job: dict) -> dict:
         labor_catalog_count=len(get_labor_catalog_entries()),
         labor_required_types=set(LABOR_RULES),
         build=build,
+        proposal_check=proposal_check,
         trust_summary=_readiness_trust_summary(
             job,
             proposal=proposal,
@@ -6544,10 +6770,18 @@ def _golden_replay_for_audit(conn, replay_id):
     return dict(row) if row else None
 
 
+def _golden_refusal(reason: str) -> str:
+    """Why the golden baseline can't be captured, in the estimator's words."""
+    return f"Can't capture the golden baseline yet. {reason}"
+
+
 @app.post("/api/jobs/{job_id}/reproducibility/baseline")
-@audit_route("golden.capture")
+@audit_route("golden.capture", "proposal.audit_refresh")
 def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
-    """Capture the current accepted proposal as this job's golden baseline."""
+    """Capture the current accepted proposal as this job's golden baseline.
+
+    A bid saved before an app update is rechecked first, as making its PDF
+    does (_recheck_saved_proposal)."""
     db_id = _resolve_job_id(job_id)
     job = load_job(db_id)
     if not job:
@@ -6561,39 +6795,47 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     if missing:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot capture golden baseline until required job fields are filled: {', '.join(missing)}.",
+            detail=_golden_refusal(
+                f"Fill in the {plain_list([JOB_FIELD_LABELS.get(field, field) for field in missing])} on the job. "
+                "Click Edit job details at the top of the page."
+            ),
         )
 
     proposal_data = job.get("proposal_data")
     if not isinstance(proposal_data, dict) or not proposal_data.get("bundles"):
-        raise HTTPException(status_code=409, detail="Cannot capture golden baseline until the proposal has saved bundles.")
+        raise HTTPException(status_code=409, detail=_golden_refusal(NO_BID_YET))
     nonpositive_bundles = [
         bundle.get("bundle_name") or "bundle"
         for bundle in proposal_data.get("bundles") or []
         if isinstance(bundle, dict) and (effective_bundle_total(bundle) <= 0)
     ]
     if nonpositive_bundles:
+        one = len(nonpositive_bundles) == 1
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot capture golden baseline until every bundle has a positive accepted price: {', '.join(nonpositive_bundles[:5])}.",
+            detail=_golden_refusal(
+                f"{plain_list(nonpositive_bundles)} {'has' if one else 'have'} a $0 price. "
+                f"Give {'it' if one else 'each one'} a price on {REVIEW_STEP}."
+            ),
         )
     arithmetic_errors = proposal_math_errors(proposal_data)
     if arithmetic_errors:
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot capture golden baseline because proposal arithmetic is invalid: {' '.join(arithmetic_errors[:3])}",
+            detail=_golden_refusal(f"Some numbers on the bid don't add up ({arithmetic_errors[0]}) {CLICK_REGENERATE}"),
         )
     try:
         _validate_proposal_body_matches_job_source(job, proposal_data)
     except HTTPException as exc:
+        raise HTTPException(status_code=409, detail=_golden_refusal(str(exc.detail))) from exc
+
+    # The same check as the page's "Before you send this bid" card.
+    check_status = _proposal_check_status(job, proposal_data)
+    if check_status["kind"] not in ("current", "tool_updated"):
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot capture golden baseline because the accepted proposal is stale. {exc.detail}",
-        ) from exc
-
-    current_proposal_fingerprint = _proposal_source_fingerprint(job, proposal_data)
-    if proposal_data.get("audit_source_fingerprint") != current_proposal_fingerprint:
-        raise HTTPException(status_code=409, detail="Cannot capture golden baseline until the saved proposal audit matches the current job source. Save or regenerate the proposal first.")
+            detail=_golden_refusal(f"{proposal_check_message(check_status)[1]} Then capture it again."),
+        )
 
     raw_deleted_codes = {str(code) for code in (proposal_data.get("deleted_material_codes") or []) if code}
     deleted_reasons = proposal_data.get("deleted_material_reasons")
@@ -6607,7 +6849,7 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     if missing_deletion_reasons:
         raise HTTPException(
             status_code=409,
-            detail="Cannot capture golden baseline until every deleted material has an explicit estimator reason.",
+            detail=_golden_refusal(f"Give a reason for each deleted material. Type it on each deleted line on {REVIEW_STEP}."),
         )
     deleted_bundle_names = {str(name) for name in (proposal_data.get("deleted_bundles") or []) if name}
     deleted_bundle_reasons = proposal_data.get("deleted_bundle_reasons")
@@ -6616,7 +6858,7 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     if any(not str(deleted_bundle_reasons.get(name) or "").strip() for name in deleted_bundle_names):
         raise HTTPException(
             status_code=409,
-            detail="Cannot capture golden baseline until every deleted bundle has an explicit estimator reason.",
+            detail=_golden_refusal(f"Give a reason for each deleted bundle on {REVIEW_STEP}."),
         )
     accepted_material_codes = {
         _job_material_key(material)
@@ -6629,7 +6871,9 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     if contradictory_deleted_codes:
         raise HTTPException(
             status_code=409,
-            detail="Cannot capture golden baseline because a material is both deleted and still present in an accepted bundle.",
+            detail=_golden_refusal(
+                f"Some materials are deleted but still show on the bid. Click Regenerate on {REVIEW_STEP} to clean this up."
+            ),
         )
     for bundle in proposal_data.get("bundles") or []:
         if not isinstance(bundle, dict):
@@ -6640,7 +6884,7 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
         if any(not str(deleted_labor_reasons.get(key) or "").strip() for key in (bundle.get("deleted_labor_keys") or [])):
             raise HTTPException(
                 status_code=409,
-                detail="Cannot capture golden baseline until every deleted labor line has an explicit estimator reason.",
+                detail=_golden_refusal(f"Give a reason for each deleted labor line on {REVIEW_STEP}."),
             )
     active_materials = [
         material for material in (job.get("materials") or [])
@@ -6655,9 +6899,10 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     if missing_from_proposal:
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Cannot capture golden baseline until every active material is represented "
-                f"in the accepted proposal: {', '.join(str(item) for item in missing_from_proposal[:5])}."
+            detail=_golden_refusal(
+                f"{plain_list(missing_from_proposal)} {'is' if len(missing_from_proposal) == 1 else 'are'} in the "
+                f"job's materials but not on the bid. Click Regenerate on {REVIEW_STEP} to add them, or delete "
+                "them there with a reason."
             ),
         )
     unknown = [
@@ -6667,25 +6912,44 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     ]
     unpriced = [m.get("item_code") or m.get("description") or "material" for m in active_materials if _as_number(m.get("unit_price")) is None or _as_number(m.get("unit_price")) <= 0]
     if unknown or unpriced:
-        details = []
+        issues = []
         if unknown:
-            details.append(f"unknown classifications: {', '.join(str(item) for item in unknown[:5])}")
+            issues.append(f"pick a type for {plain_list(unknown)}")
         if unpriced:
-            details.append(f"unpriced materials: {', '.join(str(item) for item in unpriced[:5])}")
-        raise HTTPException(status_code=409, detail=f"Cannot capture golden baseline until the proposal is clean ({'; '.join(details)}).")
+            issues.append(f"type a price for {plain_list(unpriced)}")
+        todo = " and ".join(issues)
+        raise HTTPException(
+            status_code=409,
+            detail=_golden_refusal(f"{todo[:1].upper()}{todo[1:]} on the Takeoff & Pricing step."),
+        )
 
-    run = _latest_completed_run(job["id"], {"proposal_manual_save", "proposal_editor_save", "proposal_generation"})
-    if not run:
-        raise HTTPException(status_code=409, detail="Cannot capture golden baseline until this proposal has a current audit trace. Save or regenerate first.")
+    if check_status["kind"] == "tool_updated":
+        # Only the app (or its rates) changed since the bid was saved: recheck
+        # it now, as making the PDF does, then capture the rechecked bid.
+        job = _recheck_saved_proposal(job)
+        proposal_data = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
+        check_status = _proposal_check_status(job, proposal_data, preview=False)
+        if check_status["kind"] not in ("current", "tool_updated"):
+            raise HTTPException(
+                status_code=409,
+                detail=_golden_refusal(f"{proposal_check_message(check_status)[1]} Then capture it again."),
+            )
+    current_proposal_fingerprint = _proposal_source_fingerprint(job, proposal_data)
+
+    # The calculation the saved bid points to (not a newer one nothing uses).
+    run = _proposal_run(job["id"], proposal_data)
     proposal_audit = proposal_data.get("audit") if isinstance(proposal_data.get("audit"), dict) else {}
     try:
-        audit_receipt_matches = int(proposal_audit.get("run_id")) == int(run["id"])
+        audit_receipt_matches = bool(run) and int(proposal_audit.get("run_id")) == int(run["id"])
     except (TypeError, ValueError):
         audit_receipt_matches = False
     if not audit_receipt_matches:
         raise HTTPException(
             status_code=409,
-            detail="Cannot capture golden baseline because the proposal audit receipt is stale. Save or regenerate the proposal first.",
+            detail=_golden_refusal(
+                f"This bid's numbers need to be saved again. Click Generate PDF on {REVIEW_STEP}, "
+                "then capture it again."
+            ),
         )
     _ensure_audit_calculator_current(run, label="Golden baseline")
 
@@ -6704,9 +6968,9 @@ def api_capture_golden_baseline(job_id: str, body: GoldenBaselineRequest):
     if unresolved_vendor_evidence:
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Cannot capture golden baseline while vendor pricing evidence is unresolved. "
-                "Repair the exact quote receipts and review every verified quote difference first."
+            detail=_golden_refusal(
+                'Vendor quote prices need attention. Click Fix quote prices on the "Before you send this bid" '
+                "card, then capture it again."
             ),
         )
 
@@ -6947,16 +7211,48 @@ def _ensure_audit_calculator_current(run: dict | None, *, label: str) -> None:
     expected_config = build.get("config_fingerprint")
     run_engine = metadata.get("engine_fingerprint")
     run_config = metadata.get("config_fingerprint")
-    if not run_engine or not run_config:
+    if not run_engine or not run_config or run_engine != expected_engine or run_config != expected_config:
+        # ``label`` names the caller for logs only; estimators get one plain fix.
         raise HTTPException(
             status_code=409,
-            detail=f"{label} audit predates calculator fingerprint evidence. Recalculate or save the proposal first.",
+            detail=f"This bid was last saved with an older version of the app. {CLICK_REGENERATE}",
         )
-    if run_engine != expected_engine or run_config != expected_config:
-        raise HTTPException(
-            status_code=409,
-            detail=f"{label} audit was created by a different calculator build or config. Recalculate or save the proposal first.",
-        )
+
+
+# What a saved calculation was made with: the app version (engine/config) and
+# the rates and labor prices edited in the app. A deploy or a rate edit changes
+# these without changing the bid itself.
+_CALCULATOR_IDENTITY_KEYS = (
+    "engine_fingerprint", "config_fingerprint",
+    "company_rates_fingerprint", "labor_catalog_fingerprint",
+)
+
+
+def _current_calculator_identity() -> dict:
+    build = get_build_info()
+    return {
+        "engine_fingerprint": build.get("engine_fingerprint"),
+        "config_fingerprint": build.get("config_fingerprint"),
+        **_calculator_data_fingerprints(),
+    }
+
+
+def _run_calculator_identity(run: dict | None) -> dict | None:
+    """The identity a calculation run was made with, or None when the run
+    predates app-version fingerprints (it can't be recreated then). Rates and
+    labor fingerprints missing from an older run count as unchanged."""
+    metadata = (run or {}).get("metadata") or {}
+    if not metadata.get("engine_fingerprint") or not metadata.get("config_fingerprint"):
+        return None
+    current = None
+    identity = {}
+    for key in _CALCULATOR_IDENTITY_KEYS:
+        value = metadata.get(key)
+        if not value:
+            current = current or _current_calculator_identity()
+            value = current.get(key)
+        identity[key] = value
+    return identity
 
 
 def _fingerprint_payload(payload) -> str:
@@ -7017,9 +7313,10 @@ def _line_snapshot(items: list[dict], fields: tuple[str, ...]) -> list[dict]:
     return rows
 
 
-def _bid_source_fingerprint(job: dict) -> str:
-    build = get_build_info()
-    data_fingerprints = _calculator_data_fingerprints()
+def _bid_source_fingerprint(job: dict, *, identity: dict | None = None) -> str:
+    """``identity`` recreates the fingerprint as an older app version or older
+    rates made it (see _run_calculator_identity); default is the running app."""
+    build, data_fingerprints = _fingerprint_identity_parts(identity)
     return _fingerprint_payload({
         "fingerprint_schema": 4,
         "job": _job_source_snapshot(job),
@@ -7050,10 +7347,22 @@ def _bid_source_fingerprint(job: dict) -> str:
     })
 
 
-def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -> str:
+def _fingerprint_identity_parts(identity: dict | None) -> tuple[dict, dict]:
+    if identity is None:
+        return get_build_info(), _calculator_data_fingerprints()
+    return (
+        {"engine_fingerprint": identity.get("engine_fingerprint"), "config_fingerprint": identity.get("config_fingerprint")},
+        {
+            "company_rates_fingerprint": identity.get("company_rates_fingerprint"),
+            "labor_catalog_fingerprint": identity.get("labor_catalog_fingerprint"),
+        },
+    )
+
+
+def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None, *, identity: dict | None = None) -> str:
+    """``identity``: as for _bid_source_fingerprint."""
     proposal_data = proposal_data if isinstance(proposal_data, dict) else (job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {})
-    build = get_build_info()
-    data_fingerprints = _calculator_data_fingerprints()
+    build, data_fingerprints = _fingerprint_identity_parts(identity)
     return _fingerprint_payload({
         "fingerprint_schema": 4,
         "job": _job_source_snapshot(job),
@@ -7067,7 +7376,9 @@ def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -
             "is_mosaic", "is_penny_hex", "crack_isolation_sf", "weld_rod_lf",
         )),
         "proposal": {
-            "bundles": proposal_data.get("bundles", []),
+            # Uids, line keys and row bookkeeping say which bundle or line is
+            # which, not what the proposal says: they don't change the fingerprint.
+            "bundles": stable_ids.without_identity(proposal_data.get("bundles", [])),
             "notes": proposal_data.get("notes", []),
             "terms": proposal_data.get("terms", []),
             "exclusions": proposal_data.get("exclusions", []),
@@ -7107,6 +7418,363 @@ def _proposal_source_fingerprint(job: dict, proposal_data: dict | None = None) -
 
 def _latest_completed_run(job_id: int, run_types: set[str]) -> dict | None:
     return get_latest_completed_calculation_run(job_id, run_types)
+
+
+def _completed_run_by_id(job_id: int, run_id) -> dict | None:
+    """One of the job's completed calculation runs, with its metadata."""
+    try:
+        run_id = int(run_id)
+    except (TypeError, ValueError):
+        return None
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM calculation_runs WHERE id=? AND job_id=? AND status='completed'",
+            (run_id, int(job_id)),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    run = dict(row)
+    for src, dest in (("metadata_json", "metadata"), ("summary_json", "summary")):
+        raw = run.pop(src, None)
+        try:
+            run[dest] = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            run[dest] = raw
+    return run
+
+
+def _proposal_run(job_id: int, proposal: dict | None) -> dict | None:
+    """The calculation the saved bid's numbers come from (its audit run). A
+    newer run nothing points to (a Regenerate the editor didn't apply, a
+    recheck that lost a race) left the bid as it was, so it isn't the bid's.
+    A bid saved without an audit run falls back to the job's latest run."""
+    audit_info = (proposal or {}).get("audit")
+    run = _completed_run_by_id(job_id, audit_info.get("run_id")) if isinstance(audit_info, dict) else None
+    return run or _latest_completed_run(job_id, _PROPOSAL_RUN_TYPES)
+
+
+# ── What the job said when the bid was made ──────────────────────────────────
+# Job details the PDF prints in its header. The PDF reads them from the job
+# when it is made, so changing one never changes a number on the bid.
+_PRINT_ONLY_JOB_FIELDS = ("project_name", "gc_name", "address", "city", "state", "zip", "salesperson", "exclusions")
+_PRINT_ONLY_WORDS = {
+    "project_name": "project name", "gc_name": "general contractor", "address": "address",
+    "city": "city", "state": "state", "zip": "ZIP code", "salesperson": "salesperson",
+    "exclusions": "exclusions",
+}
+# Job details the bid's numbers are made from. The bid keeps its own tax rate,
+# GPM and Textura fee (typed on the Review & Generate step; Regenerate keeps
+# them); the counts and the sundry and labor lines reach it through Regenerate.
+_BID_OWN_JOB_FIELDS = ("tax_rate", "gpm_pct", "textura_fee")
+_REGENERATE_JOB_FIELDS = ("unit_count", "tub_shower_count", "markup_pct")
+_SOURCE_SUNDRY_FIELDS = ("material_id", "sundry_name", "qty", "unit", "unit_price", "extended_cost", "freight_cost")
+_SOURCE_LABOR_FIELDS = ("material_id", "labor_description", "qty", "unit", "rate", "extended_cost")
+
+
+def _bid_source_job(job: dict, *, run_id=None, guessed: bool = False) -> dict:
+    """The job values a bid's numbers are made from. Saved on the proposal as
+    ``source_job`` when a generation makes the numbers, carried by later saves,
+    and compared with the job by _proposal_check_status."""
+    source = {field: job.get(field) or 0 for field in (*_BID_OWN_JOB_FIELDS, *_REGENERATE_JOB_FIELDS)}
+    source["sundries"] = _fingerprint_payload(_line_snapshot(job.get("sundries", []), _SOURCE_SUNDRY_FIELDS))
+    source["labor"] = _fingerprint_payload(_line_snapshot(job.get("labor", []), _SOURCE_LABOR_FIELDS))
+    source["run_id"] = run_id
+    if guessed:
+        # Saved before bids kept this: see _legacy_source_job.
+        source["guessed"] = True
+    return source
+
+
+def _is_source_job(value) -> bool:
+    return isinstance(value, dict) and bool(value.get("sundries")) and bool(value.get("labor"))
+
+
+def _same_job_input(left, right) -> bool:
+    return abs((_as_number(left) or 0) - (_as_number(right) or 0)) < 1e-9
+
+
+def _legacy_source_job(job: dict, proposal: dict, *, unchanged: bool) -> dict:
+    """``source_job`` for a bid saved before bids kept one: the job as it is
+    now, except that when the job may have changed since the bid was saved
+    (``unchanged`` false) its tax rate, GPM and Textura fee are taken to have
+    been the bid's own (``guessed``: only the difference is known). Earlier
+    changes to the counts or the sundry and labor lines can't be told."""
+    source = _bid_source_job(job, guessed=not unchanged)
+    if not unchanged:
+        for field in _BID_OWN_JOB_FIELDS:
+            source[field] = proposal.get(field) or 0
+    return source
+
+
+def _stored_fingerprint_holds(job: dict, proposal: dict, run: dict | None) -> bool:
+    """True when nothing but the app, its rates or the details only the PDF
+    prints changed since the bid's fingerprint was saved."""
+    stored = proposal.get("audit_source_fingerprint")
+    if not stored:
+        return False
+    stamped = proposal.get("audit_source_job")
+    as_saved = {**job, **stamped} if isinstance(stamped, dict) else job
+    current_identity = _current_calculator_identity()
+    if stored == _proposal_source_fingerprint(as_saved, proposal, identity=current_identity):
+        return True
+    run_identity = _run_calculator_identity(run)
+    return bool(
+        run_identity is not None and run_identity != current_identity
+        and stored == _proposal_source_fingerprint(as_saved, proposal, identity=run_identity)
+    )
+
+
+def _proposal_source_job(job: dict, proposal: dict, run: dict | None = None) -> dict:
+    """The saved bid's ``source_job`` (a copy), or the estimate for an older bid."""
+    if _is_source_job(proposal.get("source_job")):
+        return copy.deepcopy(proposal["source_job"])
+    if run is None:
+        run = _proposal_run(job["id"], proposal)
+    return _legacy_source_job(job, proposal, unchanged=_stored_fingerprint_holds(job, proposal, run))
+
+
+def _job_changes_since_bid(job: dict, proposal: dict, source_job: dict) -> list[dict]:
+    """What changed in the job since the bid's numbers were made from it and
+    isn't on the bid yet. A tax rate, GPM or Textura fee the bid already uses
+    is fine (the estimator typed it on the Review & Generate step)."""
+    changes = []
+    for field in _REGENERATE_JOB_FIELDS:
+        before, after = source_job.get(field), job.get(field) or 0
+        if not _same_job_input(before, after):
+            changes.append({"field": field, "before": before, "after": after, "fix": "regenerate"})
+    current = _bid_source_job(job)
+    for part in ("sundries", "labor"):
+        if source_job.get(part) and source_job.get(part) != current[part]:
+            changes.append({"field": part, "fix": "regenerate"})
+    for field in _BID_OWN_JOB_FIELDS:
+        before, after, bid = source_job.get(field), job.get(field) or 0, proposal.get(field) or 0
+        if not _same_job_input(before, after) and not _same_job_input(bid, after):
+            changes.append({"field": field, "before": before, "after": after, "bid": bid, "fix": "bid"})
+    return changes
+
+
+def _saved_source_job(job: dict, previous: dict, body: dict) -> dict:
+    """``source_job`` for a proposal save. The editor sends back the one from a
+    Regenerate it applied; it is taken from that generation's run (only a newer
+    generation than the saved one), so an old tab can't bring back an older
+    one. Otherwise the saved bid's is kept. A tax rate, GPM or Textura fee the
+    estimator changes in this save takes the job's value as it is now: they
+    chose the bid's value with the job in front of them."""
+    previous = previous if isinstance(previous, dict) else {}
+    prior = previous.get("source_job") if _is_source_job(previous.get("source_job")) else None
+    source = None
+    incoming = body.get("source_job") if isinstance(body.get("source_job"), dict) else {}
+    incoming_run = _as_number(incoming.get("run_id"))
+    prior_run = _as_number((prior or {}).get("run_id"))
+    if incoming_run is not None and (prior_run is None or incoming_run > prior_run):
+        run = _completed_run_by_id(job["id"], incoming_run)
+        made = ((run or {}).get("metadata") or {}).get("source_job")
+        if run and run.get("run_type") == "proposal_generation" and _is_source_job(made):
+            source = {**made, "run_id": int(incoming_run)}
+    if source is None:
+        if prior:
+            source = copy.deepcopy(prior)
+        elif previous.get("bundles"):
+            source = _proposal_source_job(job, previous)
+        else:
+            source = _bid_source_job(job)  # the first save: made from the job as it is now
+    if previous.get("bundles"):
+        for field in _BID_OWN_JOB_FIELDS:
+            if not _same_job_input(body.get(field), previous.get(field)):
+                source[field] = job.get(field) or 0
+    return source
+
+
+def _stamp_proposal_source(job: dict, proposal: dict, *, source_job: dict | None = None) -> None:
+    """Record on a proposal about to be saved what it was checked against: the
+    job details now and the fingerprint, and ``source_job`` when given (else
+    the proposal keeps its own)."""
+    if source_job is not None:
+        proposal["source_job"] = source_job
+    proposal["audit_source_job"] = _job_source_snapshot(job)
+    proposal["audit_source_fingerprint"] = _proposal_source_fingerprint(job, proposal)
+
+
+def _print_details_changed(job: dict, stamped) -> list[str]:
+    """Plain words for the header details the PDF prints that differ from
+    ``stamped`` (the job details saved with the proposal)."""
+    if not isinstance(stamped, dict):
+        return []
+    now = _job_source_snapshot(job)
+    return [
+        _PRINT_ONLY_WORDS[field] for field in _PRINT_ONLY_JOB_FIELDS
+        if str(stamped.get(field) or "").strip() != str(now.get(field) or "").strip()
+    ]
+
+
+# ── Saved bid numbers check after an app update ──────────────────────────────
+# Every deploy (and every rate or labor price edit) changes what the saved
+# calculations were made with, even though the bid itself didn't change. Such
+# a bid is rechecked automatically with the running app when its PDF is made
+# (_recheck_saved_proposal); only a recheck that changes the numbers, or a job
+# that really changed, needs the estimator.
+_PROPOSAL_RUN_TYPES = {"proposal_editor_save", "proposal_generation"}
+_RECHECK_TOTAL_FIELDS = (
+    "subtotal", "tax_amount", "grand_total", "gpm_profit", "gpm_labor",
+    "gpm_material", "manual_adjustment", "textura_amount",
+)
+_RECHECK_BUNDLE_FIELDS = (
+    "material_cost", "sundry_cost", "labor_cost", "freight_cost", "gpm_labor_adder",
+    "gpm_material_adder", "gpm_adder", "taxable", "tax_amount", "total_price",
+)
+_RECHECK_SUMMARY = "Rechecked the bid's numbers with the latest version of the tool"
+
+
+def _cents(value) -> int:
+    return int(round((_as_money_number(value) or 0) * 100))
+
+
+def _printed_bundle_amounts(bundle: dict) -> dict:
+    """The bundle amounts the PDF prints (typed overrides win)."""
+    amounts = {field: bundle.get(field) for field in _RECHECK_BUNDLE_FIELDS}
+    if bundle.get("freight_override") is not None:
+        amounts["freight_cost"] = bundle.get("freight_override")
+    if bundle.get("price_override") is not None:
+        amounts["total_price"] = bundle.get("price_override")
+    return amounts
+
+
+def _proposal_recheck(proposal: dict) -> dict:
+    """Recalculate a saved bid's totals with the running app. Writes nothing.
+
+    ``changed`` is true when any printed amount would move by a cent or more.
+    """
+    recomputed = copy.deepcopy(proposal)
+    normalize_proposal_totals(recomputed)
+    changes = [
+        amount_word(field) for field in _RECHECK_TOTAL_FIELDS
+        if _cents(proposal.get(field)) != _cents(recomputed.get(field))
+    ]
+    old_bundles = [bundle for bundle in (proposal.get("bundles") or []) if isinstance(bundle, dict)]
+    new_bundles = [bundle for bundle in (recomputed.get("bundles") or []) if isinstance(bundle, dict)]
+    for index, (old, new) in enumerate(zip(old_bundles, new_bundles)):
+        before, after = _printed_bundle_amounts(old), _printed_bundle_amounts(new)
+        name = old.get("bundle_name") or f"Bundle {index + 1}"
+        changes.extend(
+            f"{name} {amount_word(field)}" for field in _RECHECK_BUNDLE_FIELDS
+            if _cents(before[field]) != _cents(after[field])
+        )
+    return {
+        "recomputed": recomputed,
+        "changed": bool(changes),
+        "changes": changes,
+        "old_total": _as_money_number(proposal.get("grand_total")) or 0,
+        "new_total": _as_money_number(recomputed.get("grand_total")) or 0,
+    }
+
+
+def _proposal_check_status(job: dict, proposal: dict | None = None, run: dict | None = None,
+                           *, preview: bool = True) -> dict:
+    """Whether the saved bid's numbers check is current. Writes nothing.
+
+    ``kind``: "current"; "tool_updated" (only the app, its rates or its labor
+    prices changed since the bid was saved: rechecked automatically when the
+    PDF is made); "totals_changed" (that recheck would change the numbers:
+    ``old_total``/``new_total``, only with ``preview``); "job_changed" (with
+    ``changes`` from _job_changes_since_bid, or ``detail`` naming a changed
+    material); "not_saved"; or "no_proposal". ``run`` defaults to the run the
+    saved bid points to (_proposal_run).
+
+    Details only the PDF prints (address, salesperson, ...) are read from the
+    job when the PDF is made: changing them doesn't change the bid.
+    """
+    if proposal is None:
+        proposal = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
+    if not proposal.get("bundles"):
+        return {"kind": "no_proposal"}
+    if run is None:
+        run = _proposal_run(job["id"], proposal)
+    if not run:
+        return {"kind": "not_saved"}
+    fingerprint_holds = _stored_fingerprint_holds(job, proposal, run)
+    if _is_source_job(proposal.get("source_job")):
+        source_job = proposal["source_job"]
+    else:
+        source_job = _legacy_source_job(job, proposal, unchanged=fingerprint_holds)
+    changes = _job_changes_since_bid(job, proposal, source_job)
+    if changes or not fingerprint_holds:
+        # A changed material the bid copies is named first (recalculating the
+        # materials also redoes the sundry and labor lines). Anything else
+        # that isn't in ``changes`` is a detail only the PDF prints or a price
+        # decision: neither moves a number.
+        try:
+            _validate_proposal_body_matches_job_source(job, proposal)
+        except HTTPException as exc:
+            return {"kind": "job_changed", "detail": str(exc.detail)}
+    if changes:
+        return {"kind": "job_changed", "changes": changes, "guessed": bool(source_job.get("guessed"))}
+    run_identity = _run_calculator_identity(run)
+    if run_identity is not None and run_identity == _current_calculator_identity():
+        return {"kind": "current"}
+    if preview:
+        recheck = _proposal_recheck(proposal)
+        if recheck["changed"]:
+            return {
+                "kind": "totals_changed",
+                "old_total": recheck["old_total"],
+                "new_total": recheck["new_total"],
+                "changes": recheck["changes"],
+            }
+    return {"kind": "tool_updated"}
+
+
+def _recheck_saved_proposal(job: dict) -> dict:
+    """Recheck a saved bid's numbers with the running app and save the result.
+
+    Only for a bid whose job and proposal didn't change since it was saved
+    (see _proposal_check_status "tool_updated"). Records the same audit a
+    proposal save records, for the saved proposal, as a system recheck by the
+    requesting user. Raises 409 naming the old and new total when the numbers
+    would change. Returns the reloaded job.
+    """
+    saved = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
+    recheck = _proposal_recheck(saved)
+    if recheck["changed"]:
+        raise HTTPException(status_code=409, detail=totals_changed_message(recheck["old_total"], recheck["new_total"]))
+    try:
+        _validate_proposal_pdf_download_ready(job)
+        pdf_was_current = True
+    except HTTPException:
+        pdf_was_current = False
+    audit_result = _record_proposal_editor_audit(
+        job["id"], saved, recheck["recomputed"], endpoint="proposal/audit-refresh", source="system",
+    )
+    audit_trace = audit_result.get("audit_trace")
+    if not audit_trace:
+        raise HTTPException(status_code=409, detail=f"This bid's numbers couldn't be rechecked. {CLICK_REGENERATE}")
+    refreshed = copy.deepcopy(saved)
+    refreshed["audit"] = {
+        "run_id": audit_trace["run"]["id"],
+        "trace_count": audit_result["trace_count"],
+        "summary": audit_trace.get("audit", {}),
+    }
+    _stamp_proposal_source(job, refreshed, source_job=_proposal_source_job(job, saved))
+    if pdf_was_current:
+        # No number moved, so the PDF made from the bid still prints it.
+        refreshed["pdf_audit_run_id"] = audit_trace["run"]["id"]
+        refreshed["pdf_source_fingerprint"] = refreshed["audit_source_fingerprint"]
+    try:
+        with system_context("proposal_audit_refresh", run_id=audit_trace["run"]["id"]):
+            with job_write(job["id"], action="proposal.audit_refresh", scopes=("proposal",),
+                           summary=_RECHECK_SUMMARY) as tx:
+                tx.force_record()
+                set_proposal_data(tx.conn, job["id"], refreshed, expected_rev=int(job.get("proposal_rev") or 0))
+    except ProposalConflictError:
+        # Saved again meanwhile; that save recorded its own check. This one's
+        # run belongs to no saved bid: mark it so it is never taken for one.
+        complete_calculation_run(audit_trace["run"]["id"], status="superseded", summary=audit_trace.get("audit") or {})
+    fresh = load_job(job["id"])
+    if not fresh:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return fresh
 
 
 def _required_job_field_gaps(job: dict) -> list[str]:
@@ -7162,18 +7830,30 @@ def _validate_bid_pdf_download_ready(job: dict) -> None:
     _validate_bid_job_ready(job)
     bid_data = job.get("bid_data")
     if not isinstance(bid_data, dict) or not bid_data.get("pdf_audit_run_id"):
-        raise HTTPException(status_code=409, detail="Bid PDF is missing its audit receipt. Regenerate the bid.")
+        raise HTTPException(status_code=409, detail="No bid PDF has been made for this job yet. Make the bid PDF first.")
+    out_of_date = "The job changed after this bid PDF was made. Make the bid PDF again, then download it."
     latest = _latest_completed_run(job["id"], {"bid_pdf_generation"})
     if not latest or int(latest["id"]) != int(bid_data.get("pdf_audit_run_id")):
-        raise HTTPException(status_code=409, detail="Bid PDF is stale. Regenerate the bid before downloading.")
-    _ensure_audit_calculator_current(latest, label="Bid PDF")
-    if bid_data.get("pdf_source_fingerprint") != _bid_source_fingerprint(job):
-        raise HTTPException(status_code=409, detail="Bid PDF is stale because the job source changed. Regenerate the bid before downloading.")
+        raise HTTPException(status_code=409, detail=out_of_date)
+    stored = bid_data.get("pdf_source_fingerprint")
+    current_identity = _current_calculator_identity()
+    if stored != _bid_source_fingerprint(job, identity=current_identity):
+        # A PDF made before an app update (or a rate edit) still counts when
+        # the job itself didn't change.
+        run_identity = _run_calculator_identity(latest)
+        if not (
+            stored and run_identity and run_identity != current_identity
+            and stored == _bid_source_fingerprint(job, identity=run_identity)
+        ):
+            raise HTTPException(status_code=409, detail=out_of_date)
     traces = get_calculation_traces(job["id"], run_id=latest["id"], entity_type="bid", entity_key="bid", limit=200)
     by_field = {trace.get("output_field"): trace for trace in traces}
     totals = bid_data.get("pdf_totals") or {}
     for field in ("subtotal", "tax_amount", "grand_total", "total_cost", "gpm_profit", "markup_amount"):
-        _trace_result_matches(by_field.get(field), totals.get(field), label=f"bid {field}")
+        try:
+            _trace_result_matches(by_field.get(field), totals.get(field), label=f"bid {amount_word(field)}")
+        except HTTPException:
+            raise HTTPException(status_code=409, detail=out_of_date) from None
 
 
 def _record_bid_audit(job_id: int, bid_data: dict) -> dict:
@@ -7330,8 +8010,12 @@ def _record_bid_audit(job_id: int, bid_data: dict) -> dict:
     return {"run": run, "trace_count": trace_count}
 
 
-def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) -> dict:
-    """Persist a complete audit receipt for the currently displayed proposal."""
+def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict, *,
+                                  endpoint: str = "proposal/bundles/save", source: str = "user") -> dict:
+    """Persist a complete audit receipt for the currently displayed proposal.
+
+    A proposal save calls it with the defaults; the automatic recheck after an
+    app update (_recheck_saved_proposal) passes its own endpoint and source."""
     previous = previous or {}
     current = current or {}
     trace = AuditTraceBuilder(job_id, default_source="proposal_editor")
@@ -7699,14 +8383,16 @@ def _record_proposal_editor_audit(job_id: int, previous: dict, current: dict) ->
     run_id = create_calculation_run(
         job_id,
         "proposal_editor_save",
-        source="user",
-        metadata=_audit_metadata({"endpoint": "proposal/bundles/save"}),
+        source=source,
+        metadata=_audit_metadata({"endpoint": endpoint}),
     )
     for record in trace._records:
         record["run_id"] = run_id
     trace_count = save_calculation_traces(job_id, run_id, trace.records)
     complete_calculation_run(run_id, summary=trace.summary())
-    run = list_calculation_runs(job_id, limit=1)[0]
+    # This run by id: the job's newest run may be another save's by now, and
+    # the saved bid points to this one (proposal["audit"]["run_id"]).
+    run = _completed_run_by_id(job_id, run_id) or list_calculation_runs(job_id, limit=1)[0]
     return {
         "trace_count": trace_count,
         "manual_trace_count": manual_trace_count,
@@ -7877,8 +8563,8 @@ async def api_save_proposal_bundles(job_id: str, request: Request):
 # from another tab; this limit only stops a bid that never stops saving.
 _PROPOSAL_SAVE_RETRY_SECONDS = 30
 _STALE_PROPOSAL_DETAIL = (
-    "This proposal changed in another tab or session. Your stale copy was not saved. "
-    "Reload the job and review the newer accepted proposal before editing again."
+    "Someone saved this proposal in another tab or on another computer after you opened it, "
+    "so your last change was not saved. Reload the page to see their version, then make your change again."
 )
 
 
@@ -7953,20 +8639,28 @@ def _stale_proposal_save_result(stored: dict) -> dict:
 def _proposal_layout_changed(previous: dict, current: dict, changes: list[dict]) -> bool:
     """True when this save added, removed or moved bundles (or rows inside them).
 
-    Bundles have no ids yet, so the history names them by position
-    ("/proposal/bundles/2/description_text"). After a layout change the same
-    position can be a different bundle, so such a save must not join an open
-    history entry, and it closes the open ones so later edits start fresh.
+    Such a save doesn't join an open history entry, and it closes the open
+    ones so later edits start fresh. Bundles with uids are named by uid in
+    the history ("/proposal/bundles/b_1a2b3c4d/description_text"), so only
+    adding, removing or reordering them counts. Rows still named by position
+    ("/proposal/bundles/b_1a2b3c4d/labor_items/2") can become a different row
+    after one is added or removed, so that counts too.
     """
     before = [bundle for bundle in (previous or {}).get("bundles") or [] if isinstance(bundle, dict)]
     after = [bundle for bundle in (current or {}).get("bundles") or [] if isinstance(bundle, dict)]
     if len(before) != len(after):
         return True
-    # One renamed bundle keeps its place; two or more names changing at once
-    # is a reorder (or looks just like one).
-    renamed = sum(1 for old, new in zip(before, after) if old.get("bundle_name") != new.get("bundle_name"))
-    if renamed > 1:
-        return True
+    before_uids = [stable_ids.clean_uid(bundle.get("uid")) for bundle in before]
+    after_uids = [stable_ids.clean_uid(bundle.get("uid")) for bundle in after]
+    if all(before_uids) and all(after_uids):
+        if before_uids != after_uids:
+            return True
+    else:
+        # Bundles named by position: one renamed bundle keeps its place; two
+        # or more names changing at once is a reorder (or looks just like one).
+        renamed = sum(1 for old, new in zip(before, after) if old.get("bundle_name") != new.get("bundle_name"))
+        if renamed > 1:
+            return True
     for change in changes:
         if change.get("op") not in ("add", "remove"):
             continue
@@ -8022,8 +8716,13 @@ def _try_save_proposal_bundles(db_id: int, job: dict, body: dict, base_proposal_
     incoming_edit_version = check["incoming_edit_version"]
     incoming_save_sequence = check["incoming_save_sequence"]
     stored_server_revision = check["stored_server_revision"]
+    # Bundles keep the uid the client sent back; one without (a new bundle,
+    # or a client that doesn't know uids) takes the uid of the saved bundle it
+    # matches, else a new one. A copy: a retry starts from the client's bundles.
+    bundles = copy.deepcopy(body.get("bundles", []))
+    stable_ids.carry_bundle_uids(previous_proposal_data.get("bundles"), bundles)
     proposal_data = {
-        "bundles": body.get("bundles", []),
+        "bundles": bundles,
         "notes": body.get("notes", []),
         "terms": body.get("terms", []),
         "exclusions": body.get("exclusions", []),
@@ -8049,7 +8748,11 @@ def _try_save_proposal_bundles(db_id: int, job: dict, body: dict, base_proposal_
         "_server_revision": stored_server_revision + 1,
     }
     normalize_proposal_totals(proposal_data)
-    proposal_data["audit_source_fingerprint"] = _proposal_source_fingerprint(job, proposal_data)
+    # The job values the numbers were made from carry over from the saved bid
+    # (a job change stays flagged until it reaches the bid), or come from a
+    # Regenerate the editor applied.
+    _stamp_proposal_source(job, proposal_data,
+                           source_job=_saved_source_job(job, previous_proposal_data, body))
     audit_result = _record_proposal_editor_audit(job["id"], previous_proposal_data, proposal_data)
     if audit_result.get("audit_trace"):
         proposal_data["audit"] = {
@@ -8104,29 +8807,52 @@ def _whole_floats_as_int(value):
     return value
 
 
+def _raise_unless_proposal_check_ok(status: dict) -> None:
+    """409 in plain words unless the saved bid is current or only needs the
+    automatic recheck after an app update."""
+    if status.get("kind") in ("current", "tool_updated"):
+        return
+    raise HTTPException(status_code=409, detail=proposal_check_message(status)[1])
+
+
+def _body_matches_saved_proposal(job: dict, body: dict, saved_proposal: dict) -> bool:
+    # Browsers serialize whole-number floats without ".0", so compare by value.
+    identity = _current_calculator_identity()
+    return (
+        _proposal_source_fingerprint(job, _whole_floats_as_int(body), identity=identity)
+        == _proposal_source_fingerprint(job, _whole_floats_as_int(saved_proposal), identity=identity)
+    )
+
+
+_PDF_NOT_SAVED_BID = (
+    f"The bid you're printing doesn't match the last saved bid. Wait until {REVIEW_STEP} "
+    "shows Saved, then click Generate PDF again."
+)
+
+
 def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
-    """Reject PDF generation when required header data or current audit is missing."""
+    """Reject PDF generation when required header data or current audit is missing.
+
+    A bid saved before an app update (or a rate or labor price edit) is
+    rechecked here with the running app and saved as a system recheck; the
+    recheck updates ``job`` and ``body["audit"]`` in place so the caller
+    prints and saves the rechecked bid.
+    """
     missing = _required_job_field_gaps(job)
     if missing:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot generate PDF until required job fields are filled: {', '.join(missing)}.",
+            detail=(
+                f"Fill in the {plain_list([JOB_FIELD_LABELS.get(field, field) for field in missing])} on the job "
+                "before making the PDF. Click Edit job details at the top of the page."
+            ),
         )
 
     saved_proposal = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
-    saved_fingerprint = saved_proposal.get("audit_source_fingerprint")
-    # Browsers serialize whole-number floats without ".0", so compare the body
-    # to the saved proposal by value, and require the saved audit to be current.
-    if (
-        not saved_fingerprint
-        or saved_fingerprint != _proposal_source_fingerprint(job, saved_proposal)
-        or _proposal_source_fingerprint(job, _whole_floats_as_int(body))
-        != _proposal_source_fingerprint(job, _whole_floats_as_int(saved_proposal))
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot generate PDF because this is not the exact saved and audited proposal. Save it and try again.",
-        )
+    check_status = _proposal_check_status(job, saved_proposal)
+    _raise_unless_proposal_check_ok(check_status)
+    if not _body_matches_saved_proposal(job, body, saved_proposal):
+        raise HTTPException(status_code=409, detail=_PDF_NOT_SAVED_BID)
 
     raw_deleted_codes = {str(code) for code in (body.get("deleted_material_codes") or []) if code}
     deleted_material_reasons = body.get("deleted_material_reasons")
@@ -8137,14 +8863,27 @@ def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
         if not str(deleted_material_reasons.get(code) or "").strip()
     ]
     if missing_material_reasons:
-        raise HTTPException(status_code=409, detail="Cannot generate PDF until every deleted material has an estimator reason.")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Give a reason for each deleted material before making the PDF: {plain_list(missing_material_reasons)}. "
+                f"Type it on each deleted line on {REVIEW_STEP}."
+            ),
+        )
 
     deleted_bundle_names = {str(name) for name in (body.get("deleted_bundles") or []) if name}
     deleted_bundle_reasons = body.get("deleted_bundle_reasons")
     if not isinstance(deleted_bundle_reasons, dict):
         deleted_bundle_reasons = {}
-    if any(not str(deleted_bundle_reasons.get(name) or "").strip() for name in deleted_bundle_names):
-        raise HTTPException(status_code=409, detail="Cannot generate PDF until every deleted bundle has an estimator reason.")
+    missing_bundle_reasons = sorted(
+        name for name in deleted_bundle_names
+        if not str(deleted_bundle_reasons.get(name) or "").strip()
+    )
+    if missing_bundle_reasons:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Give a reason for each deleted bundle before making the PDF: {plain_list(missing_bundle_reasons)}.",
+        )
 
     accepted_codes = {
         _job_material_key(material)
@@ -8153,8 +8892,15 @@ def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
         for material in (bundle.get("materials") or [])
         if isinstance(material, dict) and _job_material_key(material)
     }
-    if raw_deleted_codes & accepted_codes:
-        raise HTTPException(status_code=409, detail="Cannot generate PDF because a material is both deleted and present in an accepted bundle.")
+    both = sorted(raw_deleted_codes & accepted_codes)
+    if both:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{plain_list(both)} {'is' if len(both) == 1 else 'are'} deleted but still on the bid. "
+                f"{CLICK_REGENERATE}"
+            ),
+        )
 
     for bundle in body.get("bundles") or []:
         if not isinstance(bundle, dict):
@@ -8163,7 +8909,13 @@ def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
         if not isinstance(reasons, dict):
             reasons = {}
         if any(not str(reasons.get(key) or "").strip() for key in (bundle.get("deleted_labor_keys") or [])):
-            raise HTTPException(status_code=409, detail="Cannot generate PDF until every deleted labor line has an estimator reason.")
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Give a reason for each deleted labor line in {bundle.get('bundle_name') or 'this bundle'} "
+                    "before making the PDF."
+                ),
+            )
 
     active_materials = [
         material for material in (job.get("materials") or [])
@@ -8182,21 +8934,37 @@ def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
     if unknown or unpriced:
         issues = []
         if unknown:
-            issues.append(f"classify {', '.join(str(item) for item in unknown[:5])}")
+            issues.append(f"pick a type for {plain_list(unknown)}")
         if unpriced:
-            issues.append(f"type a price for {', '.join(str(item) for item in unpriced[:5])}")
-        raise HTTPException(status_code=409, detail=f"Cannot generate PDF until active materials are ready: {'; '.join(issues)}.")
+            issues.append(f"type a price for {plain_list(unpriced)}")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Before making the PDF, {' and '.join(issues)} on the Takeoff & Pricing step.",
+        )
 
     arithmetic_errors = proposal_math_errors(body)
     if arithmetic_errors:
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot generate PDF because proposal arithmetic is invalid: {' '.join(arithmetic_errors[:3])}",
+            detail=f"Some numbers on the bid don't add up ({arithmetic_errors[0]}) {CLICK_REGENERATE}",
         )
 
-    run = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
+    if check_status["kind"] == "tool_updated":
+        # Only the app (or its rates) changed since the bid was saved: recheck
+        # it now, then carry on with the rechecked bid.
+        fresh = _recheck_saved_proposal(job)
+        job.clear()
+        job.update(fresh)
+        saved_proposal = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
+        _raise_unless_proposal_check_ok(_proposal_check_status(job, saved_proposal, preview=False))
+        if not _body_matches_saved_proposal(job, body, saved_proposal):
+            raise HTTPException(status_code=409, detail=_PDF_NOT_SAVED_BID)
+        if isinstance(saved_proposal.get("audit"), dict):
+            body["audit"] = copy.deepcopy(saved_proposal["audit"])
+    # The saved bid's own calculation, not a newer one nothing points to.
+    run = _proposal_run(job["id"], saved_proposal)
     if not run:
-        raise HTTPException(status_code=409, detail="Cannot generate PDF until this proposal has a current audit trace. Save or regenerate first.")
+        raise HTTPException(status_code=409, detail=f"This bid's numbers haven't been saved yet. {CLICK_REGENERATE}")
     _ensure_audit_calculator_current(run, label="Proposal PDF")
     _validate_proposal_body_matches_job_source(job, body)
     traces = get_calculation_traces(job["id"], run_id=run["id"], limit=5000)
@@ -8212,24 +8980,28 @@ def _validate_proposal_pdf_ready(job: dict, body: dict) -> None:
     if missing_traces:
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot generate PDF because audit is missing: {', '.join(missing_traces)}.",
+            detail=f"The bid's saved numbers are incomplete. {CLICK_REGENERATE}",
         )
     for field in required:
-        _trace_result_matches(by_field[field], body.get(field), label=f"proposal {field}")
+        _trace_result_matches(by_field[field], body.get(field), label=f"the bid's {amount_word(field)}")
     _validate_proposal_body_against_trace(body, traces)
 
 
 def _trace_result_matches(trace: dict | None, expected, *, label: str) -> None:
+    """``label`` is plain words for the amount ("the bid's total", "Lobby labor line 2")."""
     if not trace:
-        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because audit is missing for {label}.")
+        raise HTTPException(status_code=409, detail=f"The saved numbers for {label} are missing. {CLICK_REGENERATE}")
     expected_value = _as_number(expected)
     trace_value = _as_number(trace.get("result_value"))
     if expected_value is None:
-        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because {label} is not a finite number.")
+        raise HTTPException(status_code=409, detail=f"{label[:1].upper()}{label[1:]} is not a valid number. {CLICK_REGENERATE}")
     if trace_value is None:
-        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because audit has no numeric result for {label}.")
+        raise HTTPException(status_code=409, detail=f"The saved numbers for {label} are missing. {CLICK_REGENERATE}")
     if abs(expected_value - trace_value) > 0.02:
-        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because audit is stale for {label}.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"{label[:1].upper()}{label[1:]} doesn't match the last saved bid. {CLICK_REGENERATE}",
+        )
 
 
 def _find_trace(
@@ -8292,7 +9064,7 @@ def _validate_proposal_body_against_trace(body: dict, traces: list[dict]) -> Non
                 entity_key=bundle_name,
                 bundle_index=bundle_index,
             )
-            _trace_result_matches(trace, expected, label=f"{bundle_name} {field}")
+            _trace_result_matches(trace, expected, label=f"the {amount_word(field)} of {bundle_name}")
 
         for line_index, material in enumerate(bundle.get("materials") or []):
             if not isinstance(material, dict):
@@ -8306,7 +9078,7 @@ def _validate_proposal_body_against_trace(body: dict, traces: list[dict]) -> Non
                 bundle_index=bundle_index,
                 line_index=line_index,
             )
-            _trace_result_matches(trace, material.get("extended_cost"), label=f"{bundle_name} material line {line_index + 1}")
+            _trace_result_matches(trace, material.get("extended_cost"), label=f"{bundle_name}, material line {line_index + 1}")
 
         for line_index, sundry in enumerate(bundle.get("sundry_items") or []):
             if not isinstance(sundry, dict):
@@ -8322,7 +9094,7 @@ def _validate_proposal_body_against_trace(body: dict, traces: list[dict]) -> Non
                 bundle_index=bundle_index,
                 line_index=line_index,
             )
-            _trace_result_matches(trace, sundry.get("extended_cost"), label=f"{bundle_name} sundry line {line_index + 1}")
+            _trace_result_matches(trace, sundry.get("extended_cost"), label=f"{bundle_name}, sundry line {line_index + 1}")
 
         for line_index, labor in enumerate(bundle.get("labor_items") or []):
             if not isinstance(labor, dict):
@@ -8338,7 +9110,26 @@ def _validate_proposal_body_against_trace(body: dict, traces: list[dict]) -> Non
                 bundle_index=bundle_index,
                 line_index=line_index,
             )
-            _trace_result_matches(trace, labor.get("extended_cost"), label=f"{bundle_name} labor line {line_index + 1}")
+            _trace_result_matches(trace, labor.get("extended_cost"), label=f"{bundle_name}, labor line {line_index + 1}")
+
+
+# Plain words for the material fields a bid copies from the job.
+_MATERIAL_FIELD_WORDS = {
+    "item_code": "item code", "material_type": "type", "installed_qty": "quantity",
+    "waste_pct": "waste %", "order_qty": "order quantity", "unit_price": "price",
+    "extended_cost": "cost", "price_source": "price source", "quote_status": "quote status",
+    "ai_confidence": "type", "quote_source_hash": "quote file", "quote_file_name": "quote file",
+    "freight_per_unit": "freight", "freight_source": "freight", "fixture_count": "fixture count",
+    "labor_rate_lf": "labor rate", "labor_catalog": "labor price", "tack_strip_lf": "tack strip",
+    "seam_tape_lf": "seam tape", "pad_sy": "pad", "area_type": "area type",
+    "is_mosaic": "mosaic setting", "is_penny_hex": "penny hex setting",
+    "crack_isolation_sf": "crack isolation", "weld_rod_lf": "weld rod",
+}
+
+
+def _material_changed_detail(label: str, field: str) -> str:
+    word = _MATERIAL_FIELD_WORDS.get(field, str(field).replace("_", " "))
+    return f"The {word} of {label} changed after this bid was made. {CLICK_REGENERATE}"
 
 
 def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
@@ -8397,7 +9188,10 @@ def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
             if current is None and item_code:
                 current = current_by_code.get(item_code)
             if current is None:
-                raise HTTPException(status_code=409, detail=f"Cannot generate PDF because proposal material {item_code or 'line'} no longer exists. Regenerate the proposal.")
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{item_code or 'A material'} is on the bid but is no longer in the job's materials. {CLICK_REGENERATE}",
+                )
 
             seen.add(str(current.get("id")))
             label = item_code or current.get("description") or f"material {current.get('id')}"
@@ -8412,15 +9206,15 @@ def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
                 body_value = material.get(field)
                 if field in text_fields:
                     if str(current_value or "") != str(body_value or ""):
-                        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because proposal material {label} is stale for {field}. Regenerate the proposal.")
+                        raise HTTPException(status_code=409, detail=_material_changed_detail(label, field))
                     continue
                 current_number = _as_number(current_value)
                 body_number = _as_number(body_value)
                 if current_number is not None or body_number is not None:
                     if abs((current_number or 0) - (body_number or 0)) > 0.02:
-                        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because proposal material {label} is stale for {field}. Regenerate the proposal.")
+                        raise HTTPException(status_code=409, detail=_material_changed_detail(label, field))
                 elif str(current_value or "") != str(body_value or ""):
-                    raise HTTPException(status_code=409, detail=f"Cannot generate PDF because proposal material {label} is stale for {field}. Regenerate the proposal.")
+                    raise HTTPException(status_code=409, detail=_material_changed_detail(label, field))
 
     missing = []
     for material in job.get("materials", []) or []:
@@ -8435,28 +9229,71 @@ def _validate_proposal_body_matches_job_source(job: dict, body: dict) -> None:
         if material_id and material_id not in seen:
             missing.append(item_code or material.get("description") or material_id)
     if missing:
-        sample = ", ".join(str(item) for item in missing[:5])
-        suffix = "..." if len(missing) > 5 else ""
-        raise HTTPException(status_code=409, detail=f"Cannot generate PDF because proposal is missing current materials: {sample}{suffix}. Regenerate the proposal.")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{plain_list(missing)} {'is' if len(missing) == 1 else 'are'} in the job's materials but not "
+                f"on the bid. {CLICK_REGENERATE}"
+            ),
+        )
+
+
+PDF_NOT_MADE_YET = f"No PDF has been made for this bid yet. Click Generate PDF on {REVIEW_STEP}."
+PDF_OUT_OF_DATE = f"The bid changed after this PDF was made. Click Generate PDF on {REVIEW_STEP} to make a new one."
+
+
+def _pdf_out_of_date_detail(job: dict, proposal_data: dict, stored, identities) -> str:
+    """PDF_OUT_OF_DATE, or which header details changed when only details the
+    PDF prints (address, salesperson, ...) changed since it was made."""
+    stamped = proposal_data.get("audit_source_job")
+    changed = _print_details_changed(job, stamped)
+    if changed and stored:
+        as_saved = {**job, **stamped}
+        if any(
+            identity and stored == _proposal_source_fingerprint(as_saved, proposal_data, identity=identity)
+            for identity in identities
+        ):
+            return (
+                f"The job's {plain_list(changed)} changed after this PDF was made. "
+                f"Click Generate PDF on {REVIEW_STEP} to make a new one."
+            )
+    return PDF_OUT_OF_DATE
 
 
 def _validate_proposal_pdf_download_ready(job: dict) -> None:
-    """Reject old proposal PDFs after the proposal audit or required job fields change."""
+    """Reject old proposal PDFs after the bid or required job fields change.
+
+    A PDF made before an app update (or a rate or labor price edit) still
+    counts while the bid itself is unchanged."""
     missing = _required_job_field_gaps(job)
     if missing:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot download proposal PDF until required job fields are filled: {', '.join(missing)}.",
+            detail=(
+                f"Fill in the {plain_list([JOB_FIELD_LABELS.get(field, field) for field in missing])} on the job "
+                "before downloading the PDF. Click Edit job details at the top of the page."
+            ),
         )
     proposal_data = job.get("proposal_data")
     if not isinstance(proposal_data, dict) or not proposal_data.get("pdf_audit_run_id"):
-        raise HTTPException(status_code=409, detail="Proposal PDF is missing its audit receipt. Regenerate the proposal PDF.")
-    latest = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
+        raise HTTPException(status_code=409, detail=PDF_NOT_MADE_YET)
+    # The saved bid's own calculation: a Regenerate the editor didn't apply
+    # left the bid, and so its PDF, as they were.
+    latest = _proposal_run(job["id"], proposal_data)
     if not latest or int(latest["id"]) != int(proposal_data.get("pdf_audit_run_id")):
-        raise HTTPException(status_code=409, detail="Proposal PDF is stale. Regenerate the proposal PDF before downloading.")
-    _ensure_audit_calculator_current(latest, label="Proposal PDF")
-    if proposal_data.get("pdf_source_fingerprint") != _proposal_source_fingerprint(job, proposal_data):
-        raise HTTPException(status_code=409, detail="Proposal PDF is stale because the job or proposal source changed. Regenerate the proposal PDF before downloading.")
+        raise HTTPException(status_code=409, detail=PDF_OUT_OF_DATE)
+    stored = proposal_data.get("pdf_source_fingerprint")
+    current_identity = _current_calculator_identity()
+    if stored != _proposal_source_fingerprint(job, proposal_data, identity=current_identity):
+        run_identity = _run_calculator_identity(latest)
+        if not (
+            stored and run_identity and run_identity != current_identity
+            and stored == _proposal_source_fingerprint(job, proposal_data, identity=run_identity)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=_pdf_out_of_date_detail(job, proposal_data, stored, (current_identity, run_identity)),
+            )
     traces = get_calculation_traces(
         job["id"],
         run_id=latest["id"],
@@ -8467,7 +9304,10 @@ def _validate_proposal_pdf_download_ready(job: dict) -> None:
     by_field = {trace.get("output_field"): trace for trace in traces}
     totals = proposal_data.get("pdf_totals") or {}
     for field in ("subtotal", "tax_amount", "grand_total", "gpm_profit", "gpm_labor", "gpm_material", "manual_adjustment", "textura_amount"):
-        _trace_result_matches(by_field.get(field), totals.get(field), label=f"proposal {field}")
+        try:
+            _trace_result_matches(by_field.get(field), totals.get(field), label=f"the bid's {amount_word(field)}")
+        except HTTPException:
+            raise HTTPException(status_code=409, detail=PDF_OUT_OF_DATE) from None
 
 
 @app.post("/api/jobs/{job_id}/proposal/generate")
@@ -8491,6 +9331,10 @@ def api_generate_proposal(job_id: str):
     existing_by_codes: dict[tuple[str, ...], list[dict]] = {}
     existing_pd = job.get("proposal_data") or {}
     has_saved_accepted_proposal = bool(existing_pd.get("bundles"))
+    # Regenerate keeps the bid's own tax rate, GPM and Textura fee, so what the
+    # job said about them stays as the saved bid had it (read before the
+    # sundry and labor lines are redone below).
+    kept_source = _proposal_source_job(job, existing_pd) if has_saved_accepted_proposal else None
     # A first generation is saved only if nobody saved a proposal meanwhile.
     base_proposal_rev = int(job.get("proposal_rev") or 0)
     for b in (existing_pd.get("bundles") or []):
@@ -8602,11 +9446,17 @@ def api_generate_proposal(job_id: str):
         sundries = calculate_sundries_for_materials(materials, trace=trace)
         labor_items = calculate_labor_for_materials(materials, trace=trace)
     # The new waste figures, sundries and labor are saved together. Only the
-    # waste fields this step changed are written onto the lines.
+    # waste fields this step changed are written onto the lines, and only on
+    # lines nobody changed meanwhile (compare-and-swap).
     with job_write(db_id, action="proposal.generate", scopes=("materials", "sundries", "labor"),
                    summary="Recalculated waste, sundries and labor for the proposal") as tx:
+        if has_saved_accepted_proposal:
+            # Keep the accepted proposal as a version before regenerate reworks it.
+            tx.proposal_version_id = proposal_versions.snapshot(tx.conn, db_id, "before_regenerate")
         if waste_touched:
-            _apply_material_patches(tx.conn, db_id, loaded_materials, materials)
+            waste_conflicts = _save_step_results(tx, loaded_materials, materials)["conflicts"]
+            if waste_conflicts:
+                tx.set_summary("Recalculated waste, sundries and labor for the proposal" + conflict_note(waste_conflicts))
         if sundries is not None:
             save_sundries(db_id, sundries, conn=tx.conn)
             save_labor(db_id, labor_items, conn=tx.conn)
@@ -8615,9 +9465,16 @@ def api_generate_proposal(job_id: str):
         job = load_job(db_id)
 
     current_company_rates = get_all_company_rates()
+    # Bundles copy the lines they hold; the lines' row bookkeeping
+    # (row_version, updated_at, updated_by) is not part of the proposal.
+    bundle_source = {
+        **job,
+        **{part: [stable_ids.without_row_meta(row) for row in job.get(part) or []]
+           for part in ("materials", "sundries", "labor")},
+    }
     proposal = generate_proposal_data(
         job["id"],
-        job,
+        bundle_source,
         trace=trace,
         freight_rates_override=current_company_rates.get("freight_rates") or FREIGHT_RATES,
     )
@@ -8646,6 +9503,10 @@ def api_generate_proposal(job_id: str):
             for field in ("price_override", "freight_override", "stair_count", "stair_labor_type"):
                 if exact.get(field) is not None:
                     b[field] = exact[field]
+
+    # Each new bundle keeps the uid of the saved bundle it matches (same
+    # materials and name, same materials, ...); the others get new ones.
+    stable_ids.carry_bundle_uids(existing_pd.get("bundles"), proposal.get("bundles"))
 
     # Carry deletion lists back so the FE save can persist them.
     # The shared normalizer below recalculates totals once after these flags and
@@ -8699,13 +9560,24 @@ def api_generate_proposal(job_id: str):
             rule_id="proposal:accepted_numeric_edits",
             source="proposal_regeneration",
         )
+    # Rebuilt bundles took their accepted bundle's uid; make sure every bundle
+    # has one and no two share one.
+    stable_ids.carry_bundle_uids([], proposal.get("bundles"))
 
     _append_proposal_totals_snapshot(trace, job["id"], proposal)
 
+    # What the job said when these numbers were made. Kept on the run too: the
+    # editor sends it back when it applies this Regenerate (_saved_source_job).
+    made_from = _bid_source_job(job)
+    if kept_source:
+        for field in _BID_OWN_JOB_FIELDS:
+            made_from[field] = kept_source.get(field) or 0
+        if kept_source.get("guessed"):
+            made_from["guessed"] = True
     run_id = create_calculation_run(
         job["id"],
         "proposal_generation",
-        metadata=_audit_metadata({"endpoint": "proposal/generate"}),
+        metadata=_audit_metadata({"endpoint": "proposal/generate", "source_job": made_from}),
     )
     trace_count = save_calculation_traces(job["id"], run_id, trace.records)
     summary = trace.summary()
@@ -8715,7 +9587,7 @@ def api_generate_proposal(job_id: str):
         "trace_count": trace_count,
         "summary": summary,
     }
-    proposal["audit_source_fingerprint"] = _proposal_source_fingerprint(job, proposal)
+    _stamp_proposal_source(job, proposal, source_job={**made_from, "run_id": run_id})
     # A regenerate must never overwrite the accepted proposal before the UI has
     # merged its full manual structure and saved it. Initial generation is safe
     # to persist immediately because there is no accepted proposal yet.
@@ -8731,6 +9603,7 @@ def api_generate_proposal(job_id: str):
             with job_write(db_id, action="proposal.generate", scopes=("proposal",),
                            summary=f"Generated the proposal: {bundle_count} bundles, total ${grand_total:,.2f}") as tx:
                 set_proposal_data(tx.conn, db_id, proposal, expected_rev=base_proposal_rev)
+                tx.proposal_version_id = proposal_versions.snapshot(tx.conn, db_id, "generate")
         except ProposalConflictError:
             raise HTTPException(
                 status_code=409,
@@ -8740,7 +9613,7 @@ def api_generate_proposal(job_id: str):
 
 
 @app.post("/api/jobs/{job_id}/proposal/pdf")
-@audit_route("proposal.pdf")
+@audit_route("proposal.pdf", "proposal.audit_refresh")
 async def api_generate_proposal_pdf(job_id: str, request: Request):
     """Generate proposal PDF from edited bundle data."""
     raw_body = await request.body()
@@ -8790,9 +9663,13 @@ def _generate_proposal_pdf(job_id: str, raw_body: bytes) -> dict:
         if str(line or "").strip()
     ]
 
+    # The printed bundles keep their uids (the saved bundle's uid when the
+    # client didn't send one), so the saved proposal keeps its identities.
+    bundles = body.get("bundles", [])
+    stable_ids.carry_bundle_uids((job.get("proposal_data") or {}).get("bundles"), bundles)
     proposal_data = {
         "job_info": job_info,
-        "bundles": body.get("bundles", []),
+        "bundles": bundles,
         "subtotal": body.get("subtotal", 0),
         "tax_rate": body.get("tax_rate", 0),
         "tax_amount": body.get("tax_amount", 0),
@@ -8818,8 +9695,9 @@ def _generate_proposal_pdf(job_id: str, raw_body: bytes) -> dict:
         "_server_revision": (job.get("proposal_data") or {}).get("_server_revision", 0),
         "pdf_generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    proposal_data["audit_source_fingerprint"] = _proposal_source_fingerprint(job, proposal_data)
-    pdf_run = _latest_completed_run(job["id"], {"proposal_editor_save", "proposal_generation"})
+    saved_before_pdf = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
+    _stamp_proposal_source(job, proposal_data, source_job=_proposal_source_job(job, saved_before_pdf))
+    pdf_run = _proposal_run(job["id"], proposal_data)
     if pdf_run:
         proposal_data["pdf_audit_run_id"] = pdf_run["id"]
         proposal_data["pdf_ruleset_version"] = (pdf_run.get("metadata") or {}).get("ruleset_version")
@@ -8835,27 +9713,40 @@ def _generate_proposal_pdf(job_id: str, raw_body: bytes) -> dict:
             "textura_amount": body.get("textura_amount", 0),
         }
 
-    pdf_path = _job_pdf_path(job["id"], "proposal")
-    generate_proposal_pdf(proposal_data, pdf_path)
-    _record_artifact(job["id"], pdf_path, "proposal_pdf")
+    # Draw the PDF into a temp file first. It only becomes the job's latest
+    # PDF (new file + receipt) if the proposal it prints is saved too.
+    draft = _draft_job_pdf(job["id"], "proposal", lambda path: generate_proposal_pdf(proposal_data, path))
 
     # Save proposal data to job, only if nobody saved the proposal while the
     # PDF was being made (that PDF would print an older proposal).
     summary = f"Proposal generated: {len(proposal_data['bundles'])} bundles, total ${proposal_data['grand_total']:,.2f}"
     try:
         with job_write(job["id"], action="proposal.pdf", scopes=("proposal",), summary=summary,
-                       extra={"pdf": {"file_hash": _file_hash(pdf_path)}}) as tx:
+                       extra={"pdf": {"file_hash": draft["sha256"]}}) as tx:
             tx.force_record()
             set_proposal_data(tx.conn, job["id"], proposal_data, expected_rev=int(job.get("proposal_rev") or 0))
             log_activity(job["id"], "proposal_generated", summary,
                          {"bundle_count": len(proposal_data["bundles"]), "grand_total": proposal_data["grand_total"]})
+            # The version this PDF prints (the latest one when nothing changed
+            # since); the version and the PDF receipt point at each other.
+            version_id = proposal_versions.snapshot(tx.conn, job["id"], "pdf")
+            artifact_id = _publish_job_pdf(job["id"], draft, "proposal_pdf", conn=tx.conn,
+                                           grand_total=proposal_data.get("grand_total"),
+                                           proposal_version_id=version_id)
+            proposal_versions.link_artifact(tx.conn, version_id, artifact_id)
+            tx.proposal_version_id = version_id
+            tx.extra["pdf"]["artifact_id"] = artifact_id
+            tx.extra["pdf"]["proposal_version_id"] = version_id
     except ProposalConflictError:
         raise HTTPException(
             status_code=409,
             detail="Cannot generate PDF because the proposal was saved again while the PDF was being made. Try again.",
         )
+    finally:
+        _discard_job_pdf(draft)
 
-    return {"status": "ok", "pdf_url": f"/api/jobs/{job_id}/proposal.pdf"}
+    return {"status": "ok", "pdf_url": f"/api/jobs/{job_id}/proposal.pdf", "artifact_id": artifact_id,
+            "proposal_version_id": version_id}
 
 
 @app.get("/api/jobs/{job_id}/proposal.pdf")
@@ -8866,15 +9757,312 @@ def api_download_proposal_pdf(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _validate_proposal_pdf_download_ready(job)
-    pdf_path = _job_pdf_path(job["id"], "proposal")
-    if not os.path.exists(pdf_path):
+    # The latest print; earlier ones are under /artifacts.
+    latest = _latest_job_pdf(job["id"], "proposal_pdf")
+    if not latest or not os.path.exists(latest[0]):
         raise HTTPException(status_code=404, detail="PDF not found. Generate proposal first.")
+    pdf_path = latest[0]
     _require_artifact_receipt(job["id"], pdf_path, "proposal_pdf")
     return FileResponse(
         pdf_path,
         media_type="application/pdf",
         filename=f"{job['project_name']} Proposal.pdf",
     )
+
+
+# ── Printed PDFs (every print is kept) ───────────────────────────────────────
+_PDF_KIND_LABELS = {"proposal_pdf": "Proposal", "bid_pdf": "Bid"}
+
+
+def _artifact_person(username) -> str:
+    username = str(username or "").strip()
+    if not username:
+        return ""
+    return "System" if username.startswith("system:") else username
+
+
+def _pdf_artifact_item(job_id: int, receipt: dict, latest_ids: set) -> dict:
+    path = _checked_artifact_path(receipt.get("artifact_path") or "")
+    return {
+        "id": receipt["id"],
+        "kind": receipt["artifact_kind"],
+        "label": _PDF_KIND_LABELS.get(receipt["artifact_kind"], receipt["artifact_kind"]),
+        "created_at": receipt.get("created_at"),
+        "created_by": receipt.get("created_by"),
+        "created_by_name": receipt.get("created_by_name") or _artifact_person(receipt.get("created_by")),
+        "grand_total": receipt.get("grand_total"),
+        "proposal_version_id": receipt.get("proposal_version_id"),
+        "sha256": receipt.get("file_hash"),
+        "size": receipt.get("file_size"),
+        "request_id": receipt.get("request_id"),
+        "is_latest": receipt["id"] in latest_ids,
+        # The file is gone from storage (its download says so too). Checked
+        # without reading the file; a damaged file shows when downloaded.
+        "file_missing": not (path and os.path.isfile(path)),
+        "download_url": f"/api/jobs/{job_id}/artifacts/{receipt['id']}/download",
+    }
+
+
+@app.get("/api/jobs/{job_id}/artifacts")
+def api_list_job_artifacts(job_id: str, kind: Optional[str] = None, include_deleted: bool = False):
+    """Every printed PDF of a bid, newest first. ``kind`` = proposal_pdf or bid_pdf (default both).
+
+    /proposal.pdf and /bid.pdf keep serving the latest of each kind.
+    """
+    db_id = _resolve_job_id(job_id, include_deleted=include_deleted)
+    kind = (kind or "").strip() or None
+    if kind is not None and kind not in PDF_ARTIFACT_KINDS:
+        raise HTTPException(status_code=400, detail="kind must be proposal_pdf or bid_pdf.")
+    receipts = [
+        receipt for receipt in list_job_artifacts(db_id, kind)
+        if receipt.get("artifact_kind") in PDF_ARTIFACT_KINDS
+    ]
+    latest_ids: set = set()
+    seen_kinds: set = set()
+    for receipt in receipts:  # newest first
+        if receipt["artifact_kind"] not in seen_kinds:
+            seen_kinds.add(receipt["artifact_kind"])
+            latest_ids.add(receipt["id"])
+    return [_pdf_artifact_item(db_id, receipt, latest_ids) for receipt in receipts]
+
+
+@app.get("/api/jobs/{job_id}/artifacts/{artifact_id}/download")
+def api_download_job_artifact(job_id: str, artifact_id: int, include_deleted: bool = False):
+    """Download one printed PDF exactly as it was printed (checked against its saved hash)."""
+    db_id = _resolve_job_id(job_id, include_deleted=include_deleted)
+    receipt = get_job_artifact(db_id, artifact_id)
+    if not receipt or receipt.get("artifact_kind") not in PDF_ARTIFACT_KINDS:
+        raise HTTPException(status_code=404, detail="That PDF isn't in this bid's print history.")
+    path = _checked_artifact_path(receipt.get("artifact_path") or "")
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="This PDF's file is missing from storage.")
+    if _file_hash(path) != receipt.get("file_hash"):
+        raise HTTPException(
+            status_code=409,
+            detail="This PDF no longer matches the copy that was printed, so it can't be downloaded.",
+        )
+    conn = _get_conn()
+    try:
+        found = conn.execute("SELECT project_name FROM jobs WHERE id=?", (db_id,)).fetchone()
+    finally:
+        conn.close()
+    printed_on = str(receipt.get("created_at") or "")[:10]
+    label = _PDF_KIND_LABELS.get(receipt["artifact_kind"], "PDF")
+    name = f"{(found['project_name'] if found else '') or f'Job {db_id}'} {label}"
+    if printed_on:
+        name += f" {printed_on}"
+    return FileResponse(path, media_type="application/pdf", filename=f"{name} ({artifact_id}).pdf")
+
+
+# ── Proposal versions ────────────────────────────────────────────────────────
+# Saved copies of the proposal (proposal_versions.py): anyone logged in can
+# list, preview, compare, name and restore them.
+class ProposalVersionLabel(BaseModel):
+    label: Optional[str] = None
+
+
+_VERSION_NOT_FOUND = "That version isn't in this bid's proposal history."
+# A restore that finds another save landed first tries again on top of it.
+_RESTORE_RETRY_SECONDS = 30
+
+
+def _proposal_version_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except proposal_versions.VersionNotFoundError:
+        raise HTTPException(status_code=404, detail=_VERSION_NOT_FOUND)
+
+
+def _link_sent_version(tx, events) -> None:
+    """A "sent" event records the proposal version that went out.
+
+    When a proposal PDF was made, that PDF is what went out, so the event
+    points at the version the PDF was printed from (and says so when the
+    proposal changed after that PDF). With no PDF, the proposal as it is now
+    is saved as a "sent" version (or the latest version, when nothing changed).
+    """
+    for event_type, details in events:
+        if event_type != "sent":
+            continue
+        version_id = None
+        pdf = details.get("pdf") if isinstance(details.get("pdf"), dict) else {}
+        pdf_version_id = pdf.get("proposal_version_id")
+        if pdf_version_id is not None:
+            printed = tx.conn.execute(
+                "SELECT id, content_hash FROM proposal_versions WHERE id = ? AND job_id = ?",
+                (pdf_version_id, tx.job_id),
+            ).fetchone()
+            if printed is not None:
+                version_id = int(printed["id"])
+                now = proposal_versions.capture(tx.conn, tx.job_id)
+                details["proposal_changed_since_pdf"] = bool(
+                    now is not None and now["content_hash"] != printed["content_hash"]
+                )
+        if version_id is None:
+            version_id = proposal_versions.snapshot(tx.conn, tx.job_id, "sent")
+        if version_id is not None:
+            details["proposal_version_id"] = version_id
+            tx.proposal_version_id = version_id
+
+
+@app.get("/api/jobs/{job_id}/proposal/versions")
+def api_list_proposal_versions(job_id: str, include_deleted: bool = False):
+    """Saved versions of the bid's proposal, newest first."""
+    db_id = _resolve_job_id(job_id, include_deleted=include_deleted)
+    return proposal_versions.list_versions(db_id)
+
+
+@app.get("/api/jobs/{job_id}/proposal/versions/{version_id}")
+def api_get_proposal_version(job_id: str, version_id: int, include_deleted: bool = False,
+                             include_materials: bool = False):
+    """One version with its proposal_data and job_fields (``include_materials=1``
+    adds the material lines it was priced from)."""
+    db_id = _resolve_job_id(job_id, include_deleted=include_deleted)
+    return _proposal_version_call(
+        proposal_versions.get_version, db_id, version_id, include_materials=include_materials,
+    )
+
+
+@app.get("/api/jobs/{job_id}/proposal/versions/{version_id}/diff")
+def api_diff_proposal_version(job_id: str, version_id: int, against: str = "current",
+                              include_deleted: bool = False):
+    """What changed from this version to the current proposal
+    (``against=current``) or to another version (``against=<version id>``)."""
+    db_id = _resolve_job_id(job_id, include_deleted=include_deleted)
+    before = _proposal_version_call(proposal_versions.version_state, db_id, version_id)
+    target = str(against or "current").strip().lower()
+    if target == "current":
+        after = proposal_versions.current_state(db_id)
+    else:
+        try:
+            other_id = int(target)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Compare with 'current' or another version's id.")
+        after = _proposal_version_call(proposal_versions.version_state, db_id, other_id)
+    result = proposal_versions.diff_states(before, after)
+    result["version_id"] = version_id
+    result["against"] = target
+    return result
+
+
+@app.patch("/api/jobs/{job_id}/proposal/versions/{version_id}")
+@audit_route("proposal.version_label")
+def api_label_proposal_version(job_id: str, version_id: int, body: ProposalVersionLabel):
+    """Name a version (or clear its name with an empty label)."""
+    db_id = _resolve_job_id(job_id)
+    try:
+        label = proposal_versions.clean_label(body.label)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    with entity_write("proposal_version", version_id, proposal_versions.label_loader(db_id),
+                      "proposal.version_label", job_id=db_id) as tx:
+        if tx.before is None:
+            raise HTTPException(status_code=404, detail=_VERSION_NOT_FOUND)
+        number = tx.before["version_no"]
+        tx.set_summary(f'Named proposal version {number} "{label}"' if label
+                       else f"Removed the name of proposal version {number}")
+        proposal_versions.set_label(tx.conn, db_id, version_id, label)
+        tx.proposal_version_id = version_id
+    return proposal_versions.get_item(db_id, version_id)
+
+
+@app.post("/api/jobs/{job_id}/proposal/versions/{version_id}/restore")
+@audit_route("proposal.restore")
+def api_restore_proposal_version(job_id: str, version_id: int):
+    """Put an older version of the proposal back (anyone logged in can).
+
+    The current proposal is kept as a version first ("before_restore"), and
+    the restored proposal is saved as a new version ("restore"), so nothing
+    is lost. Bundles keep their uids; totals and the audit receipt are worked
+    out again. Returns {job, version (the new one), ...}.
+    """
+    db_id = _resolve_job_id(job_id)
+    source = _proposal_version_call(proposal_versions.version_state, db_id, version_id)
+    give_up_at = time.monotonic() + _RESTORE_RETRY_SECONDS
+    while True:
+        result = _try_restore_proposal_version(db_id, version_id, source)
+        if result is not None:
+            break
+        if time.monotonic() >= give_up_at:
+            raise JobBusyError()
+    return {"job": api_get_job(str(db_id)), **result}
+
+
+def _try_restore_proposal_version(db_id: int, version_id: int, source: dict) -> dict | None:
+    """One restore attempt; None when another save landed after the proposal
+    was read, so it must run again on top of that save."""
+    job = load_job(db_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    base_proposal_rev = int(job.get("proposal_rev") or 0)
+    current = job.get("proposal_data") if isinstance(job.get("proposal_data"), dict) else {}
+    restored = proposal_versions.restorable_proposal(source["proposal"], current)
+    normalize_proposal_totals(restored)
+    info = source["version"]
+    now_state = proposal_versions.current_state(db_id)
+    notes = {
+        "restored_from_version_id": version_id,
+        "materials_changed_since": bool(source.get("materials_fingerprint"))
+        and source.get("materials_fingerprint") != now_state.get("materials_fingerprint"),
+        # Job fields are not part of a restore (only the proposal is): these
+        # differ between the version and the bid now.
+        "job_fields_differ": sorted(
+            key for key in set(source.get("job_fields") or {}) | set(now_state.get("job_fields") or {})
+            if not audit.values_equal((source.get("job_fields") or {}).get(key), (now_state.get("job_fields") or {}).get(key))
+        ),
+    }
+    if proposal_versions.proposal_hash(restored) == proposal_versions.proposal_hash(current):
+        audit.note_checked(db_id)  # already the current proposal: nothing to save
+        return {"version": proposal_versions.get_item(db_id, version_id), "unchanged": True,
+                "before_restore_version_id": None, **notes}
+
+    audit_result = _record_proposal_editor_audit(db_id, current, restored)
+    if audit_result.get("audit_trace"):
+        restored["audit"] = {
+            "run_id": audit_result["audit_trace"]["run"]["id"],
+            "trace_count": audit_result["trace_count"],
+            "summary": audit_result["audit_trace"].get("audit", {}),
+        }
+    # The restored numbers were made from the job as the version saw it (an
+    # older version didn't keep that: its own tax rate, GPM and Textura fee).
+    version_source = (source.get("proposal") or {}).get("source_job")
+    _stamp_proposal_source(job, restored, source_job=(
+        copy.deepcopy(version_source) if _is_source_job(version_source)
+        else _legacy_source_job(job, restored, unchanged=False)
+    ))
+    name = f' "{info["label"]}"' if info.get("label") else ""
+    summary = f"Restored proposal version {info['version_no']}{name}"
+    try:
+        with job_write(db_id, action="proposal.restore", scopes=("proposal",), summary=summary,
+                       extra={"restored_from": {"version_id": version_id, "version_no": info["version_no"],
+                                                "label": info.get("label"), "reason": info.get("reason")}}) as tx:
+            if int(tx.row.get("proposal_rev") or 0) != base_proposal_rev:
+                raise ProposalConflictError()
+            tx.force_record()
+            # Keep what's there now, then put the version back.
+            before_id = proposal_versions.snapshot(tx.conn, db_id, "before_restore")
+            stored = _stored_proposal(tx.row.get("proposal_data"))
+            # A new server revision and a session no browser tab has: other
+            # open editors get "reload" instead of saving over the restore.
+            restored["_server_revision"] = _nonnegative_int(stored.get("_server_revision")) + 1
+            restored["_client_session_id"] = f"restore-{uuid.uuid4().hex[:12]}"
+            restored["_client_edit_version"] = 0
+            restored["_client_save_sequence"] = 0
+            set_proposal_data(tx.conn, db_id, restored, expected_rev=base_proposal_rev)
+            restore_id = proposal_versions.snapshot(
+                tx.conn, db_id, "restore", dedupe=False, restored_from_version_id=version_id,
+            )
+            tx.proposal_version_id = restore_id
+            tx.extra["before_restore_version_id"] = before_id
+            tx.extra["restore_version_id"] = restore_id
+    except ProposalConflictError:
+        return None
+    return {
+        "version": proposal_versions.get_item(db_id, restore_id),
+        "unchanged": False,
+        "before_restore_version_id": before_id,
+        **notes,
+    }
 
 
 @app.post("/api/labor-catalog/upload")
@@ -9531,7 +10719,7 @@ def _merge_vendors_audited(keep_id: int, merge_ids: list[int]) -> None:
             merged = {mid: _load_vendor(tx.conn, mid) for mid in others}
             merged = {mid: vendor for mid, vendor in merged.items() if vendor}
             renamed = tx.conn.execute(
-                f"SELECT id, job_id, vendor FROM job_materials WHERE vendor IN ({', '.join('?' for _ in merged_names)})",
+                f"SELECT id, uid, job_id, vendor FROM job_materials WHERE vendor IN ({', '.join('?' for _ in merged_names)})",
                 merged_names,
             ).fetchall() if merged_names else []
             merge_vendors(keep_id, merge_ids, conn=tx.conn)
@@ -9556,7 +10744,7 @@ def _merge_vendors_audited(keep_id: int, merge_ids: list[int]) -> None:
                     job_id=job_id,
                     summary=f"Vendor merged: {_count(len(rows), 'material')} now say {keep_name}",
                     changes=[
-                        {"path": f"/materials/{row['id']}/vendor", "op": "replace",
+                        {"path": f"/materials/{audit.escape_path_key(row['uid'] or row['id'])}/vendor", "op": "replace",
                          "before": row["vendor"], "after": keep_name}
                         for row in rows
                     ],
@@ -9866,9 +11054,9 @@ def api_detect_vendors(job_id: str):
     if not materials:
         audit.note_checked(db_id)  # nothing to look at, nothing saved
         return {"vendors": {}, "materials": []}
-    # Vendor on each line when this started: only lines nobody changed while
-    # the AI was working get the vendor it found.
-    loaded_vendors = [m.get("vendor") for m in materials]
+    # The lines as they were when this started: only lines nobody changed
+    # while the AI was working get the vendor it found (compare-and-swap).
+    loaded_materials = copy.deepcopy(materials)
 
     import json
 
@@ -10096,15 +11284,20 @@ def api_detect_vendors(job_id: str):
             print(f"Learning save failed: {e}")
         finally:
             tx.conn.execute("RELEASE SAVEPOINT learn_vendor_products")
-        saved = 0
-        for i, m in enumerate(materials):
-            if m.get("id") is None or (m.get("vendor") or None) == (loaded_vendors[i] or None):
-                continue
-            saved += tx.conn.execute(
-                "UPDATE job_materials SET vendor = ? WHERE id = ? AND job_id = ? AND vendor IS ?",
-                (m.get("vendor"), m["id"], db_id, loaded_vendors[i]),
-            ).rowcount
-        tx.set_summary(f"Found vendors for {_count(saved, 'material')}" if saved else "Learned vendor names for future bids")
+        # Each found vendor is saved only if the line still has the vendor,
+        # description and item code it had when this started.
+        vendor_patches = [
+            material_patch(before, {"vendor": after.get("vendor")}, depends_on=("description", "item_code"))
+            for before, after in zip(loaded_materials, materials)
+            if before.get("id") is not None and (after.get("vendor") or None) != (before.get("vendor") or None)
+        ]
+        result = apply_material_patches(tx, vendor_patches)
+        saved = sum(1 for item in result["applied"] if item["fields"])
+        conflicts = result["conflicts"]
+        tx.set_summary(
+            (f"Found vendors for {_count(saved, 'material')}" if saved else "Learned vendor names for future bids")
+            + conflict_note(conflicts)
+        )
 
     return {
         "vendor_groups": vendor_groups,
@@ -10115,6 +11308,9 @@ def api_detect_vendors(job_id: str):
             "ai": ai_resolved,
             "ai_corrected": ai_corrected,
         },
+        # Lines someone changed while the vendors were being looked up: their
+        # change was kept and the vendor found was not saved on them.
+        "conflicts": conflicts,
     }
 
 
@@ -10403,7 +11599,9 @@ def api_get_notifications(unread_only: bool = True):
 @app.put("/api/notifications/{notification_id}/read")
 @audit_route("notification.read")
 def api_mark_notification_read(notification_id: int):
-    with entity_write("notification", notification_id, _load_notification, "notification.read") as tx:
+    # Only who has seen what, so it works for a deleted bid's notifications too.
+    with entity_write("notification", notification_id, _load_notification, "notification.read",
+                      allow_deleted=True) as tx:
         mark_notification_read(notification_id, conn=tx.conn)
         tx.job_id = (tx.before or {}).get("job_id")
         message = (tx.before or {}).get("message")
@@ -10423,9 +11621,11 @@ def api_get_activity(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/comments")
-def api_get_comments(job_id: str):
-    db_id = _resolve_job_id(job_id)
-    job = load_job(db_id)
+def api_get_comments(job_id: str, include_deleted: bool = False):
+    """A bid's comments, newest first. ``?include_deleted=1`` also reads a
+    deleted bid's comments (new comments on it are refused)."""
+    db_id = _resolve_job_id(job_id, include_deleted=include_deleted)
+    job = load_job(db_id, include_deleted=include_deleted)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return get_comments(job["id"])

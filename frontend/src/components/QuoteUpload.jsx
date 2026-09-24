@@ -3,6 +3,7 @@ import { FileText, Package, AlertTriangle, CheckCircle2, Trash2, Search, Link2, 
 import FileUpload from './FileUpload'
 import ConfirmDialog from './ConfirmDialog'
 import { QUOTE_EMAILS_ENABLED } from '../features'
+import { conflictNotice } from '../conflicts'
 
 const DROPBOX_HANDLE_DB = 'si-bid-tool-folders'
 const DROPBOX_HANDLE_STORE = 'directory-handles'
@@ -53,6 +54,8 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
   const [products, setProducts] = useState([])
   const [autoMatched, setAutoMatched] = useState(0)
   const [error, setError] = useState(null)
+  // Lines skipped because someone else changed them while the quotes were matched.
+  const [conflictNote, setConflictNote] = useState('')
   const [confirmDialog, setConfirmDialog] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const saveTimers = useRef({})
@@ -76,13 +79,14 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
   }
 
   const handleUpload = async (files) => {
-    setLoading(true); setError(null)
+    setLoading(true); setError(null); setConflictNote('')
     try {
       await prepareMutation()
       const fileList = Array.isArray(files) ? files : [files]
       const result = await api.uploadQuotes(jobId, fileList)
       setProducts(result.products || [])
       setAutoMatched(result.auto_matched || 0)
+      setConflictNote(conflictNotice(result.conflicts))
       setRecoveryResult({
         attempted: true,
         receipts: result.provenance_repaired || 0,
@@ -133,6 +137,7 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
           await api.clearQuotes(jobId)
           setProducts([])
           setAutoMatched(0)
+          setConflictNote('')
           setRecoveryResult(null)
           onQuotesCleared?.()
         } catch (err) { setError(err.message) }
@@ -151,7 +156,8 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
         saveTimers.current[product.id] = setTimeout(async () => {
           try {
             await prepareMutation()
-            await api.updateQuote(product.id, { [field]: value })
+            const saved = await api.updateQuote(product.id, { [field]: value })
+            setConflictNote(conflictNotice(saved?.conflicts))
             // Refresh job to pick up re-matched materials
             onQuotesParsed?.()
           } catch (err) {
@@ -266,11 +272,13 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
     if (!scanPreview?.fileObjects?.length) return
     setLoading(true)
     setError(null)
+    setConflictNote('')
     try {
       await prepareMutation()
       const result = await api.uploadQuotes(jobId, scanPreview.fileObjects)
       setProducts(result.products || [])
       setAutoMatched(result.auto_matched || 0)
+      setConflictNote(conflictNotice(result.conflicts))
       setRecoveryResult({
         attempted: true,
         receipts: result.provenance_repaired || 0,
@@ -365,6 +373,17 @@ export default function QuoteUpload({ jobId, onQuotesParsed, onQuotesCleared, ex
         <div className="flex items-center gap-2 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-400">
           <AlertTriangle className="w-4 h-4 flex-shrink-0" /> {error}
           <button onClick={() => setError(null)} className="ml-auto text-red-500/60 hover:text-red-400 text-xs">dismiss</button>
+        </div>
+      )}
+
+      {conflictNote && (
+        <div role="status" className="flex items-start gap-2 px-4 py-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-sm text-amber-300">
+          <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <p className="font-medium">Some quote prices were not saved</p>
+            <p className="text-xs text-amber-300/80 mt-0.5">{conflictNote} Check those lines in the takeoff.</p>
+          </div>
+          <button onClick={() => setConflictNote('')} className="ml-auto text-amber-500/60 hover:text-amber-300 text-xs">dismiss</button>
         </div>
       )}
 

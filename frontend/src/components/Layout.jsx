@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell, Building2, ListChecks, LogOut, ClipboardList, Users, History } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Settings, HardHat, Menu, X, Search, DollarSign, Bell, Building2, ListChecks, LogOut, ClipboardList, Users, History, Trash2 } from 'lucide-react'
 import { api } from '../api'
 import { useAuth } from '../auth'
 import { QUOTE_EMAILS_ENABLED } from '../features'
@@ -221,6 +221,9 @@ function SidebarContent({ location, onNavigate }) {
         <NavItem to="/settings" icon={Settings} label="Settings" active={location.pathname === '/settings'} onClick={onNavigate} />
         {user?.is_admin && (
           <NavItem to="/users" icon={Users} label="Users" active={location.pathname === '/users'} onClick={onNavigate} />
+        )}
+        {user?.is_admin && (
+          <NavItem to="/deleted-bids" icon={Trash2} label="Deleted bids" active={location.pathname === '/deleted-bids'} onClick={onNavigate} />
         )}
         <OnlineNow currentUsername={user?.username} />
         <UserBar onNavigate={onNavigate} />

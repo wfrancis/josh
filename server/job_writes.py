@@ -36,6 +36,7 @@ from datetime import datetime
 import audit
 import models
 from models import BID_TRACKING_COLUMNS, JOB_ESTIMATE_HEADER_FIELDS
+from stable_ids import ROW_META_COLUMNS
 
 # How long a save waits for another save of the same bid before giving up.
 LOCK_WAIT_SECONDS = 60
@@ -61,6 +62,11 @@ class JobDeletedError(JobWriteError):
     status_code = 410
     default_message = "This bid was deleted, so it can't be changed. An admin can restore it."
 
+    @classmethod
+    def for_row(cls, row: dict, conn=None) -> "JobDeletedError":
+        """The error for a change to this deleted bid, naming who deleted it and when."""
+        return cls(deleted_bid_message(row, conn), **deleted_bid_info(row, conn))
+
 
 class VersionConflictError(JobWriteError):
     status_code = 409
@@ -75,6 +81,69 @@ class ProposalConflictError(JobWriteError):
 class JobBusyError(JobWriteError):
     status_code = 503
     default_message = "This bid is busy saving another change. Try again in a moment."
+
+
+# ── Deleted bids ──────────────────────────────────────────────────────────────
+def _person_name(conn, username) -> str:
+    """How to show whoever is in deleted_by (a username, or system:<source>)."""
+    username = str(username or "").strip()
+    if not username:
+        return "someone"
+    if username.startswith("system:"):
+        return "System"
+    own = conn is None
+    conn = conn or models._get_conn()
+    try:
+        found = conn.execute(
+            "SELECT display_name FROM users WHERE username = ? COLLATE NOCASE", (username,)
+        ).fetchone()
+    except sqlite3.Error:
+        found = None
+    finally:
+        if own:
+            conn.close()
+    return (found["display_name"] if found and found["display_name"] else None) or username
+
+
+def _plain_date(ts) -> str:
+    when = audit.parse_ts(ts)
+    return f"{when:%b} {when.day}, {when.year}" if when else "an unknown date"
+
+
+def deleted_bid_info(row: dict, conn=None) -> dict:
+    """Who deleted a bid, when and why (for error responses and read-only views)."""
+    return {
+        "deleted": True,
+        "deleted_at": row.get("deleted_at"),
+        "deleted_by": row.get("deleted_by"),
+        "deleted_by_name": _person_name(conn, row.get("deleted_by")),
+        "delete_reason": row.get("delete_reason"),
+    }
+
+
+def deleted_bid_message(row: dict, conn=None) -> str:
+    """'This bid was deleted by Josh on Sep 24, 2026. An admin can restore it.'"""
+    return (
+        f"This bid was deleted by {_person_name(conn, row.get('deleted_by'))} "
+        f"on {_plain_date(row.get('deleted_at'))}. An admin can restore it."
+    )
+
+
+def deleted_job_row(job_id, conn=None) -> dict | None:
+    """The jobs row (id, deleted_at, deleted_by, delete_reason) if that bid is deleted, else None."""
+    if job_id is None:
+        return None
+    own = conn is None
+    conn = conn or models._get_conn()
+    try:
+        found = conn.execute(
+            "SELECT id, deleted_at, deleted_by, delete_reason FROM jobs WHERE id = ? AND deleted_at IS NOT NULL",
+            (int(job_id),),
+        ).fetchone()
+        return dict(found) if found else None
+    finally:
+        if own:
+            conn.close()
 
 
 # ── Locks ─────────────────────────────────────────────────────────────────────
@@ -156,8 +225,8 @@ def _check_scopes(scopes) -> tuple[str, ...]:
 
 def snapshot_job(conn, job_id: int, scopes=ALL_SCOPES, *, row: dict | None = None) -> dict | None:
     """The parts of a bid named in ``scopes`` as one dict, shaped for audit
-    paths: header fields at the top ("/notes"), materials keyed by id
-    ("/materials/12/unit_price"), the proposal under "/proposal"."""
+    paths: header fields at the top ("/notes"), materials keyed by uid
+    ("/materials/m12/unit_price"), the proposal under "/proposal"."""
     scopes = _check_scopes(scopes)
     if row is None:
         found = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -174,20 +243,26 @@ def snapshot_job(conn, job_id: int, scopes=ALL_SCOPES, *, row: dict | None = Non
             snapshot[column] = row.get(column)
     if "exclusions" in scopes:
         snapshot["exclusions"] = _loads_or_text(row.get("exclusions"))
+    # Material lines are matched by uid ("/materials/m12/unit_price"), sundry
+    # and labor lines by line_key ("/sundries/m12|thinset/qty"). The row
+    # bookkeeping (row_version, updated_at, updated_by) is never diffed.
     if "materials" in scopes:
         snapshot["materials"] = _rows(
-            conn, "SELECT * FROM job_materials WHERE job_id = ? ORDER BY id", job_id, ("job_id",),
+            conn, "SELECT * FROM job_materials WHERE job_id = ? ORDER BY id", job_id,
+            ("job_id", *ROW_META_COLUMNS),
         )
-    # Sundry, labor and bundle rows are deleted and re-inserted on every
-    # save, so their ids mean nothing; rows are matched by content instead.
     if "sundries" in scopes:
         snapshot["sundries"] = _rows(
-            conn, "SELECT * FROM job_sundries WHERE job_id = ? ORDER BY id", job_id, ("job_id", "id"),
+            conn, "SELECT * FROM job_sundries WHERE job_id = ? ORDER BY id", job_id,
+            ("job_id", "id", *ROW_META_COLUMNS),
         )
     if "labor" in scopes:
         snapshot["labor"] = _rows(
-            conn, "SELECT * FROM job_labor WHERE job_id = ? ORDER BY id", job_id, ("job_id", "id"),
+            conn, "SELECT * FROM job_labor WHERE job_id = ? ORDER BY id", job_id,
+            ("job_id", "id", *ROW_META_COLUMNS),
         )
+    # Bid bundle rows are still deleted and re-inserted on every save, so
+    # their ids mean nothing; they are matched by content instead.
     if "bundles" in scopes:
         snapshot["bundles"] = _rows(
             conn, "SELECT * FROM job_bundles WHERE job_id = ? ORDER BY id", job_id, ("job_id", "id"),
@@ -234,6 +309,9 @@ class _WriteTx:
         self._extra_changes: list[dict] = []
         self._force = False
         self._hooks: list = []
+        # The proposal version this change made or printed (proposal_versions.py);
+        # saved on the audit entry so history links to it.
+        self.proposal_version_id: int | None = None
 
     def set_summary(self, summary: str) -> None:
         self.summary = summary
@@ -294,6 +372,15 @@ def _rollback(conn) -> None:
     audit.discard_pending(conn)
 
 
+def _refuse_if_deleted(conn, job_id) -> None:
+    try:
+        row = deleted_job_row(job_id, conn)
+    except (TypeError, ValueError):
+        return  # not a bid id
+    if row is not None:
+        raise JobDeletedError.for_row(row, conn)
+
+
 def _changes_with_flags(changes: list[dict], entity_type: str) -> list[dict]:
     flagged = []
     for change in changes:
@@ -341,7 +428,7 @@ def job_write(
                 raise JobNotFoundError()
             row = dict(found)
             if row.get("deleted_at") and not allow_deleted:
-                raise JobDeletedError()
+                raise JobDeletedError.for_row(row, conn)
             version = int(row.get("version") or 0)
             if expected_version is not None and int(expected_version) != version:
                 raise VersionConflictError(current_version=version)
@@ -398,6 +485,7 @@ def _finish_job_write(tx: JobWriteTx, scopes, group) -> None:
         field_path=field_path,
         group=group,
         extra=tx.extra or None,
+        proposal_version_id=tx.proposal_version_id,
     )
 
 
@@ -413,6 +501,7 @@ def entity_write(
     job_id=None,
     field_path: str | None = None,
     extra: dict | None = None,
+    allow_deleted: bool = False,
 ):
     """Change something that isn't a bid (vendor, price list row, setting,
     person, ...) under a per-type lock, with an audit entry.
@@ -420,6 +509,10 @@ def entity_write(
     ``loader(conn, entity_id)`` returns the entity as a dict (None if it
     doesn't exist); it runs before and after the block. When creating, pass
     ``entity_id=None`` and set ``tx.entity_id`` inside the block.
+
+    When it belongs to a bid (``job_id``, or ``tx.job_id`` set in the block)
+    and that bid is deleted, the change is refused with JobDeletedError (410)
+    unless ``allow_deleted``.
     """
     _assert_off_event_loop("entity_write")
     _assert_not_nested("entity_write")
@@ -430,6 +523,8 @@ def entity_write(
         committed = False
         try:
             conn.execute("BEGIN IMMEDIATE")
+            if not allow_deleted:
+                _refuse_if_deleted(conn, job_id)
             before = loader(conn, entity_id) if entity_id is not None else None
             tx = EntityWriteTx(conn, entity_type, entity_id, before, job_id=job_id, action=action,
                                summary=summary, field_path=field_path, extra=extra)
@@ -438,6 +533,8 @@ def entity_write(
                 yield tx
             finally:
                 audit.pop_active_write(tx)
+            if not allow_deleted and tx.job_id != job_id:
+                _refuse_if_deleted(conn, tx.job_id)
             after = loader(conn, tx.entity_id) if tx.entity_id is not None else None
             changes = audit.diff(before, after, tx.field_path or "", entity_type=entity_type)
             changes += _changes_with_flags(tx._extra_changes, entity_type)
@@ -467,6 +564,7 @@ def entity_write(
                     field_path=field_path,
                     group=group,
                     extra=tx.extra or None,
+                    proposal_version_id=tx.proposal_version_id,
                 )
             else:
                 audit.note_checked(tx.job_id)

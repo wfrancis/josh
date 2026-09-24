@@ -1,12 +1,19 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react'
 import { createPortal } from 'react-dom'
 import {
   FileDown, Loader2, ChevronDown, ChevronRight, ChevronUp,
   GripVertical, Pencil, Trash2, Plus, Save, RotateCcw, Eye, Check, X,
-  Package, FileText, AlertTriangle, ArrowLeft, Combine, Square, CheckSquare, Sparkles
+  Package, FileText, AlertTriangle, ArrowLeft, Combine, Square, CheckSquare, Sparkles, Layers
 } from 'lucide-react'
 import AuditTraceButton, { resolveAuditTrace } from './AuditTraceButton'
-import { apiFetch } from '../api'
+import PastPdfsMenu from './PastPdfsMenu'
+import HistoryDrawerBoundary from '../history/HistoryDrawerBoundary'
+import { api, apiFetch } from '../api'
+
+// The Versions drawer loads when first opened. Plain lazy() on purpose (a page
+// reload would throw away unsaved edits); HistoryDrawerBoundary shows a failed
+// load inside the drawer with "Try again".
+const loadVersionsDrawer = () => import('../history/ProposalVersionsDrawer')
 
 function formatCurrency(val) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0)
@@ -1362,11 +1369,26 @@ function BundleCard({ bundle, index, total, onUpdate, onDelete, onMove, taxRate,
 }
 
 /* ─── Main Component ──────────────────────────────────────────────────── */
-export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfidenceChange, onSaved }) {
+export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfidenceChange, onSaved, onRestored, onBidDeleted, requestedAction, onActionHandled }) {
   // Called after each successful save (the page's Bid Tracking card re-reads the
   // bid total). Kept in a ref so a new callback never re-triggers auto-save.
   const onSavedRef = useRef(onSaved)
   onSavedRef.current = onSaved
+  // onRestored(result): a proposal version was restored ({ job, version }).
+  // onBidDeleted(): a save was refused because someone deleted the bid (410).
+  const onRestoredRef = useRef(onRestored)
+  onRestoredRef.current = onRestored
+  const onBidDeletedRef = useRef(onBidDeleted)
+  onBidDeletedRef.current = onBidDeleted
+  // Proposal versions drawer. A failed lazy() load stays failed, so "Try again" swaps in a fresh one.
+  const [versionsOpen, setVersionsOpen] = useState(false)
+  const [versionsLoad, setVersionsLoad] = useState(() => ({ attempt: 0, Drawer: lazy(loadVersionsDrawer) }))
+  const retryVersions = useCallback(() => {
+    setVersionsLoad(prev => ({ attempt: prev.attempt + 1, Drawer: lazy(loadVersionsDrawer) }))
+  }, [])
+  const VersionsDrawer = versionsLoad.Drawer
+  // Bumped after a PDF is made so the Past PDFs list picks it up.
+  const [pdfListKey, setPdfListKey] = useState(0)
   const [bundles, setBundles] = useState([])
   const [deletedBundleNames, setDeletedBundleNames] = useState(new Set())
   const [deletedBundleReasons, setDeletedBundleReasons] = useState({})
@@ -1410,6 +1432,10 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
   const saveSessionRef = useRef(
     globalThis.crypto?.randomUUID?.() || `proposal-${Date.now()}-${Math.random().toString(16).slice(2)}`
   )
+  // What the job said when this bid's numbers were made (the server's
+  // source_job). Sent back with every save so a Regenerate this editor
+  // applied tells the server the bid now matches the job.
+  const sourceJobRef = useRef(job?.proposal_data?.source_job || null)
 
   const markDirty = useCallback(() => {
     editVersionRef.current += 1
@@ -1520,6 +1546,8 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
         setError(`Regeneration changed the material grouping for ${conflicts.slice(0, 3).join(', ')}. Your accepted proposal was left unchanged. Review the structural change before replacing those bundles.`)
         return
       }
+      // This Regenerate is applied: the next save says which job values made it.
+      if (data.source_job) sourceJobRef.current = data.source_job
 
       // Merge manual edits from previous bundles into fresh bundles
       setBundlesAndDirty(prevBundles => {
@@ -1740,6 +1768,31 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
     }
   }, [job, apiProp, bundles, setBundlesAndDirty, deletedBundleNames, deletedMaterialCodes])
 
+  // Put a proposal saved on the server into the editor (on open, and after a
+  // version is restored). jobFields: the bid's tax / GPM to fall back on.
+  const applySavedProposal = (saved, jobFields = job) => {
+    serverRevisionRef.current = Number(saved?._server_revision || 0)
+    sourceJobRef.current = saved?.source_job || null
+    setBundles(Array.isArray(saved?.bundles) ? saved.bundles : [])
+    setNotes(saved?.notes || [])
+    setTerms(saved?.terms || [])
+    setExclusions(saved?.exclusions || [])
+    if (saved?.audit_trace || saved?.audit || saved?.audit_traces) {
+      setAuditTrace(saved.audit_trace || saved.audit || saved.audit_traces)
+    }
+    setTaxRate(saved?.tax_rate ?? jobFields?.tax_rate ?? job?.tax_rate ?? 0)
+    // Use saved gpm_pct if non-zero, otherwise fall back to the job's gpm_pct
+    const jobGpm = jobFields?.gpm_pct ?? job?.gpm_pct ?? 0
+    const savedGpm = saved?.gpm_pct != null ? saved.gpm_pct : jobGpm
+    setGpmPct((savedGpm || jobGpm || 0) * 100)
+    if (saved?.textura_fee != null) setTexturaEnabled(!!saved.textura_fee)
+    else if (jobFields?.textura_fee != null) setTexturaEnabled(!!jobFields.textura_fee)
+    setDeletedBundleNames(new Set(saved?.deleted_bundles || []))
+    setDeletedBundleReasons(saved?.deleted_bundle_reasons || {})
+    setDeletedMaterialCodes(new Set(saved?.deleted_material_codes || []))
+    setDeletedMaterialReasons(saved?.deleted_material_reasons || {})
+  }
+
   // Load saved bundles on mount, or auto-generate if none saved
   useEffect(() => {
     if (!job?.id || hasGenerated) return
@@ -1750,23 +1803,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
         const saved = await apiFetch(`/api/jobs/${job.id}/proposal/bundles`).then(r => r.ok ? r.json() : null)
         if (cancelled) return
         if (saved && saved.bundles && saved.bundles.length > 0) {
-          serverRevisionRef.current = Number(saved._server_revision || 0)
-          setBundles(saved.bundles)
-          setNotes(saved.notes || [])
-          setTerms(saved.terms || [])
-          setExclusions(saved.exclusions || [])
-          if (saved.audit_trace || saved.audit || saved.audit_traces) {
-            setAuditTrace(saved.audit_trace || saved.audit || saved.audit_traces)
-          }
-          setTaxRate(saved.tax_rate ?? job.tax_rate ?? 0)
-          // Use saved gpm_pct if non-zero, otherwise fall back to job's gpm_pct
-          const savedGpm = saved.gpm_pct != null ? saved.gpm_pct : (job?.gpm_pct || 0)
-          setGpmPct((savedGpm || job?.gpm_pct || 0) * 100)
-          if (saved.textura_fee != null) setTexturaEnabled(!!saved.textura_fee)
-          if (saved.deleted_bundles?.length) setDeletedBundleNames(new Set(saved.deleted_bundles))
-          if (saved.deleted_bundle_reasons) setDeletedBundleReasons(saved.deleted_bundle_reasons)
-          if (saved.deleted_material_codes?.length) setDeletedMaterialCodes(new Set(saved.deleted_material_codes))
-          if (saved.deleted_material_reasons) setDeletedMaterialReasons(saved.deleted_material_reasons)
+          applySavedProposal(saved)
           setHasGenerated(true)
           setLoading(false)
           return
@@ -1816,10 +1853,13 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
           client_edit_version: saveVersion,
           client_save_sequence: saveSequence,
           base_server_revision: serverRevisionRef.current,
+          source_job: sourceJobRef.current || undefined,
         }),
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }))
+        // 410: someone deleted this bid. The page switches to its read-only view.
+        if (res.status === 410) onBidDeletedRef.current?.()
         throw new Error(err.detail || 'Auto-save failed')
       }
       const saved = await res.json().catch(() => ({}))
@@ -1888,6 +1928,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
         client_edit_version: editVersionRef.current,
         client_save_sequence: saveSequence,
         base_server_revision: serverRevisionRef.current,
+        source_job: sourceJobRef.current || undefined,
       })
       navigator.sendBeacon(`/api/jobs/${job.id}/proposal/bundles/save`, new Blob([payload], { type: 'application/json' }))
     }
@@ -1897,6 +1938,39 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
       flushSave() // Also flush on component unmount (tab switch)
     }
   }, [job?.id])
+
+  // Restore a proposal version (from the Versions drawer). Edits not saved yet
+  // are saved first, so the "Before restore" copy the server makes has them.
+  const restoreVersion = useCallback(async (version) => {
+    if (!job?.id) throw new Error('No bid is open.')
+    clearTimeout(autoSaveRef.current)
+    if (stateRef.current.isDirty) await doSave({ throwOnError: true })
+    // A save already on its way must not land after the restore.
+    for (let waited = 0; activeSaveCountRef.current > 0 && waited < 100; waited += 1) {
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    const result = await api.restoreProposalVersion(job.id, version.id)
+    const saved = await api.loadProposalBundles(job.id)
+    applySavedProposal(saved, result?.job || job)
+    setIsDirty(false)
+    setHasGenerated(true)
+    setPdfReady(false)
+    setError(null)
+    setLastSaved(new Date())
+    onSavedRef.current?.()
+    onConfidenceChange?.()
+    onRestoredRef.current?.(result)
+    return result
+  }, [job, doSave, onConfidenceChange])
+
+  const openVersions = useCallback(() => {
+    // Save typed edits now, so "Compare with current" includes them.
+    if (stateRef.current.isDirty) {
+      clearTimeout(autoSaveRef.current)
+      doSave()
+    }
+    setVersionsOpen(true)
+  }, [doSave])
 
   // Update a bundle at index
   const updateBundle = useCallback((idx, updated) => {
@@ -2109,7 +2183,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
     try {
       const saved = await doSave({ throwOnError: true })
       if (!saved?.audit_trace && !saved?.audit) {
-        throw new Error('Cannot generate PDF until the proposal has a current audit trace.')
+        throw new Error("The bid couldn't be saved, so the PDF wasn't made. Click Generate PDF again.")
       }
       const accepted = saved.proposal_data
       if (!accepted?.bundles) {
@@ -2125,6 +2199,7 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
         throw new Error(err.detail || 'Failed to generate PDF')
       }
       setPdfReady(true)
+      setPdfListKey(key => key + 1)
       onConfidenceChange?.()
     } catch (err) {
       setError(err.message)
@@ -2132,6 +2207,22 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
       setGenerating(false)
     }
   }, [job, bundles, notes, terms, exclusions, subtotal, taxRate, taxAmount, gpmPct, gpmTotal, gpmLabor, gpmMaterial, texturaEnabled, texturaAmount, grandTotal, deletedBundleNames, deletedBundleReasons, deletedMaterialCodes, deletedMaterialReasons, doSave, onConfidenceChange])
+
+  // Regenerate / Make PDF asked for by a button on the page's "Before you send
+  // this bid" card: run it once the saved proposal has loaded.
+  const handledActionRef = useRef(null)
+  useEffect(() => {
+    if (!requestedAction?.nonce || handledActionRef.current === requestedAction.nonce) return
+    if (!hasGenerated || loading) return
+    handledActionRef.current = requestedAction.nonce
+    onActionHandled?.()
+    if (requestedAction.type === 'regenerate') {
+      if (bundles.length > 0 && !window.confirm("Update this bid's numbers from the job's current materials? Prices you typed, lines you deleted and bundles you combined are kept. If some materials would land in different bundles, nothing changes and you'll see which ones.")) return
+      generateBundles()
+    } else if (requestedAction.type === 'make_pdf' && bundles.length > 0) {
+      generatePdf()
+    }
+  }, [requestedAction, hasGenerated, loading, bundles.length, generateBundles, generatePdf, onActionHandled])
 
   // Download PDF
   const downloadPdf = useCallback(() => {
@@ -2154,12 +2245,21 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
             {!saving && lastSaved && <span className="text-xs text-emerald-500/60">✓ Saved</span>}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {!selectMode ? (
             <>
               <button
+                onClick={openVersions}
+                disabled={!job?.id}
+                className="flex items-center gap-2 bg-white/[0.04] border border-white/[0.08] hover:bg-white/[0.08] text-gray-300 font-medium rounded-xl px-4 py-2 text-sm transition-colors disabled:opacity-50"
+                title="Saved copies of this proposal: preview, compare or restore"
+              >
+                <Layers className="w-4 h-4" />
+                Versions
+              </button>
+              <button
                 onClick={() => {
-                  if (bundles.length > 0 && !window.confirm('Regenerate from current materials? Manual prices, deletions, and clean bundle combinations will be preserved. Ambiguous regrouping will stop for review.')) return
+                  if (bundles.length > 0 && !window.confirm("Update this bid's numbers from the job's current materials? Prices you typed, lines you deleted and bundles you combined are kept. If some materials would land in different bundles, nothing changes and you'll see which ones.")) return
                   generateBundles()
                 }}
                 disabled={loading}
@@ -2446,6 +2546,8 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
 
             <div className="flex-1" />
 
+            <PastPdfsMenu jobId={job?.id} refreshKey={pdfListKey} />
+
             <button
               onClick={generatePdf}
               disabled={generating || bundles.length === 0}
@@ -2476,6 +2578,26 @@ export default function ProposalEditor({ job, api: apiProp, onGoBack, onConfiden
           </div>
         </div>
         )})()}
+
+      {/* Proposal versions drawer: portaled to document.body (this editor sits inside an animated container) */}
+      {versionsOpen && job?.id && (
+        <HistoryDrawerBoundary
+          key={versionsLoad.attempt}
+          title="Proposal versions"
+          onRetry={retryVersions}
+          onClose={() => setVersionsOpen(false)}
+        >
+          <Suspense fallback={null}>
+            <VersionsDrawer
+              jobId={job.id}
+              jobName={job.project_name}
+              currentBundles={bundles}
+              onRestore={restoreVersion}
+              onClose={() => setVersionsOpen(false)}
+            />
+          </Suspense>
+        </HistoryDrawerBoundary>
+      )}
 
       {/* Combine Bundles Dialog — portaled to document.body to escape CSS transform containing block */}
       {showCombineDialog && createPortal(

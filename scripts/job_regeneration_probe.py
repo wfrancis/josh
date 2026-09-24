@@ -655,7 +655,7 @@ def main() -> int:
     finally:
         if clone_id:
             try:
-                client.request("DELETE", f"/api/jobs/{clone_id}")
+                client.request("DELETE", f"/api/jobs/{clone_id}", json_body={"reason": "Regeneration probe cleanup"})
                 deleted_status, _, _ = client.get_optional(f"/api/jobs/{clone_id}")
                 result["clone_cleanup"] = {"status": deleted_status, "deleted": deleted_status == 404}
                 if deleted_status != 404:

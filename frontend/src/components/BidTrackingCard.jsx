@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ClipboardList, Send, PhoneCall, MessageSquarePlus, Trophy, ThumbsDown,
-  Loader2, Save, AlertTriangle, X,
+  Loader2, Save, AlertTriangle, X, FileDown,
 } from 'lucide-react'
 import { api } from '../api'
 import BidStatusBadge from './BidStatusBadge'
@@ -466,6 +466,23 @@ export default function BidTrackingCard({ jobId, hasMaterials, refreshKey = 0 })
                     <div className="min-w-0">
                       <div className="text-sm text-gray-200">{describeBidEvent(event)}</div>
                       {facts.length > 0 && <div className="text-xs text-gray-500 mt-0.5">{facts.join(' · ')}</div>}
+                      {event.event_type === 'sent' && event.details?.pdf?.artifact_id != null && (
+                        <div className="text-xs mt-0.5">
+                          <a
+                            href={api.jobArtifactDownloadUrl(jobId, event.details.pdf.artifact_id)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-emerald-400 hover:text-emerald-300"
+                            title="Open the proposal PDF that was current when this was sent"
+                          >
+                            <FileDown className="w-3 h-3" /> PDF sent
+                            {event.details.pdf.created_at ? ` (made ${formatWhen(event.details.pdf.created_at)})` : ''}
+                          </a>
+                          {event.details.proposal_changed_since_pdf && (
+                            <span className="block text-amber-400/80 mt-0.5">The proposal was changed after this PDF was made.</span>
+                          )}
+                        </div>
+                      )}
                       {event.details?.note && (
                         <div className="text-xs text-gray-400 mt-1 whitespace-pre-wrap break-words">"{event.details.note}"</div>
                       )}

@@ -23,11 +23,12 @@ export default class HistoryDrawerBoundary extends Component {
 
   render() {
     if (!this.state.failed) return this.props.children
-    return <HistoryLoadFailed onRetry={this.props.onRetry} onClose={this.props.onClose} />
+    return <HistoryLoadFailed title={this.props.title} onRetry={this.props.onRetry} onClose={this.props.onClose} />
   }
 }
 
-function HistoryLoadFailed({ onRetry, onClose }) {
+// title: the drawer's name ("History" unless another drawer uses this boundary).
+function HistoryLoadFailed({ title = 'History', onRetry, onClose }) {
   const retryRef = useRef(null)
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
@@ -46,14 +47,14 @@ function HistoryLoadFailed({ onRetry, onClose }) {
           <div className="w-9 h-9 flex-shrink-0 rounded-xl bg-si-bright/10 border border-si-bright/15 flex items-center justify-center">
             <History className="w-4 h-4 text-blue-300" />
           </div>
-          <h2 id="history-load-failed-title" className="flex-1 min-w-0 text-base font-bold text-white pt-1.5">History</h2>
-          <button type="button" onClick={onClose} className="btn-ghost p-2 -mr-2" title="Close history">
+          <h2 id="history-load-failed-title" className="flex-1 min-w-0 text-base font-bold text-white pt-1.5">{title}</h2>
+          <button type="button" onClick={onClose} className="btn-ghost p-2 -mr-2" title="Close">
             <X className="w-4 h-4" />
           </button>
         </div>
         <div className="px-5 py-16 text-center">
           <AlertTriangle className="w-6 h-6 text-amber-400 mx-auto mb-3" />
-          <p className="text-sm text-gray-300">History couldn't be loaded.</p>
+          <p className="text-sm text-gray-300">{title} couldn't be loaded.</p>
           <p className="text-xs text-gray-500 mt-1">
             Your work on this bid is still here. Check your connection, then try again.
           </p>

@@ -979,7 +979,8 @@ export default function MaterialsTable({ materials, onUpdate, readOnly = false, 
                         if (!onAiEstimate) return
                         setEstimatingIdx(m._origIdx)
                         try {
-                          await onAiEstimate(m._origIdx)
+                          // The line itself (the server finds it by id); its place is only for a line not saved yet.
+                          await onAiEstimate(m, m._origIdx)
                         } finally {
                           setEstimatingIdx(null)
                         }

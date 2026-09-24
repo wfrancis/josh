@@ -1,4 +1,4 @@
-import { AlertTriangle, Copy, Trash2, X } from 'lucide-react'
+import { AlertTriangle, ArchiveRestore, Copy, Trash2, X } from 'lucide-react'
 
 const VARIANT_STYLES = {
   danger: {
@@ -10,6 +10,11 @@ const VARIANT_STYLES = {
     icon: <Copy className="w-5 h-5 text-blue-400" />,
     iconBg: 'bg-blue-500/10 border border-blue-500/20',
     button: 'bg-blue-500/15 border border-blue-500/25 text-blue-400 hover:bg-blue-500/25',
+  },
+  restore: {
+    icon: <ArchiveRestore className="w-5 h-5 text-emerald-400" />,
+    iconBg: 'bg-emerald-500/10 border border-emerald-500/20',
+    button: 'bg-emerald-500/15 border border-emerald-500/25 text-emerald-400 hover:bg-emerald-500/25',
   },
   warning: {
     icon: <AlertTriangle className="w-5 h-5 text-amber-400" />,

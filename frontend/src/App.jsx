@@ -44,6 +44,7 @@ const VendorContactsPage = lazyPage(() => import('./components/VendorContactsPag
 const RulesRegistryPage = lazyPage(() => import('./components/RulesRegistryPage'))
 const UsersPage = lazyPage(() => import('./components/UsersPage'))
 const AuditPage = lazyPage(() => import('./components/AuditPage'))
+const DeletedBidsPage = lazyPage(() => import('./components/DeletedBidsPage'))
 
 function PageLoading() {
   return (
@@ -165,6 +166,7 @@ export default function App() {
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/users" element={<UsersPage />} />
               <Route path="/audit" element={<AuditPage />} />
+              <Route path="/deleted-bids" element={<DeletedBidsPage />} />
             </Routes>
           </Suspense>
         </PageLoadBoundary>

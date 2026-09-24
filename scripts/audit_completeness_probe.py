@@ -10,7 +10,7 @@ For each response it looks up the X-Request-Id in /api/audit and checks:
   * its "after" values match what a fresh GET returns.
 
 The throwaway bid, its copy and the vendor are deleted at the end (those
-deletes are checked too). Nothing else is touched: no AI calls, no emails,
+deletes are checked too; deleted bids only move to Deleted bids). Nothing else is touched: no AI calls, no emails,
 no settings, no people.
 
 Usage (staging):
@@ -211,7 +211,8 @@ def build_steps(stamp: str) -> list[Step]:
         Step("copy the bid", "POST /api/jobs/{job_id}/duplicate", lambda s: f"/api/jobs/{s['job']}/duplicate",
              None, ("job.duplicate",), save=lambda s, r: s.update(copy=r["id"]), needs=("job",)),
         Step("delete the copy", "DELETE /api/jobs/{job_id}", lambda s: f"/api/jobs/{s['copy']}",
-             None, ("job.delete",), check=_gone(lambda s: f"/api/jobs/{s['copy']}"), needs=("copy",)),
+             lambda s: {"reason": "Audit probe cleanup"}, ("job.delete",),
+             check=_gone(lambda s: f"/api/jobs/{s['copy']}"), needs=("copy",)),
         Step("add a vendor", "POST /api/vendors", lambda s: "/api/vendors",
              lambda s: {"name": f"{name} vendor", "contact_email": "probe@example.com"}, ("vendor.create",),
              check=_vendor, save=lambda s, r: s.update(vendor=r["id"])),
@@ -220,7 +221,8 @@ def build_steps(stamp: str) -> list[Step]:
         Step("delete the vendor", "DELETE /api/vendors/{vendor_id}", lambda s: f"/api/vendors/{s['vendor']}",
              None, ("vendor.delete",), check=_gone(lambda s: f"/api/vendors/{s['vendor']}"), needs=("vendor",)),
         Step("delete the bid", "DELETE /api/jobs/{job_id}", lambda s: f"/api/jobs/{s['job']}",
-             None, ("job.delete",), check=_gone(lambda s: f"/api/jobs/{s['job']}"), needs=("job",)),
+             lambda s: {"reason": "Audit probe cleanup"}, ("job.delete",),
+             check=_gone(lambda s: f"/api/jobs/{s['job']}"), needs=("job",)),
     ]
 
 

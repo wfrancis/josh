@@ -91,8 +91,10 @@ function LinesDiff({ change }) {
   return <div className="space-y-0.5">{rows}</div>
 }
 
-function ChangeRow({ change, item }) {
-  const label = pathLabel(change.path, item)
+// One change: its label and the before/after. label: shown instead of the
+// label worked out from the path (e.g. without a row name a heading already shows).
+export function ChangeRow({ change, item, label: labelOverride }) {
+  const label = labelOverride || pathLabel(change.path, item)
   let body
   if (change.redacted || isRedacted(change.before) || isRedacted(change.after)) {
     body = (

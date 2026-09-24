@@ -345,6 +345,9 @@ VOLATILE_KEYS = frozenset({
     "_client_session_id", "_client_edit_version", "_client_save_sequence",
     "_server_revision", "audit", "audit_source_fingerprint",
     "pdf_generated_at", "last_seen_at",
+    # What the job said when the proposal's numbers were made / last checked
+    # (main._stamp_proposal_source): the proposal's bookkeeping, not its content.
+    "source_job", "audit_source_job",
 })
 # Rows in a list are matched by the first of these every row has (unique).
 ROW_ID_KEYS = ("uid", "line_key", "id", "item_code")
@@ -1121,6 +1124,24 @@ def sweep_idle_groups(now: datetime | None = None) -> int:
 
 SWEEP_INTERVAL_SECONDS = 10
 _sweeper_tasks: dict = {}
+# Steps that run after each idle-group sweep, in a worker thread (e.g. saving
+# a proposal version once someone stops editing).
+_sweep_hooks: list = []
+
+
+def register_sweep_hook(hook) -> None:
+    """Run ``hook()`` in a worker thread after every idle-group sweep. Errors
+    are logged, never raised; the next sweep runs it again."""
+    if hook not in _sweep_hooks:
+        _sweep_hooks.append(hook)
+
+
+def run_sweep_hooks() -> None:
+    for hook in list(_sweep_hooks):
+        try:
+            hook()
+        except Exception as err:  # keep sweeping; a busy database clears up
+            print(f"[audit] After-sweep step {getattr(hook, '__name__', hook)} failed: {err}")
 
 
 async def _sweep_forever() -> None:
@@ -1130,6 +1151,8 @@ async def _sweep_forever() -> None:
             await asyncio.to_thread(sweep_idle_groups)
         except Exception as err:  # keep sweeping; a busy database clears up
             print(f"[audit] Couldn't close idle history entries: {err}")
+        if _sweep_hooks:
+            await asyncio.to_thread(run_sweep_hooks)
 
 
 def start_sweeper() -> None:
@@ -1886,6 +1909,8 @@ def _item(row, actors: list[dict] | None) -> dict:
         "edit_count": row["edit_count"],
         "group_open": bool(row["group_open"]),
         "net_noop": bool(row["net_noop"]),
+        # The proposal version this change made, printed or restored (if any).
+        "proposal_version_id": row["proposal_version_id"],
         "extra": extra if isinstance(extra, dict) else None,
     }
 

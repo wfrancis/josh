@@ -1,16 +1,25 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { AlertTriangle, Check, CheckCircle2, RefreshCw, ShieldAlert, ShieldCheck, Upload, X, XCircle } from 'lucide-react'
+import { AlertTriangle, Check, CheckCircle2, ChevronRight, RefreshCw, ShieldAlert, ShieldCheck, Upload, X, XCircle } from 'lucide-react'
 import StatusBadge from './StatusBadge'
 
+// Checks only an admin or developer can act on. They never show in the
+// estimator's to-do list, only under "Technical details" (the server marks
+// them with technical: true; this list covers an older server).
+const TECHNICAL_CHECK_IDS = new Set(['deployed_build_identity', 'durable_artifacts', 'golden_replay', 'current_replay_drift'])
+
+function isTechnical(check) {
+  return Boolean(check.technical) || TECHNICAL_CHECK_IDS.has(check.id)
+}
+
 function CheckIcon({ status }) {
-  if (status === 'pass') return <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-  if (status === 'fail') return <XCircle className="w-4 h-4 text-red-400" />
-  return <AlertTriangle className="w-4 h-4 text-amber-400" />
+  if (status === 'pass') return <CheckCircle2 className="w-4 h-4 flex-shrink-0 text-emerald-400" />
+  if (status === 'fail') return <XCircle className="w-4 h-4 flex-shrink-0 text-red-400" />
+  return <AlertTriangle className="w-4 h-4 flex-shrink-0 text-amber-400" />
 }
 
 function shortCommit(value) {
-  if (!value || value === 'unknown') return 'build unknown'
+  if (!value || value === 'unknown') return 'unknown'
   return String(value).slice(0, 10)
 }
 
@@ -25,11 +34,146 @@ function formatDate(value) {
   return Number.isNaN(date.getTime()) ? 'Not recorded' : date.toLocaleString()
 }
 
+function plural(count, one, many) {
+  return `${count} ${count === 1 ? one : (many || `${one}s`)}`
+}
+
+// Same message twice (e.g. two checks pointing at one fix) shows once.
+function uniqueByMessage(checks) {
+  const seen = new Set()
+  return checks.filter(check => {
+    if (seen.has(check.message)) return false
+    seen.add(check.message)
+    return true
+  })
+}
+
 function Metric({ label, value, title }) {
   return (
     <div className="min-w-0 border-t border-white/[0.06] pt-3" title={title}>
       <p className="text-[10px] font-semibold uppercase text-gray-500">{label}</p>
       <p className="mt-1 break-words text-sm font-semibold leading-5 text-gray-200">{value}</p>
+    </div>
+  )
+}
+
+function ActionButton({ action, onAction }) {
+  if (!action?.id || !onAction) return null
+  return (
+    <button
+      type="button"
+      onClick={() => onAction(action.id)}
+      className="btn-secondary min-h-9 flex-shrink-0 px-3 py-1.5 text-xs"
+      data-testid={`readiness-action-${action.id}`}
+    >
+      {action.label}
+      <ChevronRight className="h-3.5 w-3.5" />
+    </button>
+  )
+}
+
+function CheckRow({ check, onAction, children }) {
+  const items = check.affected_items || []
+  return (
+    <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5" data-testid={`readiness-check-${check.id}`}>
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
+        <div className="flex min-w-0 flex-1 items-start gap-2">
+          <span className="mt-0.5"><CheckIcon status={check.status} /></span>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm leading-5 text-gray-200">{check.message}</p>
+            {items.length > 0 && (
+              <p className="mt-1 break-words text-xs leading-5 text-gray-500">
+                {items.slice(0, 8).join(', ')}{items.length > 8 ? ` and ${items.length - 8} more` : ''}
+              </p>
+            )}
+          </div>
+        </div>
+        <ActionButton action={check.action} onAction={onAction} />
+      </div>
+      {children}
+    </div>
+  )
+}
+
+function VendorConflictList({ conflicts, total, onReview }) {
+  return (
+    <div className="mt-3 border-t border-amber-500/15 pt-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs font-bold uppercase text-amber-300">Price differs from the vendor's quote</p>
+        <span className="text-[10px] font-semibold uppercase text-gray-500">
+          {plural(total || conflicts.length, 'price')}
+        </span>
+      </div>
+      <div className="mt-2 max-h-72 overflow-y-auto border-y border-white/[0.06] sm:hidden">
+        <div className="divide-y divide-white/[0.04]">
+          {conflicts.map((row, index) => (
+            <div key={`mobile-${row.material_id}-${row.source_hash}-${index}`} className="py-3">
+              <div className="flex items-start justify-between gap-3">
+                <p className="min-w-0 break-words text-sm font-semibold text-gray-200">{row.item_code}</p>
+                <p className="flex-shrink-0 text-sm font-semibold tabular-nums text-amber-300">{formatMoney(row.delta)}</p>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-3 text-xs">
+                <div>
+                  <p className="text-[10px] font-semibold uppercase text-gray-600">On the bid</p>
+                  <p className="mt-0.5 tabular-nums text-gray-300">{formatMoney(row.accepted_price)} / {row.accepted_unit}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-semibold uppercase text-gray-600">Vendor quote</p>
+                  <p className="mt-0.5 tabular-nums text-gray-300">{formatMoney(row.quote_price)} / {row.quote_unit}</p>
+                </div>
+              </div>
+              <p className="mt-2 break-words text-[11px] leading-4 text-gray-500">{row.source_file || 'Vendor quote'}</p>
+              {onReview && (
+                <button
+                  type="button"
+                  onClick={() => onReview(row)}
+                  className="btn-secondary mt-3 flex min-h-9 w-full items-center justify-center gap-2 text-xs"
+                >
+                  <Check className="h-3.5 w-3.5" />
+                  Review price
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="mt-2 hidden max-h-56 overflow-auto border-y border-white/[0.06] sm:block">
+        <table className="w-full min-w-[580px] text-xs">
+          <thead className="sticky top-0 bg-[#111827] text-[10px] uppercase text-gray-500">
+            <tr>
+              <th className="px-2 py-2 text-left font-semibold">Material</th>
+              <th className="px-2 py-2 text-right font-semibold">On the bid</th>
+              <th className="px-2 py-2 text-right font-semibold">Vendor quote</th>
+              <th className="px-2 py-2 text-right font-semibold">Difference</th>
+              <th className="px-2 py-2 text-left font-semibold">Quote file</th>
+              {onReview && <th className="px-2 py-2 text-right font-semibold">Action</th>}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-white/[0.04]">
+            {conflicts.map((row, index) => (
+              <tr key={`${row.material_id}-${row.source_hash}-${index}`} className="text-gray-300">
+                <td className="px-2 py-2 font-semibold text-gray-200">{row.item_code}</td>
+                <td className="px-2 py-2 text-right tabular-nums">{formatMoney(row.accepted_price)} / {row.accepted_unit}</td>
+                <td className="px-2 py-2 text-right tabular-nums">{formatMoney(row.quote_price)} / {row.quote_unit}</td>
+                <td className="px-2 py-2 text-right font-semibold tabular-nums text-amber-300">{formatMoney(row.delta)}</td>
+                <td className="max-w-52 truncate px-2 py-2 text-gray-500" title={row.source_file}>{row.source_file || 'Vendor quote'}</td>
+                {onReview && (
+                  <td className="px-2 py-2 text-right">
+                    <button
+                      type="button"
+                      onClick={() => onReview(row)}
+                      className="btn-secondary inline-flex min-h-8 items-center gap-1.5 px-2.5 text-xs"
+                    >
+                      <Check className="h-3.5 w-3.5" />
+                      Review
+                    </button>
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
@@ -118,8 +262,8 @@ function PriceDecisionDialog({ conflict, onClose, onSubmit }) {
           </div>
           <p className="mt-2 text-xs leading-5 text-gray-500">
             {decision === 'use_quote'
-              ? 'The material unit price will change to the verified quote. The saved proposal will require recalculation.'
-              : 'The accepted price will stay, and this difference will remain visible as a reviewed override.'}
+              ? 'The material price will change to the vendor quote. Afterwards, click Regenerate on the Review & Generate step to update the bid.'
+              : 'The price on the bid stays. The difference and your reason stay on record.'}
           </p>
 
           <label className="mt-4 block text-xs font-semibold text-gray-300">
@@ -158,15 +302,23 @@ function PriceDecisionDialog({ conflict, onClose, onSubmit }) {
   )
 }
 
-export default function ReadinessSummary({ readiness, onRefresh, onRecoverEvidence, onResolveVendorConflict }) {
+
+export default function ReadinessSummary({ readiness, onRefresh, onRecoverEvidence, onResolveVendorConflict, onAction }) {
   const [selectedConflict, setSelectedConflict] = useState(null)
+  const [technicalOpen, setTechnicalOpen] = useState(false)
+  const technicalRef = useRef(null)
   if (!readiness) return null
-  const failed = (readiness.checks || []).filter(check => check.status === 'fail')
-  const warnings = (readiness.checks || []).filter(check => check.status === 'warn')
-  const important = [...failed, ...warnings]
+  const checks = readiness.checks || []
+  const handleAction = onAction || (actionId => { if (actionId === 'quotes') onRecoverEvidence?.() })
+  // A check another failing check already covers (covered_by) isn't listed twice.
+  const isCovered = check => Boolean(check.covered_by)
+    && checks.some(other => other.id === check.covered_by && other.status === 'fail')
+  const mustDo = uniqueByMessage(checks.filter(check => check.status === 'fail' && !isTechnical(check) && !isCovered(check)))
+  const secondLook = uniqueByMessage(checks.filter(check => check.status === 'warn' && !isTechnical(check)))
+  const technicalChecks = checks.filter(isTechnical)
+  const technicalBlockers = technicalChecks.filter(check => check.status === 'fail' && !isCovered(check))
   const build = readiness.build || {}
   const trust = readiness.trust_summary || {}
-  const evidenceRecoveryNeeded = Boolean(trust.evidence_recovery_needed)
   const vendorPriceConflicts = trust.vendor_price_conflicts || []
   const vendorPriceOverrides = trust.vendor_price_overrides || []
   const goldenBadgeStatus = readiness.golden_verification_status === 'golden_verified' ? 'golden' : null
@@ -182,245 +334,207 @@ export default function ReadinessSummary({ readiness, onRefresh, onRecoverEviden
     ))
       ? 'drift'
       : null
-  const HeaderIcon = readiness.status === 'blocked' ? ShieldAlert : readiness.status === 'warning' ? AlertTriangle : ShieldCheck
-  const headerTone = readiness.status === 'blocked'
+
+  const fixCount = mustDo.length + (technicalBlockers.length > 0 ? 1 : 0)
+  const blocked = fixCount > 0
+  const HeaderIcon = blocked ? ShieldAlert : secondLook.length ? AlertTriangle : ShieldCheck
+  const headerTone = blocked
     ? 'border-red-500/20 bg-red-500/10 text-red-300'
-    : readiness.status === 'warning'
+    : secondLook.length
       ? 'border-amber-500/20 bg-amber-500/10 text-amber-300'
       : 'border-emerald-500/15 bg-emerald-500/10 text-emerald-300'
+  const headline = blocked
+    ? `Fix ${plural(fixCount, 'thing')} before sending`
+    : secondLook.length
+      ? `Ready to send. ${plural(secondLook.length, 'thing')} worth a second look.`
+      : 'Ready to send'
+
+  const openTechnical = () => {
+    setTechnicalOpen(true)
+    window.setTimeout(() => technicalRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+  }
 
   return (
     <>
-    <section className="glass-card p-4 sm:p-5 mb-6" aria-label="Bid readiness">
-      <div className="flex flex-wrap items-start gap-3">
+    <section className="glass-card p-4 sm:p-5 mb-6" aria-label="Before you send this bid" data-testid="readiness-card">
+      <div className="flex items-start gap-3">
         <div className={`flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-lg border ${headerTone}`}>
           <HeaderIcon className="h-5 w-5" />
         </div>
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-sm font-bold text-white">Bid Readiness</h2>
-            <StatusBadge status={readiness.status} />
-            {goldenBadgeStatus && <StatusBadge status={goldenBadgeStatus} />}
-            {metadataBadgeStatus && <StatusBadge status={metadataBadgeStatus} />}
-            {driftBadgeStatus && <StatusBadge status={driftBadgeStatus} />}
-            {readiness.warning_count > 0 && (
-              <span className="rounded-md border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-[10px] font-bold uppercase text-amber-300">
-                {readiness.warning_count} warning{readiness.warning_count === 1 ? '' : 's'}
-              </span>
-            )}
-          </div>
-          <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-gray-500">
-            <span>{readiness.blocking_count ? `${readiness.blocking_count} blocker${readiness.blocking_count === 1 ? '' : 's'}` : 'No blockers'}</span>
-            <span>verified {new Date(readiness.verified_at).toLocaleString()}</span>
-            <span className="font-mono">{shortCommit(build.commit)}</span>
-            {build.engine_fingerprint && <span className="font-mono">engine {String(build.engine_fingerprint).slice(0, 10)}</span>}
-          </div>
+          <h2 className="text-sm font-bold text-white">Before you send this bid</h2>
+          <p
+            className={`mt-0.5 text-sm font-semibold ${blocked ? 'text-red-300' : secondLook.length ? 'text-amber-300' : 'text-emerald-300'}`}
+            data-testid="readiness-status"
+            data-status={blocked ? 'blocked' : secondLook.length ? 'warning' : 'ready'}
+          >
+            {headline}
+          </p>
         </div>
-        <button onClick={onRefresh} className="btn-ghost p-2" title="Refresh bid readiness">
+        <button onClick={onRefresh} className="btn-ghost p-2" title="Check again">
           <RefreshCw className="w-4 h-4" />
         </button>
       </div>
 
-      <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3 xl:grid-cols-6">
-        <Metric label="Last audit" value={formatDate(trust.last_audit_at)} />
-        <Metric label="Last PDF" value={formatDate(trust.last_pdf_at)} />
-        <Metric
-          label="Build"
-          value={`${trust.build_tag && trust.build_tag !== 'unknown' ? trust.build_tag : 'untagged'} / ${shortCommit(trust.build_commit || build.commit)}`}
-          title={trust.engine_fingerprint ? `Engine ${trust.engine_fingerprint}` : undefined}
-        />
-        <Metric label="Rules" value={trust.ruleset_version != null ? `Ruleset v${trust.ruleset_version}` : 'Not recorded'} />
-        <Metric label="Golden baseline" value={trust.golden_baseline_version ? `Version ${trust.golden_baseline_version}` : 'Not captured'} />
-        <Metric
-          label="Source evidence"
-          value={`${trust.verified_source_count || 0} verified / ${trust.unverified_source_count || 0} unverified`}
-        />
-        <Metric
-          label="Dropbox mode"
-          value={trust.vendor_source_mode === 'browser_local_sync_folder' ? 'Local folder only' : 'Not recorded'}
-          title={trust.vendor_source_automatic_sync === false ? 'User-started local folder scan; automatic Dropbox cloud sync is not configured.' : undefined}
-        />
-        <Metric label="JR target" value={formatMoney(trust.jr_target_total)} />
-        <Metric label="Accepted proposal" value={formatMoney(trust.accepted_proposal_total)} />
-        <Metric
-          label={trust.replay_mode === 'current' ? 'Current replay' : 'Latest replay'}
-          value={formatMoney(trust.replay_total)}
-          title={trust.replay_status ? `Replay status: ${trust.replay_status}` : undefined}
-        />
-        <Metric label="Manual overrides" value={String(trust.manual_override_count || 0)} />
-        <Metric label="Typed prices" value={String(trust.manual_price_count || 0)} />
-        <Metric label="Unknown materials" value={String(trust.unknown_material_count || 0)} />
-        <Metric label="Low confidence" value={String(trust.low_confidence_material_count || 0)} />
-      </div>
+      {!blocked && !secondLook.length && (
+        <div className="mt-4 flex items-center gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-3 py-3 text-sm font-semibold text-emerald-200" data-testid="readiness-ready">
+          <CheckCircle2 className="h-5 w-5 flex-shrink-0 text-emerald-400" />
+          Ready to send. Everything on this bid checks out.
+        </div>
+      )}
 
-      {evidenceRecoveryNeeded && (
-        <div className="mt-4 border-t border-amber-500/20 pt-4">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
-            <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-400" />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-semibold text-amber-200">Vendor pricing evidence needs review</p>
-              <p className="mt-1 text-xs leading-5 text-gray-400">
-                {trust.missing_vendor_receipt_count || 0} accepted vendor price{trust.missing_vendor_receipt_count === 1 ? '' : 's'} lack an exact receipt. {trust.vendor_price_conflict_count || 0} verified quote price{trust.vendor_price_conflict_count === 1 ? '' : 's'} differ from the accepted number. Exact matches link automatically; differences stay blocked until a reviewer records the decision.
-              </p>
-              <p className="mt-1 text-xs leading-5 text-gray-500">
-                Dropbox is scanned from a locally synced folder after the estimator chooses it in Chrome. There is no automatic Dropbox cloud connection.
-              </p>
-              {trust.quote_source_files_needed?.length > 0 && (
-                <p className="mt-2 break-words text-xs leading-5 text-gray-500">
-                  Missing originals: {trust.quote_source_files_needed.join(', ')}
-                </p>
+      {blocked && (
+        <div className="mt-4 space-y-2" data-testid="readiness-todo">
+          {mustDo.map(check => (
+            <CheckRow key={check.id} check={check} onAction={handleAction}>
+              {check.id === 'vendor_quote_evidence' && vendorPriceConflicts.length > 0 && (
+                <VendorConflictList
+                  conflicts={vendorPriceConflicts}
+                  total={trust.vendor_price_conflict_count}
+                  onReview={onResolveVendorConflict ? setSelectedConflict : null}
+                />
               )}
-              {vendorPriceConflicts.length > 0 && (
-                <div className="mt-3 border-t border-amber-500/15 pt-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <p className="text-xs font-bold uppercase text-amber-300">Verified quote price differs</p>
-                    <span className="text-[10px] font-semibold uppercase text-gray-500">
-                      {trust.vendor_price_conflict_count || vendorPriceConflicts.length} conflict{(trust.vendor_price_conflict_count || vendorPriceConflicts.length) === 1 ? '' : 's'}
-                    </span>
-                  </div>
-                  <div className="mt-2 max-h-72 overflow-y-auto border-y border-white/[0.06] sm:hidden">
-                    <div className="divide-y divide-white/[0.04]">
-                      {vendorPriceConflicts.map((row, index) => (
-                        <div key={`mobile-${row.material_id}-${row.source_hash}-${index}`} className="py-3">
-                          <div className="flex items-start justify-between gap-3">
-                            <p className="min-w-0 break-words text-sm font-semibold text-gray-200">{row.item_code}</p>
-                            <p className="flex-shrink-0 text-sm font-semibold tabular-nums text-amber-300">{formatMoney(row.delta)}</p>
-                          </div>
-                          <div className="mt-2 grid grid-cols-2 gap-3 text-xs">
-                            <div>
-                              <p className="text-[10px] font-semibold uppercase text-gray-600">Accepted</p>
-                              <p className="mt-0.5 tabular-nums text-gray-300">{formatMoney(row.accepted_price)} / {row.accepted_unit}</p>
-                            </div>
-                            <div>
-                              <p className="text-[10px] font-semibold uppercase text-gray-600">Verified quote</p>
-                              <p className="mt-0.5 tabular-nums text-gray-300">{formatMoney(row.quote_price)} / {row.quote_unit}</p>
-                            </div>
-                          </div>
-                          <p className="mt-2 break-words text-[11px] leading-4 text-gray-500">{row.source_file || 'Verified quote'}</p>
-                          {onResolveVendorConflict && (
-                            <button
-                              type="button"
-                              onClick={() => setSelectedConflict(row)}
-                              className="btn-secondary mt-3 flex min-h-9 w-full items-center justify-center gap-2 text-xs"
-                            >
-                              <Check className="h-3.5 w-3.5" />
-                              Review price
-                            </button>
-                          )}
-                        </div>
-                      ))}
+            </CheckRow>
+          ))}
+          {technicalBlockers.length > 0 && (
+            <div className="flex flex-col gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 sm:flex-row sm:items-center">
+              <div className="flex min-w-0 flex-1 items-start gap-2">
+                <span className="mt-0.5"><CheckIcon status="fail" /></span>
+                <p className="text-sm leading-5 text-gray-200">
+                  Something behind the scenes needs attention. Open Technical details below, or ask your admin.
+                </p>
+              </div>
+              <button type="button" onClick={openTechnical} className="btn-secondary min-h-9 flex-shrink-0 px-3 py-1.5 text-xs">
+                Show details
+                <ChevronRight className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {secondLook.length > 0 && (
+        <div className="mt-4" data-testid="readiness-warnings">
+          {blocked && <p className="mb-2 text-[11px] font-semibold uppercase text-gray-500">Also worth a second look</p>}
+          <div className="space-y-2">
+            {secondLook.map(check => (
+              <CheckRow key={check.id} check={check} onAction={handleAction} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      <details
+        ref={technicalRef}
+        open={technicalOpen}
+        onToggle={event => setTechnicalOpen(event.currentTarget.open)}
+        className="mt-4 scroll-mt-20 border-t border-white/[0.06] pt-3"
+        data-testid="readiness-technical"
+      >
+        <summary className="flex cursor-pointer select-none items-center gap-2 text-xs font-semibold text-gray-500 hover:text-gray-300">
+          <ChevronRight className={`h-3.5 w-3.5 transition-transform ${technicalOpen ? 'rotate-90' : ''}`} />
+          Technical details
+        </summary>
+
+        <div className="mt-3">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
+            <StatusBadge status={readiness.status} />
+            {goldenBadgeStatus && <StatusBadge status={goldenBadgeStatus} />}
+            {metadataBadgeStatus && <StatusBadge status={metadataBadgeStatus} />}
+            {driftBadgeStatus && <StatusBadge status={driftBadgeStatus} />}
+            <span>checked {formatDate(readiness.verified_at)}</span>
+            <span className="font-mono">{shortCommit(build.commit)}</span>
+            {build.engine_fingerprint && <span className="font-mono">engine {String(build.engine_fingerprint).slice(0, 10)}</span>}
+          </div>
+
+          <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3 xl:grid-cols-6">
+            <Metric label="Last numbers check" value={formatDate(trust.last_audit_at)} />
+            <Metric label="Last PDF" value={formatDate(trust.last_pdf_at)} />
+            <Metric
+              label="Build"
+              value={`${trust.build_tag && trust.build_tag !== 'unknown' ? trust.build_tag : 'untagged'} / ${shortCommit(trust.build_commit || build.commit)}`}
+              title={trust.engine_fingerprint ? `Engine ${trust.engine_fingerprint}` : undefined}
+            />
+            <Metric label="Rules" value={trust.ruleset_version != null ? `Ruleset v${trust.ruleset_version}` : 'Not recorded'} />
+            <Metric label="Golden baseline" value={trust.golden_baseline_version ? `Version ${trust.golden_baseline_version}` : 'Not captured'} />
+            <Metric
+              label="Source evidence"
+              value={`${trust.verified_source_count || 0} verified / ${trust.unverified_source_count || 0} unverified`}
+            />
+            <Metric
+              label="Dropbox mode"
+              value={trust.vendor_source_mode === 'browser_local_sync_folder' ? 'Local folder only' : 'Not recorded'}
+              title={trust.vendor_source_automatic_sync === false ? 'Dropbox is scanned from a locally synced folder after the estimator picks it in Chrome. There is no automatic Dropbox cloud connection.' : undefined}
+            />
+            <Metric label="JR target" value={formatMoney(trust.jr_target_total)} />
+            <Metric label="Accepted proposal" value={formatMoney(trust.accepted_proposal_total)} />
+            <Metric
+              label={trust.replay_mode === 'current' ? 'Current replay' : 'Latest replay'}
+              value={formatMoney(trust.replay_total)}
+              title={trust.replay_status ? `Replay status: ${trust.replay_status}` : undefined}
+            />
+            <Metric label="Manual overrides" value={String(trust.manual_override_count || 0)} />
+            <Metric label="Typed prices" value={String(trust.manual_price_count || 0)} />
+            <Metric label="Unknown materials" value={String(trust.unknown_material_count || 0)} />
+            <Metric label="Low confidence" value={String(trust.low_confidence_material_count || 0)} />
+          </div>
+
+          {technicalChecks.length > 0 && (
+            <div className="mt-4 space-y-2">
+              {technicalChecks.map(check => (
+                <CheckRow key={check.id} check={check} />
+              ))}
+            </div>
+          )}
+
+          {vendorPriceOverrides.length > 0 && (
+            <div className="mt-4 border-t border-white/[0.06] pt-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-[10px] font-semibold uppercase text-gray-500">Prices kept on purpose</p>
+                <span className="text-[10px] font-semibold uppercase text-gray-500">
+                  {trust.vendor_price_override_count || vendorPriceOverrides.length} with a reason
+                </span>
+              </div>
+              <div className="mt-2 divide-y divide-white/[0.05] border-y border-white/[0.06]">
+                {vendorPriceOverrides.map((row, index) => (
+                  <div key={`${row.decision_id}-${index}`} className="grid gap-1 py-2 text-xs sm:grid-cols-[minmax(0,1fr)_auto] sm:gap-x-5">
+                    <div className="min-w-0">
+                      <p className="font-semibold text-gray-200">{row.item_code}</p>
+                      <p className="mt-0.5 break-words leading-5 text-gray-500">{row.reason}</p>
+                    </div>
+                    <div className="text-left tabular-nums text-gray-400 sm:text-right">
+                      <p>{formatMoney(row.accepted_price)} kept vs {formatMoney(row.quote_price)}</p>
+                      <p className="mt-0.5 text-[11px] text-gray-600">{row.reviewer_name} / {formatDate(row.created_at)}</p>
                     </div>
                   </div>
-                  <div className="mt-2 hidden max-h-56 overflow-auto border-y border-white/[0.06] sm:block">
-                    <table className="w-full min-w-[580px] text-xs">
-                      <thead className="sticky top-0 bg-[#111827] text-[10px] uppercase text-gray-500">
-                        <tr>
-                          <th className="px-2 py-2 text-left font-semibold">Material</th>
-                          <th className="px-2 py-2 text-right font-semibold">Accepted</th>
-                          <th className="px-2 py-2 text-right font-semibold">Quote</th>
-                          <th className="px-2 py-2 text-right font-semibold">Difference</th>
-                          <th className="px-2 py-2 text-left font-semibold">Source</th>
-                          {onResolveVendorConflict && <th className="px-2 py-2 text-right font-semibold">Action</th>}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-white/[0.04]">
-                        {vendorPriceConflicts.map((row, index) => (
-                          <tr key={`${row.material_id}-${row.source_hash}-${index}`} className="text-gray-300">
-                            <td className="px-2 py-2 font-semibold text-gray-200">{row.item_code}</td>
-                            <td className="px-2 py-2 text-right tabular-nums">{formatMoney(row.accepted_price)} / {row.accepted_unit}</td>
-                            <td className="px-2 py-2 text-right tabular-nums">{formatMoney(row.quote_price)} / {row.quote_unit}</td>
-                            <td className="px-2 py-2 text-right font-semibold tabular-nums text-amber-300">{formatMoney(row.delta)}</td>
-                            <td className="max-w-52 truncate px-2 py-2 text-gray-500" title={row.source_file}>{row.source_file || 'Verified quote'}</td>
-                            {onResolveVendorConflict && (
-                              <td className="px-2 py-2 text-right">
-                                <button
-                                  type="button"
-                                  onClick={() => setSelectedConflict(row)}
-                                  className="btn-secondary inline-flex min-h-8 items-center gap-1.5 px-2.5 text-xs"
-                                >
-                                  <Check className="h-3.5 w-3.5" />
-                                  Review
-                                </button>
-                              </td>
-                            )}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-            </div>
-            {onRecoverEvidence && (
-              <button onClick={onRecoverEvidence} className="btn-secondary flex items-center justify-center gap-2 text-sm sm:flex-shrink-0">
-                <Upload className="h-4 w-4" />
-                Repair quote receipts
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {vendorPriceOverrides.length > 0 && (
-        <div className="mt-4 border-t border-amber-500/20 pt-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-xs font-bold uppercase text-amber-300">Reviewed vendor price overrides</p>
-            <span className="text-[10px] font-semibold uppercase text-gray-500">
-              {trust.vendor_price_override_count || vendorPriceOverrides.length} documented
-            </span>
-          </div>
-          <div className="mt-2 divide-y divide-white/[0.05] border-y border-white/[0.06]">
-            {vendorPriceOverrides.map((row, index) => (
-              <div key={`${row.decision_id}-${index}`} className="grid gap-1 py-2 text-xs sm:grid-cols-[minmax(0,1fr)_auto] sm:gap-x-5">
-                <div className="min-w-0">
-                  <p className="font-semibold text-gray-200">{row.item_code}</p>
-                  <p className="mt-0.5 break-words leading-5 text-gray-500">{row.reason}</p>
-                </div>
-                <div className="text-left tabular-nums text-gray-400 sm:text-right">
-                  <p>{formatMoney(row.accepted_price)} kept vs {formatMoney(row.quote_price)}</p>
-                  <p className="mt-0.5 text-[11px] text-gray-600">{row.reviewer_name} / {formatDate(row.created_at)}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {trust.largest_deltas?.length > 0 && (
-        <div className="mt-4 border-t border-white/[0.06] pt-3">
-          <p className="text-[10px] font-semibold uppercase text-gray-500">
-            {trust.largest_deltas.some(delta => delta.target_source === 'jr') ? 'Largest JR bundle deltas' : 'Largest replay deltas'}
-          </p>
-          <div className="mt-2 flex flex-wrap gap-x-5 gap-y-2">
-            {trust.largest_deltas.map((delta, index) => (
-              <span key={`${delta.bundle_name}-${index}`} className={delta.status === 'fail' ? 'text-sm text-red-300' : delta.status === 'warn' ? 'text-sm text-amber-300' : 'text-sm text-gray-300'}>
-                {delta.bundle_name || `Bundle ${index + 1}`}: {formatMoney(delta.delta)}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {important.length > 0 ? (
-        <div className="mt-4 space-y-2">
-          {important.map(check => (
-            <div key={check.id} className="flex items-start gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-              <CheckIcon status={check.status} />
-              <div className="min-w-0 flex-1">
-                <p className="text-sm text-gray-200">{check.message}</p>
-                {check.affected_items?.length > 0 && (
-                  <p className="mt-1 truncate text-xs text-gray-500">{check.affected_items.slice(0, 6).join(', ')}{check.affected_items.length > 6 ? '...' : ''}</p>
-                )}
+                ))}
               </div>
             </div>
-          ))}
+          )}
+
+          {trust.largest_deltas?.length > 0 && (
+            <div className="mt-4 border-t border-white/[0.06] pt-3">
+              <p className="text-[10px] font-semibold uppercase text-gray-500">
+                {trust.largest_deltas.some(delta => delta.target_source === 'jr') ? 'Largest JR bundle deltas' : 'Largest replay deltas'}
+              </p>
+              <div className="mt-2 flex flex-wrap gap-x-5 gap-y-2">
+                {trust.largest_deltas.map((delta, index) => (
+                  <span key={`${delta.bundle_name}-${index}`} className={delta.status === 'fail' ? 'text-sm text-red-300' : delta.status === 'warn' ? 'text-sm text-amber-300' : 'text-sm text-gray-300'}>
+                    {delta.bundle_name || `Bundle ${index + 1}`}: {formatMoney(delta.delta)}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {onRecoverEvidence && trust.evidence_recovery_needed && (
+            <button type="button" onClick={onRecoverEvidence} className="btn-secondary mt-4 flex items-center justify-center gap-2 text-xs">
+              <Upload className="h-3.5 w-3.5" />
+              Repair quote receipts
+            </button>
+          )}
         </div>
-      ) : (
-        <div className="mt-4 flex items-center gap-2 rounded-lg border border-emerald-500/15 bg-emerald-500/[0.04] px-3 py-2 text-sm text-emerald-200">
-          <CheckCircle2 className="w-4 h-4" />
-          All required readiness checks passed.
-        </div>
-      )}
+      </details>
     </section>
     {selectedConflict && onResolveVendorConflict && (
       <PriceDecisionDialog

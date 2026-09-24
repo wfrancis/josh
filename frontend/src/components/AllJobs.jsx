@@ -2,12 +2,12 @@ import { useState, useEffect } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import {
   Plus, Building2, User, Loader2, ChevronRight,
-  Search, FolderOpen, Trash2, Copy
+  Search, FolderOpen, Trash2, Copy, CheckCircle2, X
 } from 'lucide-react'
 import { api } from '../api'
 import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge'
 import BidStatusBadge from './BidStatusBadge'
-import ConfirmDialog from './ConfirmDialog'
+import DeleteBidDialog from './DeleteBidDialog'
 
 export default function AllJobs() {
   const navigate = useNavigate()
@@ -16,7 +16,8 @@ export default function AllJobs() {
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState(new Set())
   const [deleting, setDeleting] = useState(false)
-  const [confirmDialog, setConfirmDialog] = useState(null)
+  const [askDeleteReason, setAskDeleteReason] = useState(false)
+  const [deleteNotice, setDeleteNotice] = useState('')
 
   useEffect(() => {
     api.listJobs()
@@ -56,26 +57,26 @@ export default function AllJobs() {
     else setSelected(new Set(filtered.map(j => j.id)))
   }
 
+  // Deleting only hides bids (they move to Deleted bids); a reason is required.
   const handleBulkDelete = () => {
-    setConfirmDialog({
-      title: 'Delete Jobs',
-      message: `Delete ${selected.size} job${selected.size !== 1 ? 's' : ''}? All materials, pricing, and bid data will be permanently removed.`,
-      confirmLabel: `Delete ${selected.size} Job${selected.size !== 1 ? 's' : ''}`,
-      confirmVariant: 'danger',
-      onConfirm: async () => {
-        setConfirmDialog(null)
-        setDeleting(true)
-        try {
-          await api.bulkDeleteJobs([...selected])
-          setJobs(prev => prev.filter(j => !selected.has(j.id)))
-          setSelected(new Set())
-        } catch (err) {
-          console.error(err)
-        } finally {
-          setDeleting(false)
-        }
-      }
-    })
+    setDeleteNotice('')
+    setAskDeleteReason(true)
+  }
+
+  const confirmBulkDelete = async (reason) => {
+    const ids = [...selected]
+    setDeleting(true)
+    try {
+      const result = await api.bulkDeleteJobs(ids, reason)
+      const removed = new Set(ids)
+      setJobs(prev => prev.filter(j => !removed.has(j.id)))
+      setSelected(new Set())
+      setAskDeleteReason(false)
+      const count = Number(result?.deleted ?? ids.length)
+      setDeleteNotice(`Moved ${count} bid${count === 1 ? '' : 's'} to Deleted bids. An admin can restore ${count === 1 ? 'it' : 'them'}.`)
+    } finally {
+      setDeleting(false)
+    }
   }
 
   if (loading) {
@@ -99,6 +100,16 @@ export default function AllJobs() {
           New Job
         </button>
       </div>
+
+      {deleteNotice && (
+        <div role="status" className="flex items-start gap-2 px-4 py-3 mb-6 rounded-xl text-sm border bg-emerald-500/10 border-emerald-500/20 text-emerald-300">
+          <CheckCircle2 className="w-4 h-4 flex-shrink-0 mt-0.5" />
+          <span className="flex-1">{deleteNotice}</span>
+          <button type="button" onClick={() => setDeleteNotice('')} title="Dismiss" className="flex-shrink-0 opacity-70 hover:opacity-100">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Search */}
       {jobs.length > 0 && (
@@ -234,7 +245,13 @@ export default function AllJobs() {
         </div>
       )}
 
-      <ConfirmDialog {...confirmDialog} open={!!confirmDialog} onCancel={() => setConfirmDialog(null)} />
+      <DeleteBidDialog
+        open={askDeleteReason}
+        count={selected.size}
+        bidName={selected.size === 1 ? (jobs.find(j => selected.has(j.id))?.project_name || '') : ''}
+        onConfirm={confirmBulkDelete}
+        onCancel={() => { if (!deleting) setAskDeleteReason(false) }}
+      />
     </div>
   )
 }
