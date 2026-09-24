@@ -22,6 +22,24 @@ def _slugify(text: str) -> str:
 
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "si_bid_tool.db"))
 
+# Optional job fields printed on the customer Estimate PDF header (JobRunner
+# layout). All are free text; blank values print as empty boxes/lines.
+JOB_ESTIMATE_HEADER_FIELDS: tuple[str, ...] = (
+    "quote_number",
+    "customer_po",
+    "contract_number",
+    "salesperson2",
+    "customer_account",
+    "customer_address",
+    "customer_city",
+    "customer_state",
+    "customer_zip",
+    "customer_phone",
+    "customer_fax",
+    "site_phone",
+    "site_contact",
+)
+
 
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -496,6 +514,10 @@ def init_db() -> None:
             ("golden_version_id", "ALTER TABLE golden_job_replays ADD COLUMN golden_version_id INTEGER"),
             ("job_quote_source_hash", "ALTER TABLE job_quotes ADD COLUMN source_hash TEXT"),
             ("vendor_price_source_hash", "ALTER TABLE vendor_prices ADD COLUMN source_hash TEXT"),
+            *[
+                (f"job_{column}", f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
+                for column in JOB_ESTIMATE_HEADER_FIELDS
+            ],
         ]:
             try:
                 conn.execute(sql)
@@ -628,6 +650,18 @@ def save_job(job_data: dict) -> int:
                 bid_data_val, job_data.get("architect"), job_data.get("designer"),
                 proposal_data_val, job_data.get("textura_fee", 0), job_id
             ))
+            # Estimate header fields are optional and only written when the
+            # caller sends them, so partial job dicts never blank them out.
+            header_updates = [
+                (column, job_data.get(column))
+                for column in JOB_ESTIMATE_HEADER_FIELDS
+                if column in job_data
+            ]
+            if header_updates:
+                conn.execute(
+                    f"UPDATE jobs SET {', '.join(f'{column}=?' for column, _ in header_updates)} WHERE id=?",
+                    [value for _, value in header_updates] + [job_id],
+                )
         else:
             slug = _make_unique_slug(conn, slug)
             cur = conn.execute("""
@@ -650,6 +684,16 @@ def save_job(job_data: dict) -> int:
                 datetime.now().isoformat()
             ))
             job_id = cur.lastrowid
+            header_values = [
+                (column, job_data.get(column))
+                for column in JOB_ESTIMATE_HEADER_FIELDS
+                if job_data.get(column) is not None
+            ]
+            if header_values:
+                conn.execute(
+                    f"UPDATE jobs SET {', '.join(f'{column}=?' for column, _ in header_values)} WHERE id=?",
+                    [value for _, value in header_values] + [job_id],
+                )
         conn.commit()
         return job_id
     finally:
@@ -1033,6 +1077,34 @@ def get_latest_completed_calculation_run(
             else:
                 result[dest] = {}
         return result
+    finally:
+        conn.close()
+
+
+def get_first_calculation_run_started_at(
+    job_id: int,
+    run_types: set[str] | list[str] | tuple[str, ...],
+) -> str | None:
+    """started_at of the job's oldest completed run of any requested type."""
+    normalized_types = sorted({str(run_type).strip() for run_type in run_types if str(run_type).strip()})
+    if not normalized_types:
+        return None
+
+    placeholders = ", ".join("?" for _ in normalized_types)
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            f"""
+            SELECT started_at FROM calculation_runs
+            WHERE job_id=?
+              AND status='completed'
+              AND run_type IN ({placeholders})
+            ORDER BY started_at ASC, id ASC
+            LIMIT 1
+            """,
+            (job_id, *normalized_types),
+        ).fetchone()
+        return row["started_at"] if row else None
     finally:
         conn.close()
 

@@ -50,12 +50,14 @@ from models import (
     get_active_rules, seed_rules_registry_defaults,
     create_calculation_run, save_calculation_traces, complete_calculation_run,
     list_calculation_runs, get_latest_completed_calculation_run, get_calculation_traces,
+    get_first_calculation_run_started_at,
     record_material_price_decision, list_material_price_decisions,
     upsert_golden_job, get_golden_job_for_source, get_golden_replay,
     save_golden_replay, list_golden_replays_for_job, list_golden_replays_for_version,
     get_latest_golden_replay_for_version,
+    JOB_ESTIMATE_HEADER_FIELDS,
 )
-from rfms_parser import ai_merge_materials, disambiguate_item_codes, infer_material_type_fallback, parse_rfms
+from rfms_parser import infer_material_type_fallback, label_uploaded_lines, merge_reupload_materials, parse_rfms
 from quote_parser import (
     MAX_QUOTE_FILE_BYTES,
     parse_quote_file,
@@ -837,6 +839,20 @@ class JobCreate(BaseModel):
     architect: Optional[str] = None
     designer: Optional[str] = None
     textura_fee: int = 0
+    # Optional Estimate PDF header fields (see models.JOB_ESTIMATE_HEADER_FIELDS)
+    quote_number: Optional[str] = None
+    customer_po: Optional[str] = None
+    contract_number: Optional[str] = None
+    salesperson2: Optional[str] = None
+    customer_account: Optional[str] = None
+    customer_address: Optional[str] = None
+    customer_city: Optional[str] = None
+    customer_state: Optional[str] = None
+    customer_zip: Optional[str] = None
+    customer_phone: Optional[str] = None
+    customer_fax: Optional[str] = None
+    site_phone: Optional[str] = None
+    site_contact: Optional[str] = None
 
 
 class MaterialUpdate(BaseModel):
@@ -1619,6 +1635,11 @@ def api_duplicate_job(job_id: str):
         "designer": job.get("designer"),
         "textura_fee": job.get("textura_fee", 0),
     }
+    # Customer and site details carry over; the copy gets its own quote,
+    # PO and contract numbers.
+    for field in JOB_ESTIMATE_HEADER_FIELDS:
+        if field not in ("quote_number", "customer_po", "contract_number"):
+            new_job[field] = job.get(field)
     new_id = save_job(new_job)
 
     # Copy materials (strip id and job_id)
@@ -1665,6 +1686,20 @@ class JobUpdate(BaseModel):
     architect: Optional[str] = None
     designer: Optional[str] = None
     textura_fee: Optional[int] = None
+    # Estimate PDF header fields; send "" to clear one.
+    quote_number: Optional[str] = None
+    customer_po: Optional[str] = None
+    contract_number: Optional[str] = None
+    salesperson2: Optional[str] = None
+    customer_account: Optional[str] = None
+    customer_address: Optional[str] = None
+    customer_city: Optional[str] = None
+    customer_state: Optional[str] = None
+    customer_zip: Optional[str] = None
+    customer_phone: Optional[str] = None
+    customer_fax: Optional[str] = None
+    site_phone: Optional[str] = None
+    site_contact: Optional[str] = None
 
 @app.put("/api/jobs/{job_id}")
 def api_update_job(job_id: str, body: JobUpdate):
@@ -1781,56 +1816,44 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
     }
     save_job(job_update)
 
-    # AI merge if job already has materials, otherwise use raw parsed
-    existing_materials = job.get("materials", [])
-    if existing_materials:
-        print(f"[rfms_upload] Job has {len(existing_materials)} existing materials, running AI merge")
-        merged_raw = ai_merge_materials(existing_materials, all_materials_raw)
-    else:
-        # First upload — just use the parsed materials directly
-        merged_raw = []
-        for m in all_materials_raw:
-            merged_raw.append({
-                "item_code": m.get("item_code"),
-                "description": m.get("description"),
-                "material_type": m.get("material_type", "unknown"),
-                "installed_qty": m.get("qty", 0),
-                "unit": m.get("unit"),
-                "area_type": m.get("area_type", "unit"),
-                "tack_strip_lf": m.get("tack_strip_lf", 0),
-                "seam_tape_lf": m.get("seam_tape_lf", 0),
-                "pad_sy": m.get("pad_sy", 0),
-                "is_mosaic": m.get("is_mosaic", False),
-                "is_penny_hex": m.get("is_penny_hex", False),
-                "crack_isolation_sf": m.get("crack_isolation_sf", 0),
-            })
+    # Give the newly parsed lines their final codes before any merge, so a
+    # re-parsed line always gets the same code. On a re-upload a line that
+    # replaces a saved line keeps the saved line's code (merge_reupload_materials),
+    # so saved codes are not renamed. Lines that share a code (e.g. the same
+    # label in the units and common-area files) are kept and given their own
+    # code, never silently dropped.
+    label_uploaded_lines(all_materials_raw)
+    new_lines = []
+    for m in all_materials_raw:
+        new_lines.append({
+            "item_code": m.get("item_code"),
+            "description": m.get("description"),
+            "material_type": m.get("material_type", "unknown"),
+            "installed_qty": m.get("qty", 0),
+            "unit": m.get("unit"),
+            "area_type": m.get("area_type", "unit"),
+            "tack_strip_lf": m.get("tack_strip_lf", 0),
+            "seam_tape_lf": m.get("seam_tape_lf", 0),
+            "pad_sy": m.get("pad_sy", 0),
+            "is_mosaic": m.get("is_mosaic", False),
+            "is_penny_hex": m.get("is_penny_hex", False),
+            "crack_isolation_sf": m.get("crack_isolation_sf", 0),
+        })
 
-    # Drop only true duplicates (the same line uploaded twice). Different lines
-    # that share an item_code (e.g. the same label in the units and common-area
-    # files) are kept and given their own code, never silently dropped.
-    seen_lines = set()
-    deduped = []
-    for m in merged_raw:
-        line_key = (
-            str(m.get("item_code") or "").upper(),
-            re.sub(r"\s+", " ", str(m.get("description") or "")).strip().lower(),
-            m.get("area_type"),
-            round(float(m.get("installed_qty") or 0), 2),
-        )
-        if line_key in seen_lines:
-            continue
-        seen_lines.add(line_key)
-        deduped.append(m)
-    code_counts = {}
-    for m in deduped:
-        key = str(m.get("item_code") or "").upper()
-        code_counts[key] = code_counts.get(key, 0) + 1
-    for m in deduped:
-        key = str(m.get("item_code") or "").upper()
-        if key and code_counts[key] > 1 and m.get("area_type") == "common":
-            m["item_code"] = f"{m.get('item_code')} (Common Area)"
-    disambiguate_item_codes(deduped)
-    merged_raw = deduped
+    # Re-upload onto a job with saved lines: each new line replaces the saved
+    # line with the same description and area (new qty; saved id, code, price,
+    # vendor, quote, labor and fixture fields). Saved lines of an area the
+    # upload covers that it no longer has (changed or removed in the revised
+    # takeoff, or surplus duplicates) are dropped; saved lines of other areas
+    # stay; new lines are added. Deterministic, so uploading the same takeoff
+    # again never adds lines.
+    existing_materials = job.get("materials", [])
+    dropped_saved_lines: list[dict] = []
+    if existing_materials:
+        print(f"[rfms_upload] Job has {len(existing_materials)} existing materials, merging by description and area")
+        merged_raw = merge_reupload_materials(existing_materials, new_lines, dropped=dropped_saved_lines)
+    else:
+        merged_raw = new_lines
 
     # Load waste factors from DB (falls back to config defaults)
     import json as _json
@@ -1840,31 +1863,28 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
     # Load price list for auto-pricing
     _price_list = get_price_list_entries()
 
-    # The merge keeps unit_price/vendor but drops price_source, quote_status and
-    # fixture_count. For a transition priced by the stick (transition rule, price
-    # book, or a typed stick price on an EA line) that would bill the new LF times
-    # the stick price, so find the line it came from to keep stick pricing.
-    prior_piece_lines: dict[str, dict] = {}
-    prior_code_counts: dict[str, int] = {}
+    # A line priced by the stick (transition rule, price book, or a typed stick
+    # price on an EA line) must keep stick pricing on the new LF, or it would
+    # bill the new LF times the stick price. Picked by pricing evidence, not
+    # material type: the classifier types a Schluter profile by its adjacent
+    # floor (wall_tile, floor_tile, vct, ...), and the price book prices those
+    # by the stick with unit EA. Each merged line knows the saved line it came from.
+    prior_piece_lines: dict[int, dict] = {}
     for em in existing_materials:
-        code = str(em.get("item_code") or "").strip()
-        if code:
-            prior_code_counts[code] = prior_code_counts.get(code, 0) + 1
-    for em in existing_materials:
-        code = str(em.get("item_code") or "").strip()
-        if not code or prior_code_counts[code] != 1:
-            continue
-        if (em.get("material_type") or "").strip().lower() != "transitions":
-            continue
         if (_as_number(em.get("unit_price")) or 0) <= 0:
             continue
         source = str(em.get("price_source") or "").strip().lower()
-        ea_sticks = (
-            str(em.get("unit") or "").strip().upper() == "EA"
-            and not _order_qty_is_lf(em, em.get("order_qty"))
+        is_transition = (em.get("material_type") or "").strip().lower() == "transitions"
+        is_ea = str(em.get("unit") or "").strip().upper() == "EA"
+        ea_sticks = is_ea and not _order_qty_is_lf(em, em.get("order_qty"))
+        stick_product = is_transition or any(
+            name in f"{em.get('vendor') or ''} {em.get('description') or ''}".lower()
+            for name in ("schluter", "silver pin")
         )
-        if source in ("price_book", "default_rule") or (source == "manual" and ea_sticks):
-            prior_piece_lines[code] = em
+        if source in ("price_book", "default_rule") and (is_transition or is_ea):
+            prior_piece_lines[id(em)] = em
+        elif source == "manual" and ea_sticks and stick_product:
+            prior_piece_lines[id(em)] = em
 
     # Apply waste factors to the final merged list
     materials = []
@@ -1875,14 +1895,13 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         order_qty = installed_qty * (1 + waste_pct)
 
         # Auto-price from internal price list and price books
-        unit_price = m.get("unit_price", 0)
-        vendor = m.get("vendor", "")
+        unit_price = m.get("unit_price") or 0
+        vendor = m.get("vendor") or ""
         price_source = m.get("price_source")
-        prior = prior_piece_lines.get(str(m.get("item_code") or "").strip())
+        saved_line = m.get("_existing")
+        prior = prior_piece_lines.get(id(saved_line)) if saved_line is not None else None
         if not (
             prior
-            and not price_source
-            and (material_type or "").strip().lower() == "transitions"
             and abs((_as_number(unit_price) or 0) - (_as_number(prior.get("unit_price")) or 0)) <= 0.005
         ):
             prior = None
@@ -1911,28 +1930,44 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
 
         # Set quote_status for unpriced materials
         quote_status = m.get("quote_status")
+        if unit_price and not m.get("unit_price"):
+            quote_status = None  # priced just now; a saved "needs price" no longer applies
         if not unit_price and not quote_status:
             quote_status = "needs_quote" if QUOTE_EMAILS_ENABLED else "needs_price"
 
         unit = unit_override or m.get("unit")
         pricing_qty = round(order_qty, 2)
         carried = {}
+        if saved_line is not None:
+            # Labor, fixture and quote/freight evidence of the saved line.
+            carried = {
+                field: m.get(field)
+                for field in (
+                    "fixture_count", "labor_rate_lf", "labor_catalog",
+                    "quote_source_hash", "quote_file_name",
+                    "freight_per_unit", "freight_source",
+                )
+                if m.get(field) is not None
+            }
         if prior:
             # Keep stick pricing on the new LF (same rule as api_update_materials).
             price_source = prior.get("price_source")
             quote_status = prior.get("quote_status")
             vendor = vendor or prior.get("vendor") or ""
-            carried = {
+            carried.update({
                 "fixture_count": prior.get("fixture_count") or 0,
                 "labor_rate_lf": prior.get("labor_rate_lf") or 0,
                 "labor_catalog": prior.get("labor_catalog"),
-            }
+            })
             pricing_qty = _transition_pieces(order_qty, vendor, carried["fixture_count"])
             unit = prior.get("unit") or unit
             if str(unit or "").strip().upper() == "EA":
                 order_qty = pricing_qty
 
         materials.append({
+            # A line that replaces (or keeps) a saved line keeps its id, so its
+            # reviewer price decisions stay attached (save_materials retains ids).
+            **({"id": saved_line.get("id")} if saved_line is not None and saved_line.get("id") is not None else {}),
             **carried,
             "item_code": m.get("item_code"),
             "description": m.get("description"),
@@ -1982,6 +2017,22 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
 
     file_names = [f.filename for f in files if hasattr(f, 'filename')]
     log_activity(db_id, "rfms_uploaded", f"Uploaded {len(file_names)} RFMS file(s), {len(materials)} materials parsed", {"files": file_names, "material_count": len(materials)})
+    removed_materials = [
+        {
+            "item_code": em.get("item_code"),
+            "description": em.get("description"),
+            "area_type": em.get("area_type") or "unit",
+            "extended_cost": em.get("extended_cost"),
+        }
+        for em in dropped_saved_lines
+    ]
+    if removed_materials:
+        log_activity(
+            db_id,
+            "rfms_lines_removed",
+            f"Re-upload removed {len(removed_materials)} saved line(s) the revised takeoff no longer has",
+            {"files": file_names, "lines": removed_materials},
+        )
 
     updated_job = load_job(db_id) or {}
     return {
@@ -1989,6 +2040,7 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
         "slug": updated_job.get("slug"),
         "job_info": rfms_job_info,
         "materials": materials,
+        "removed_materials": removed_materials,
     }
 
 
@@ -6900,6 +6952,26 @@ async def api_generate_proposal_pdf(job_id: str, request: Request):
         "unit_count": job.get("unit_count", 0),
         "salesperson": job.get("salesperson") or "Standard Interiors",
     }
+    # Estimate header fields (Quote # falls back to the job id in the PDF).
+    for field in JOB_ESTIMATE_HEADER_FIELDS:
+        job_info[field] = str(job.get(field) or "").strip()
+    # The header 'Date' box is the quote's date, which stays the same on every
+    # re-print: a stored quote date, else the first proposal generation, else
+    # the job's creation. The PDF uses the print date only if none is set.
+    job_info["quote_date"] = (
+        str(job.get("quote_date") or "").strip()
+        or get_first_calculation_run_started_at(job["id"], {"proposal_generation"})
+        or str(job.get("created_at") or "").strip()
+    )
+    # The job's own "X is excluded at this time" lines print with the notes.
+    try:
+        job_exclusions = _json.loads(job.get("exclusions") or "[]")
+    except (TypeError, ValueError):
+        job_exclusions = []
+    job_info["excluded_at_this_time"] = [
+        str(line).strip() for line in (job_exclusions if isinstance(job_exclusions, list) else [])
+        if str(line or "").strip()
+    ]
 
     proposal_data = {
         "job_info": job_info,

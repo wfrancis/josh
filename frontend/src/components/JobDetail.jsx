@@ -22,6 +22,24 @@ import StatusBadge, { getJobConfidenceStatus, getJobStatus } from './StatusBadge
 import ConfirmDialog from './ConfirmDialog'
 import ActivityLog from './ActivityLog'
 
+// Optional fields printed on the customer Estimate PDF header (JobRunner layout).
+// Blank fields print as empty boxes/lines.
+const ESTIMATE_HEADER_FIELDS = [
+  { key: 'quote_number', label: 'Quote #', placeholder: 'Defaults to job ID' },
+  { key: 'customer_po', label: 'Customer PO', placeholder: 'Customer PO' },
+  { key: 'contract_number', label: 'Contract #', placeholder: 'Contract #' },
+  { key: 'salesperson2', label: 'Sales Person 2', placeholder: 'Sales Person 2' },
+  { key: 'customer_account', label: 'Customer Acct #', placeholder: 'Acct #' },
+  { key: 'customer_phone', label: 'Customer Phone', placeholder: '303 555-0100' },
+  { key: 'customer_fax', label: 'Customer Fax', placeholder: 'Fax' },
+  { key: 'customer_address', label: 'Customer Address', placeholder: 'Street Address' },
+  { key: 'customer_city', label: 'Customer City', placeholder: 'City' },
+  { key: 'customer_state', label: 'Customer State', placeholder: 'ST' },
+  { key: 'customer_zip', label: 'Customer ZIP', placeholder: 'ZIP' },
+  { key: 'site_phone', label: 'Job Site Phone', placeholder: '303 555-0100' },
+  { key: 'site_contact', label: 'Job Site Contact', placeholder: 'Name and phone' },
+]
+
 export default function JobDetail() {
   const { jobId } = useParams()
   const navigate = useNavigate()
@@ -111,6 +129,7 @@ export default function JobDetail() {
       architect: job.architect || '',
       designer: job.designer || '',
       textura_fee: job.textura_fee || 0,
+      ...Object.fromEntries(ESTIMATE_HEADER_FIELDS.map(({ key }) => [key, job[key] || ''])),
     })
     setEditing(true)
   }
@@ -138,6 +157,8 @@ export default function JobDetail() {
         architect: editForm.architect || null,
         designer: editForm.designer || null,
         textura_fee: editForm.textura_fee ? 1 : 0,
+        // Sent as strings (not null) so clearing a field saves it blank.
+        ...Object.fromEntries(ESTIMATE_HEADER_FIELDS.map(({ key }) => [key, (editForm[key] || '').trim()])),
       }
       await api.updateJob(jobId, updates)
       const updated = await api.getJob(jobId)
@@ -463,6 +484,19 @@ export default function JobDetail() {
                     placeholder="Designer" />
                 </label>
               </div>
+              <div>
+                <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider block mb-2">Estimate PDF Header</span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {ESTIMATE_HEADER_FIELDS.map(({ key, label, placeholder }) => (
+                    <label key={key} className="block">
+                      <span className="text-xs text-gray-500 mb-1 block">{label}</span>
+                      <input type="text" value={editForm[key] || ''} onChange={e => setEditForm(f => ({ ...f, [key]: e.target.value }))}
+                        className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:border-si-bright/50 focus:outline-none"
+                        placeholder={placeholder} />
+                    </label>
+                  ))}
+                </div>
+              </div>
               <div className="flex items-center gap-2">
                 <button onClick={saveEditing} disabled={editSaving || !editForm.project_name?.trim()}
                   className="btn-primary text-sm px-4 py-2 flex items-center gap-2">
@@ -495,6 +529,11 @@ export default function JobDetail() {
                 {job.salesperson && (
                   <span className="flex items-center gap-1.5">
                     <User className="w-3.5 h-3.5" /> {job.salesperson}
+                  </span>
+                )}
+                {job.quote_number && (
+                  <span className="flex items-center gap-1.5">
+                    <Hash className="w-3.5 h-3.5" /> Quote {job.quote_number}
                   </span>
                 )}
                 {job.tax_rate > 0 && (

@@ -248,58 +248,132 @@ def _extract_item_label(desc: str) -> str:
 
 def _normalize_line(desc: str) -> str:
     """Lowercased description with the Install prefix, repeated scheme/option
-    prefixes, trailing colon and extra spaces removed, for line matching."""
+    prefixes, a dash after those prefixes, trailing colon and extra spaces
+    removed, for line matching."""
     text = re.sub(r"^\s*install\b", "", desc or "", flags=re.IGNORECASE)
     text = re.sub(r"^[\s\-–—]+", "", text)
     text = re.sub(r"(\([^)]*\)\s*)\1+", r"\1", text)
+    text = re.sub(r"^((?:\([^)]*\)\s*)+)[-–—]\s*", r"\1", text)
     text = re.sub(r"\s+", " ", text).strip().rstrip(":").strip().lower()
     return text
 
 
-def _location(desc: str) -> str:
-    """Text after the last '@' (the RFMS area name), lowercased."""
+def _collapse_code(code: str) -> str:
+    """Upper-cased code with a repeated scheme/option prefix collapsed, so
+    '(SCHEME A & B) (SCHEME A & B) DALTILE' compares equal to '(SCHEME A & B) DALTILE'."""
+    return re.sub(r"(\([^)]*\)\s*)\1+", r"\1", (code or "").upper()).strip()
+
+
+def _location_raw(desc: str) -> str:
+    """Text after the last '@' (the RFMS area name), as written."""
     if "@" not in (desc or ""):
         return ""
-    return re.sub(r"\s+", " ", desc.rsplit("@", 1)[1]).strip().rstrip(":").strip().lower()
+    return re.sub(r"\s+", " ", desc.rsplit("@", 1)[1]).strip().rstrip(":").strip()
 
 
-def _match_install_lines(desc: str, item_code: str, install_records: list) -> list:
-    """Install lines that belong to this material line: same description first,
-    then same label plus same @location. Empty when nothing matches exactly."""
+def _location(desc: str) -> str:
+    """Text after the last '@' (the RFMS area name), lowercased."""
+    return _location_raw(desc).lower()
+
+
+_MIN_PREFIX_MATCH = 15
+
+
+def _prefix_match_len(a: str, b: str) -> int:
+    """When one normalized description starts the other and the match ends at a
+    word boundary (end of text, space, '(' or ':'), the length of the shorter
+    one; otherwise 0. Short texts (under 15 characters) never prefix-match, so
+    't-1' does not match 't-10 floor tile'."""
+    short, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) < _MIN_PREFIX_MATCH or not longer.startswith(short):
+        return 0
+    if len(longer) == len(short) or longer[len(short)] in " (:":
+        return len(short)
+    return 0
+
+
+def _match_install_lines(desc: str, item_code: str, install_records: list, *,
+                         exact_only: bool = False, exclude=()) -> list[int]:
+    """Indexes of the install lines that belong to this material line.
+
+    1. Same normalized description.
+    2. Otherwise the single longest boundary-aware prefix match, for notes like
+       '(Size Assumed)' that appear on only one of the two lines. A tie between
+       different install lines is ambiguous and matches nothing.
+    3. Otherwise the same label plus the same @location.
+    Empty when nothing matches. exact_only stops after step 1. Install lines
+    in exclude (already taken by another line's exact match) are never
+    returned by steps 2 and 3; a prefix tie is still judged against all
+    install lines, so excluding one side of a tie does not make it a match."""
     target = _normalize_line(desc)
     if not target:
         return []
-    exact = [r for r in install_records if _normalize_line(r[0]) == target]
-    if exact:
+    norms = [_normalize_line(r[0]) for r in install_records]
+    exact = [i for i, n in enumerate(norms) if n == target]
+    if exact or exact_only:
         return exact
-    prefix = [
-        r for r in install_records
-        if len(_normalize_line(r[0])) >= 15
-        and (_normalize_line(r[0]).startswith(target) or target.startswith(_normalize_line(r[0])))
-    ]
-    if prefix:
-        return prefix
+    excluded = set(exclude)
+    best_len, best = 0, []
+    for i, n in enumerate(norms):
+        length = _prefix_match_len(target, n) if n else 0
+        if length > best_len:
+            best_len, best = length, [i]
+        elif length and length == best_len:
+            best.append(i)
+    if best and len({norms[i] for i in best}) == 1:
+        usable = [i for i in best if i not in excluded]
+        if usable:
+            return usable
     loc = _location(desc)
-    code = (item_code or "").upper()
+    code = _collapse_code(item_code)
     if loc and code:
-        return [r for r in install_records if (r[2] or "").upper() == code and _location(r[0]) == loc]
+        return [
+            i for i, r in enumerate(install_records)
+            if i not in excluded and _collapse_code(r[2]) == code and _location(r[0]) == loc
+        ]
     return []
 
 
+def _product_name(desc: str, label: str) -> str:
+    """First ' - ' part of the description (before the @location) that the label
+    does not already contain, e.g. 'Modern Hearth' for '(Scheme A & B) Daltile -
+    Modern Hearth - ...' or 'Daltile' for '(Standard) - F-102 - Daltile - ...'."""
+    body = desc.rsplit("@", 1)[0] if "@" in (desc or "") else (desc or "")
+    label_head = (label or "").split("@", 1)[0].strip().lower()
+    for part in body.split(" - "):
+        text = re.sub(r"\s+", " ", part).strip().rstrip(":").strip()
+        if not text or text.lower() in label_head:
+            continue
+        return text
+    return ""
+
+
 def _distinct_label(desc: str, label: str, level: int) -> str:
-    """A longer label built from the description, used when two lines share one."""
-    parts = [p.strip() for p in (desc or "").split(" - ") if p.strip()]
-    loc_raw = desc.rsplit("@", 1)[1].strip().rstrip(":").strip() if "@" in (desc or "") else ""
-    head = parts[0] if parts else label
-    if level >= 1 and len(parts) > 1:
-        head = f"{head} - {parts[1].split('@')[0].strip()}"
-    if loc_raw and "@" not in head:
-        return f"{head} @{loc_raw}"
-    return head
+    """A longer code for a line whose code another line also has, built from its
+    current code so the scheme/option prefix and spec code stay in it:
+    level 0 adds the @location ('(Standard) F-102 @Lobby'), level 1 adds the
+    product name before it ('(Standard) F-102 - Daltile @Lobby')."""
+    label = (label or "").strip()
+    loc = _location_raw(desc)
+    if level == 0:
+        if not loc or f"@{loc}".lower() in label.lower():
+            return label
+        if "@" in label:
+            # A label cut from the description at 30 characters, e.g.
+            # 'Vertical Exposed Edge Trim @W1': put the whole location back.
+            return f"{label.split('@', 1)[0].rstrip()} @{loc}"
+        return f"{label} @{loc}"
+    product = _product_name(desc, label)
+    if not product:
+        return label
+    if "@" in label:
+        head, tail = label.split("@", 1)
+        return f"{head.rstrip()} - {product} @{tail.lstrip()}"
+    return f"{label} - {product}"
 
 
 def disambiguate_item_codes(materials: list[dict]) -> None:
-    """Give lines that share an item_code their own code (label + @location,
+    """Give lines that share an item_code their own code (code + @location,
     then + product name, then #n), so no takeoff line is lost or merged."""
     for level in (0, 1):
         groups: dict[str, list[dict]] = {}
@@ -309,7 +383,7 @@ def disambiguate_item_codes(materials: list[dict]) -> None:
             if not code or len(group) < 2:
                 continue
             for m in group:
-                m["item_code"] = _distinct_label(m.get("description") or "", m.get("item_code") or "", level)
+                m["item_code"] = _distinct_label(m.get("description") or "", str(m.get("item_code") or ""), level)
     seen: dict[str, int] = {}
     for m in materials:
         code = str(m.get("item_code") or "")
@@ -319,6 +393,22 @@ def disambiguate_item_codes(materials: list[dict]) -> None:
             m["item_code"] = f"{code} #{seen[key]}"
         else:
             seen[key] = 1
+
+
+def label_uploaded_lines(materials: list[dict]) -> None:
+    """Final item codes for the lines parsed from one upload (all files), set
+    before they are merged with a job's saved lines so a re-parsed line always
+    gets the same code. A code found in more than one file gets ' (Common Area)'
+    on its common-area line; any code still shared is made distinct."""
+    code_counts: dict[str, int] = {}
+    for m in materials:
+        key = str(m.get("item_code") or "").upper()
+        code_counts[key] = code_counts.get(key, 0) + 1
+    for m in materials:
+        key = str(m.get("item_code") or "").upper()
+        if key and code_counts[key] > 1 and m.get("area_type") == "common":
+            m["item_code"] = f"{m.get('item_code')} (Common Area)"
+    disambiguate_item_codes(materials)
 
 
 # ── AI Classification ────────────────────────────────────────────────────────
@@ -597,15 +687,7 @@ def parse_rfms(file_path: str) -> dict:
     ai_results = _classify_with_ai(ai_input, install_lines)
 
     # ── Build materials list ─────────────────────────────────────────────────
-    # Several material lines can share a short label (e.g. two "(Scheme A & B)
-    # Daltile" lines for shower vs tub surrounds), so each line is matched to
-    # its own install line by description, not just by label.
-    label_counts: dict[str, int] = {}
-    for _, desc, _ in material_lines:
-        key = (_extract_item_label(desc) or "").upper()
-        label_counts[key] = label_counts.get(key, 0) + 1
-
-    materials = []
+    kept_lines = []  # (index, description, qty, material_type, ai_confidence)
     for i, desc, qty in material_lines:
         # AI is primary classifier; if it returns "unknown" we fall back to
         # deterministic item-code/keyword rules so B-xxx/WM-xxx/RF-xxx etc.
@@ -622,21 +704,59 @@ def parse_rfms(file_path: str) -> dict:
         # Skip if AI classified as sundry
         if material_type == "sundry":
             continue
+        kept_lines.append((i, desc, qty, material_type, ai_confidence))
 
+    # A label used by one material line keeps the label's summed install lines.
+    # When several lines share a label (e.g. two "(Scheme A & B) Daltile" lines
+    # for shower vs tub surrounds), that sum belongs to all of them, so each
+    # line takes only its own install line(s). Exact (same description) matches
+    # are assigned first; prefix and location matches may then claim only the
+    # install lines no exact match took. An install line that more than one
+    # line claims in the same pass is used by none, and those lines keep their
+    # own qty.
+    label_counts: dict[str, int] = {}
+    for _, desc, _, _, _ in kept_lines:
+        key = (_extract_item_label(desc) or "").upper()
+        label_counts[key] = label_counts.get(key, 0) + 1
+    shared_lines = [
+        (i, desc, _extract_item_label(desc))
+        for i, desc, _, _, _ in kept_lines
+        if label_counts.get((_extract_item_label(desc) or "").upper(), 0) > 1
+    ]
+    shared_matches: dict[int, list[int]] = {}
+    install_claims: dict[int, int] = {}
+    for i, desc, label in shared_lines:
+        found = _match_install_lines(desc, label, install_records, exact_only=True)
+        if found:
+            shared_matches[i] = found
+            for r in found:
+                install_claims[r] = install_claims.get(r, 0) + 1
+    exact_claimed = set(install_claims)
+    for i, desc, label in shared_lines:
+        if i in shared_matches:
+            continue
+        found = _match_install_lines(desc, label, install_records, exclude=exact_claimed)
+        shared_matches[i] = found
+        for r in found:
+            install_claims[r] = install_claims.get(r, 0) + 1
+
+    materials = []
+    for i, desc, qty, material_type, ai_confidence in kept_lines:
         unit = _extract_unit(desc, material_type)
         item_code = _extract_item_label(desc)
+        code_upper = (item_code or "").upper()
 
-        own_installs = _match_install_lines(desc, item_code, install_records)
-        shared_label = label_counts.get((item_code or "").upper(), 0) > 1
+        own_installs = None
+        if i in shared_matches:
+            found = shared_matches[i]
+            if found and all(install_claims.get(r) == 1 for r in found):
+                own_installs = [install_records[r] for r in found]
         if own_installs:
             install_candidates = {t for _, _, _, t in own_installs if t != "unknown"}
-        elif shared_label:
-            install_candidates = set()
         else:
-            install_candidates = install_types.get((item_code or "").upper(), set())
+            install_candidates = install_types.get(code_upper, set())
         install_fallback = next(iter(install_candidates)) if len(install_candidates) == 1 else "unknown"
         fallback = _infer_material_type_fallback(item_code, desc)
-        code_upper = (item_code or "").upper()
         force_prefix_rule = code_upper.startswith(("B-", "WB-", "WM-", "RF-", "VCT-"))
         if material_type == "unknown" and install_fallback != "unknown":
             material_type = install_fallback
@@ -650,10 +770,10 @@ def parse_rfms(file_path: str) -> dict:
         # but we apply our own waste factors — so we need the net qty.
         if own_installs:
             install_qty = sum(q for _, q, _, _ in own_installs)
-        elif shared_label:
+        elif i in shared_matches:
             install_qty = None  # the label's install total belongs to several lines
         else:
-            install_qty = install_qtys.get(item_code.upper())
+            install_qty = install_qtys.get(code_upper)
         if install_qty and install_qty > 0:
             base_qty = install_qty
         else:
@@ -933,3 +1053,143 @@ def _backfill_unknowns(materials: list[dict]) -> list[dict]:
             if inferred != "unknown":
                 m["material_type"] = inferred
     return materials
+
+
+# ── Re-upload merge ───────────────────────────────────────────────────────────
+
+# Fields the estimator (or quote/price-book pricing) set on a saved line that a
+# re-uploaded takeoff line takes over; the takeoff itself never sets them.
+_SAVED_LINE_FIELDS = (
+    "unit_price", "vendor", "price_source", "quote_status",
+    "quote_source_hash", "quote_file_name", "freight_per_unit", "freight_source",
+    "fixture_count", "labor_rate_lf", "labor_catalog",
+)
+
+
+def _reupload_line_key(m: dict) -> tuple[str, str]:
+    """Identity of a takeoff line across uploads: its description (spacing, case
+    and trailing colon ignored) and its area. Not the code or qty, which change."""
+    desc = re.sub(r"\s+", " ", str(m.get("description") or "")).strip().rstrip(":").strip().lower()
+    return desc, str(m.get("area_type") or "unit").strip().lower()
+
+
+def _has_saved_price(m: dict) -> bool:
+    try:
+        return float(m.get("unit_price") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def merge_reupload_materials(existing: list[dict], new_lines: list[dict],
+                             dropped: Optional[list] = None) -> list[dict]:
+    """Merge a re-uploaded takeoff into a job's saved lines, deterministically.
+
+    Each new line replaces the saved line with the same description and area
+    (one-to-one, in order when a description repeats): the new installed qty
+    and takeoff measures win, and the saved code, price, vendor, price source,
+    quote status, quote/freight evidence, labor and fixture fields carry over,
+    as does a saved material type other than unknown (with its unit). When
+    more saved lines than new lines share a description and area (duplicates
+    left by an older merge), priced saved lines are paired first.
+
+    The upload covers the areas (area_type) its lines have. A saved line of a
+    covered area that no new line replaces was changed (product or color swap)
+    or removed in the revised takeoff, so it is dropped (and appended to
+    `dropped` when a list is given); this also drops surplus duplicates.
+    Saved lines of areas the upload does not cover stay as they are (e.g. the
+    common-area lines when only the units file is re-uploaded). New lines with
+    no saved line are added after the kept lines. `new_lines` must already
+    carry their final codes (see label_uploaded_lines).
+
+    Each returned line has "_existing" (the saved line it came from, or None)
+    and "_origin" ("paired", "saved" or "new")."""
+    new_by_key: dict[tuple[str, str], list[dict]] = {}
+    for n in new_lines:
+        new_by_key.setdefault(_reupload_line_key(n), []).append(n)
+    covered_areas = {key[1] for key in new_by_key}
+
+    saved_by_key: dict[tuple[str, str], list[int]] = {}
+    for index, saved in enumerate(existing):
+        key = _reupload_line_key(saved)
+        if key[0]:
+            saved_by_key.setdefault(key, []).append(index)
+    pair_for: dict[int, dict] = {}
+    for key, indexes in saved_by_key.items():
+        bucket = new_by_key.get(key) or []
+        if not bucket:
+            continue
+        ranked = sorted(indexes, key=lambda i: (0 if _has_saved_price(existing[i]) else 1, i))
+        for index, new in zip(sorted(ranked[:len(bucket)]), bucket):
+            pair_for[index] = new
+
+    paired_new: set[int] = set()
+    result: list[dict] = []
+    for index, saved in enumerate(existing):
+        key = _reupload_line_key(saved)
+        if index in pair_for:
+            new = pair_for[index]
+            paired_new.add(id(new))
+            line = dict(new)
+            for field in _SAVED_LINE_FIELDS:
+                if field in saved:
+                    line[field] = saved.get(field)
+            saved_type = str(saved.get("material_type") or "").strip().lower()
+            if saved_type and saved_type != "unknown":
+                line["material_type"] = saved.get("material_type")
+                line["unit"] = saved.get("unit") or line.get("unit")
+                line["ai_confidence"] = saved.get("ai_confidence")
+            line["_existing"] = saved
+            line["_origin"] = "paired"
+        elif key[0] and key[1] in covered_areas:
+            if dropped is not None:
+                dropped.append(saved)
+            continue
+        else:
+            line = dict(saved)
+            line["_existing"] = saved
+            line["_origin"] = "saved"
+        result.append(line)
+    for new in new_lines:
+        if id(new) not in paired_new:
+            line = dict(new)
+            line["_existing"] = None
+            line["_origin"] = "new"
+            result.append(line)
+
+    # Codes are stable across uploads: kept saved lines keep theirs, and a line
+    # that replaces a saved line keeps the saved line's code (proposal rewrites,
+    # deleted-material lists and price decisions are keyed by it). Only when
+    # that code is already taken does it fall back to its new code, then its
+    # " (Common Area)" form (for a common-area line), then "#n". Added lines
+    # take their new code, then the " (Common Area)" form, then "#n".
+    taken = {
+        str(m.get("item_code") or "").upper()
+        for m in result
+        if m["_origin"] == "saved" and m.get("item_code")
+    }
+    for origin in ("paired", "new"):
+        for m in result:
+            if m["_origin"] != origin:
+                continue
+            code = str(m.get("item_code") or "").strip()
+            saved_code = (
+                str(m["_existing"].get("item_code") or "").strip()
+                if m["_existing"] is not None else ""
+            )
+            candidates = [saved_code] if saved_code else []
+            if code:
+                candidates.append(code)
+                if m.get("area_type") == "common" and not code.endswith("(Common Area)"):
+                    candidates.append(f"{code} (Common Area)")
+            base = code or saved_code
+            if not base:
+                continue
+            choice = next((c for c in candidates if c.upper() not in taken), None)
+            if choice is None:
+                n = 2
+                while f"{base} #{n}".upper() in taken:
+                    n += 1
+                choice = f"{base} #{n}"
+            m["item_code"] = choice
+            taken.add(choice.upper())
+    return _backfill_unknowns(result)
