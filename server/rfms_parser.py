@@ -246,6 +246,81 @@ def _extract_item_label(desc: str) -> str:
     return desc[:30]
 
 
+def _normalize_line(desc: str) -> str:
+    """Lowercased description with the Install prefix, repeated scheme/option
+    prefixes, trailing colon and extra spaces removed, for line matching."""
+    text = re.sub(r"^\s*install\b", "", desc or "", flags=re.IGNORECASE)
+    text = re.sub(r"^[\s\-–—]+", "", text)
+    text = re.sub(r"(\([^)]*\)\s*)\1+", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip().rstrip(":").strip().lower()
+    return text
+
+
+def _location(desc: str) -> str:
+    """Text after the last '@' (the RFMS area name), lowercased."""
+    if "@" not in (desc or ""):
+        return ""
+    return re.sub(r"\s+", " ", desc.rsplit("@", 1)[1]).strip().rstrip(":").strip().lower()
+
+
+def _match_install_lines(desc: str, item_code: str, install_records: list) -> list:
+    """Install lines that belong to this material line: same description first,
+    then same label plus same @location. Empty when nothing matches exactly."""
+    target = _normalize_line(desc)
+    if not target:
+        return []
+    exact = [r for r in install_records if _normalize_line(r[0]) == target]
+    if exact:
+        return exact
+    prefix = [
+        r for r in install_records
+        if len(_normalize_line(r[0])) >= 15
+        and (_normalize_line(r[0]).startswith(target) or target.startswith(_normalize_line(r[0])))
+    ]
+    if prefix:
+        return prefix
+    loc = _location(desc)
+    code = (item_code or "").upper()
+    if loc and code:
+        return [r for r in install_records if (r[2] or "").upper() == code and _location(r[0]) == loc]
+    return []
+
+
+def _distinct_label(desc: str, label: str, level: int) -> str:
+    """A longer label built from the description, used when two lines share one."""
+    parts = [p.strip() for p in (desc or "").split(" - ") if p.strip()]
+    loc_raw = desc.rsplit("@", 1)[1].strip().rstrip(":").strip() if "@" in (desc or "") else ""
+    head = parts[0] if parts else label
+    if level >= 1 and len(parts) > 1:
+        head = f"{head} - {parts[1].split('@')[0].strip()}"
+    if loc_raw and "@" not in head:
+        return f"{head} @{loc_raw}"
+    return head
+
+
+def disambiguate_item_codes(materials: list[dict]) -> None:
+    """Give lines that share an item_code their own code (label + @location,
+    then + product name, then #n), so no takeoff line is lost or merged."""
+    for level in (0, 1):
+        groups: dict[str, list[dict]] = {}
+        for m in materials:
+            groups.setdefault(str(m.get("item_code") or "").upper(), []).append(m)
+        for code, group in groups.items():
+            if not code or len(group) < 2:
+                continue
+            for m in group:
+                m["item_code"] = _distinct_label(m.get("description") or "", m.get("item_code") or "", level)
+    seen: dict[str, int] = {}
+    for m in materials:
+        code = str(m.get("item_code") or "")
+        key = code.upper()
+        if key and key in seen:
+            seen[key] += 1
+            m["item_code"] = f"{code} #{seen[key]}"
+        else:
+            seen[key] = 1
+
+
 # ── AI Classification ────────────────────────────────────────────────────────
 
 AI_CLASSIFICATION_PROMPT = """You are a commercial flooring estimator assistant. I need you to classify each material line item from an RFMS takeoff pivot table.
@@ -486,6 +561,7 @@ def parse_rfms(file_path: str) -> dict:
 
     install_qtys = {}     # item_code -> install qty (net installed area)
     install_types: dict[str, set[str]] = {}
+    install_records = []  # (description, qty, item_code, inferred type)
 
     for desc, qty in all_rows:
         if _is_install(desc):
@@ -493,9 +569,10 @@ def parse_rfms(file_path: str) -> dict:
             # Extract item code and qty from install lines
             # e.g. "Install CPT-2 Broadloom" -> code "CPT-2", qty 34.6
             install_code = _extract_install_code(desc)
+            install_type = _infer_material_type_from_install(desc)
+            install_records.append((desc, qty, install_code, install_type))
             if install_code:
                 install_qtys[install_code] = install_qtys.get(install_code, 0) + qty
-                install_type = _infer_material_type_from_install(desc)
                 if install_type != "unknown":
                     install_types.setdefault(install_code, set()).add(install_type)
         elif _is_sundry(desc):
@@ -520,6 +597,14 @@ def parse_rfms(file_path: str) -> dict:
     ai_results = _classify_with_ai(ai_input, install_lines)
 
     # ── Build materials list ─────────────────────────────────────────────────
+    # Several material lines can share a short label (e.g. two "(Scheme A & B)
+    # Daltile" lines for shower vs tub surrounds), so each line is matched to
+    # its own install line by description, not just by label.
+    label_counts: dict[str, int] = {}
+    for _, desc, _ in material_lines:
+        key = (_extract_item_label(desc) or "").upper()
+        label_counts[key] = label_counts.get(key, 0) + 1
+
     materials = []
     for i, desc, qty in material_lines:
         # AI is primary classifier; if it returns "unknown" we fall back to
@@ -541,7 +626,14 @@ def parse_rfms(file_path: str) -> dict:
         unit = _extract_unit(desc, material_type)
         item_code = _extract_item_label(desc)
 
-        install_candidates = install_types.get((item_code or "").upper(), set())
+        own_installs = _match_install_lines(desc, item_code, install_records)
+        shared_label = label_counts.get((item_code or "").upper(), 0) > 1
+        if own_installs:
+            install_candidates = {t for _, _, _, t in own_installs if t != "unknown"}
+        elif shared_label:
+            install_candidates = set()
+        else:
+            install_candidates = install_types.get((item_code or "").upper(), set())
         install_fallback = next(iter(install_candidates)) if len(install_candidates) == 1 else "unknown"
         fallback = _infer_material_type_fallback(item_code, desc)
         code_upper = (item_code or "").upper()
@@ -556,7 +648,12 @@ def parse_rfms(file_path: str) -> dict:
         # Use install line qty (net installed area) when available.
         # The material line qty from RFMS includes RFMS-calculated waste,
         # but we apply our own waste factors — so we need the net qty.
-        install_qty = install_qtys.get(item_code.upper())
+        if own_installs:
+            install_qty = sum(q for _, q, _, _ in own_installs)
+        elif shared_label:
+            install_qty = None  # the label's install total belongs to several lines
+        else:
+            install_qty = install_qtys.get(item_code.upper())
         if install_qty and install_qty > 0:
             base_qty = install_qty
         else:
@@ -570,6 +667,8 @@ def parse_rfms(file_path: str) -> dict:
             "material_type": material_type,
             "ai_confidence": ai_confidence,
         })
+
+    disambiguate_item_codes(materials)
 
     # Detect mosaic tiles from description and tile dimensions
     _MOSAIC_KEYWORDS = {"mosaic"}

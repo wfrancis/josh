@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -54,7 +55,7 @@ from models import (
     save_golden_replay, list_golden_replays_for_job, list_golden_replays_for_version,
     get_latest_golden_replay_for_version,
 )
-from rfms_parser import ai_merge_materials, infer_material_type_fallback, parse_rfms
+from rfms_parser import ai_merge_materials, disambiguate_item_codes, infer_material_type_fallback, parse_rfms
 from quote_parser import (
     MAX_QUOTE_FILE_BYTES,
     parse_quote_file,
@@ -1804,18 +1805,31 @@ async def api_upload_rfms(job_id: str, request: Request, files: list[UploadFile]
                 "crack_isolation_sf": m.get("crack_isolation_sf", 0),
             })
 
-    # Deduplicate by item_code — if the same item_code appears with different
-    # area_types (e.g. from uploading unit + common area files), keep only the first
-    seen_codes = {}
+    # Drop only true duplicates (the same line uploaded twice). Different lines
+    # that share an item_code (e.g. the same label in the units and common-area
+    # files) are kept and given their own code, never silently dropped.
+    seen_lines = set()
     deduped = []
     for m in merged_raw:
-        code = m.get("item_code")
-        if code and code in seen_codes:
-            # Skip duplicate — same item_code already present
+        line_key = (
+            str(m.get("item_code") or "").upper(),
+            re.sub(r"\s+", " ", str(m.get("description") or "")).strip().lower(),
+            m.get("area_type"),
+            round(float(m.get("installed_qty") or 0), 2),
+        )
+        if line_key in seen_lines:
             continue
-        if code:
-            seen_codes[code] = True
+        seen_lines.add(line_key)
         deduped.append(m)
+    code_counts = {}
+    for m in deduped:
+        key = str(m.get("item_code") or "").upper()
+        code_counts[key] = code_counts.get(key, 0) + 1
+    for m in deduped:
+        key = str(m.get("item_code") or "").upper()
+        if key and code_counts[key] > 1 and m.get("area_type") == "common":
+            m["item_code"] = f"{m.get('item_code')} (Common Area)"
+    disambiguate_item_codes(deduped)
     merged_raw = deduped
 
     # Load waste factors from DB (falls back to config defaults)
