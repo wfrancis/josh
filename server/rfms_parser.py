@@ -507,7 +507,7 @@ _AI_CLASSIFICATION_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "index": {"type": "integer"},
-                        "material_type": {"type": "string", "enum": VALID_MATERIAL_TYPES + ["sundry"]},
+                        "material_type": {"type": "string", "enum": VALID_MATERIAL_TYPES + ["sundry", "unknown"]},
                         "confidence": {"type": "number"},
                     },
                     "required": ["index", "material_type", "confidence"],
@@ -758,12 +758,9 @@ def parse_rfms(file_path: str) -> dict:
             material_type = ai_result.get("type", "unknown")
             ai_confidence = ai_result.get("confidence")
 
-        # Skip if AI classified as sundry, but only when the description agrees;
-        # otherwise keep it as "unknown" so readiness asks for a real type.
+        # Skip if AI classified as sundry
         if material_type == "sundry":
-            if _is_sundry(desc):
-                continue
-            material_type, ai_confidence = "unknown", None
+            continue
         kept_lines.append((i, desc, qty, material_type, ai_confidence))
 
     # A label used by one material line keeps the label's summed install lines.

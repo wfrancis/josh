@@ -26,7 +26,7 @@ _ANTHROPIC_MODEL_MAP = {
 }
 
 # Seconds to wait for one AI answer, and how many extra tries after a failure.
-OPENAI_TIMEOUT_SECONDS = 150
+OPENAI_TIMEOUT_SECONDS = 480
 OPENAI_MAX_RETRIES = 1
 
 _provider = None  # "openai" or "anthropic" — auto-detected

@@ -373,18 +373,14 @@ def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
             group_passes[group_index].add(pass_no)
             exact_groups[identity] = group_index
 
-    # Every read that found products must find the same products. A product
-    # found by only some reads is usually a misread or a renamed duplicate, so
-    # fail closed instead of saving it as an extra row.
+    # A product found by only some reads may be a misread or a renamed
+    # duplicate. Keep it, but say so in its notes so the estimator checks it.
     passes_with_rows = {i for i, result in enumerate(all_results) if _normalize_products(result)}
+    partial_groups = set()
     if len(passes_with_rows) > 1:
-        for variants, passes in zip(groups, group_passes):
-            if passes != passes_with_rows:
-                label = str(variants[0].get("product_name") or "a product")
-                raise ValueError(
-                    f"AI quote-reading passes disagree on whether {label} is in this quote. "
-                    "Review the source and retry."
-                )
+        partial_groups = {
+            index for index, passes in enumerate(group_passes) if passes != passes_with_rows
+        }
 
     merged = []
     for variants in groups:
@@ -434,6 +430,9 @@ def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
             else:
                 base["freight"] = freights[0]
 
+        if len(merged) in partial_groups:
+            flag = f"Found by only some of the {len(passes_with_rows)} AI reads. Check this line against the quote."
+            base["notes"] = f"{base['notes']} {flag}" if base.get("notes") else flag
         merged.append(base)
 
     return _normalize_products(merged)

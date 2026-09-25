@@ -3520,8 +3520,8 @@ def _upload_rfms_files(job_id: str, files: list[UploadFile]) -> dict:
             )
 
     ai_classification = _combine_ai_classification(ai_statuses)
-    if ai_classification["total"] and not ai_classification["ai_used"]:
-        log_activity(db_id, "rfms_ai_not_used", ai_classification["message"] or "AI did not sort the takeoff lines.", ai_classification)
+    if ai_classification["total"] and ai_classification["message"]:
+        log_activity(db_id, "rfms_ai_not_used", ai_classification["message"], ai_classification)
 
     updated_job = load_job(db_id) or {}
     return {
@@ -3539,10 +3539,17 @@ def _combine_ai_classification(statuses: list[dict]) -> dict:
     statuses = [st for st in statuses if st.get("total")]
     classified = sum(st.get("classified", 0) for st in statuses)
     total = sum(st.get("total", 0) for st in statuses)
-    message = next((st["message"] for st in statuses if st.get("message")), None)
     ai_used = bool(statuses) and all(st.get("ai_used") for st in statuses)
-    if not statuses:
+    messages = [st["message"] for st in statuses if st.get("message")]
+    if not messages:
         message = None
+    elif len(statuses) == 1:
+        message = messages[0]
+    elif classified == 0:
+        message = messages[0]
+    else:
+        message = (f"AI sorted {classified} of {total} materials. The rest were filled in by rules. "
+                   "Please check the Type column.")
     return {
         "ai_used": ai_used,
         "model": next((st["model"] for st in statuses if st.get("model")), None),
@@ -3837,6 +3844,8 @@ def _match_quotes_to_materials(job_id: int, products: list[dict]) -> tuple[int, 
     matched_prod_indices = set()
     freight_rates = (get_all_company_rates().get("freight_rates") or FREIGHT_RATES)
 
+    unit_mismatches: list[str] = []
+
     # Phase 1: Fast matching — item_code AND description-based product identifiers
     # Extract searchable identifiers from material descriptions.
     # e.g. "Interface - Woven Gradience - WG100 - 108051 Onyx" → ["wg100", "108051", "woven gradience"]
@@ -4064,6 +4073,9 @@ def _match_quotes_to_materials(job_id: int, products: list[dict]) -> tuple[int, 
                 best_prod_idx = prod_idx
 
         # Require a minimum score of 3 to accept a match (prevents single generic word matches)
+        if best_score >= 3 and best_prod and not _quote_unit_matches(best_prod, mat):
+            unit_mismatches.append(_unit_mismatch_note(best_prod, mat))
+            continue
         if best_score >= 3 and best_prod:
             if provenance_only:
                 mat["quote_source_hash"] = best_prod.get("source_hash") or best_prod.get("_source_hash")
@@ -4099,6 +4111,9 @@ def _match_quotes_to_materials(job_id: int, products: list[dict]) -> tuple[int, 
         for mat_idx, prod_idx in ai_matched:
             mat = materials[mat_idx]
             prod = products[prod_idx]
+            if not _quote_unit_matches(prod, mat):
+                unit_mismatches.append(_unit_mismatch_note(prod, mat))
+                continue
             mat["unit_price"] = prod["unit_price"]
             mat["vendor"] = prod.get("vendor", "")
             mat["quote_status"] = "quoted"
@@ -4112,6 +4127,13 @@ def _match_quotes_to_materials(job_id: int, products: list[dict]) -> tuple[int, 
             updated = True
 
     # Phase 3: Apply transition default rules (Carpet→LVT = Silver Pin, etc.)
+    if unit_mismatches:
+        log_activity(
+            job_id, "quote_unit_mismatch",
+            f"{len(unit_mismatches)} quote price(s) weren't used because the unit didn't match the line. "
+            "Type those prices by hand: " + "; ".join(unit_mismatches[:5]),
+            {"lines": unit_mismatches},
+        )
     still_unpriced = [i for i, m in enumerate(materials) if i not in matched_mat_indices and (not m.get("unit_price") or m["unit_price"] == 0)]
     if still_unpriced:
         td_matched = _apply_transition_defaults(materials, still_unpriced)
@@ -4149,6 +4171,19 @@ def _match_quotes_to_materials(job_id: int, products: list[dict]) -> tuple[int, 
     _link_upload_to_requests(job_id, products)
 
     return matched, loaded, (materials if updated else None)
+
+
+def _quote_unit_matches(prod: dict, mat: dict) -> bool:
+    """A quote price is copied onto a line only when both use the same unit
+    (or either unit is unknown). A per-SF price on an SY line would be 9x off."""
+    prod_unit = normalize_quote_unit(prod.get("unit"))
+    mat_unit = normalize_quote_unit(mat.get("unit"))
+    return not prod_unit or not mat_unit or prod_unit == mat_unit
+
+
+def _unit_mismatch_note(prod: dict, mat: dict) -> str:
+    return (f"{mat.get('item_code') or mat.get('description') or 'A line'}: the quote price is per "
+            f"{normalize_quote_unit(prod.get('unit'))} but the line is in {normalize_quote_unit(mat.get('unit'))}")
 
 
 def _ai_match_quotes(unmatched_mats: list, unmatched_prods: list) -> tuple[list, str | None]:
@@ -10652,11 +10687,14 @@ def api_update_settings(body: SettingsUpdate):
 
 @app.post("/api/settings/test-ai")
 @no_audit("AI connection check only: sends one tiny request and saves nothing")
-def api_test_ai():
-    """Check that the saved key and model really answer, for the Settings page."""
+def api_test_ai(body: dict | None = Body(default=None)):
+    """Check that the key and the chosen model really answer, for the Settings page."""
     settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
-    model = settings.get("openai_model", DEFAULT_MODEL)
+    stored_model = settings.get("openai_model", DEFAULT_MODEL)
+    model = (body or {}).get("model") or stored_model
+    if model not in {option["id"] for option in MODEL_OPTIONS} | {stored_model}:
+        raise HTTPException(status_code=400, detail="Pick one of the listed AI models to test.")
     started = time.monotonic()
     try:
         raw = chat_complete(

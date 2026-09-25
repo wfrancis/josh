@@ -277,7 +277,7 @@ export default function JobDetail() {
     setError(null)
     try {
       const upload = await api.uploadRFMS(jobId, fileList)
-      setRfmsAiStatus(upload.ai_classification || null)
+      setRfmsAiStatus(upload.ai_classification ? { ...upload.ai_classification, jobDbId: upload.job_id } : null)
       const updated = await api.getJob(upload.job_id || jobId)
       materialsStateRef.current = updated.materials || []
       materialsFingerprintRef.current = updated.materials_source_fingerprint || ''
@@ -1034,9 +1034,9 @@ export default function JobDetail() {
                     <CheckCircle2 className="w-5 h-5 text-emerald-400 flex-shrink-0" />
                     <span className="text-sm font-medium text-emerald-300 flex-1">
                       {job.materials?.length || 0} materials parsed with waste factors applied
-                      {rfmsAiStatus?.ai_used && !rfmsAiStatus?.message && (
+                      {rfmsAiStatus?.jobDbId === job.id && rfmsAiStatus.ai_used && !rfmsAiStatus.message && (
                         <span className="block text-xs font-normal text-emerald-400/70">
-                          Sorted by AI ({rfmsAiStatus.model})
+                          Sorted by AI{isAdmin && rfmsAiStatus.model ? ` (${rfmsAiStatus.model})` : ''}
                         </span>
                       )}
                     </span>
@@ -1045,7 +1045,7 @@ export default function JobDetail() {
                       className="text-xs text-emerald-500/70 hover:text-emerald-400 transition-colors"
                     >Upload new files</button>
                   </div>
-                  {rfmsAiStatus?.message && (
+                  {rfmsAiStatus?.jobDbId === job.id && rfmsAiStatus.message && (
                     <div className="flex items-start gap-3 px-4 py-3 bg-amber-500/[0.08] border border-amber-500/25 rounded-xl" role="status">
                       <AlertTriangle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
                       <span className="text-sm text-amber-200">{rfmsAiStatus.message}</span>

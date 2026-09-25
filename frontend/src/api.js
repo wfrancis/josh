@@ -297,7 +297,7 @@ export const api = {
   // Settings
   getSettings: () => request('/settings'),
   updateSettings: (data) => request('/settings', { method: 'POST', body: JSON.stringify(data) }),
-  testAi: () => request('/settings/test-ai', { method: 'POST' }),
+  testAi: (model) => request('/settings/test-ai', { method: 'POST', body: JSON.stringify({ model }) }),
 
   // Vendors
   listVendors: () => request('/vendors'),

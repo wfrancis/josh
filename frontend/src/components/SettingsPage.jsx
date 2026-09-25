@@ -31,6 +31,7 @@ export default function SettingsPage() {
     { id: 'gpt-6-luna', label: 'GPT-6 Luna', note: 'Newest model. Best accuracy.' },
   ])
   const [aiTest, setAiTest] = useState(null) // null | { running } | { ok, message }
+  const [savedModel, setSavedModel] = useState('gpt-5-mini')
   const [multiPassCount, setMultiPassCount] = useState(2)
 
   // Vendor quote test mode
@@ -58,6 +59,7 @@ export default function SettingsPage() {
         setAnthropicKeyMasked(data.anthropic_api_key_masked || '')
         setAiProvider(data.ai_provider || 'none')
         setModel(data.openai_model || 'gpt-5-mini')
+        setSavedModel(data.openai_model || 'gpt-5-mini')
         if (Array.isArray(data.model_options) && data.model_options.length) setModelOptions(data.model_options)
         setMultiPassCount(data.multi_pass_count || 2)
         // Email automation settings
@@ -78,7 +80,7 @@ export default function SettingsPage() {
   const handleTestAi = async () => {
     setAiTest({ running: true })
     try {
-      const result = await api.testAi()
+      const result = await api.testAi(model)
       setAiTest({ ok: !!result.ok, message: result.message })
     } catch (err) {
       setAiTest({ ok: false, message: err.message || 'The AI test could not run. Try again.' })
@@ -107,6 +109,8 @@ export default function SettingsPage() {
       setAnthropicKeySet(result.anthropic_api_key_set)
       setAnthropicKeyMasked(result.anthropic_api_key_masked || '')
       setAiProvider(result.ai_provider || 'none')
+      setSavedModel(result.openai_model || model)
+      setAiTest(null)
       setEditingKey(false)
       setApiKey('')
       setEditingAnthropicKey(false)
@@ -272,7 +276,7 @@ export default function SettingsPage() {
                     </button>
                   )}
                 </div>
-                {aiTest && !aiTest.running && (
+                {aiProvider !== 'none' && aiTest && !aiTest.running && (
                   <p className={`mt-2 text-xs ${aiTest.ok ? 'text-emerald-300' : 'text-amber-300'}`} role="status">
                     {aiTest.message}
                   </p>
@@ -286,11 +290,11 @@ export default function SettingsPage() {
                   AI Model
                 </label>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  {[...modelOptions, ...(modelOptions.some(opt => opt.id === model) ? [] : [{ id: model, label: model, note: 'Saved model (not on the list).' }])].map(opt => (
+                  {[...modelOptions, ...(modelOptions.some(opt => opt.id === savedModel) ? [] : [{ id: savedModel, label: savedModel, note: 'Saved model (not on the list).' }])].map(opt => (
                     <button
                       key={opt.id}
                       type="button"
-                      onClick={() => setModel(opt.id)}
+                      onClick={() => { setModel(opt.id); setAiTest(null) }}
                       className={`p-4 rounded-xl border text-left transition-all ${
                         model === opt.id
                           ? 'bg-si-bright/10 border-si-bright/30 ring-1 ring-si-bright/20'
