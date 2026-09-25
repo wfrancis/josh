@@ -25,6 +25,12 @@ export default function SettingsPage() {
   const [editingAnthropicKey, setEditingAnthropicKey] = useState(false)
   const [aiProvider, setAiProvider] = useState('none')
   const [model, setModel] = useState('gpt-5-mini')
+  const [modelOptions, setModelOptions] = useState([
+    { id: 'gpt-5-mini', label: 'GPT-5 Mini', note: 'Fast and low cost.' },
+    { id: 'gpt-5.4', label: 'GPT-5.4', note: 'Strong accuracy for complex quotes.' },
+    { id: 'gpt-6-luna', label: 'GPT-6 Luna', note: 'Newest model. Best accuracy.' },
+  ])
+  const [aiTest, setAiTest] = useState(null) // null | { running } | { ok, message }
   const [multiPassCount, setMultiPassCount] = useState(2)
 
   // Vendor quote test mode
@@ -52,6 +58,7 @@ export default function SettingsPage() {
         setAnthropicKeyMasked(data.anthropic_api_key_masked || '')
         setAiProvider(data.ai_provider || 'none')
         setModel(data.openai_model || 'gpt-5-mini')
+        if (Array.isArray(data.model_options) && data.model_options.length) setModelOptions(data.model_options)
         setMultiPassCount(data.multi_pass_count || 2)
         // Email automation settings
         if (data.vendor_quote_test_mode === 'true') setTestMode(true)
@@ -67,6 +74,16 @@ export default function SettingsPage() {
   useEffect(() => {
     api.getVendorIngestionHealth().then(setVendorHealth).catch(() => setVendorHealth(null))
   }, [saveSuccess, emailSaveSuccess, testMode])
+
+  const handleTestAi = async () => {
+    setAiTest({ running: true })
+    try {
+      const result = await api.testAi()
+      setAiTest({ ok: !!result.ok, message: result.message })
+    } catch (err) {
+      setAiTest({ ok: false, message: err.message || 'The AI test could not run. Try again.' })
+    }
+  }
 
   const handleSaveSettings = async () => {
     setSaving(true)
@@ -240,11 +257,26 @@ export default function SettingsPage() {
                 <div className="flex items-center gap-2">
                   <div className={`w-2 h-2 rounded-full ${aiProvider !== 'none' ? 'bg-emerald-400' : 'bg-amber-400'}`} />
                   <span className="text-xs font-medium text-gray-300">
-                    {aiProvider === 'openai' && 'Active: OpenAI'}
-                    {aiProvider === 'anthropic' && 'Active: Anthropic Claude'}
-                    {aiProvider === 'none' && 'No AI provider configured — quote parsing and material classification disabled'}
+                    {aiProvider === 'openai' && 'OpenAI key found'}
+                    {aiProvider === 'anthropic' && 'Anthropic key found'}
+                    {aiProvider === 'none' && 'No AI key. Takeoffs are sorted by rules only, and quote reading is off.'}
                   </span>
+                  {aiProvider !== 'none' && (
+                    <button
+                      type="button"
+                      onClick={handleTestAi}
+                      disabled={aiTest?.running}
+                      className="ml-auto text-xs font-medium px-2.5 py-1 rounded-lg border border-white/[0.1] text-gray-200 hover:bg-white/[0.06] disabled:opacity-50"
+                    >
+                      {aiTest?.running ? 'Testing…' : 'Test AI'}
+                    </button>
+                  )}
                 </div>
+                {aiTest && !aiTest.running && (
+                  <p className={`mt-2 text-xs ${aiTest.ok ? 'text-emerald-300' : 'text-amber-300'}`} role="status">
+                    {aiTest.message}
+                  </p>
+                )}
               </div>
 
               {/* Model Selection */}
@@ -253,42 +285,25 @@ export default function SettingsPage() {
                   <Brain className="w-3.5 h-3.5" />
                   AI Model
                 </label>
-                <div className="grid grid-cols-2 gap-3">
-                  <button
-                    onClick={() => setModel('gpt-5-mini')}
-                    className={`p-4 rounded-xl border text-left transition-all ${
-                      model === 'gpt-5-mini'
-                        ? 'bg-si-bright/10 border-si-bright/30 ring-1 ring-si-bright/20'
-                        : 'bg-white/[0.03] border-white/[0.06] hover:border-white/[0.12]'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2 mb-1.5">
-                      <div className={`w-3 h-3 rounded-full ${model === 'gpt-5-mini' ? 'bg-si-bright' : 'bg-white/10'}`} />
-                      <span className="text-sm font-semibold text-white">GPT-5 Mini</span>
-                    </div>
-                    <p className="text-xs text-gray-500 leading-relaxed">
-                      Fast & cost-efficient. Great for standard quote parsing.
-                    </p>
-                  </button>
-                  <button
-                    onClick={() => setModel('gpt-5.4')}
-                    className={`p-4 rounded-xl border text-left transition-all ${
-                      model === 'gpt-5.4'
-                        ? 'bg-si-orange/10 border-si-orange/30 ring-1 ring-si-orange/20'
-                        : 'bg-white/[0.03] border-white/[0.06] hover:border-white/[0.12]'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2 mb-1.5">
-                      <div className={`w-3 h-3 rounded-full ${model === 'gpt-5.4' ? 'bg-si-orange' : 'bg-white/10'}`} />
-                      <span className="text-sm font-semibold text-white">GPT-5.4</span>
-                      <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-si-orange/15 text-si-orange uppercase">
-                        Flagship
-                      </span>
-                    </div>
-                    <p className="text-xs text-gray-500 leading-relaxed">
-                      Most capable model. Best accuracy for complex quotes.
-                    </p>
-                  </button>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  {[...modelOptions, ...(modelOptions.some(opt => opt.id === model) ? [] : [{ id: model, label: model, note: 'Saved model (not on the list).' }])].map(opt => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setModel(opt.id)}
+                      className={`p-4 rounded-xl border text-left transition-all ${
+                        model === opt.id
+                          ? 'bg-si-bright/10 border-si-bright/30 ring-1 ring-si-bright/20'
+                          : 'bg-white/[0.03] border-white/[0.06] hover:border-white/[0.12]'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 mb-1.5">
+                        <div className={`w-3 h-3 rounded-full ${model === opt.id ? 'bg-si-bright' : 'bg-white/10'}`} />
+                        <span className="text-sm font-semibold text-white">{opt.label}</span>
+                      </div>
+                      <p className="text-xs text-gray-500 leading-relaxed">{opt.note}</p>
+                    </button>
+                  ))}
                 </div>
               </div>
 

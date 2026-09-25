@@ -63,7 +63,7 @@ export default function FileUpload({
                 </svg>
               </div>
             </div>
-            <p className="text-sm font-medium text-white mb-1">AI is analyzing your files</p>
+            <p className="text-sm font-medium text-white mb-1">Reading your files</p>
             <div className="flex items-center justify-center gap-1 mb-4">
               <span className="text-xs text-gray-500">Processing</span>
               <span className="flex gap-0.5 ml-1">

@@ -213,7 +213,7 @@ def rewrite_bundle_descriptions(bundles: list[dict], job: dict = None) -> list[d
     model = settings.get("openai_model", "gpt-5-mini")
 
     # Build user prompt with bundle data
-    job_name = (job or {}).get("name", "Unknown Project")
+    job_name = (job or {}).get("project_name") or (job or {}).get("name") or "Unknown Project"
     unit_count = (job or {}).get("unit_count", 0)
 
     lines = [f"Project: {job_name}"]
@@ -268,6 +268,12 @@ def rewrite_bundle_descriptions(bundles: list[dict], job: dict = None) -> list[d
 
     try:
         result = json.loads(content)
-        return result.get("descriptions", [])
-    except (json.JSONDecodeError, AttributeError):
-        return []
+    except (json.JSONDecodeError, TypeError):
+        result = None
+    descriptions = result.get("descriptions") if isinstance(result, dict) else None
+    if not isinstance(descriptions, list):
+        raise RuntimeError("The AI reply could not be read. Nothing was changed. Click Rewrite to try again.")
+    return [
+        d for d in descriptions
+        if isinstance(d, dict) and isinstance(d.get("index"), int) and isinstance(d.get("description"), str)
+    ]

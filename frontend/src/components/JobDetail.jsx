@@ -78,6 +78,7 @@ export default function JobDetail() {
   const [step, setStep] = useState('takeoff')
   const [rfmsLoading, setRfmsLoading] = useState(false)
   const [rfmsSuccess, setRfmsSuccess] = useState(false)
+  const [rfmsAiStatus, setRfmsAiStatus] = useState(null)
   const [stagedFiles, setStagedFiles] = useState([])
   const rfmsInputRef = useRef(null)
   const quoteSectionRef = useRef(null)
@@ -276,6 +277,7 @@ export default function JobDetail() {
     setError(null)
     try {
       const upload = await api.uploadRFMS(jobId, fileList)
+      setRfmsAiStatus(upload.ai_classification || null)
       const updated = await api.getJob(upload.job_id || jobId)
       materialsStateRef.current = updated.materials || []
       materialsFingerprintRef.current = updated.materials_source_fingerprint || ''
@@ -1027,15 +1029,28 @@ export default function JobDetail() {
               )}
 
               {rfmsSuccess ? (
-                <div className="flex items-center gap-3 px-4 py-3 bg-emerald-500/[0.06] border border-emerald-500/20 rounded-xl">
-                  <CheckCircle2 className="w-5 h-5 text-emerald-400 flex-shrink-0" />
-                  <span className="text-sm font-medium text-emerald-300 flex-1">
-                    {job.materials?.length || 0} materials parsed with waste factors applied
-                  </span>
-                  <button
-                    onClick={() => { setStagedFiles([]); setRfmsSuccess(false) }}
-                    className="text-xs text-emerald-500/70 hover:text-emerald-400 transition-colors"
-                  >Upload new files</button>
+                <div className="space-y-2">
+                  <div className="flex items-center gap-3 px-4 py-3 bg-emerald-500/[0.06] border border-emerald-500/20 rounded-xl">
+                    <CheckCircle2 className="w-5 h-5 text-emerald-400 flex-shrink-0" />
+                    <span className="text-sm font-medium text-emerald-300 flex-1">
+                      {job.materials?.length || 0} materials parsed with waste factors applied
+                      {rfmsAiStatus?.ai_used && !rfmsAiStatus?.message && (
+                        <span className="block text-xs font-normal text-emerald-400/70">
+                          Sorted by AI ({rfmsAiStatus.model})
+                        </span>
+                      )}
+                    </span>
+                    <button
+                      onClick={() => { setStagedFiles([]); setRfmsSuccess(false); setRfmsAiStatus(null) }}
+                      className="text-xs text-emerald-500/70 hover:text-emerald-400 transition-colors"
+                    >Upload new files</button>
+                  </div>
+                  {rfmsAiStatus?.message && (
+                    <div className="flex items-start gap-3 px-4 py-3 bg-amber-500/[0.08] border border-amber-500/25 rounded-xl" role="status">
+                      <AlertTriangle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+                      <span className="text-sm text-amber-200">{rfmsAiStatus.message}</span>
+                    </div>
+                  )}
                 </div>
               ) : rfmsLoading ? (
                 <div className="upload-zone text-center py-10">
@@ -1048,9 +1063,9 @@ export default function JobDetail() {
                       </svg>
                     </div>
                   </div>
-                  <p className="text-sm font-medium text-white mb-1">AI is analyzing your files</p>
+                  <p className="text-sm font-medium text-white mb-1">Reading your files</p>
                   <div className="flex items-center justify-center gap-1 mb-4">
-                    <span className="text-xs text-gray-500">Classifying materials</span>
+                    <span className="text-xs text-gray-500">Sorting materials</span>
                     <span className="flex gap-0.5 ml-1">
                       <span className="ai-dot w-1 h-1 rounded-full bg-si-bright inline-block" />
                       <span className="ai-dot w-1 h-1 rounded-full bg-si-bright inline-block" />

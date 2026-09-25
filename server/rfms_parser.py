@@ -439,6 +439,7 @@ VALID MATERIAL TYPES (you must use exactly one of these):
 - tread_riser: Stair tread and riser
 - transitions: Transitions, edge trims, Schluter profiles
 - waterproofing: Waterproofing membrane
+- sound_mat: Sound mat / acoustical underlayment under LVT
 
 CLASSIFICATION RULES:
 - Match material codes (F102, W131, B102, etc.) to their install line counterparts
@@ -495,14 +496,49 @@ def infer_material_type_fallback(item_code: str, description: str) -> str:
     return _infer_material_type_fallback(item_code, description)
 
 
+_AI_CLASSIFICATION_SCHEMA = {
+    "name": "material_classifications",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "classifications": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "material_type": {"type": "string", "enum": VALID_MATERIAL_TYPES + ["sundry"]},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["index", "material_type", "confidence"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["classifications"],
+        "additionalProperties": False,
+    },
+}
+
+AI_RULES_FALLBACK_NOTE = "Types were filled in by rules instead. Please check the Type column."
+
+
 def _classify_with_ai(material_lines: list[tuple[int, str]],
-                       install_lines: list[str]) -> dict[int, dict]:
+                       install_lines: list[str],
+                       status: dict | None = None) -> dict[int, dict]:
     """
     Use OpenAI to classify material lines by matching with install lines.
-    Returns: {index: material_type}
+    Returns: {index: {"type", "confidence"}}. Fills `status` (when given) with
+    whether the AI really ran, so the upload can tell the estimator.
     """
+    if status is None:
+        status = {}
+    status.update({"ai_used": False, "model": None, "classified": 0,
+                   "total": len(material_lines), "message": None})
+    if not material_lines:
+        return {}
     try:
-        from ai_client import chat_complete, get_provider_info
+        from ai_client import AIError, chat_complete, get_provider_info
         from models import get_settings
 
         settings = get_settings()
@@ -510,9 +546,11 @@ def _classify_with_ai(material_lines: list[tuple[int, str]],
         provider = get_provider_info(api_key)
         if not provider["available"]:
             print("[rfms_parser] No AI API key available for classification")
+            status["message"] = "AI is not set up, so it did not sort the materials. " + AI_RULES_FALLBACK_NOTE
             return {}
 
         model = settings.get("openai_model", "gpt-5-mini")
+        status["model"] = model
         print(f"[rfms_parser] Classifying {len(material_lines)} materials with provider={provider['provider']}, model={model}")
 
         # Build the user message
@@ -533,6 +571,7 @@ INSTALL LINES (use these to identify material types):
             api_key=api_key,
             model=model,
             json_mode=True,
+            response_schema=_AI_CLASSIFICATION_SCHEMA,
         )
         print(f"[rfms_parser] AI classification raw response: {raw[:500]}")
         parsed = json.loads(raw)
@@ -553,23 +592,40 @@ INSTALL LINES (use these to identify material types):
         elif isinstance(parsed, list):
             items = parsed
         else:
-            return {}
+            items = []
 
+        sent = {idx for idx, _ in material_lines}
         result = {}
         for item in items:
-            idx = item.get("index")
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if idx not in sent:
+                continue
             mtype = item.get("material_type", "unknown")
             confidence = item.get("confidence", 0.5)
-            if idx is not None and mtype in VALID_MATERIAL_TYPES:
+            if mtype in VALID_MATERIAL_TYPES or mtype == "sundry":
                 result[idx] = {"type": mtype, "confidence": confidence}
-            elif idx is not None and mtype == "sundry":
-                result[idx] = {"type": "sundry", "confidence": confidence}
 
         print(f"[rfms_parser] Classification result: {len(result)} classified out of {len(material_lines)}")
+        status.update({"ai_used": bool(result), "classified": len(result)})
+        if not result:
+            status["message"] = "AI answered but sorted none of the materials. " + AI_RULES_FALLBACK_NOTE
+        elif len(result) < len(material_lines):
+            status["message"] = (f"AI sorted {len(result)} of {len(material_lines)} materials. "
+                                 "The rest were filled in by rules. Please check the Type column.")
         return result
 
+    except AIError as e:
+        print(f"[rfms_parser] AI classification failed: {e.reason}: {e}")
+        status["message"] = f"{e.user_message} {AI_RULES_FALLBACK_NOTE}"
+        return {}
     except Exception as e:
         print(f"[rfms_parser] AI classification failed, materials will be 'unknown': {e}")
+        status["message"] = "AI couldn't read its own answer this time. " + AI_RULES_FALLBACK_NOTE
         return {}
 
 
@@ -684,7 +740,8 @@ def parse_rfms(file_path: str) -> dict:
 
     # ── Classify with AI ─────────────────────────────────────────────────────
     ai_input = [(i, desc) for i, desc, qty in material_lines]
-    ai_results = _classify_with_ai(ai_input, install_lines)
+    ai_status: dict = {}
+    ai_results = _classify_with_ai(ai_input, install_lines, ai_status)
 
     # ── Build materials list ─────────────────────────────────────────────────
     kept_lines = []  # (index, description, qty, material_type, ai_confidence)
@@ -701,9 +758,12 @@ def parse_rfms(file_path: str) -> dict:
             material_type = ai_result.get("type", "unknown")
             ai_confidence = ai_result.get("confidence")
 
-        # Skip if AI classified as sundry
+        # Skip if AI classified as sundry, but only when the description agrees;
+        # otherwise keep it as "unknown" so readiness asks for a real type.
         if material_type == "sundry":
-            continue
+            if _is_sundry(desc):
+                continue
+            material_type, ai_confidence = "unknown", None
         kept_lines.append((i, desc, qty, material_type, ai_confidence))
 
     # A label used by one material line keeps the label's summed install lines.
@@ -849,7 +909,7 @@ def parse_rfms(file_path: str) -> dict:
                     m["crack_isolation_sf"] = round(crack_sf * share, 2)
 
     wb.close()
-    return {"job_info": job_info, "materials": materials}
+    return {"job_info": job_info, "materials": materials, "ai_classification": ai_status}
 
 
 # ── AI Merge Prompt ───────────────────────────────────────────────────────────

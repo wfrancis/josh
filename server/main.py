@@ -120,7 +120,7 @@ from reproducibility import (
 from config import WASTE_FACTORS, SUNDRY_RULES, FREIGHT_RATES, LABOR_QTY_RULES, EXCLUSIONS_TEMPLATE, STAIR_SUNDRY_KITS
 from config import QUOTE_EMAILS_ENABLED, QUOTE_EMAILS_OFF_DETAIL
 from email_agent import compose_quote_request, send_email, generate_quote_request_text
-from ai_client import chat_complete, get_provider_info
+from ai_client import AIError, DEFAULT_MODEL, MODEL_OPTIONS, chat_complete, get_provider_info
 from inbox_monitor import InboxMonitor
 from audit_engine import AuditTraceBuilder
 import audit
@@ -3387,6 +3387,7 @@ def _upload_rfms_files(job_id: str, files: list[UploadFile]) -> dict:
     all_materials_raw = []
     rfms_job_info = {}
     imported_uploads = []
+    ai_statuses = []
 
     for file in files:
         if os.path.splitext(file.filename or "")[1].lower() != ".xlsx":
@@ -3408,6 +3409,8 @@ def _upload_rfms_files(job_id: str, files: list[UploadFile]) -> dict:
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to parse RFMS file '{file.filename}': {e}")
         imported_uploads.append((file.filename, file_hash, len(content), file_path))
+        if result.get("ai_classification"):
+            ai_statuses.append(result["ai_classification"])
 
         # Use job info from first file that has it
         file_job_info = result.get("job_info", {})
@@ -3516,6 +3519,10 @@ def _upload_rfms_files(job_id: str, files: list[UploadFile]) -> dict:
                 {"files": file_names, "lines": removed_materials},
             )
 
+    ai_classification = _combine_ai_classification(ai_statuses)
+    if ai_classification["total"] and not ai_classification["ai_used"]:
+        log_activity(db_id, "rfms_ai_not_used", ai_classification["message"] or "AI did not sort the takeoff lines.", ai_classification)
+
     updated_job = load_job(db_id) or {}
     return {
         "job_id": db_id,
@@ -3523,6 +3530,25 @@ def _upload_rfms_files(job_id: str, files: list[UploadFile]) -> dict:
         "job_info": rfms_job_info,
         "materials": materials,
         "removed_materials": removed_materials,
+        "ai_classification": ai_classification,
+    }
+
+
+def _combine_ai_classification(statuses: list[dict]) -> dict:
+    """One summary of whether AI sorted the takeoff lines, across all uploaded files."""
+    statuses = [st for st in statuses if st.get("total")]
+    classified = sum(st.get("classified", 0) for st in statuses)
+    total = sum(st.get("total", 0) for st in statuses)
+    message = next((st["message"] for st in statuses if st.get("message")), None)
+    ai_used = bool(statuses) and all(st.get("ai_used") for st in statuses)
+    if not statuses:
+        message = None
+    return {
+        "ai_used": ai_used,
+        "model": next((st["model"] for st in statuses if st.get("model")), None),
+        "classified": classified,
+        "total": total,
+        "message": message,
     }
 
 
@@ -4066,7 +4092,10 @@ def _match_quotes_to_materials(job_id: int, products: list[dict]) -> tuple[int, 
     unmatched_prods = [(i, p) for i, p in enumerate(products) if i not in matched_prod_indices and not p.get("error") and p.get("unit_price")]
 
     if unmatched_mats and unmatched_prods:
-        ai_matched = _ai_match_quotes(unmatched_mats, unmatched_prods)
+        ai_matched, ai_match_error = _ai_match_quotes(unmatched_mats, unmatched_prods)
+        if ai_match_error:
+            log_activity(job_id, "quote_ai_match_failed",
+                         ai_match_error + " Type prices on the lines still marked Needs price.")
         for mat_idx, prod_idx in ai_matched:
             mat = materials[mat_idx]
             prod = products[prod_idx]
@@ -4122,15 +4151,19 @@ def _match_quotes_to_materials(job_id: int, products: list[dict]) -> tuple[int, 
     return matched, loaded, (materials if updated else None)
 
 
-def _ai_match_quotes(unmatched_mats: list, unmatched_prods: list) -> list:
-    """Use AI to fuzzy-match vendor products to job materials."""
+def _ai_match_quotes(unmatched_mats: list, unmatched_prods: list) -> tuple[list, str | None]:
+    """Use AI to fuzzy-match vendor products to job materials.
+
+    Returns (pairs, error): error is a plain-English note when the AI could
+    not do the matching, so the caller can tell the estimator.
+    """
     settings = get_settings()
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
     model = settings.get("openai_model", "gpt-5-mini")
 
     provider = get_provider_info(api_key)
     if not provider["available"]:
-        return []
+        return [], "AI is not set up, so quote lines were matched by exact code only."
 
     try:
         import json
@@ -4173,23 +4206,23 @@ Return {{"matches": []}} if no confident matches."""
 
         pairs = []
         for m in matches_raw:
-            conf = m.get("confidence", 0)
-            if conf < 0.8:
-                continue
-            mat_ref = m.get("material", "")
-            prod_ref = m.get("product", "")
             try:
-                mat_local_idx = int(mat_ref.replace("M", ""))
-                prod_local_idx = int(prod_ref.replace("P", ""))
+                if float(m.get("confidence", 0)) < 0.8:
+                    continue
+                mat_local_idx = int(str(m.get("material", "")).replace("M", ""))
+                prod_local_idx = int(str(m.get("product", "")).replace("P", ""))
                 if 0 <= mat_local_idx < len(unmatched_mats) and 0 <= prod_local_idx < len(unmatched_prods):
                     pairs.append((unmatched_mats[mat_local_idx][0], unmatched_prods[prod_local_idx][0]))
-            except (ValueError, IndexError):
+            except (AttributeError, TypeError, ValueError, IndexError):
                 continue
 
-        return pairs
+        return pairs, None
+    except AIError as e:
+        print(f"AI quote matching failed (non-fatal): {e.reason}: {e}")
+        return [], f"AI quote matching didn't run: {e.user_message}"
     except Exception as e:
         print(f"AI quote matching failed (non-fatal): {e}")
-        return []
+        return [], "AI quote matching didn't run this time."
 
 
 # ─── Transition Default Rules ───────────────────────────────────────────────
@@ -5754,7 +5787,14 @@ def _rewrite_descriptions(job_id: str, raw_body: bytes) -> dict:
     if not bundles:
         raise HTTPException(status_code=400, detail="No bundles provided")
 
-    descriptions = rewrite_bundle_descriptions(bundles, job)
+    try:
+        descriptions = rewrite_bundle_descriptions(bundles, job)
+    except AIError as e:
+        raise HTTPException(status_code=502, detail=f"{e.user_message} Nothing was changed.")
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if not descriptions:
+        raise HTTPException(status_code=502, detail="The AI didn't rewrite any bundles. Nothing was changed. Click Rewrite to try again.")
     return {"descriptions": descriptions}
 
 
@@ -10088,8 +10128,21 @@ def api_upload_labor_catalog(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Upload .pdf or .xlsx")
     except HTTPException:
         raise
+    except AIError as e:
+        raise HTTPException(status_code=400, detail=f"{e.user_message} Nothing was changed.")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse labor catalog: {e}")
+
+    # Saving replaces the whole catalog, so refuse a read that looks incomplete.
+    if not catalog:
+        raise HTTPException(status_code=400, detail="No labor rates were found in that file. Nothing was changed.")
+    current_count = len(get_labor_catalog_entries())
+    if ext == ".pdf" and current_count and len(catalog) < current_count / 2:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"That file gave only {len(catalog)} labor rates, but the catalog has {current_count}. "
+                    "Nothing was changed. Check the file, or upload the catalog as Excel."),
+        )
 
     with entity_write("labor_catalog", WHOLE_LIST, _load_labor_catalog, "labor_catalog.upload",
                       summary=f"Uploaded the labor catalog from {file.filename} ({_count(len(catalog), 'entry', 'entries')})",
@@ -10528,7 +10581,9 @@ def api_get_settings():
         "openai_api_key_masked": masked,
         "anthropic_api_key_set": bool(anthropic_key),
         "anthropic_api_key_masked": anthropic_masked,
-        "openai_model": settings.get("openai_model", "gpt-5-mini"),
+        "openai_model": settings.get("openai_model", DEFAULT_MODEL),
+        "model_options": MODEL_OPTIONS,
+        "openai_key_on_server": bool(os.environ.get("OPENAI_API_KEY")),
         "multi_pass_count": int(settings.get("multi_pass_count", "2")),
         "email_automation_enabled": settings.get("email_automation_enabled", "false"),
         "email_config": settings.get("email_config", ""),
@@ -10551,8 +10606,13 @@ def api_update_settings(body: SettingsUpdate):
     if body.anthropic_api_key is not None:
         updates["anthropic_api_key"] = body.anthropic_api_key
     if body.openai_model is not None:
-        if body.openai_model not in ("gpt-5-mini", "gpt-5.4"):
-            raise HTTPException(status_code=400, detail="Invalid model. Choose gpt-5-mini or gpt-5.4")
+        allowed = {option["id"] for option in MODEL_OPTIONS}
+        # Saving the model that is already stored is always fine, even if it
+        # has since left the list, so other settings can still be saved.
+        allowed.add(get_settings().get("openai_model", DEFAULT_MODEL))
+        if body.openai_model not in allowed:
+            names = ", ".join(option["label"] for option in MODEL_OPTIONS)
+            raise HTTPException(status_code=400, detail=f"Pick one of these AI models: {names}.")
         updates["openai_model"] = body.openai_model
     if body.multi_pass_count is not None:
         if body.multi_pass_count < 1 or body.multi_pass_count > 5:
@@ -10588,6 +10648,33 @@ def api_update_settings(body: SettingsUpdate):
             _start_sim_watcher()
             _start_inbox_monitor()  # Re-evaluate: stop real monitor if test mode on
     return {"message": "Settings updated", **api_get_settings()}
+
+
+@app.post("/api/settings/test-ai")
+@no_audit("AI connection check only: sends one tiny request and saves nothing")
+def api_test_ai():
+    """Check that the saved key and model really answer, for the Settings page."""
+    settings = get_settings()
+    api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+    model = settings.get("openai_model", DEFAULT_MODEL)
+    started = time.monotonic()
+    try:
+        raw = chat_complete(
+            system="Return JSON only.",
+            user='Return exactly {"ok": true}',
+            api_key=api_key,
+            model=model,
+            json_mode=True,
+        )
+        ok = json.loads(raw).get("ok") is True
+    except AIError as exc:
+        return {"ok": False, "model": model, "message": exc.user_message}
+    except (ValueError, AttributeError):
+        return {"ok": False, "model": model, "message": "The AI answered, but not in the expected format. Try again."}
+    seconds = round(time.monotonic() - started, 1)
+    if not ok:
+        return {"ok": False, "model": model, "message": "The AI answered, but not in the expected format. Try again."}
+    return {"ok": True, "model": model, "seconds": seconds, "message": f"Working: {model} answered in {seconds} s."}
 
 
 def _apply_openai_config(settings: dict = None):

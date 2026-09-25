@@ -55,9 +55,11 @@ Extract product pricing from the vendor quote text.
 
 IMPORTANT RULES:
 1. If a single price applies to multiple product lines (e.g. "WG100 and WG200 $27.25"), create a SEPARATE entry for EACH product line with the same price.
-2. Match the original quote request if included in the email thread — use those product names and codes.
-3. The unit for carpet tile (CPT) is always SY (square yards). LVT units are typically SF (square feet).
+2. Copy each product name, price and unit EXACTLY as printed in the quote. Never convert units (for example SF to SY) and never calculate a price. If the quote gives a list price and a net price, use the net price.
+3. List each priced product only ONCE, even if it is mentioned in several places.
 4. Extract accessory/adhesive pricing as separate products (TacTiles, adhesives, primers, etc.)
+5. Do not list freight, tax, subtotals, totals, deposits or fees as products. Put freight terms in the freight field.
+6. vendor is the company that sent the quote, written the same way for every product.
 
 Return a JSON object with a "products" array. Each product should have:
 - vendor: string (company name of the vendor)
@@ -354,8 +356,9 @@ def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
     values that were not proven by the quote.
     """
     groups: list[list[dict]] = []
+    group_passes: list[set[int]] = []
     exact_groups: dict[tuple[str, str], int] = {}
-    for pass_result in all_results:
+    for pass_no, pass_result in enumerate(all_results):
         prior_group_count = len(groups)
         for product in _normalize_products(pass_result):
             identity = _product_identity_key(product)
@@ -365,8 +368,23 @@ def _merge_multipass_results(all_results: list[list[dict]]) -> list[dict]:
             if group_index is None:
                 group_index = len(groups)
                 groups.append([])
+                group_passes.append(set())
             groups[group_index].append(product)
+            group_passes[group_index].add(pass_no)
             exact_groups[identity] = group_index
+
+    # Every read that found products must find the same products. A product
+    # found by only some reads is usually a misread or a renamed duplicate, so
+    # fail closed instead of saving it as an extra row.
+    passes_with_rows = {i for i, result in enumerate(all_results) if _normalize_products(result)}
+    if len(passes_with_rows) > 1:
+        for variants, passes in zip(groups, group_passes):
+            if passes != passes_with_rows:
+                label = str(variants[0].get("product_name") or "a product")
+                raise ValueError(
+                    f"AI quote-reading passes disagree on whether {label} is in this quote. "
+                    "Review the source and retry."
+                )
 
     merged = []
     for variants in groups:
