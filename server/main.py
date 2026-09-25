@@ -3437,6 +3437,7 @@ def _upload_rfms_files(job_id: str, files: list[UploadFile]) -> dict:
             "item_code": m.get("item_code"),
             "description": m.get("description"),
             "material_type": m.get("material_type", "unknown"),
+            "ai_confidence": m.get("ai_confidence"),
             "installed_qty": m.get("qty", 0),
             "unit": m.get("unit"),
             "area_type": m.get("area_type", "unit"),
